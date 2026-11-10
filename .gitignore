@@ -1,0 +1,23 @@
+# Node
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# CMake / C++
+build/
+out/
+cmake-build-*/
+*.o
+*.obj
+*.pdb
+compile_commands.json
+
+# Validation output
+tools/validate/out/
+*.contact-sheet.png
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
