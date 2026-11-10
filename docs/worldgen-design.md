@@ -1,8 +1,6 @@
 # Voxel World Generation — Design Doc
 
-Draft · last updated 2026-11-10
-
-Living version (comment and edit there): https://claude.ai/artifact/8nuPt4GoZuViRseetj2gvu
+Draft · last updated 2026-11-10 · this file is canonical
 
 ## Summary and key decisions
 

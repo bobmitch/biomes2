@@ -21,3 +21,17 @@ tools/validate/out/
 .vscode/
 .idea/
 .DS_Store
+
+# Build outputs
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+.cache/
+CMakeUserPresets.json
+
+# Local environment
+.env
+.env.local
