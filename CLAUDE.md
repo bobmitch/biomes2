@@ -53,6 +53,13 @@ cmake --preset dev && cmake --build --preset dev
    determinism authority: golden hashes come from it, and CPU-to-GPU agreement
    is a TOLERANCE comparison, never a hash — WGSL §15.7.5 permits
    reassociation and fusion with no opt-out, so an exact check is impossible.
+9. The field function uses ONLY `+ - * /`, `sqrt`, `floor` and comparisons.
+   No `pow`, `exp`, `log`, `sin` or `cos`: libm transcendentals are not
+   exactly specified and glibc disagrees with the MSVC CRT by an ULP. Layer 5
+   is a discrete function of the heightfield, so one ULP moves a river — this
+   broke three of eight golden seeds across platforms and only the two-OS CI
+   matrix caught it. Shape curves are built from arithmetic; see
+   `flatness_curve` in `worldgen/shaders/field.h` for the pattern.
 
 ## Gotchas that have bitten us
 

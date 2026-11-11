@@ -76,13 +76,26 @@ float fbm_shaped(float x, float y, int octaves, float lacunarity, float gain, fl
     return 0.0f;
 }
 
-// One biome's profile, in metres. flatness is a power curve applied after
-// shaping: above 1 pushes ground towards the base elevation and makes plains,
-// below 1 makes peaks.
+// A rational bias curve, NOT pow(t, flatness). Same shape -- identity at
+// flatness 1, pushes towards the base elevation above it and towards peaks
+// below it, endpoints fixed at 0 and 1 -- but built from multiply and divide
+// only, so it is bit-identical on every platform.
+//
+// pow is a libm function and is not exactly specified: glibc and the MSVC CRT
+// disagree by an ULP. Layer 4 absorbed that, because its output is continuous.
+// Layer 5 does not: the drainage network is a DISCRETE function of this
+// heightfield, so one ULP flips a depression-fill comparison and the river
+// moves. It cost three of eight golden seeds across platforms before CI caught
+// it. The denominator is flatness*(1-t) + t, positive for any flatness > 0.
+float flatness_curve(float t, float flatness) {
+    return t / (flatness * (1.0f - t) + t);
+}
+
+// One biome's profile, in metres.
 float layer4_profile(float x, float z, float freq, float base_elevation, float amplitude, int octaves, float lacunarity, float gain, float ridge_blend, float flatness, uint seed) {
     const float n = fbm_shaped(x * freq, z * freq, octaves, lacunarity, gain, ridge_blend, seed);
     const float t = wg_saturate(n * 0.5f + 0.5f);
-    const float shaped = pow(t, flatness);
+    const float shaped = flatness_curve(t, flatness);
     return base_elevation + amplitude * (shaped * 2.0f - 1.0f);
 }
 

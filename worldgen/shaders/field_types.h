@@ -45,11 +45,18 @@ inline int  asint(int v) { return v; }
 // Brought in rather than redefined: the standard library already declares
 // float overloads of these in the global namespace, and a second definition
 // is a hard error. HLSL has them as builtins, so the dialect just calls them.
+// ONLY these. Every one is exactly specified by IEEE-754 or is pure
+// comparison, so the field function is bit-identical on every platform.
+//
+// Do not add pow, exp, log, sin, cos or any other libm transcendental. They
+// are not exactly specified, glibc and the MSVC CRT differ by an ULP, and
+// layer 5's drainage network is a discrete function of the heightfield -- one
+// ULP moves a river. That is not a theoretical worry: it broke three of eight
+// golden seeds across platforms, and only the two-OS CI matrix caught it.
 using std::floor;
 using std::sqrt;
 using std::clamp;
 using std::abs;    // the float overload; HLSL and WGSL have it as a builtin
-using std::pow;
 
 #endif  // __cplusplus
 #endif  // WORLDGEN_FIELD_TYPES_H
