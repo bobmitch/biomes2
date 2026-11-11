@@ -25,6 +25,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
+#include <queue>
 #include <stdexcept>
 #include <cstdio>
 #include <cstring>
@@ -69,6 +71,10 @@ struct WorldParams {
     float continent_scale   = 140.0f;     // metres per unit of continent mask
     float biome_freq        = 1.0f / 900.0f;
     float blend_width       = 500.0f;     // metres of cross-boundary height blend
+
+    // layer 5
+    int   river_grid        = 256;        // the doc's figure; ample over the disc
+    float river_threshold   = 70.0f;      // upstream cells before it is a river
 };
 
 // Thin adapters onto the canonical field function in worldgen/shaders/field.h.
@@ -260,6 +266,22 @@ struct SeedWorld {
     AssignStats             stats;
     uint32_t s_cont = 0, s_dang = 0, s_wx = 0, s_wz = 0, s_height = 0;
     float    land_fraction = 0.0f;
+
+    // --- layer 5 ---
+    // The drainage network as segments, each from a grid cell to the one it
+    // flows into, plus a uniform grid binning them so the carve only tests
+    // the few that could be near a sample.
+    struct RiverSeg {
+        float ax, az, bx, bz;
+        float width, depth;
+    };
+    std::vector<RiverSeg> rivers;
+    int   rgrid_n = 0;
+    float rgrid_cell = 0.0f;
+    std::vector<std::vector<int> > rgrid;
+    int   river_paths_to_ocean = 0;
+    int   river_paths_total = 0;
+    int   river_ascending = 0;   // segments that climb on the filled surface
     // Highest layer-0 sample beyond r = 0.95. The edge taper assertion: land
     // must have fallen away before the rim, on every seed.
     float    max_h_outer = -1.0e9f;
@@ -279,7 +301,7 @@ inline uint64_t fnv1a(uint64_t h, uint64_t v) {
 // Ground height in metres. Which cells are near a point is an index question,
 // so the lookup and the weights live here; every metre of the result comes
 // from worldgen/shaders/field.h.
-static float terrain_height(const SeedWorld& w, const WorldParams& wp,
+static float terrain_base(const SeedWorld& w, const WorldParams& wp,
                             const ArchetypeTable& table, float x, float z, float r) {
     const float cont = layer0_height(x, z, r, wp, w.s_cont);
 
@@ -309,6 +331,194 @@ static float terrain_height(const SeedWorld& w, const WorldParams& wp,
     return layer4_height(cont, wp.continent_scale, blended, wp.sea_level);
 }
 
+// Distance to the nearest river segment, with that channel's shape. Shared by
+// the carve and the relief renderer, so the water is drawn where it is.
+static float nearest_river(const SeedWorld& w, const WorldParams& wp,
+                           float x, float z, float& out_w, float& out_d) {
+    out_w = 0.0f;
+    out_d = 0.0f;
+    if (w.rivers.empty()) return 3.4e38f;
+
+    const float R = wp.radius;
+    const int   gx = std::min(w.rgrid_n - 1, std::max(0, static_cast<int>((x + R) / w.rgrid_cell)));
+    const int   gz = std::min(w.rgrid_n - 1, std::max(0, static_cast<int>((z + R) / w.rgrid_cell)));
+
+    float best_d = 3.4e38f;
+    float best_w = 0.0f, best_depth = 0.0f;
+    for (int j = gz - 1; j <= gz + 1; ++j) {
+        if (j < 0 || j >= w.rgrid_n) continue;
+        for (int i = gx - 1; i <= gx + 1; ++i) {
+            if (i < 0 || i >= w.rgrid_n) continue;
+            const std::vector<int>& bin = w.rgrid[static_cast<size_t>(j) * w.rgrid_n + i];
+            for (size_t m = 0; m < bin.size(); ++m) {
+                const SeedWorld::RiverSeg& s = w.rivers[bin[m]];
+                const float d = river_segment_distance(x, z, s.ax, s.az, s.bx, s.bz);
+                if (d < best_d) { best_d = d; best_w = s.width; best_depth = s.depth; }
+            }
+        }
+    }
+    out_w = best_w;
+    out_d = best_depth;
+    return best_d;
+}
+
+// Ground height with the drainage carved in. The tracing in build_rivers runs
+// against terrain_base, so this is the one place the two must not be confused:
+// carving the surface the rivers were traced on would feed back on itself.
+static float terrain_height(const SeedWorld& w, const WorldParams& wp,
+                            const ArchetypeTable& table, float x, float z, float r) {
+    const float h = terrain_base(w, wp, table, x, z, r);
+    float rw = 0.0f, rd = 0.0f;
+    const float dist = nearest_river(w, wp, x, z, rw, rd);
+    if (dist >= rw) return h;
+    return river_carve(h, dist, rw, rd);
+}
+
+// --- layer 5: trace the drainage -------------------------------------------
+//
+// Steepest descent on a raw heightfield gets stuck in every local minimum, so
+// the surface is depression-filled first (priority flood). That buys more than
+// convenience: the flood pops cells in order of spill height, so the cell that
+// relaxes a neighbour is always downstream of it. Taking that as the flow
+// direction makes "descends monotonically and terminates in ocean" true by
+// construction rather than something to test for and patch up.
+static void build_rivers(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table) {
+    const int   G = wp.river_grid;
+    const int   N = G * G;
+    const float R = wp.radius;
+    const float step = 2.0f * R / G;
+
+    std::vector<float> h(N, 0.0f);
+    std::vector<char>  inside(N, 0);
+    for (int j = 0; j < G; ++j) {
+        const float z = -R + (j + 0.5f) * step;
+        for (int i = 0; i < G; ++i) {
+            const float x = -R + (i + 0.5f) * step;
+            const float rr = std::sqrt(x * x + z * z) / R;
+            const int   k = j * G + i;
+            if (rr > 1.0f) { h[k] = -1.0e9f; continue; }
+            inside[k] = 1;
+            h[k] = terrain_base(w, wp, table, x, z, rr);
+        }
+    }
+
+    std::vector<float> filled(h);
+    std::vector<int>   parent(N, -1);
+    std::vector<char>  done(N, 0);
+    std::vector<int>   order;
+    order.reserve(N);
+
+    typedef std::pair<float, int> PQ;
+    std::priority_queue<PQ, std::vector<PQ>, std::greater<PQ> > pq;
+    for (int k = 0; k < N; ++k) {
+        // The sea and everything beyond the rim are the outlets.
+        if (!inside[k] || h[k] <= 0.0f) {
+            done[k] = 1;
+            order.push_back(k);
+            pq.push(PQ(h[k], k));
+        }
+    }
+
+    // Eight-connected, not four. Four-connected flow can only run along the
+    // grid axes, so every river comes out as a right-angled staircase -- which
+    // is invisible on a contact sheet at 87 m per pixel and unmistakable the
+    // moment you look at one seed close up.
+    const int dxs[8] = {1, -1, 0, 0, 1, 1, -1, -1};
+    const int dzs[8] = {0, 0, 1, -1, 1, -1, 1, -1};
+    while (!pq.empty()) {
+        const PQ cur = pq.top();
+        pq.pop();
+        const int k = cur.second, ci = k % G, cj = k / G;
+        for (int d = 0; d < 8; ++d) {
+            const int ni = ci + dxs[d], nj = cj + dzs[d];
+            if (ni < 0 || ni >= G || nj < 0 || nj >= G) continue;
+            const int nk = nj * G + ni;
+            if (done[nk] || !inside[nk]) continue;
+            done[nk] = 1;
+            filled[nk] = std::max(h[nk], cur.first);
+            parent[nk] = k;              // the cell it spills into: downstream
+            order.push_back(nk);
+            pq.push(PQ(filled[nk], nk));
+        }
+    }
+
+    // Upstream area. Children are relaxed after their parent, so walking the
+    // flood order backwards visits every cell before the one it drains into.
+    std::vector<float> acc(N, 1.0f);
+    for (size_t idx = order.size(); idx-- > 0;) {
+        const int k = order[idx];
+        if (parent[k] >= 0) acc[parent[k]] += acc[k];
+    }
+
+    w.rivers.clear();
+    for (int k = 0; k < N; ++k) {
+        if (!inside[k] || parent[k] < 0) continue;
+        if (h[k] <= 0.0f) continue;                 // already at sea
+        if (acc[k] < wp.river_threshold) continue;
+        const int p = parent[k];
+        const int g = parent[p];
+        // Corner-cut: run the segment between edge midpoints rather than cell
+        // centres. One pass of Chaikin on the flow path, which costs nothing
+        // and takes the hard right angles off the grid.
+        const float kx = -R + ((k % G) + 0.5f) * step, kz = -R + ((k / G) + 0.5f) * step;
+        const float px = -R + ((p % G) + 0.5f) * step, pz = -R + ((p / G) + 0.5f) * step;
+        SeedWorld::RiverSeg s;
+        s.ax = 0.5f * (kx + px);
+        s.az = 0.5f * (kz + pz);
+        if (g >= 0) {
+            const float gx = -R + ((g % G) + 0.5f) * step, gz = -R + ((g / G) + 0.5f) * step;
+            s.bx = 0.5f * (px + gx);
+            s.bz = 0.5f * (pz + gz);
+        } else {
+            s.bx = px;
+            s.bz = pz;
+        }
+        const float f = std::sqrt(acc[k] / wp.river_threshold);
+        s.width = std::min(38.0f + 26.0f * f, 170.0f);
+        s.depth = std::min(3.0f + 2.4f * f, 17.0f);
+        w.rivers.push_back(s);
+        if (filled[p] > filled[k]) ++w.river_ascending;
+    }
+
+    // Every river head followed to its outlet, as the harness asserts.
+    for (int k = 0; k < N; ++k) {
+        if (!inside[k] || h[k] <= 0.0f || acc[k] < wp.river_threshold) continue;
+        bool head = true;
+        for (int d = 0; d < 8 && head; ++d) {
+            const int ni = (k % G) + dxs[d], nj = (k / G) + dzs[d];
+            if (ni < 0 || ni >= G || nj < 0 || nj >= G) continue;
+            const int nk = nj * G + ni;
+            if (parent[nk] == k && acc[nk] >= wp.river_threshold) head = false;
+        }
+        if (!head) continue;
+        ++w.river_paths_total;
+        int cur = k, steps = 0;
+        while (cur >= 0 && steps < 4 * N) {
+            if (h[cur] <= 0.0f || !inside[cur]) { ++w.river_paths_to_ocean; break; }
+            cur = parent[cur];
+            ++steps;
+        }
+    }
+
+    // Bin the segments so the carve only tests the few that could be near.
+    w.rgrid_n = std::max(8, G / 4);
+    w.rgrid_cell = 2.0f * R / w.rgrid_n;
+    w.rgrid.assign(static_cast<size_t>(w.rgrid_n) * w.rgrid_n, std::vector<int>());
+    for (size_t s = 0; s < w.rivers.size(); ++s) {
+        const SeedWorld::RiverSeg& seg = w.rivers[s];
+        const float pad = seg.width;
+        const int i0 = std::max(0, static_cast<int>((std::min(seg.ax, seg.bx) - pad + R) / w.rgrid_cell));
+        const int i1 = std::min(w.rgrid_n - 1, static_cast<int>((std::max(seg.ax, seg.bx) + pad + R) / w.rgrid_cell));
+        const int j0 = std::max(0, static_cast<int>((std::min(seg.az, seg.bz) - pad + R) / w.rgrid_cell));
+        const int j1 = std::min(w.rgrid_n - 1, static_cast<int>((std::max(seg.az, seg.bz) + pad + R) / w.rgrid_cell));
+        for (int j = j0; j <= j1; ++j) {
+            for (int i = i0; i <= i1; ++i) {
+                w.rgrid[static_cast<size_t>(j) * w.rgrid_n + i].push_back(static_cast<int>(s));
+            }
+        }
+    }
+}
+
 // --- per-seed evaluation ---------------------------------------------------
 struct SeedResult {
     int   cells = 0, land_cells = 0;
@@ -329,6 +539,8 @@ struct SeedResult {
     bool  spawn_coastal = false;
     bool  spawn_calmest = false;
     float slope_gentle = 1.0f;  // share of land under 30 degrees
+    int   river_segments = 0;
+    int   river_paths_total = 0, river_paths_to_ocean = 0, river_ascending = 0;
     uint64_t hash = 0;
     float mean_patch_cells = 0.0f;
     float mean_patch_km2 = 0.0f;
@@ -440,6 +652,10 @@ static SeedWorld build_world(uint64_t world_seed,
 
     // --- the thing under test ---
     assign_biomes(cells, graph, table, ap, w.biome, w.stats);
+
+    // Layer 5 runs last: it needs the finished heightfield, which needs the
+    // biome assignment.
+    build_rivers(w, wp, table);
     return w;
 }
 
@@ -595,6 +811,11 @@ static SeedResult eval_seed(uint64_t world_seed,
         }
     }
 
+    out.river_segments     = static_cast<int>(w.rivers.size());
+    out.river_paths_total  = w.river_paths_total;
+    out.river_paths_to_ocean = w.river_paths_to_ocean;
+    out.river_ascending    = w.river_ascending;
+
     // --- slope budget ---
     // Measured over a 4 m baseline, not the sampling step: walkability is a
     // local property, and a 100 m baseline would average every cliff away.
@@ -717,6 +938,8 @@ struct Summary {
     int boat_failures = 0;       // a biome unreachable even by sea
     int spawn_failures = 0;      // no spawn, not coastal, or not calmest
     int slope_failures = 0;      // under 60% of land walkable
+    int river_failures = 0;      // no rivers, or one that climbs or never reaches the sea
+    float mean_river_segments = 0.0f;
     float min_foot_reach = 2.0f;
     float min_slope_gentle = 2.0f;
     float mean_cells = 0, mean_land_cells = 0, mean_land_frac = 0;
@@ -763,6 +986,9 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
         if (!r.boat_all_biomes) ++sm.boat_failures;
         if (r.spawn_cell < 0 || !r.spawn_coastal || !r.spawn_calmest) ++sm.spawn_failures;
         if (r.slope_gentle < 0.60f) ++sm.slope_failures;
+        if (r.river_segments == 0 || r.river_ascending > 0 ||
+            r.river_paths_to_ocean != r.river_paths_total) ++sm.river_failures;
+        sm.mean_river_segments += r.river_segments;
         sm.min_foot_reach = std::min(sm.min_foot_reach, r.foot_reach);
         sm.min_slope_gentle = std::min(sm.min_slope_gentle, r.slope_gentle);
         sm.mean_cells += r.cells;
@@ -784,6 +1010,7 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
     sm.mean_quota_err *= inv; sm.mean_spearman *= inv;
     sm.mean_patch_cells *= inv; sm.mean_patch_km2 *= inv;
     sm.mean_relaxed *= inv; sm.mean_overflow *= inv; sm.mean_candidates *= inv;
+    sm.mean_river_segments *= inv;
     std::sort(errs.begin(), errs.end());
     sm.p95_quota_err = errs[std::min<size_t>(errs.size() - 1, static_cast<size_t>(errs.size() * 0.95))];
     return sm;
@@ -917,11 +1144,16 @@ static void render_relief_tile(const SeedWorld& w, const WorldParams& wp,
                 c[0] = 10; c[1] = 12; c[2] = 18;
             } else {
                 const float h0 = terrain_height(w, wp, table, x, z, rr);
+                float rw = 0.0f, rd = 0.0f;
+                const float rdist = nearest_river(w, wp, x, z, rw, rd);
                 if (h0 <= 0.0f) {
                     const float d = wg_saturate(-h0 / 160.0f);
                     c[0] = static_cast<unsigned char>(46 - 30 * d);
                     c[1] = static_cast<unsigned char>(78 - 46 * d);
                     c[2] = static_cast<unsigned char>(130 - 62 * d);
+                } else if (rdist < rw * 0.42f) {
+                    // Inside the channel: draw the water, not the riverbed.
+                    c[0] = 52; c[1] = 96; c[2] = 150;
                 } else {
                     const float hx = terrain_height(w, wp, table, x + e, z,
                                                     std::sqrt((x + e) * (x + e) + z * z) / R);
@@ -1018,6 +1250,18 @@ static bool contact_sheet(const WorldParams& wp, const ArchetypeTable& table,
     for (size_t i = 0; i < pool.size(); ++i) pool[i].join();
 
     return write_bmp(path, W, H, img);
+}
+
+// One seed, rendered large. Rivers are 40-170 m wide and a contact-sheet tile
+// is ~87 m per pixel, so the drainage is sub-pixel there and can only be judged
+// close up.
+static bool single_relief(const WorldParams& wp, const ArchetypeTable& table,
+                          const AssignParams& ap, uint64_t seed,
+                          const char* path, int tile) {
+    std::vector<unsigned char> img(static_cast<size_t>(tile) * tile * 3, 26);
+    const SeedWorld w = build_world(seed, wp, table, ap);
+    render_relief_tile(w, wp, table, img, tile, 0, 0, tile);
+    return write_bmp(path, tile, tile, img);
 }
 
 // --- adjacency test --------------------------------------------------------
@@ -1159,6 +1403,8 @@ int main(int argc, char** argv) {
     bool adjacency = false;
     bool bless = false;
     bool relief = false;
+    bool closeup = false;
+    uint64_t closeup_seed = 0;
     int  tile = 192;
     const char* sheet_path = "build/contact_sheet.bmp";
     WorldParams wp;
@@ -1186,6 +1432,10 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--test-adjacency"))         adjacency = true;
         else if (!std::strcmp(argv[i], "--bless"))                  bless = true;
         else if (!std::strcmp(argv[i], "--relief"))                 relief = true;
+        else if (!std::strcmp(argv[i], "--closeup") && i + 1 < argc) {
+            closeup = true;
+            closeup_seed = std::strtoull(argv[++i], nullptr, 10);
+        }
         else if (!std::strcmp(argv[i], "--danger-feat") && i + 1 < argc) wp.danger_freq = 1.0f / static_cast<float>(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--dump-seeds") && i + 1 < argc) {
             dump_world_seed = std::strtoull(argv[++i], nullptr, 10);
@@ -1201,6 +1451,17 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("archetypes: %d biomes, invariants OK\n", static_cast<int>(table.size()));
+
+    if (closeup) {
+        std::printf("close-up relief, seed %llu, %dpx\n",
+                    static_cast<unsigned long long>(closeup_seed), tile);
+        if (!single_relief(wp, table, ap, closeup_seed, sheet_path, tile)) {
+            std::printf("FAILED to write %s\n", sheet_path);
+            return 1;
+        }
+        std::printf("wrote %s\n", sheet_path);
+        return 0;
+    }
 
     if (dump) {
         // The CPU side of the ADR-001 tolerance check. Samples exactly as
@@ -1333,29 +1594,34 @@ int main(int argc, char** argv) {
         print_header();
         char label[64];
         std::snprintf(label, sizeof(label), "R=%.0fkm", wp.radius / 1000.0f);
+        // Throughput, measured BEFORE the 200-seed run and as the best of
+        // three. Taken afterwards it contended with threads that had just
+        // finished and swung by more than 2x between runs, which is useless as
+        // a regression guard -- the fix is a better measurement, not a looser
+        // threshold.
+        double ns = 1.0e30;
+        {
+            const int N = 1000000;
+            const uint32_t sd = feature_seed(0, FEATURE_CONTINENT);
+            for (int rep = 0; rep < 3; ++rep) {
+                double sink = 0.0;
+                const std::chrono::high_resolution_clock::time_point t0 =
+                    std::chrono::high_resolution_clock::now();
+                for (int i = 0; i < N; ++i) {
+                    const float x = static_cast<float>(i & 2047) * 9.7f - 10000.0f;
+                    const float z = static_cast<float>(i >> 11) * 9.7f - 10000.0f;
+                    sink += layer0_height(x, z, 0.5f, wp, sd);
+                }
+                const std::chrono::high_resolution_clock::time_point t1 =
+                    std::chrono::high_resolution_clock::now();
+                const double e = std::chrono::duration<double, std::nano>(t1 - t0).count() / N;
+                if (e < ns) ns = e;
+                if (sink == 1234.5678) std::printf("");   // keep the loop
+            }
+        }
+
         const Summary s = run(nseeds, wp, table, ap);
         print_summary(label, s);
-
-        // Throughput. The no-storage design makes the per-sample cost a hard
-        // constraint, so it is tracked from the first week rather than when it
-        // starts hurting.
-        double ns = 0.0;
-        {
-            const int N = 2000000;
-            const uint32_t sd = feature_seed(0, FEATURE_CONTINENT);
-            double sink = 0.0;
-            const std::chrono::high_resolution_clock::time_point t0 =
-                std::chrono::high_resolution_clock::now();
-            for (int i = 0; i < N; ++i) {
-                const float x = static_cast<float>(i & 2047) * 9.7f - 10000.0f;
-                const float z = static_cast<float>(i >> 11) * 9.7f - 10000.0f;
-                sink += layer0_height(x, z, 0.5f, wp, sd);
-            }
-            const std::chrono::high_resolution_clock::time_point t1 =
-                std::chrono::high_resolution_clock::now();
-            ns = std::chrono::duration<double, std::nano>(t1 - t0).count() / N;
-            if (sink == 1234.5678) std::printf("");   // keep the loop
-        }
 
         // Golden seeds.
         Golden g;
@@ -1419,6 +1685,9 @@ int main(int argc, char** argv) {
         std::snprintf(d, sizeof(d), "worst seed has %.1f%% of land under 30 degrees, threshold 60%%",
                       100.0 * s.min_slope_gentle);
         line("slope budget", s.slope_failures == 0, d);
+        std::snprintf(d, sizeof(d), "%.0f segments/seed, all descending and reaching the sea",
+                      s.mean_river_segments);
+        line("river sanity", s.river_failures == 0, d);
         std::snprintf(d, sizeof(d), "%.0f ns/sample, scalar CPU reference; design budget is "
                       "20 ns serial-equivalent for the full field on the shipping path", ns);
         line("throughput", ns <= 400.0, d);
@@ -1443,6 +1712,7 @@ int main(int argc, char** argv) {
                          s.adjacency_failures == 0 && s.taper_failures == 0 &&
                          s.foot_failures == 0 && s.boat_failures == 0 &&
                          s.spawn_failures == 0 && s.slope_failures == 0 &&
+                         s.river_failures == 0 &&
                          ns <= 400.0 && golden_ok && sheet_ok;
         std::printf("\n%s\n", all ? "ALL CHECKS PASSED" : "FAILED");
         return all ? 0 : 1;

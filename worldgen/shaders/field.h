@@ -105,4 +105,36 @@ float layer4_height(float continent, float continent_scale, float blended, float
     return continent * continent_scale + blended * land;
 }
 
+// --- layer 5: rivers --------------------------------------------------------
+//
+// Same split as layer 4. WHICH segments are near a point is a spatial index
+// question and belongs to the caller; the geometry and the channel profile are
+// here, so both backends agree on the shape of the water. That keeps arrays
+// out of the dialect, which is the only reason the generator is still small.
+
+// Distance from a point to a segment, in the plane.
+float river_segment_distance(float px, float pz, float ax, float az, float bx, float bz) {
+    const float vx = bx - ax;
+    const float vz = bz - az;
+    const float wx = px - ax;
+    const float wz = pz - az;
+    const float len2 = vx * vx + vz * vz;
+    float t = 0.0f;
+    if (len2 > 0.0f) {
+        t = wg_saturate((wx * vx + wz * vz) / len2);
+    }
+    const float dx = wx - vx * t;
+    const float dz = wz - vz * t;
+    return sqrt(dx * dx + dz * dz);
+}
+
+// Carve the channel out of the surface. Subtracted from the height rather
+// than faked with noise: noise-faked rivers are cheaper and read as fake the
+// moment the player has seen real drainage.
+float river_carve(float h, float d, float width, float depth) {
+    const float t = wg_saturate(1.0f - d / width);
+    const float profile = t * t * (3.0f - 2.0f * t);
+    return h - depth * profile;
+}
+
 #endif

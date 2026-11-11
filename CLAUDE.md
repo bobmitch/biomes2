@@ -76,9 +76,12 @@ and boat connectivity, spawn, slope budget, throughput and the golden hashes,
 and emits a 64-seed contact sheet — look at it. Automated checks cannot tell you whether a
 world is interesting.
 
-It also emits a shaded-relief sheet with `--relief`. Not yet asserted, and
-why: **LOD agreement** needs octave dropping at Nyquist, which is not
-implemented; **river sanity** needs layer 5.
+It also emits a shaded-relief sheet with `--relief`, and a single seed rendered
+large with `--closeup <seed>`. Use the close-up for anything narrower than a
+few hundred metres: a contact-sheet tile is ~87 m per pixel, so rivers are
+sub-pixel there and an axis-aligned drainage network looked perfectly fine on
+it. Not yet asserted: **LOD agreement**, which needs octave dropping at
+Nyquist.
 
 **Golden hashes are pinned.** Any change to `worldgen/` moves them and the run
 fails. That is the gate working: either revert, or bump `generator_version` in

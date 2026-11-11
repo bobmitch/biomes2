@@ -152,6 +152,12 @@ After the heightfield is defined, trace steepest-descent paths from high cells t
 
 Noise-faked rivers are cheaper and always read as fake once the player has seen real drainage. The polyline set is small, computed once at world init, and lives in the same buffer as the cells.
 
+**As built.** Steepest descent on a raw heightfield stalls in every local minimum, so the surface is depression-filled with a priority flood first. That buys more than convenience: the flood pops cells in order of spill height, so the cell that relaxes a neighbour is always downstream of it. Taking that as the flow direction makes "descends monotonically and terminates in ocean" true *by construction* rather than a property to test for and patch up — which is why the river sanity check passes on every seed rather than most of them. Upstream area then comes from walking the flood order backwards, and any cell above the accumulation threshold emits one segment.
+
+**Use eight-connected flow, not four.** Four-connected flow can only run along the grid axes, so every river comes out as a right-angled staircase. At 87 m per pixel on a contact sheet that is completely invisible; on a single seed rendered close up it looks like a circuit board. One corner-cutting pass — segments between edge midpoints rather than cell centres — takes the remaining 45° kinks off for free.
+
+The lesson generalises past rivers: **the contact sheet is the wrong instrument for anything thinner than a few hundred metres.** It catches global structure, and it cannot see a channel.
+
 ### Layer 6 — 3D density
 
 ```c

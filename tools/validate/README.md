@@ -31,13 +31,18 @@ with contraction disabled — [ADR-001](../../docs/adr-001-field-function-author
 makes it the determinism authority, because WGSL permits reassociation and FMA
 fusion and so cannot produce a stable hash at all.
 
-`--relief` renders the same 64 seeds as shaded relief instead of biome colour.
-CI uploads both.
+`--relief` renders the same 64 seeds as shaded relief instead of biome colour;
+CI uploads both. `--closeup <seed>` renders one seed large.
 
-Two checks the design doc wants are **not** asserted yet, deliberately rather
-than by oversight: **LOD agreement** needs octave dropping at Nyquist (not
-implemented), and **river sanity** needs layer 5. Asserting them now would
-measure the wrong thing and report false confidence.
+**Use the close-up for anything narrower than a few hundred metres.** A
+contact-sheet tile is about 87 m per pixel, so a river 40-170 m wide is
+sub-pixel on it. The first drainage network shipped was four-connected, which
+makes every river a right-angled staircase; it looked entirely fine on the
+contact sheet and like a circuit board the moment one seed was rendered large.
+
+One check the design doc wants is **not** asserted yet: **LOD agreement**,
+which needs octave dropping at Nyquist. Asserting it now would measure the
+wrong thing and report false confidence.
 
 Two thresholds are judgement calls worth knowing about. **Foot connectivity**
 is 75%, not 100%, because islands are a designed feature and some land is
