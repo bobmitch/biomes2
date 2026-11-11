@@ -127,13 +127,19 @@ The dual-compile was not awkward. The one constraint worth recording is that
 rather than defining them — the standard library already declares float
 overloads in the global namespace and a second definition is a hard error.
 
-**Honest limit of this pilot:** the generated WGSL has been checked
-structurally — balanced braces and parens, every `fn` carries a return type, no
-C-isms survive — but it has **not** been parsed by a real WGSL frontend or
-executed. The C++ half is proven bit-identical; the WGSL half is plausible and
-unverified. Wiring naga or Tint over `build/noise.wgsl` is the first thing
-`tools/mapview` should do, and until then the generator's output is an
-untested artifact.
+**Now verified on both sides.** `tools/mapview` (A1) compiles the generated
+WGSL with Tint, in Chromium, and fails loudly on any compilation message. The
+land-fraction readout cross-checks the result against the C++ authority: at
+world seed 0 both report **54.03%** on a 2048² grid, with identical per-feature
+seeds. That is the tolerance comparison this ADR requires, and it passes.
+
+It also found a real defect on its first run, which the structural check could
+not have: **WGSL rejects a mix of `*` and `^` without parentheses** rather than
+applying C's precedence, and the C++ build accepts the same expression
+silently. The fix went into the dialect source, where explicit grouping is
+correct for all three backends. The lesson generalises — the dialect can be
+valid C++ and invalid WGSL, and only a real frontend will say so, so the
+mapview shader compile is a required step in the loop rather than a nicety.
 
 ## Scope — field function only
 
@@ -186,8 +192,14 @@ source.
 
 ## Open
 
-- Validate the generated WGSL with naga or Tint as part of the `mapview` build.
-  Until that exists the generator is unverified on its output side.
+- Validation currently requires loading `tools/mapview` by hand. Once CI exists
+  it wants a headless WGSL parse — naga or Tint over the generated files — so a
+  generator regression fails the build rather than waiting for someone to open
+  a page.
+- The dialect has no structs, so field parameters are passed as loose scalars.
+  `layer0_height` already takes nine. Layer 4's per-biome height profile will
+  make that untenable, and adding structs is the next real pressure on the
+  generator budget.
 - Does the dialect stay small as layers 4–6 arrive? Height composition and the
   cave field are the next test of the budget. Re-measure then; the fallback
   stays available and taking it is not a reversal of decisions 1, 3 or 4.
