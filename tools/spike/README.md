@@ -15,7 +15,17 @@ build\quota_spike.exe --sweep               # the three quota gates
 build\quota_spike.exe --sweep-cells         # cell size vs quota accuracy
 build\quota_spike.exe --sweep-bands         # band width vs candidate count
 build\quota_spike.exe --sweep-w             # w vs patch size
+build\quota_spike.exe --contact-sheet       # 64 seeds -> build/contact_sheet.bmp
+build\quota_spike.exe --test-adjacency      # are adjacency rules honoured?
 ```
+
+Useful flags: `--w`, `--danger-feat <metres>`, `--cellarea <m2>`, `--mode 0|1|2`,
+`--tile <px>`, `--out <path>`.
+
+The contact sheet is written as an uncompressed 24-bit BMP. A PNG writer needs
+zlib framing and CRCs, which is more code than a debug image justifies, and the
+harness is meant to stay dependency-free. Convert in CI if the artifact viewer
+insists on PNG.
 
 `tools/spike/noise_standin.h` is a **stand-in**, not the authority. It exists
 only so layer 3 has a plausible land mask to chew on. Delete it when
@@ -80,7 +90,12 @@ is about 4× tighter. R = 20 km passes at the specified cell size.
 The design doc calls patch size and quota granularity "independent knobs,
 which is the whole trick". They are not independent as specified.
 
-The mean candidate set in pass 1 is **1.0**. Quota exhaustion closes biomes out
+> **Since fixed.** The danger bands in `archetypes.json` have been widened ×2
+> (see §6), which takes the candidate set to 2.5 and relaxation to zero. The
+> paragraph below describes the narrow bands as originally authored, which is
+> how the inert cost function was found.
+
+The mean candidate set in pass 1 was **1.0**. Quota exhaustion closes biomes out
 so fast that there is usually exactly one legal biome per cell, which makes the
 entire cost function — `danger_preferred`, the adjacency penalty, the
 contiguity bonus — inert. Sweeping the contiguity bonus from 0.00 to 0.40
@@ -115,6 +130,83 @@ area (r²) works exactly as intended.
 The flip side: the Spearman check will not catch a world that reads as a
 dartboard. That judgement needs the contact sheet, not an assertion.
 
+### 5. The world reads as a dartboard at the specified `w`
+
+This is what the contact sheet is for, and it earned its place on the first
+run. At the design doc's `w = 0.20` and a 4.5 km danger feature size, all 64
+seeds show the same silhouette: a solid bright-green meadows blob in the
+centre, a ring of mixed terrain, glacier hugging the coast, and rift present
+only as a thin fringe at the rim. Three of the exact failures the doc says the
+sheet catches — same silhouette every seed, one biome always on the coast,
+radial structure visible — are all present at once.
+
+**Spearman reads 1.00 throughout.** No assertion in the harness fires. The only
+reason we know is the picture.
+
+The cause is structural. `D = saturate(r² + w·fbm)` with `w = 0.20` means the
+noise can move `D` by at most ±0.20 against a term that sweeps the full 0→1.
+Worse, `r² < 0.2` for all `r < 0.45`, so the inner fifth of the world's area is
+locked to the calmest biomes on every seed regardless of noise. To put a
+hostile pocket within sight of spawn you would need `w ≈ 0.9`.
+
+Raising `w` alone trades the dartboard for confetti, because `w` is also the
+patch-size control from §3:
+
+| `w` | danger feature | mean patch | Spearman mean/min | quota err | reads as |
+| --- | --- | --- | --- | --- | --- |
+| 0.20 | 4.5 km | 4.4 cells / 1.41 km² | 1.00 / 1.00 | 3.9% | clear dartboard |
+| 0.35 | 4.5 km | 3.4 cells / 1.09 km² | 1.00 / 1.00 | 3.8% | still radial |
+| 0.60 | 4.5 km | 2.6 cells / 0.84 km² | 1.00 / 0.98 | 3.8% | confetti |
+| **0.60** | **9 km** | **3.8 cells / 1.22 km²** | **0.99 / 0.95** | **3.8%** | **best so far** |
+
+Raising the feature size with `w` is what separates them: fewer, larger
+non-radial lobes break the rings without shredding the patches. Quota accuracy
+is untouched throughout, and radial ordering still passes with margin.
+
+**Recommendation: `w ≈ 0.6` with a 9 km danger feature, not `0.15–0.25` at
+3–6 km.** This is a feel judgement rather than a correctness one, so the
+default is left at the doc's value — change it deliberately after looking at
+`--contact-sheet --w 0.60 --danger-feat 9000` yourself.
+
+Even at that setting, meadows is still a central blob on most seeds and
+glacier still favours the rim. Breaking that needs the danger field to stop
+being a pure function of radius plus noise.
+
+### 6. Adjacency constraints were not honoured — fixed by widening the bands
+
+Following from §3: with a candidate set of 1.0 the cost function was inert, so
+the `adjacency_mask` rules in `archetypes.json` were decorative. They held only
+because the danger ordering keeps `meadows` and `rift` apart anyway.
+
+`--test-adjacency` forbids the two biomes whose danger bands overlap most, then
+counts how often that rule is broken over 96 seeds:
+
+| danger bands | pair | cell borders | violations | seeds with ≥1 | verdict |
+| --- | --- | --- | --- | --- | --- |
+| as originally authored | forest/wetland, overlap 0.22 | 119,111 | 3,921 | 95 / 96 | **FAIL** |
+| widened ×2, now in the table | forest/wetland, overlap 0.51 | 119,111 | 0 | 0 / 96 | PASS |
+
+The constraint mechanism worked all along — it never got a choice to apply it
+to. **The bands in `archetypes.json` have been widened ×2 around each
+`danger_preferred`, clamped to [0,1].** Measured before and after over 200
+seeds at a 1024² grid:
+
+| | quota err | Spearman | mean patch | relaxed/seed | candidates |
+| --- | --- | --- | --- | --- | --- |
+| narrow bands | 3.9% | 1.00 / 1.00 | 4.4 cells / 1.41 km² | 104.2 | 1.0 |
+| widened ×2 | 3.9% | 1.00 / 1.00 | 4.4 cells / 1.41 km² | **0.0** | **2.5** |
+
+Everything that matters is unchanged, relaxation is gone, and the cost function
+finally has a choice to make. The band-coverage invariant cannot break, since
+widening only increases coverage.
+
+It also changes the *output* almost not at all: re-rendering the contact sheet
+with the old and new bands differs in 237 bytes of 7.2 million, 0.003% of
+pixels. The relaxation branch had been placing those cells in the same biomes
+the widened bands now permit legally. So this is a correctness fix with no
+effect on how the world looks — and in particular it does **not** help the
+dartboard problem in §5, which is entirely about `w`.
+
 ## What this implies for A2
 
 - The half-cell gate is in and is the default. Done.
@@ -124,9 +216,14 @@ dartboard. That judgement needs the contact sheet, not an assertion.
   genuinely controls patch size — the contiguity bonus as specified is not one.
   The cheapest candidate is a second pass that swaps cells between
   over- and under-filled biomes to grow patches at constant quota.
-- Relaxation runs at ~21% of land cells in the passing config. Radial ordering
-  survives it, but a fifth of cells ignoring their danger band means the bands
-  are not really governing placement. Worth a look when biome counts change.
+- Bands widened ×2 and relaxation is now zero, so `--test-adjacency` passes.
+  Done. Re-run it whenever the biome table changes — the failure mode is
+  silent, and nothing else in the harness would catch it.
+- Decide `w` by looking at `--contact-sheet`, not at Spearman. Spearman cannot
+  see the failure (§5).
+- The contact sheet belongs in CI as a build artifact from A3 onward, exactly
+  as the design doc says. It is the only check here that caught anything the
+  assertions missed.
 
 ## Caveats
 
