@@ -13,6 +13,15 @@
 #ifndef WORLDGEN_FIELD_TYPES_H
 #define WORLDGEN_FIELD_TYPES_H
 
+// Every field function carries WG_FN. In C++ it is `inline`, because more than
+// one translation unit includes these headers; in HLSL it expands to nothing,
+// since the field function is compiled as a shader there rather than linked.
+#ifdef __cplusplus
+#define WG_FN inline
+#else
+#define WG_FN
+#endif
+
 #ifdef __cplusplus
 
 #include <algorithm>

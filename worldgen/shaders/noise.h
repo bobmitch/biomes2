@@ -24,7 +24,7 @@
 #define WORLDGEN_NOISE_H
 #include "field_types.h"
 
-uint pcg(uint v) {
+WG_FN uint pcg(uint v) {
     const uint state = v * 747796405u + 2891336453u;
     const uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
     return (word >> 22u) ^ word;
@@ -34,12 +34,12 @@ uint pcg(uint v) {
 // refuses to infer precedence when * and ^ are mixed, where C would silently
 // apply its own. Parenthesising matches C's grouping exactly, so the C++ and
 // HLSL builds are unchanged.
-uint hash2i(int x, int y, uint seed) {
+WG_FN uint hash2i(int x, int y, uint seed) {
     return pcg((asuint(x) * 0x9E3779B1u) ^ pcg((asuint(y) * 0x85EBCA77u) ^ seed));
 }
 
 // 16 gradients on the unit circle, indexed by hash. A table, not a texture.
-float2 grad2(uint h) {
+WG_FN float2 grad2(uint h) {
     float2 kG[16];
     kG[0] = float2(1.000000f, 0.000000f);
     kG[1] = float2(0.923880f, 0.382683f);
@@ -62,7 +62,7 @@ float2 grad2(uint h) {
 
 // Simplex family, never classic Perlin: Perlin's axis-aligned artifacts are
 // invisible at 10 m and glaring at 5 km, which is the scale layer 0 works at.
-float simplex2(float x, float y, uint seed) {
+WG_FN float simplex2(float x, float y, uint seed) {
     const float F2 = 0.3660254037844386f;
     const float G2 = 0.21132486540518713f;
     const float s = (x + y) * F2;
@@ -100,7 +100,7 @@ float simplex2(float x, float y, uint seed) {
     return 70.0f * n;
 }
 
-float fbm(float x, float y, int octaves, float lacunarity, float gain, uint seed) {
+WG_FN float fbm(float x, float y, int octaves, float lacunarity, float gain, uint seed) {
     float amp = 1.0f;
     float freq = 1.0f;
     float sum = 0.0f;
@@ -117,11 +117,11 @@ float fbm(float x, float y, int octaves, float lacunarity, float gain, uint seed
 
 // Spelled out rather than using the HLSL/WGSL builtins: the C++ build is the
 // determinism authority, so the arithmetic has to be ours, not the backend's.
-float wg_saturate(float v) {
+WG_FN float wg_saturate(float v) {
     return clamp(v, 0.0f, 1.0f);
 }
 
-float wg_smoothstep(float e0, float e1, float v) {
+WG_FN float wg_smoothstep(float e0, float e1, float v) {
     const float t = wg_saturate((v - e0) / (e1 - e0));
     return t * t * (3.0f - 2.0f * t);
 }
@@ -131,7 +131,7 @@ float wg_smoothstep(float e0, float e1, float v) {
 // adds height everywhere near the centre, which makes the world centre the
 // highest point on almost every seed; a floor only raises ground that was
 // already below it, and leaves the peaks to the noise.
-float wg_smax(float a, float b, float k) {
+WG_FN float wg_smax(float a, float b, float k) {
     const float d = a - b;
     return 0.5f * (a + b + sqrt(d * d + k)) - 0.5f * sqrt(k);
 }

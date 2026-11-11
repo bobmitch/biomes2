@@ -29,7 +29,7 @@
 // The floor is blended out across r rather than driven to zero, because
 // wg_smax(base, 0, k) is a soft ReLU and would clamp every ocean in the world
 // to a uniform shelf -- interior ocean depth collapses sevenfold if you do.
-float layer0_height(float x, float z, float r, float freq, int octaves, float centre_floor, float edge_drop, float land_offset, uint seed) {
+WG_FN float layer0_height(float x, float z, float r, float freq, int octaves, float centre_floor, float edge_drop, float land_offset, uint seed) {
     const float base = fbm(x * freq, z * freq, octaves, 2.0f, 0.5f, seed) + land_offset;
     const float t = wg_smoothstep(0.0f, 0.40f, r);
     const float lifted = wg_smax(base, centre_floor, 0.01f) * (1.0f - t) + base * t;
@@ -39,7 +39,7 @@ float layer0_height(float x, float z, float r, float freq, int octaves, float ce
 // Layer 1 -- the danger field, defined on normalised AREA (r squared), never
 // on normalised radius. Disc area grows as r squared, so using radius here
 // silently skews every biome quota downstream.
-float layer1_danger(float x, float z, float r, float w, float freq, int octaves, uint seed) {
+WG_FN float layer1_danger(float x, float z, float r, float w, float freq, int octaves, uint seed) {
     const float r2 = r * r;
     return wg_saturate(r2 + w * fbm(x * freq, z * freq, octaves, 2.0f, 0.5f, seed));
 }
@@ -51,14 +51,14 @@ float layer1_danger(float x, float z, float r, float w, float freq, int octaves,
 // exactly the place the player is looking, so each neighbouring cell's profile
 // is evaluated in full and only the metres are mixed.
 //
-// Parameters arrive as loose scalars because the dialect has no structs. At
-// eleven arguments this is at the edge of what reads: see the note in
-// tools/validate/README.md before adding a twelfth.
+// The per-biome shaping parameters travel as a BiomeProfile struct. They were
+// eleven loose scalars while a WGSL generator forbade structs; ADR-002
+// retired that, and layer 6's cave parameters would have made it thirteen.
 
 // fBm with a warp from rolling to ridged. ridge_blend 0 is plain fBm; 1 is
 // ridged peaks. Not a blend of billow against ridged -- those are mirror
 // images of each other and cancel to a flat field at the midpoint.
-float fbm_shaped(float x, float y, int octaves, float lacunarity, float gain, float ridge_blend, uint seed) {
+WG_FN float fbm_shaped(float x, float y, int octaves, float lacunarity, float gain, float ridge_blend, uint seed) {
     float amp = 1.0f;
     float freq = 1.0f;
     float sum = 0.0f;
@@ -87,22 +87,36 @@ float fbm_shaped(float x, float y, int octaves, float lacunarity, float gain, fl
 // heightfield, so one ULP flips a depression-fill comparison and the river
 // moves. It cost three of eight golden seeds across platforms before CI caught
 // it. The denominator is flatness*(1-t) + t, positive for any flatness > 0.
-float flatness_curve(float t, float flatness) {
+WG_FN float flatness_curve(float t, float flatness) {
     return t / (flatness * (1.0f - t) + t);
 }
 
+// The shaping half of a BiomeArchetype, which is all layer 4 needs. Kept here
+// rather than taking the archetype directly so worldgen/shaders/ stays
+// independent of the table format, and so the same struct can be packed into
+// a constant buffer for the HLSL path.
+struct BiomeProfile {
+    float base_elevation;
+    float amplitude;
+    int   octaves;
+    float lacunarity;
+    float gain;
+    float ridge_blend;
+    float flatness;
+};
+
 // One biome's profile, in metres.
-float layer4_profile(float x, float z, float freq, float base_elevation, float amplitude, int octaves, float lacunarity, float gain, float ridge_blend, float flatness, uint seed) {
-    const float n = fbm_shaped(x * freq, z * freq, octaves, lacunarity, gain, ridge_blend, seed);
+WG_FN float layer4_profile(float x, float z, float freq, BiomeProfile p, uint seed) {
+    const float n = fbm_shaped(x * freq, z * freq, p.octaves, p.lacunarity, p.gain, p.ridge_blend, seed);
     const float t = wg_saturate(n * 0.5f + 0.5f);
-    const float shaped = flatness_curve(t, flatness);
-    return base_elevation + amplitude * (shaped * 2.0f - 1.0f);
+    const float shaped = flatness_curve(t, p.flatness);
+    return p.base_elevation + p.amplitude * (shaped * 2.0f - 1.0f);
 }
 
 // Weighted mix of up to four neighbouring cells' heights. Weights come from
 // smoothed distance to the cell boundary and are the caller's business: which
 // cells are near a point is an index question, not a field one.
-float layer4_blend(float h0, float w0, float h1, float w1, float h2, float w2, float h3, float w3) {
+WG_FN float layer4_blend(float h0, float w0, float h1, float w1, float h2, float w2, float h3, float w3) {
     const float wsum = w0 + w1 + w2 + w3;
     if (wsum > 0.0f) {
         return (h0 * w0 + h1 * w1 + h2 * w2 + h3 * w3) / wsum;
@@ -113,7 +127,7 @@ float layer4_blend(float h0, float w0, float h1, float w1, float h2, float w2, f
 // Final ground height in metres: the biome profiles laid over the shared
 // continental base, faded out as the continent mask drops to sea level so the
 // coastline does not step.
-float layer4_height(float continent, float continent_scale, float blended, float sea_level) {
+WG_FN float layer4_height(float continent, float continent_scale, float blended, float sea_level) {
     const float land = wg_smoothstep(sea_level, sea_level + 0.12f, continent);
     return continent * continent_scale + blended * land;
 }
@@ -126,7 +140,7 @@ float layer4_height(float continent, float continent_scale, float blended, float
 // out of the dialect, which is the only reason the generator is still small.
 
 // Distance from a point to a segment, in the plane.
-float river_segment_distance(float px, float pz, float ax, float az, float bx, float bz) {
+WG_FN float river_segment_distance(float px, float pz, float ax, float az, float bx, float bz) {
     const float vx = bx - ax;
     const float vz = bz - az;
     const float wx = px - ax;
@@ -144,7 +158,7 @@ float river_segment_distance(float px, float pz, float ax, float az, float bx, f
 // Carve the channel out of the surface. Subtracted from the height rather
 // than faked with noise: noise-faked rivers are cheaper and read as fake the
 // moment the player has seen real drainage.
-float river_carve(float h, float d, float width, float depth) {
+WG_FN float river_carve(float h, float d, float width, float depth) {
     const float t = wg_saturate(1.0f - d / width);
     const float profile = t * t * (3.0f - 2.0f * t);
     return h - depth * profile;
