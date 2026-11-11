@@ -9,7 +9,7 @@ The WGSL under `src/generated/` is a build product. Generate it first, then
 start the dev server:
 
 ```bash
-tools\spike\build.bat
+tools\validate\build.bat
 ```
 
 ```bash
@@ -41,7 +41,7 @@ A2.
 
 Nothing in `src/` defines terrain. `src/generated/*.wgsl` is emitted by
 `tools/wgslgen` from `worldgen/shaders/`, which is the canonical source and
-also compiles as C++ for `tools/spike` and as HLSL for the engine
+also compiles as C++ for `tools/validate` and as HLSL for the engine
 ([ADR-001](../../docs/adr-001-field-function-authority.md)). If a number that
 shapes the world shows up in this directory, it is in the wrong place.
 
@@ -63,7 +63,7 @@ silently. The fix went into the dialect source, where it is correct for all
 three backends.
 
 The land-fraction readout is the other half of that check. It should match
-`build\quota_spike.exe --dump-seeds <seed> --grid 2048` — the CPU build is the
+`build\validate.exe --dump-seeds <seed> --grid 2048` — the CPU build is the
 determinism authority, and this is the tolerance comparison ADR-001 requires.
 At world seed 0 both report 54.33%. It can never be an exact hash comparison:
 WGSL §15.7.5 permits reassociation and FMA fusion with no opt-out.

@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Quota spike -- does layer 3 actually deliver "every biome, every seed, within
+// Validation harness -- does layer 3 actually deliver "every biome, every seed, within
 // tolerance, radially ordered"?
 //
 // No graphics. It scatters cells, rasterises the disc to get real cell areas
@@ -29,7 +29,7 @@
 #include <thread>
 #include <vector>
 
-using namespace spike;
+using namespace host;
 using namespace worldgen;
 
 // --- world parameters ------------------------------------------------------
@@ -53,7 +53,7 @@ struct WorldParams {
     float land_offset       = 0.17f;   // calibrated to the 55% land target
 
     // layer 1
-    float danger_w          = 0.60f;      // the feel parameter; see tools/spike/README.md
+    float danger_w          = 0.60f;      // the feel parameter; see tools/validate/README.md
     float danger_freq       = 1.0f / 2000.0f;
     int   danger_octaves    = 3;
 
@@ -63,7 +63,7 @@ struct WorldParams {
 };
 
 // Thin adapters onto the canonical field function in worldgen/shaders/field.h.
-// The arithmetic lives there so the spike, the engine and mapview cannot drift
+// The arithmetic lives there so the harness, the engine and mapview cannot drift
 // apart -- these only unpack WorldParams into the scalars the dialect takes.
 static inline float layer0_height(float x, float z, float r, const WorldParams& wp, uint32_t seed) {
     return ::layer0_height(x, z, r, wp.continent_freq, wp.continent_octaves,

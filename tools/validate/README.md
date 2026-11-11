@@ -1,4 +1,4 @@
-# Layer-3 quota spike
+# Validation harness
 
 A headless measurement of the claim the whole design rests on: *every biome,
 every seed, within ±10% of its quota, ordered calm-to-hostile*. No graphics —
@@ -7,16 +7,16 @@ runs `worldgen/assign/`, and reports what the validation harness will later
 assert.
 
 ```bash
-tools\spike\build.bat                       # from the repo root
-build\quota_spike.exe --seeds 200 --grid 1024
-build\quota_spike.exe --mode 0              # the original gate, for comparison
-build\quota_spike.exe --detail              # per-biome breakdown, one seed
-build\quota_spike.exe --sweep               # the three quota gates
-build\quota_spike.exe --sweep-cells         # cell size vs quota accuracy
-build\quota_spike.exe --sweep-bands         # band width vs candidate count
-build\quota_spike.exe --sweep-w             # w vs patch size
-build\quota_spike.exe --contact-sheet       # 64 seeds -> build/contact_sheet.bmp
-build\quota_spike.exe --test-adjacency      # are adjacency rules honoured?
+tools\validate\build.bat                       # from the repo root
+build\validate.exe --seeds 200 --grid 1024
+build\validate.exe --mode 0              # the original gate, for comparison
+build\validate.exe --detail              # per-biome breakdown, one seed
+build\validate.exe --sweep               # the three quota gates
+build\validate.exe --sweep-cells         # cell size vs quota accuracy
+build\validate.exe --sweep-bands         # band width vs candidate count
+build\validate.exe --sweep-w             # w vs patch size
+build\validate.exe --contact-sheet       # 64 seeds -> build/contact_sheet.bmp
+build\validate.exe --test-adjacency      # are adjacency rules honoured?
 ```
 
 Useful flags: `--w`, `--danger-feat <metres>`, `--cellarea <m2>`, `--mode 0|1|2`,
@@ -27,7 +27,7 @@ zlib framing and CRCs, which is more code than a debug image justifies, and the
 harness is meant to stay dependency-free. Convert in CI if the artifact viewer
 insists on PNG.
 
-`tools/spike/noise_standin.h` is a **stand-in**, not the authority. It exists
+`tools/validate/noise_standin.h` is a **stand-in**, not the authority. It exists
 only so layer 3 has a plausible land mask to chew on. Delete it when
 `worldgen/shaders/noise.wgsl` exists rather than keeping the two in sync — two
 implementations of a float-heavy function will not agree.

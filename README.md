@@ -24,12 +24,12 @@ Track A is at **A1**. The field function (layers 0 and 1) and quota assignment
 | --- | --- | --- |
 | Field function, canonical | `worldgen/shaders/` | compiles as C++ and HLSL; `tools/wgslgen` emits the WGSL |
 | Quota assignment | `worldgen/assign/` | portable C++, no host deps |
-| Validation spike | `tools/spike/` | `tools\spike\build.bat` then `build\quota_spike.exe` |
+| Validation harness | `tools/validate/` | `tools\validate\build.bat` then `build\validate.exe` |
 | Map view (A1) | `tools/mapview/` | `cd tools/mapview && npm install && npm run dev` |
 
 Two decisions were taken against the original design and are recorded rather
 than silently applied: [ADR-001](docs/adr-001-field-function-authority.md)
 inverts the field function's language authority, and
-[`tools/spike/README.md`](tools/spike/README.md) documents what measurement
+[`tools/validate/README.md`](tools/validate/README.md) documents what measurement
 changed about layer 3 — including a quota bug that missed its target on every
 seed, and a danger field that reads as a dartboard at the documented `w`.

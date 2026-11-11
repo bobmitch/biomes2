@@ -1,5 +1,5 @@
 @echo off
-REM Builds the layer-3 quota spike. Run from the repository root.
+REM Builds the validation harness. Run from the repository root.
 REM /fp:precise is deliberate: never compile the field function with fast-math,
 REM FMA contraction breaks CPU/GPU parity (CLAUDE.md invariant 8).
 
@@ -13,10 +13,10 @@ REM must stay host-neutral and knows nothing about MSVC.
 REM /fp:contract is off under /fp:precise, which is the point: this build is the
 REM determinism authority for golden hashes (ADR-001).
 cl /nologo /O2 /std:c++17 /EHsc /fp:precise /W3 /MT /D_CRT_SECURE_NO_WARNINGS ^
-   tools\spike\quota_spike.cpp ^
+   tools\validate\validate.cpp ^
    worldgen\assign\assign.cpp ^
    worldgen\assign\archetypes.cpp ^
-   /Fe:build\quota_spike.exe /Fo:build\ /link /INCREMENTAL:NO
+   /Fe:build\validate.exe /Fo:build\ /link /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 
 cl /nologo /O2 /std:c++17 /EHsc /W3 /MT /D_CRT_SECURE_NO_WARNINGS ^

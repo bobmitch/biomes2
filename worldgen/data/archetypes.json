@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "_note": "The generator knows nothing about what these mean. 'name' is for humans and diagnostics only; nothing branches on it. Layer 3 reads the placement block; the height/volumetric/surface blocks are the layer 4-6 contract and are not consumed yet.",
-  "_note_bands": "danger_band is roughly twice as wide as danger_preferred spacing would suggest, and that is deliberate. Narrow bands plus the quota gate leave exactly one legal biome per cell, which makes the whole assignment cost function inert -- adjacency_forbid stops being enforced and ~21% of cells fall through to the relaxation branch. Widening costs nothing measurable in quota accuracy or radial ordering. See tools/spike/README.md sections 3 and 6. The band is a legality bound; danger_preferred is what actually places a biome.",
+  "_note_bands": "danger_band is roughly twice as wide as danger_preferred spacing would suggest, and that is deliberate. Narrow bands plus the quota gate leave exactly one legal biome per cell, which makes the whole assignment cost function inert -- adjacency_forbid stops being enforced and ~21% of cells fall through to the relaxation branch. Widening costs nothing measurable in quota accuracy or radial ordering. See tools/validate/README.md sections 3 and 6. The band is a legality bound; danger_preferred is what actually places a biome.",
   "sea_level": 0.0,
   "biomes": [
     {

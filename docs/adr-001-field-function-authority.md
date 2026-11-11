@@ -111,7 +111,7 @@ changes *how* WGSL is produced, not which language is canonical — decisions 1,
 
 ### Pilot result: the bet holds, for now
 
-`tools/spike/noise_standin.h` — a working C++ simplex and fBm — was expressed
+`tools/validate/noise_standin.h` — a working C++ simplex and fBm — was expressed
 in the dialect as [`worldgen/shaders/noise.h`](../worldgen/shaders/noise.h) and
 `tools/wgslgen` emits the WGSL.
 
@@ -170,14 +170,14 @@ source.
 
 ## Consequences
 
-- **The spike is the validator.** `tools/spike` already does 200 seeds at
+- **The harness grew out of the spike.** `tools/validate` already does 200 seeds at
   1024² in about 11 seconds, native, threaded, with `assign` linked in.
   Connectivity, slope budget, LOD agreement and golden hashes are growth of
   what exists, not a new program in a new language.
 - **`noise_standin.h` is gone.** Its noise was promoted to the canonical
   dialect source; what remained is CPU-only scaffolding (64-bit seed
   derivation, which WGSL cannot express, and the scatter RNG) and now lives in
-  `tools/spike/host_support.h`. There is no second implementation of the field
+  `tools/validate/host_support.h`. There is no second implementation of the field
   function and never was one for longer than this change.
 - **Generated WGSL is a build product**, written to `build/`. It is not checked
   in and must never be hand-edited.

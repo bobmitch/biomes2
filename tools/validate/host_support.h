@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Host-side scaffolding for the spike. NOT the field function.
+// Host-side scaffolding for the harness. NOT the field function.
 //
 // The noise that was here has been promoted to worldgen/shaders/noise.h, which
 // is the canonical dialect source (ADR-001). What remains is CPU-only and has
@@ -16,7 +16,7 @@
 
 #include <cstdint>
 
-namespace spike {
+namespace host {
 
 // Per-feature seeds: hash64(world_seed ^ FEATURE_ID). Retuning one layer must
 // not reshuffle any other layer.
@@ -54,4 +54,4 @@ struct Rng {
     float uniform() { return static_cast<float>(next() >> 8) * (1.0f / 16777216.0f); }
 };
 
-}  // namespace spike
+}  // namespace host

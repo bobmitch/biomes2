@@ -12,7 +12,7 @@ import blitWgsl from './blit.wgsl?raw';
 
 const RES = 2048;
 
-// World parameters, matching tools/spike's defaults so the two can be compared
+// World parameters, matching tools/validate's defaults so the two can be compared
 // directly. These move into a shared data file when A2 brings the tuning UI.
 // dangerW and dangerFreq are the slider defaults and what Reset restores; the
 // live values come from the sliders, not from here.
@@ -30,7 +30,7 @@ const WORLD = {
 };
 
 // Per-feature seeds: hash64(world_seed ^ FEATURE_ID). This mirrors
-// tools/spike/host_support.h deliberately -- it is host-side seed derivation,
+// tools/validate/host_support.h deliberately -- it is host-side seed derivation,
 // not field evaluation, and WGSL has no 64-bit integers to do it with.
 const MASK64 = (1n << 64n) - 1n;
 

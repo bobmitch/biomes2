@@ -132,7 +132,7 @@ for cell in land_cells:
 
 Sorting by danger before assigning is what produces the radial ordering; the quota decrement is what produces equal measure; the relaxation branch is what guarantees presence even on a pathological seed. The adjacency penalty is where rules like "never place the hardest biome adjacent to the spawn cell" live, as a cost rather than a hard constraint, so the solver can never deadlock.
 
-**The half-cell floor on the quota gate is load-bearing.** An earlier draft of this pseudocode gated on `quota[b] > 0`, which lets a biome holding a sliver of quota swallow a whole cell. Every biome then overshoots by up to one cell, and whichever sorts last by danger absorbs the sum of everyone else's overshoot — measured at 200 seeds out of 200 missing the ±10% requirement, with the last biome landing 53% under target on a typical seed. Holding back half a cell makes the rounding symmetric instead of always positive. See [`tools/spike/README.md`](../tools/spike/README.md) for the measurement.
+**The half-cell floor on the quota gate is load-bearing.** An earlier draft of this pseudocode gated on `quota[b] > 0`, which lets a biome holding a sliver of quota swallow a whole cell. Every biome then overshoots by up to one cell, and whichever sorts last by danger absorbs the sum of everyone else's overshoot — measured at 200 seeds out of 200 missing the ±10% requirement, with the last biome landing 53% under target on a typical seed. Holding back half a cell makes the rounding symmetric instead of always positive. See [`tools/validate/README.md`](../tools/validate/README.md) for the measurement.
 
 Cells left over in ocean become island clusters, drawn from the same quota pool. A biome occasionally landing island-only is free seed variety at no cost.
 
@@ -623,7 +623,7 @@ Starting points, not measurements. Every budget row is a number to instrument an
 | Region cells, R = 20 km | \~960 | Same cell size, more of them |
 | Cell lookup grid | 64 × 64 buckets | A handful of candidates per sample |
 | Boundary warp amplitude | \~1.3 km | Roughly one cell radius; the parameter that makes cells read as coastlines |
-| Danger noise weight `w` | 0.60 | The most important feel parameter in the generator. 0.15–0.25 was the first guess and reads as a dartboard; see `tools/spike/README.md` §5 |
+| Danger noise weight `w` | 0.60 | The most important feel parameter in the generator. 0.15–0.25 was the first guess and reads as a dartboard; see `tools/validate/README.md` §5 |
 | Danger feature size | 2 km | Smaller than the original 3–6 km. Fragments the assignment on its own; the layer-3 repair pass is what makes it read as zones rather than noise |
 | Patch repair passes | 4 | Converges by 4. Without it, `w` and patch size are the same knob |
 | Continent fBm | 4–6 octaves, 2–8 km base | Simplex family, never classic Perlin |
