@@ -7,23 +7,28 @@ Procedural voxel world generator for a bounded disc world. Full design in
 
 | Path | What |
 | --- | --- |
-| `worldgen/shaders/` | The field function. Restricted C dialect: compiles as C++ and HLSL. |
-| `tools/wgslgen/` | Emits WGSL from the dialect. See `docs/adr-001-*`. |
+| `worldgen/shaders/` | The field function. Ordinary C++ that also compiles as HLSL. |
+| `worldgen/world.{h,cpp}` | Cell scatter, per-feature seeding, world build, carved terrain. |
 | `worldgen/assign/` | Quota assignment (layer 3). Portable C++, no host deps. |
 | `worldgen/data/` | `archetypes.json` — the biome table. All tuning lives here. |
 | `worldgen/golden/` | Pinned seed hashes. Changes must be deliberate. |
-| `tools/mapview/` | Browser prototype (TS + WebGPU). |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
+| `tools/view/` | Native world viewer (Win32). Debug tool, Windows only. |
+| `tools/shared/` | Presentation, shared by the harness and the viewer. |
 | `engine/` | C++ runtime: svdag, meshing, streaming, physics, render. |
+
+**`worldgen/` is everything upstream of the golden hash; `tools/` is
+everything downstream.** That line is what makes invariant 9 checkable — the
+metrics legitimately use `atan`, and they are on the far side of it.
 
 ## Build
 
 ```bash
-cd tools/mapview && npm run dev
+tools\validate\build.bat && build\validate.exe
 ```
 
 ```bash
-tools\validate\build.bat && build\validate.exe
+build\view.exe
 ```
 
 ```bash
@@ -33,12 +38,18 @@ cmake --preset dev && cmake --build --preset dev
 ## Invariants — breaking one of these is a bug, not a tradeoff
 
 1. `worldgen/` imports nothing from `tools/` or `engine/`.
-2. The field function is a RESTRICTED C DIALECT that compiles unmodified as
-   C++ and as HLSL; `tools/wgslgen` emits the WGSL. One statement per line,
-   functional casts, no structs/pointers/overloads, only the builtins in
-   `field_types.h`. Never hand-edit generated WGSL. Kernel code
-   (`surface_nets`, anything with workgroup memory, atomics or barriers) is
-   OUTSIDE the dialect and stays hand-written per backend.
+2. The field function is ORDINARY C++ that also compiles as HLSL behind
+   `worldgen/shaders/field_types.h`. Every function carries `WG_FN` — `inline`
+   in C++, empty in HLSL — because more than one translation unit includes
+   these headers. Structs are fine and preferred over long scalar argument
+   lists. Only the builtins declared in `field_types.h`, which invariant 9
+   explains. Kernel code (`surface_nets`, anything with workgroup memory,
+   atomics or barriers) stays hand-written per backend: it never needs CPU
+   evaluation, so it gains nothing from being shared.
+   There is no WGSL and no generator. That was ADR-001's one bet, taken given
+   a browser prototype; `docs/adr-002-*` retires it along with the prototype.
+   ADR-001's other decisions stand, including why a GPU can never anchor a
+   golden hash.
 3. Noise is an analytic integer hash. Never a permutation texture — those are
    not bit-reproducible across our two backends.
 4. Per-feature seeds: `hash64(world_seed ^ FEATURE_ID)`. Never thread one RNG
@@ -51,8 +62,10 @@ cmake --preset dev && cmake --build --preset dev
 8. Never compile the field function with fast-math. FMA contraction breaks
    CPU/GPU parity. The C++ build (`/fp:precise`, `-ffp-contract=off`) is the
    determinism authority: golden hashes come from it, and CPU-to-GPU agreement
-   is a TOLERANCE comparison, never a hash — WGSL §15.7.5 permits
-   reassociation and fusion with no opt-out, so an exact check is impossible.
+   is a TOLERANCE comparison, never a hash. Shader languages permit
+   reassociation and fusion at the implementation's discretion — WGSL §15.7.5
+   says so outright, and HLSL needs per-expression `precise` to pin anything —
+   so an exact check against a GPU is impossible whichever backend ships.
 9. EVERYTHING THAT FEEDS THE GOLDEN HASH uses only `+ - * /`, `sqrt`, `floor`
    and comparisons — the field function AND the layer-2 scatter AND layer 3.
    No `pow`, `exp`, `log`, `sin`, `cos` or `atan`: libm is not exactly
