@@ -1,0 +1,65 @@
+name: validate
+
+# Path-filtered, as the design doc asks: a change to the generator runs the
+# 200-seed gate, and a change to tools/mapview does not.
+#
+# engine/** belongs in this filter too once it exists, with its own job for the
+# C++ build and tests. It is listed here already so the first engine commit
+# does not silently land untested.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'worldgen/**'
+      - 'tools/validate/**'
+      - 'tools/wgslgen/**'
+      - 'engine/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/validate.yml'
+  pull_request:
+    paths:
+      - 'worldgen/**'
+      - 'tools/validate/**'
+      - 'tools/wgslgen/**'
+      - 'engine/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/validate.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    # Both platforms deliberately. The golden hashes are supposed to be stable
+    # across runs AND platforms; running one compiler would let that claim rot
+    # untested. If these two ever disagree, the determinism requirement is not
+    # met and the result is worth more than a green tick.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build/cmake -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build/cmake --config Release
+
+      - name: Validate 200 seeds
+        shell: bash
+        run: ./build/validate --seeds 200 --grid 1024
+
+      - name: Upload contact sheet
+        # Automated checks cannot tell you whether a world is interesting.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contact-sheet-${{ matrix.os }}
+          path: build/contact_sheet.bmp
+          if-no-files-found: warn
