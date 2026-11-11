@@ -170,14 +170,17 @@ Raising the feature size with `w` is what separates them: fewer, larger
 non-radial lobes break the rings without shredding the patches. Quota accuracy
 is untouched throughout, and radial ordering still passes with margin.
 
-**Recommendation: `w ≈ 0.6` with a 9 km danger feature, not `0.15–0.25` at
-3–6 km.** This is a feel judgement rather than a correctness one, so the
-default is left at the doc's value — change it deliberately after looking at
-`--contact-sheet --w 0.60 --danger-feat 9000` yourself.
+**Settled at `w = 0.60` with a 2 km danger feature**, not the `0.15–0.25` at
+3–6 km the doc first guessed. Note this table recommended 9 km, on the
+reasoning that a larger feature was the only way to keep patches from
+shredding. §7 removed that constraint: with the repair pass restoring patch
+size independently, the small feature became the better choice — it gives
+granular zones that still read as places. A feel judgement, taken by the
+author on the contact sheet rather than from any assertion.
 
-Even at that setting, meadows is still a central blob on most seeds and
-glacier still favours the rim. Breaking that needs the danger field to stop
-being a pure function of radius plus noise.
+Even so, meadows is still a central blob on most seeds and glacier still
+favours the rim. Breaking that needs the danger field to stop being a pure
+function of radius plus noise.
 
 ### 6. Adjacency constraints were not honoured — fixed by widening the bands
 
@@ -229,24 +232,37 @@ before and after. Presence cannot break. Only the area difference between the
 two cells drifts, inside a budget. Swaps that leave a cell outside its new
 danger band, create a forbidden border, or exceed the budget are rejected.
 
-| passes | mean patch | quota err | Spearman mean/min |
-| --- | --- | --- | --- |
-| 0 | 1.9 cells / 0.62 km² | 3.9% | 1.00 / 0.98 |
-| 1 | 4.9 cells / 1.59 km² | 3.9% | 0.99 / 0.95 |
-| 2 | 6.4 cells / 2.05 km² | 3.9% | 0.99 / 0.93 |
-| **4** | **7.4 cells / 2.40 km²** | **3.9%** | **0.99 / 0.95** |
-| 8 | 7.7 cells / 2.49 km² | 3.9% | 0.99 / 0.93 |
-| 16 | 7.8 cells / 2.50 km² | 3.9% | 0.99 / 0.93 |
+| passes | mean patch | quota err | Spearman mean/min | seeds breaking adjacency |
+| --- | --- | --- | --- | --- |
+| 0 | 1.9 cells / 0.63 km² | 3.5% | 1.00 / 0.98 | 70 / 200 |
+| 2 | 6.5 cells / 2.10 km² | 3.5% | 0.99 / 0.93 | 1 / 200 |
+| **4** | **7.6 cells / 2.46 km²** | **3.6%** | **0.99 / 0.93** | **0 / 200** |
+| 8 | 7.9 cells / 2.57 km² | 3.6% | 0.99 / 0.93 | 0 / 200 |
 
-Measured at `w = 0.60`, 2 km danger feature, 96 seeds. It converges by about
-four passes, triples patch area at every `(w, feature)` pair tried, leaves
-quota error untouched, and costs well under a second over 200 seeds.
+Measured at `w = 0.60`, 2 km danger feature, 200 seeds at 1024². It converges
+by about four passes, triples patch area at every `(w, feature)` pair tried,
+leaves quota error untouched, and costs well under a second over 200 seeds.
+
+**It also repairs adjacency, and that turned out to be load-bearing.** The
+greedy pass treats `adjacency_mask` as a cost rather than a veto — by design,
+so it cannot deadlock — so it can leave forbidden borders behind. A
+fast-varying danger field makes that far likelier: at these settings 70 seeds
+in 200 had a `meadows` cell touching `glacier` or `rift`, against 0 at the old
+`w = 0.20` / 4.5 km. Scoring violation removal as a gain, and refusing any
+swap that raises the count, takes it to 0 in 200. **Without the repair pass
+these settings would not be usable at all**, which was not obvious before the
+harness started asserting the authored rules on every run rather than only in
+`--test-adjacency`.
 
 The price is radial ordering: Spearman 1.00 → 0.92–0.99, still comfortably
 above the 0.8 the harness asserts. That is the real trade — not quota, which
 the label-swap construction protects, but how strongly calm-to-hostile reads.
 
-**Off by default** (`repair_passes = 0`). Turning it on moves every seed.
+**On by default** at 4 passes, together with `w = 0.60` and a 2 km danger
+feature. Those three go together: the small feature gives granular zones, `w`
+breaks the radial banding, and the repair pass is what stops the first two
+reading as noise. Changing any of them moves every seed, which is free only
+until A3 pins the golden hashes.
 
 ## What this implies for A2
 

@@ -101,7 +101,7 @@ Use OpenSimplex2 or simplex-family noise, not classic Perlin. Perlin's axis-alig
 
 ### Layer 1 — danger field
 
-`D(p) = saturate(r² + w · fbm_low(p.xz))`, where `r²` is normalised **area**, not normalised radius — see the area budget section below, which is the authority on this. A feature size of 3–6 km, and `w` around 0.15–0.25; note that range was first quoted against the radius form and is worth re-deriving once the biome map is on screen.
+`D(p) = saturate(r² + w · fbm_low(p.xz))`, where `r²` is normalised **area**, not normalised radius — see the area budget section below, which is the authority on this. **Measured settings: `w = 0.60` with a 2 km feature size**, not the 0.15–0.25 at 3–6 km first guessed here. At `w = 0.20` every seed reads as a dartboard — same silhouette, glacier always on the coast — and no assertion catches it, because Spearman sits at 1.00 throughout. Only the contact sheet shows it. A 2 km feature on its own fragments the assignment into speckle; it reads as zones because the layer-3 repair pass restores patch size independently.
 
 This is the "distance from centre" axis, softened. The wobble buys an occasional hostile pocket within sight of spawn and a calm valley at the rim — the thing that stops a radially-ordered world from reading as a dartboard. `w` is the single most important feel parameter in the generator; expose it prominently in the prototype.
 
@@ -195,6 +195,8 @@ Measured over 96 seeds, it roughly triples mean patch area wherever it is applie
 | `w` 0.60, 9 km feature | 3.8 cells / 1.24 km² | 11.4 cells / 3.67 km² | 3.6% |
 
 It converges by about four passes and costs well under a second over 200 seeds. The price is paid in radial ordering: Spearman falls from 1.00 to 0.92–0.99, still far above the 0.8 the harness asserts. So patch size and quota granularity are independent knobs after all, as this section originally claimed — just not through the mechanism it named, and `w` remains the control for how strongly the world reads as radial.
+
+**The pass also repairs adjacency.** Because the greedy assignment treats `adjacency_mask` as a cost rather than a veto — deliberately, so it can never deadlock — it can leave forbidden borders behind, and a fast-varying danger field makes that far more likely: at `w = 0.60` with a 2 km feature, 70 seeds in 200 had one. Scoring the removal of a violation as a gain, and refusing any swap that increases the count, takes that to **0 in 200** while the quota, presence and land-fraction checks stay green. Without the repair pass those settings would not be usable.
 
 Rule of thumb: `cells ≈ 15 × biome_count / land_fraction`, then check the implied cell diameter lands between 1 km and 2.5 km. **This undersizes R = 10 km by about 4×.** The estimate assumes the quota error is centred; it is not, so ~245 cells misses the ±10% requirement on every seed even with the half-cell gate. Budget ~920 cells (0.32 km² each) at R = 10 km. R = 20 km passes at the figure below.
 
@@ -432,6 +434,7 @@ The harness runs the generator headless over N seeds at coarse resolution — a 
 | Presence | Every biome has ≥ 1 cell, all N seeds | Assignment deadlock; over-tight danger bands |
 | Quota | Per-biome land share within ±10% of target | Granularity too coarse; bands not covering \[0,1\] |
 | Radial order | Spearman correlation between a biome's `danger_preferred` and its cells' mean normalised area ≥ 0.8 | Danger field defined on radius instead of area; `w` too high |
+| Adjacency | No cell borders a biome its `adjacency_mask` forbids | Rules silently ignored; a danger field fast-varying enough that the ordering can no longer keep forbidden pairs apart |
 | Land fraction | Within ±5% of target, all seeds | Continent mask drifting with parameter edits |
 | Edge taper | No land above sea level past `r = 0.95`; terrain below void threshold at `r = 1.0` | Taper too weak for an unusual seed |
 | Foot connectivity | Flood fill from spawn over walkable land reaches ≥ X% of land cells | Biomes stranded behind cliffs |
@@ -620,7 +623,9 @@ Starting points, not measurements. Every budget row is a number to instrument an
 | Region cells, R = 20 km | \~960 | Same cell size, more of them |
 | Cell lookup grid | 64 × 64 buckets | A handful of candidates per sample |
 | Boundary warp amplitude | \~1.3 km | Roughly one cell radius; the parameter that makes cells read as coastlines |
-| Danger noise weight `w` | 0.15–0.25 | The most important feel parameter in the generator |
+| Danger noise weight `w` | 0.60 | The most important feel parameter in the generator. 0.15–0.25 was the first guess and reads as a dartboard; see `tools/spike/README.md` §5 |
+| Danger feature size | 2 km | Smaller than the original 3–6 km. Fragments the assignment on its own; the layer-3 repair pass is what makes it read as zones rather than noise |
+| Patch repair passes | 4 | Converges by 4. Without it, `w` and patch size are the same knob |
 | Continent fBm | 4–6 octaves, 2–8 km base | Simplex family, never classic Perlin |
 | Land fraction target | 55% | ±5% tolerance in the harness |
 | Quota tolerance | ±10% relative | Granularity-limited; tighten by adding cells |

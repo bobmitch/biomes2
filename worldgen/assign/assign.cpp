@@ -52,17 +52,18 @@ bool adjacent(int a, int b, const CellGraph& g) {
     return false;
 }
 
-// Does this cell's current biome border anything it is forbidden to?
-bool forbidden_any(int cell, const CellGraph& g, const std::vector<int>& biome,
-                   const ArchetypeTable& t) {
+// How many of this cell's borders are forbidden by its current biome?
+int forbidden_count(int cell, const CellGraph& g, const std::vector<int>& biome,
+                    const ArchetypeTable& t) {
     const int b = biome[cell];
-    if (b < 0) return false;
+    if (b < 0) return 0;
+    int n = 0;
     for (int k = g.offset[cell]; k < g.offset[cell + 1]; ++k) {
         const int nb = biome[g.list[k]];
         if (nb < 0) continue;
-        if ((t[b].adjacency_mask >> nb) & 1u) return true;
+        if ((t[b].adjacency_mask >> nb) & 1u) ++n;
     }
-    return false;
+    return n;
 }
 
 // Grow contiguous patches at constant quota by swapping biome labels between
@@ -137,14 +138,16 @@ void repair_patches(const std::vector<CellRecord>& cells,
 
                     const int before = same_neighbours(i, graph, biome) +
                                        same_neighbours(j, graph, biome);
+                    const int viol_before = forbidden_count(i, graph, biome, table) +
+                                            forbidden_count(j, graph, biome, table);
                     biome[i] = bp; biome[j] = bi;
                     int after = same_neighbours(i, graph, biome) +
                                 same_neighbours(j, graph, biome);
                     if (adjacent(i, j, graph) && biome[i] == biome[j]) after -= 1;
-                    const bool bad = forbidden_any(i, graph, biome, table) ||
-                                     forbidden_any(j, graph, biome, table);
+                    const int viol_after = forbidden_count(i, graph, biome, table) +
+                                           forbidden_count(j, graph, biome, table);
                     biome[i] = bi; biome[j] = bp;
-                    if (bad) continue;
+                    if (viol_after > viol_before) continue;   // never make it worse
 
                     const float dd =
                         std::fabs(cells[i].danger - table[bp].danger_preferred) +
@@ -153,7 +156,9 @@ void repair_patches(const std::vector<CellRecord>& cells,
                         std::fabs(cells[j].danger - table[bp].danger_preferred);
 
                     const float gain = static_cast<float>(after - before) -
-                                       params.repair_danger_weight * dd;
+                                       params.repair_danger_weight * dd +
+                                       params.repair_adjacency_weight *
+                                           static_cast<float>(viol_before - viol_after);
                     if (gain > best_gain) { best_gain = gain; best_j = j; }
                 }
 

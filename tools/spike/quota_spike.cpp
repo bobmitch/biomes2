@@ -53,8 +53,8 @@ struct WorldParams {
     float land_offset       = 0.17f;   // calibrated to the 55% land target
 
     // layer 1
-    float danger_w          = 0.20f;      // the feel parameter
-    float danger_freq       = 1.0f / 4500.0f;
+    float danger_w          = 0.60f;      // the feel parameter; see tools/spike/README.md
+    float danger_freq       = 1.0f / 2000.0f;
     int   danger_octaves    = 3;
 
     // layer 2
@@ -210,6 +210,7 @@ struct SeedResult {
     float spearman = 0.0f;
     int   missing_biomes = 0;
     int   relaxed = 0, overflow = 0;
+    int   adj_violations = 0;   // against the authored adjacency_forbid rules
     float mean_candidates = 0.0f;
     float mean_patch_cells = 0.0f;
     float mean_patch_km2 = 0.0f;
@@ -372,6 +373,18 @@ static SeedResult eval_seed(uint64_t world_seed,
         out.max_quota_err = std::max(out.max_quota_err, static_cast<float>(rel));
     }
 
+    // Violations of the adjacency rules actually authored in archetypes.json.
+    // The --test-adjacency mode probes a synthetic worst-case pair; this
+    // asserts the rules the table really states, on every run.
+    for (int i = 0; i < n; ++i) {
+        if (biome[i] < 0) continue;
+        for (int k = graph.offset[i]; k < graph.offset[i + 1]; ++k) {
+            const int j = graph.list[k];
+            if (j <= i || biome[j] < 0) continue;
+            if ((table[biome[i]].adjacency_mask >> biome[j]) & 1u) ++out.adj_violations;
+        }
+    }
+
     // Spearman over biomes that got cells.
     {
         std::vector<int> idx;
@@ -433,6 +446,7 @@ struct Summary {
     int quota_failures = 0;      // max rel err > 0.10
     int radial_failures = 0;     // spearman < 0.8
     int land_failures = 0;       // |land - 0.55| > 0.05
+    int adjacency_failures = 0;  // seeds with >= 1 authored-rule violation
     float mean_cells = 0, mean_land_cells = 0, mean_land_frac = 0;
     float mean_quota_err = 0, max_quota_err = 0, p95_quota_err = 0;
     float mean_spearman = 0, min_spearman = 2.0f;
@@ -467,6 +481,7 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
         if (r.max_quota_err > 0.10f) ++sm.quota_failures;
         if (r.spearman < 0.8f) ++sm.radial_failures;
         if (std::fabs(r.land_fraction - 0.55f) > 0.05f) ++sm.land_failures;
+        if (r.adj_violations > 0) ++sm.adjacency_failures;
         sm.mean_cells += r.cells;
         sm.mean_land_cells += r.land_cells;
         sm.mean_land_frac += r.land_fraction;
@@ -492,19 +507,20 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
 }
 
 static void print_summary(const char* label, const Summary& s) {
-    std::printf("%-24s %5.0f %5.0f %5.1f%%  %5.1f%% %5.1f%% %5.1f%%  %5.2f %5.2f  %4.1f %5.2f  %4.1f %4.1f  %3d %3d %3d %3d\n",
+    std::printf("%-24s %5.0f %5.0f %5.1f%%  %5.1f%% %5.1f%% %5.1f%%  %5.2f %5.2f  %4.1f %5.2f  %4.1f %4.1f  %3d %3d %3d %3d %3d\n",
                 label, s.mean_cells, s.mean_land_cells, 100.0 * s.mean_land_frac,
                 100.0 * s.mean_quota_err, 100.0 * s.p95_quota_err, 100.0 * s.max_quota_err,
                 s.mean_spearman, s.min_spearman,
                 s.mean_patch_cells, s.mean_patch_km2,
                 s.mean_relaxed, s.mean_candidates,
-                s.presence_failures, s.quota_failures, s.radial_failures, s.land_failures);
+                s.presence_failures, s.quota_failures, s.radial_failures, s.land_failures,
+                s.adjacency_failures);
 }
 
 static void print_header() {
     std::printf("\n%-24s %5s %5s %6s  %-21s %-12s %-11s %-10s %s\n",
                 "config", "cells", "land", "land%", "quota err mean/p95/max",
-                "spearman", "patch c/km2", "relax/cand", "fail: pres quota rad land");
+                "spearman", "patch c/km2", "relax/cand", "fail: pres quota rad land adj");
     std::printf("%s\n", std::string(136, '-').c_str());
 }
 

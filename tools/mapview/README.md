@@ -29,6 +29,9 @@ a compute shader or not at all.
 
 ## What is deliberately missing
 
+**Superseded:** `w` and the danger feature size now have sliders. The rest of
+the layer-0 and layer-1 parameters still do not, for the reason below.
+
 **Tuning sliders.** The starter prompt put them in A1, but `w` — the parameter
 they most matter for — can only be judged against a biome map, and biomes are
 A2. A slider you cannot evaluate is UI you rebuild once you can. They land with

@@ -66,9 +66,14 @@ struct AssignParams {
     // This pass supplies one. It swaps biome LABELS between pairs of cells,
     // which leaves every biome's cell count exactly unchanged -- presence
     // cannot break, and only area drifts, by the difference in cell size.
-    int   repair_passes = 0;          // 0 disables
+    int   repair_passes = 4;          // 0 disables; converges by about 4
     float repair_danger_weight = 2.0f;  // cost per unit of danger displacement
     float repair_quota_budget = 0.5f;   // allowed area drift, in mean cells
+    // Gain per adjacency violation removed. The greedy pass treats
+    // adjacency_forbid as a cost so it can never deadlock, which means it can
+    // leave violations behind; this makes the repair pass seek them out rather
+    // than merely avoid adding more.
+    float repair_adjacency_weight = 10.0f;
 };
 
 struct AssignStats {
