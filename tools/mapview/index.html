@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Map view</title>
+    <style>
+      :root {
+        --bg: #14161a;
+        --panel: #1c1f25;
+        --line: #2b303a;
+        --text: #dfe3ea;
+        --dim: #8b94a4;
+        --accent: #7fc8a9;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 13px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
+        display: flex;
+        height: 100vh;
+        overflow: hidden;
+      }
+      #panel {
+        width: 260px;
+        flex: 0 0 260px;
+        padding: 18px;
+        background: var(--panel);
+        border-right: 1px solid var(--line);
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+        overflow-y: auto;
+      }
+      h1 { font-size: 13px; margin: 0; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dim); }
+      .group { display: flex; flex-direction: column; gap: 6px; }
+      label { color: var(--dim); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; }
+      input, select, button {
+        background: #23272f;
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 6px 8px;
+        font: inherit;
+      }
+      button { cursor: pointer; }
+      button:hover { border-color: var(--accent); }
+      .row { display: flex; gap: 6px; }
+      .row > input { flex: 1; min-width: 0; }
+      .row > button { flex: 0 0 34px; }
+      .stat { display: flex; justify-content: space-between; gap: 8px; }
+      .stat span:last-child { color: var(--accent); }
+      #stage { flex: 1; display: grid; place-items: center; padding: 18px; min-width: 0; }
+      canvas {
+        width: min(100%, calc(100vh - 36px));
+        height: auto;
+        aspect-ratio: 1;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        image-rendering: auto;
+      }
+      #error {
+        display: none;
+        max-width: 560px;
+        padding: 16px;
+        border: 1px solid #6b3030;
+        border-radius: 6px;
+        background: #241a1a;
+        color: #e8b4b4;
+        white-space: pre-wrap;
+      }
+      .note { color: var(--dim); font-size: 11px; line-height: 1.45; }
+    </style>
+  </head>
+  <body>
+    <div id="panel">
+      <h1>Map view · A1</h1>
+
+      <div class="group">
+        <label for="seed">World seed</label>
+        <div class="row">
+          <input id="seed" type="text" value="0" spellcheck="false" />
+          <button id="prev" title="Previous seed">&lt;</button>
+          <button id="next" title="Next seed">&gt;</button>
+        </div>
+      </div>
+
+      <div class="group">
+        <label for="layer">Layer</label>
+        <select id="layer">
+          <option value="0">Continent mask</option>
+          <option value="1">Danger field D</option>
+          <option value="2">Raw fBm</option>
+          <option value="3" selected>Layer-0 height</option>
+        </select>
+      </div>
+
+      <div class="group">
+        <label>Readout</label>
+        <div class="stat"><span>Land fraction</span><span id="land">–</span></div>
+        <div class="stat"><span>Render</span><span id="ms">–</span></div>
+        <div class="stat"><span>Radius</span><span id="radius">–</span></div>
+        <div class="stat"><span>Seed · continent</span><span id="sc">–</span></div>
+        <div class="stat"><span>Seed · danger</span><span id="sd">–</span></div>
+      </div>
+
+      <p class="note">
+        Tuning sliders land at A2, once biomes are on screen to judge them
+        against. The field function is generated from
+        <code>worldgen/shaders/</code>; this page does not define it.
+      </p>
+    </div>
+
+    <div id="stage">
+      <canvas id="map" width="2048" height="2048"></canvas>
+      <div id="error"></div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "mapview",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "tools/mapview", "run", "dev"],
+      "port": 5173
+    }
+  ]
+}
