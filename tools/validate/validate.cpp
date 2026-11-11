@@ -1483,7 +1483,7 @@ int main(int argc, char** argv) {
             WorldParams cw = wp;
             cw.grid = 1024;
             const SeedWorld cwld = build_world(ws, cw, table, ap);
-            uint64_t h0 = 0xCBF29CE484222325ull, h1 = h0, h2 = h0, h3 = h0;
+            uint64_t h0 = 0xCBF29CE484222325ull, h1 = h0, h2 = h0, h3 = h0, hn = h0, hc = h0;
             const int HG = 256;
             const float CR = cw.radius, cs = 2.0f * CR / HG;
             for (int gj = 0; gj < HG; ++gj) {
@@ -1494,6 +1494,17 @@ int main(int argc, char** argv) {
                     if (rr > 1.0f) continue;
                     const float a = layer0_height(x, z, rr, cw, cwld.s_cont);
                     const float b = layer1_danger(x, z, rr, cw, cwld.s_dang);
+                    // Split layer 4: the shaped noise alone (exercises abs and
+                    // the ridge warp) versus the cell lookup alone (integers
+                    // and sqrt only).
+                    const float sn = fbm_shaped(x * cw.biome_freq, z * cw.biome_freq,
+                                                5, 2.0f, 0.5f, 0.5f, cwld.s_height);
+                    int li[4]; float ld[4];
+                    const float wxx = x + cw.warp_amp * fbm(x * cw.warp_freq, z * cw.warp_freq, 2, 2.0f, 0.5f, cwld.s_wx);
+                    const float wzz = z + cw.warp_amp * fbm(x * cw.warp_freq, z * cw.warp_freq, 2, 2.0f, 0.5f, cwld.s_wz);
+                    const int lf = cwld.lookup.nearest4(cwld.pts, wxx, wzz, li, ld);
+                    hn = fnv1a(hn, static_cast<uint64_t>(static_cast<int64_t>(sn * 65536.0f)));
+                    for (int q = 0; q < lf; ++q) hc = fnv1a(hc, static_cast<uint64_t>(li[q] + 1));
                     const float c = terrain_base(cwld, cw, table, x, z, rr);
                     const float e = terrain_height(cwld, cw, table, x, z, rr);
                     h0 = fnv1a(h0, static_cast<uint64_t>(static_cast<int64_t>(a * 4096.0f)));
