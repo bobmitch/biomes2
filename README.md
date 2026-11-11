@@ -17,19 +17,23 @@ Terrain is a pure function, never stored. Only player edits persist.
 
 ## Status
 
-Track A is at **A1**. The field function (layers 0 and 1) and quota assignment
-(layer 3) exist; region cells, rivers and 3D density do not.
+Track A is at **A4**. Layers 0–5 exist — continent mask, danger field, region
+cells, quota assignment, height composition and rivers. 3D density and caves
+(layer 6) do not. The world is pinned at `generator_version` 5 and the
+200-seed gate runs in CI on Linux and Windows.
 
 | What | Where | Run it |
 | --- | --- | --- |
-| Field function, canonical | `worldgen/shaders/` | compiles as C++ and HLSL; `tools/wgslgen` emits the WGSL |
+| Field function | `worldgen/shaders/` | ordinary C++ that also compiles as HLSL |
 | Quota assignment | `worldgen/assign/` | portable C++, no host deps |
 | Validation harness | `tools/validate/` | `tools\validate\build.bat` then `build\validate.exe` |
-| Map view (A1) | `tools/mapview/` | `cd tools/mapview && npm install && npm run dev` |
+| World viewer | `tools/view/` | `build\view.exe` from the repo root (Windows) |
 
-Two decisions were taken against the original design and are recorded rather
-than silently applied: [ADR-001](docs/adr-001-field-function-authority.md)
-inverts the field function's language authority, and
+Decisions taken against the original design are recorded rather than silently
+applied: [ADR-001](docs/adr-001-field-function-authority.md) inverts the field
+function's language authority,
+[ADR-002](docs/adr-002-drop-wgsl-native-viewer.md) retires WGSL and the browser
+prototype for a native viewer, and
 [`tools/validate/README.md`](tools/validate/README.md) documents what measurement
 changed about layer 3 — including a quota bug that missed its target on every
 seed, and a danger field that reads as a dartboard at the documented `w`.

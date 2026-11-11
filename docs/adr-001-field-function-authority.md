@@ -1,7 +1,16 @@
 # ADR-001 — Field function authority and the validator's language
 
-Status: **accepted** · 2026-11-10 · supersedes two decisions in
-[`worldgen-design.md`](worldgen-design.md)
+Status: **accepted, decision 2 superseded** · 2026-11-10 · supersedes two
+decisions in [`worldgen-design.md`](worldgen-design.md)
+
+> **Decision 2 — the dialect and the WGSL generator — was retired by
+> [ADR-002](adr-002-drop-wgsl-native-viewer.md) on 2026-11-11.** It was taken
+> given a browser prototype, and `tools/mapview` was the only consumer of WGSL
+> in the repository; removing it removed the reason. Decisions **1, 3 and 4
+> stand**: `tools/validate` is native C++, the C++ build with contraction
+> disabled is the determinism authority, and kernel code is hand-written per
+> backend. Part 1 of this document — what the WGSL specification forces — is
+> unaffected and is still the reason the GPU can never anchor a hash.
 
 ## Decision
 

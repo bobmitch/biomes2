@@ -12,8 +12,8 @@ A single-seed, radially-structured voxel world of 10–20 km radius, generated a
 | Radial banding | Equal-**area** rings, `r_k = R·√(k/N)` | Disk area grows as r²; linear rings give the inner band a few percent of the world |
 | Base terrain storage | None — regenerated on demand from the field function | A 20 km world at 0.5 m is 6.4×10⁹ columns; even the heightmap can't be precomputed |
 | SVDAG contents | Player edits only, as a sparse delta over the function | Edits dedup extremely well; noise terrain does not |
-| Field function language | A restricted C-like dialect that compiles unmodified as C++ and HLSL; WGSL generated from it ([ADR-001](adr-001-field-function-authority.md)) | WGSL permits reassociation and FMA fusion with no opt-out (§15.7.5), so it cannot be the determinism authority. C++ can, and HLSL is the same text behind a vector header |
-| Prototype environment | Browser (WebGPU) for worldgen, C++ for the voxel pipeline | They de-risk different things and neither translates to the other's environment |
+| Field function language | Ordinary C++ that also compiles as HLSL behind a vector header ([ADR-001](adr-001-field-function-authority.md), [ADR-002](adr-002-drop-wgsl-native-viewer.md)) | WGSL permits reassociation and FMA fusion with no opt-out (§15.7.5), so it cannot be the determinism authority. C++ can, and HLSL is the same text. WGSL went with the browser prototype that was its only consumer |
+| Prototype environment | Native C++ throughout ([ADR-002](adr-002-drop-wgsl-native-viewer.md)) | A browser prototype tunes against a translation of the generator on a backend that may reassociate; a native viewer runs the shipping code |
 | Repository | One repo, several build systems | The shader source is shared verbatim by both tracks; a repo boundary through it guarantees drift |
 | Physics shapes | `HeightFieldShape` by default, `MeshShape` only for overhangs and edited chunks | Cooking and query cost differ by an order of magnitude, and most chunks are 2.5D |
 
