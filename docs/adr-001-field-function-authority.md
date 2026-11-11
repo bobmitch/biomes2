@@ -183,7 +183,9 @@ source.
   in and must never be hand-edited.
 - **Golden hashes become meaningful.** They pin the C++ build's output, the one
   thing in the system that can be held stable, so the generator-version gate
-  hangs off something reproducible.
+  hangs off something reproducible. **Since confirmed in CI:** hashes blessed
+  by MSVC on Windows are reproduced bit-for-bit by GCC on Linux, so the
+  reproducibility this decision assumed is measured rather than hoped for.
 - **The multiplayer open question gets cheaper.** The design doc calls it "the
   single question whose answer most changes the architecture", because a
   headless server would have to generate terrain without a GPU. It already can.

@@ -286,6 +286,10 @@ There is still only one *source* — the dialect — so this is not two implemen
 2. Pin golden hashes to the CPU build, and compare CPU to GPU within a tolerance. Never by hash: that comparison cannot be made exact, by specification.
 3. Where a GPU result must feed a decision, keep the decision tolerant of a few centimetres.
 
+**Measured: the CPU path is bit-identical across compilers and platforms.** The golden hashes are blessed by MSVC on Windows and verified by GCC on Linux in CI, and they match exactly — as do every other figure the harness reports, to the digit. So "stable across runs and platforms" is a demonstrated property of the C++ build rather than an aspiration, and the golden-seed gate means something. It is checked on every commit touching `worldgen/`, which is the only way it stays true.
+
+This says nothing about the GPU path, which §15.7.5 puts permanently out of reach of an exact comparison.
+
 ### Generator versioning
 
 Store `generator_version` in the world save. Pin it per world and never migrate silently.

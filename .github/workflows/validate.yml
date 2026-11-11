@@ -43,7 +43,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure
         run: cmake -S . -B build/cmake -DCMAKE_BUILD_TYPE=Release
@@ -58,7 +58,7 @@ jobs:
       - name: Upload contact sheet
         # Automated checks cannot tell you whether a world is interesting.
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: contact-sheet-${{ matrix.os }}
           path: build/contact_sheet.bmp
