@@ -1478,7 +1478,7 @@ int main(int argc, char** argv) {
             }
             std::printf("archetype table hash: %016llx\n", static_cast<unsigned long long>(th));
         }
-        std::printf("seed  layer0            +layer1           +layer4(base)     +layer5(carved)   segs\n");
+        std::printf("seed  layer0            layer1            fbm_shaped        cells             layer4base        layer5carved      segs\n");
         for (uint64_t ws = 0; ws < 8; ++ws) {
             WorldParams cw = wp;
             cw.grid = 1024;
@@ -1513,9 +1513,10 @@ int main(int argc, char** argv) {
                     h3 = fnv1a(h3, static_cast<uint64_t>(static_cast<int64_t>(e * 64.0f)));
                 }
             }
-            std::printf("%4llu  %016llx  %016llx  %016llx  %016llx  %d\n",
+            std::printf("%4llu  %016llx  %016llx  %016llx  %016llx  %016llx  %016llx  %d\n",
                         static_cast<unsigned long long>(ws),
                         static_cast<unsigned long long>(h0), static_cast<unsigned long long>(h1),
+                        static_cast<unsigned long long>(hn), static_cast<unsigned long long>(hc),
                         static_cast<unsigned long long>(h2), static_cast<unsigned long long>(h3),
                         static_cast<int>(cwld.rivers.size()));
         }
