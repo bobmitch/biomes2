@@ -112,14 +112,17 @@ for each biome b:  quota[b] = b.area_fraction * total_land_area
 sort land_cells ascending by D(centroid)
 
 for cell in land_cells:
-    candidates = biomes where D(cell) within b.danger_band and quota[b] > 0
-    if candidates empty: candidates = biomes where quota[b] > 0   # relax
+    candidates = biomes where D(cell) within b.danger_band
+                        and quota[b] > cell.area / 2
+    if candidates empty: candidates = biomes where quota[b] > cell.area / 2  # relax
     pick b minimising  |D(cell) - b.danger_preferred|
                      + adjacency_penalty(b, already-assigned neighbours)
     assign cell -> b;  quota[b] -= cell.area
 ```
 
 Sorting by danger before assigning is what produces the radial ordering; the quota decrement is what produces equal measure; the relaxation branch is what guarantees presence even on a pathological seed. The adjacency penalty is where rules like "never place the hardest biome adjacent to the spawn cell" live, as a cost rather than a hard constraint, so the solver can never deadlock.
+
+**The half-cell floor on the quota gate is load-bearing.** An earlier draft of this pseudocode gated on `quota[b] > 0`, which lets a biome holding a sliver of quota swallow a whole cell. Every biome then overshoots by up to one cell, and whichever sorts last by danger absorbs the sum of everyone else's overshoot — measured at 200 seeds out of 200 missing the ±10% requirement, with the last biome landing 53% under target on a typical seed. Holding back half a cell makes the rounding symmetric instead of always positive. See [`tools/spike/README.md`](../tools/spike/README.md) for the measurement.
 
 Cells left over in ocean become island clusters, drawn from the same quota pool. A biome occasionally landing island-only is free seed variety at no cost.
 
@@ -167,9 +170,11 @@ The same applies to the danger field: `D` should be defined on normalised area, 
 
 ### Scale and cell count
 
-Quota accuracy is limited by cell granularity: you cannot assign half a cell. Size the cell count so each biome receives enough cells for the tolerance you want, then recover large contiguous patches with a **contiguity bonus** in the assignment cost — a negative penalty for matching an already-assigned neighbour. Many small cells give fine quota control; the bonus clumps them into patches of three to six. Patch size and quota granularity are then independent knobs, which is the whole trick.
+Quota accuracy is limited by cell granularity: you cannot assign half a cell. Size the cell count so each biome receives enough cells for the tolerance you want, then recover large contiguous patches with a **contiguity bonus** in the assignment cost — a negative penalty for matching an already-assigned neighbour.
 
-Rule of thumb: `cells ≈ 15 × biome_count / land_fraction`, then check the implied cell diameter lands between 1 km and 2.5 km.
+**Measured correction.** The contiguity bonus does not work and patch size is not a free knob. Because cells are assigned in global danger order, a cell's already-assigned neighbours are the ones at slightly lower `D` — exactly the ones the `danger_preferred` term would have given the same biome anyway, so the bonus only reinforces a decision already made. Sweeping it from 0.00 to 0.40 changes the output not at all. The patches that do appear come from the danger field's own spatial correlation, and `w` is the real control: mean patch falls from 5.3 cells at `w = 0.05` to 3.4 at `w = 0.35`, with quota error flat across the range. Patch size and quota granularity *are* separable, but through `w`, not through the assignment cost.
+
+Rule of thumb: `cells ≈ 15 × biome_count / land_fraction`, then check the implied cell diameter lands between 1 km and 2.5 km. **This undersizes R = 10 km by about 4×.** The estimate assumes the quota error is centred; it is not, so ~245 cells misses the ±10% requirement on every seed even with the half-cell gate. Budget ~920 cells (0.32 km² each) at R = 10 km. R = 20 km passes at the figure below.
 
 | Metric | R = 10 km | R = 20 km |
 | --- | --- | --- |

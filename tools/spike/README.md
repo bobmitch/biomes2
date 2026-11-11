@@ -9,6 +9,7 @@ assert.
 ```bash
 tools\spike\build.bat                       # from the repo root
 build\quota_spike.exe --seeds 200 --grid 1024
+build\quota_spike.exe --mode 0              # the original gate, for comparison
 build\quota_spike.exe --detail              # per-biome breakdown, one seed
 build\quota_spike.exe --sweep               # the three quota gates
 build\quota_spike.exe --sweep-cells         # cell size vs quota accuracy
@@ -50,6 +51,10 @@ the last one in sort order absorbs the sum of everyone else's overshoot.
 cell of quota remains (`QUOTA_HALF_CELL`). The rounding error becomes symmetric
 instead of always positive and stops accumulating. At R = 20 km this alone
 takes the failure count from 21/48 to 0/48.
+
+This is now the **default** in `AssignParams`, and the design doc's layer-3
+pseudocode has been corrected to match. `--mode 0` reproduces the original
+behaviour for comparison; the tables below name whichever gate was used.
 
 A softer, gateless variant (`QUOTA_SOFT_FILL`, cost rises as a biome fills) was
 also tried and is **much worse** — 83% mean error. The hard quota gate is what
@@ -112,7 +117,7 @@ dartboard. That judgement needs the contact sheet, not an assertion.
 
 ## What this implies for A2
 
-- Take the half-cell gate before building anything on top of layer 3.
+- The half-cell gate is in and is the default. Done.
 - Budget ~900 cells at R = 10 km, not ~245. Cell lookup cost roughly 4×; still
   nothing on the GPU, but the 64×64 bucket grid should be re-checked.
 - Either accept ~1.4 km² patches at R = 10 km, or add a mechanism that

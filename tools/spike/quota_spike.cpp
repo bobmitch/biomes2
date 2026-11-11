@@ -35,7 +35,11 @@ using namespace worldgen;
 // --- world parameters ------------------------------------------------------
 struct WorldParams {
     float radius            = 10000.0f;   // R, metres
-    float cell_area_target  = 1.28e6f;    // m^2; held constant across R
+    // m^2, held constant across R. 0.32e6 rather than the 1.28e6 the scale
+    // table implies: the rule of thumb assumes a centred quota error, and it
+    // is not centred, so R = 10 km needs about 4x the cells. R = 20 km passes
+    // at either figure.
+    float cell_area_target  = 0.32e6f;
     int   grid              = 1024;       // sample grid per side
 
     // layer 0 stand-in

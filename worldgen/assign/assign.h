@@ -29,14 +29,18 @@ struct CellGraph {
 
 // How a biome stops accepting cells once it approaches its quota.
 enum QuotaMode {
-    // As specified in the design doc: a biome stays a candidate while any
-    // quota remains, so it can overshoot by almost a whole cell.
+    // The original specification: a biome stays a candidate while any quota
+    // remains, so it can overshoot by almost a whole cell. Retained only to
+    // reproduce the measurement -- it misses the +/-10% quota requirement on
+    // 200 seeds out of 200.
     QUOTA_DOC = 0,
-    // Stop accepting once less than half a cell of quota remains, so the
-    // rounding error is symmetric rather than always positive.
+    // The default. Stop accepting once less than half a cell of quota
+    // remains, so the rounding error is symmetric rather than always
+    // positive and stops accumulating onto the last biome in sort order.
     QUOTA_HALF_CELL = 1,
-    // No hard gate: being ahead of schedule is a cost, so the error spreads
-    // across all biomes instead of landing on the last one in sort order.
+    // No hard gate: being ahead of schedule is a cost rather than a bar.
+    // Measured at 83% mean quota error -- the hard gate is what *makes* the
+    // guarantee and cannot be relaxed into a preference. Kept as a signpost.
     QUOTA_SOFT_FILL = 2
 };
 
@@ -49,7 +53,7 @@ struct AssignParams {
     // a constraint, so the solver can never deadlock.
     float adjacency_penalty = 10.0f;
 
-    int   quota_mode  = QUOTA_DOC;
+    int   quota_mode  = QUOTA_HALF_CELL;
     float fill_weight = 2.0f;   // QUOTA_SOFT_FILL only
 };
 
