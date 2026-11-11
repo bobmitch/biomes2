@@ -45,7 +45,7 @@ struct WorldParams {
     // table implies: the rule of thumb assumes a centred quota error, and it
     // is not centred, so R = 10 km needs about 4x the cells. R = 20 km passes
     // at either figure.
-    float cell_area_target  = 0.32e6f;
+    float cell_area_target  = 0.27e6f;
     int   grid              = 1024;       // sample grid per side
 
     // layer 0 stand-in
@@ -134,10 +134,30 @@ static std::vector<std::pair<float, float> > scatter_cells(const WorldParams& wp
         const int    pi = active[ai];
         bool placed = false;
         for (int k = 0; k < 30; ++k) {
-            const float ang = rng.uniform() * 6.28318530718f;
+            // A direction by rejection in the unit disc, normalised with sqrt,
+            // rather than cos and sin of a random angle. Those are libm and
+            // not bit-reproducible across platforms, and the cell positions
+            // feed every layer below this one -- an ULP here moves a Voronoi
+            // boundary, which moves a height, which moves a river.
+            //
+            // Rejecting straight into the annulus would have been simpler but
+            // samples it uniformly by AREA where the original sampled
+            // uniformly by RADIUS. The packing changes, and quota went to
+            // 11.3% against a 10% tolerance. Same distribution, exact
+            // arithmetic.
+            float dx = 0.0f, dz = 0.0f, dd = 0.0f;
+            bool  ok = false;
+            for (int t = 0; t < 24 && !ok; ++t) {
+                dx = rng.uniform() * 2.0f - 1.0f;
+                dz = rng.uniform() * 2.0f - 1.0f;
+                dd = dx * dx + dz * dz;
+                ok = (dd > 1.0e-8f) && (dd <= 1.0f);
+            }
+            if (!ok) continue;
+            const float inv = 1.0f / std::sqrt(dd);
             const float rad = rmin * (1.0f + rng.uniform());
-            const float x = pts[pi].first  + std::cos(ang) * rad;
-            const float z = pts[pi].second + std::sin(ang) * rad;
+            const float x = pts[pi].first  + dx * inv * rad;
+            const float z = pts[pi].second + dz * inv * rad;
             if (x * x + z * z > R * R) continue;
             if (!fits(x, z)) continue;
             push(x, z);

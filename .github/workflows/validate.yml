@@ -55,11 +55,6 @@ jobs:
         shell: bash
         run: ./build/validate --seeds 200 --grid 1024
 
-      - name: Component hashes (temporary, localising a divergence)
-        if: always()
-        shell: bash
-        run: ./build/validate --components
-
       - name: Render shaded relief
         if: always()
         shell: bash
