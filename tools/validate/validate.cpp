@@ -1404,6 +1404,7 @@ int main(int argc, char** argv) {
     bool bless = false;
     bool relief = false;
     bool closeup = false;
+    bool components = false;
     uint64_t closeup_seed = 0;
     int  tile = 192;
     const char* sheet_path = "build/contact_sheet.bmp";
@@ -1432,6 +1433,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--test-adjacency"))         adjacency = true;
         else if (!std::strcmp(argv[i], "--bless"))                  bless = true;
         else if (!std::strcmp(argv[i], "--relief"))                 relief = true;
+        else if (!std::strcmp(argv[i], "--components"))              components = true;
         else if (!std::strcmp(argv[i], "--closeup") && i + 1 < argc) {
             closeup = true;
             closeup_seed = std::strtoull(argv[++i], nullptr, 10);
@@ -1451,6 +1453,43 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("archetypes: %d biomes, invariants OK\n", static_cast<int>(table.size()));
+
+    if (components) {
+        // Localises a cross-platform divergence to a layer. Each hash covers
+        // one more stage than the last, so the first column that differs
+        // between two platforms is where the determinism broke.
+        std::printf("seed  layer0            +layer1           +layer4(base)     +layer5(carved)   segs\n");
+        for (uint64_t ws = 0; ws < 8; ++ws) {
+            WorldParams cw = wp;
+            cw.grid = 1024;
+            const SeedWorld cwld = build_world(ws, cw, table, ap);
+            uint64_t h0 = 0xCBF29CE484222325ull, h1 = h0, h2 = h0, h3 = h0;
+            const int HG = 256;
+            const float CR = cw.radius, cs = 2.0f * CR / HG;
+            for (int gj = 0; gj < HG; ++gj) {
+                const float z = -CR + (gj + 0.5f) * cs;
+                for (int gi = 0; gi < HG; ++gi) {
+                    const float x = -CR + (gi + 0.5f) * cs;
+                    const float rr = std::sqrt(x * x + z * z) / CR;
+                    if (rr > 1.0f) continue;
+                    const float a = layer0_height(x, z, rr, cw, cwld.s_cont);
+                    const float b = layer1_danger(x, z, rr, cw, cwld.s_dang);
+                    const float c = terrain_base(cwld, cw, table, x, z, rr);
+                    const float e = terrain_height(cwld, cw, table, x, z, rr);
+                    h0 = fnv1a(h0, static_cast<uint64_t>(static_cast<int64_t>(a * 4096.0f)));
+                    h1 = fnv1a(h1, static_cast<uint64_t>(static_cast<int64_t>(b * 4096.0f)));
+                    h2 = fnv1a(h2, static_cast<uint64_t>(static_cast<int64_t>(c * 64.0f)));
+                    h3 = fnv1a(h3, static_cast<uint64_t>(static_cast<int64_t>(e * 64.0f)));
+                }
+            }
+            std::printf("%4llu  %016llx  %016llx  %016llx  %016llx  %d\n",
+                        static_cast<unsigned long long>(ws),
+                        static_cast<unsigned long long>(h0), static_cast<unsigned long long>(h1),
+                        static_cast<unsigned long long>(h2), static_cast<unsigned long long>(h3),
+                        static_cast<int>(cwld.rivers.size()));
+        }
+        return 0;
+    }
 
     if (closeup) {
         std::printf("close-up relief, seed %llu, %dpx\n",
