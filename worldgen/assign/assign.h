@@ -55,6 +55,20 @@ struct AssignParams {
 
     int   quota_mode  = QUOTA_HALF_CELL;
     float fill_weight = 2.0f;   // QUOTA_SOFT_FILL only
+
+    // --- patch repair (post-pass) ---
+    // The contiguity bonus in the assignment cost does nothing, because cells
+    // are assigned in danger order: a cell's already-assigned neighbours are
+    // the ones danger_preferred would have matched anyway, so the bonus can
+    // only agree with a decision already made. Patch size therefore has no
+    // working control during assignment.
+    //
+    // This pass supplies one. It swaps biome LABELS between pairs of cells,
+    // which leaves every biome's cell count exactly unchanged -- presence
+    // cannot break, and only area drifts, by the difference in cell size.
+    int   repair_passes = 0;          // 0 disables
+    float repair_danger_weight = 2.0f;  // cost per unit of danger displacement
+    float repair_quota_budget = 0.5f;   // allowed area drift, in mean cells
 };
 
 struct AssignStats {
@@ -64,6 +78,7 @@ struct AssignStats {
     // Mean size of the candidate set in pass 1. If this is ~1 the cost
     // function is inert and quota exhaustion is deciding everything.
     float mean_candidates = 0.0f;
+    int   swaps = 0;         // label swaps applied by the repair pass
 };
 
 // out_biome is sized to cells.size(); ocean cells get -1.

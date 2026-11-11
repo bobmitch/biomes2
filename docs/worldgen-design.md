@@ -182,7 +182,19 @@ The same applies to the danger field: `D` should be defined on normalised area, 
 
 Quota accuracy is limited by cell granularity: you cannot assign half a cell. Size the cell count so each biome receives enough cells for the tolerance you want, then recover large contiguous patches with a **contiguity bonus** in the assignment cost — a negative penalty for matching an already-assigned neighbour.
 
-**Measured correction.** The contiguity bonus does not work and patch size is not a free knob. Because cells are assigned in global danger order, a cell's already-assigned neighbours are the ones at slightly lower `D` — exactly the ones the `danger_preferred` term would have given the same biome anyway, so the bonus only reinforces a decision already made. Sweeping it from 0.00 to 0.40 changes the output not at all. The patches that do appear come from the danger field's own spatial correlation, and `w` is the real control: mean patch falls from 5.3 cells at `w = 0.05` to 3.4 at `w = 0.35`, with quota error flat across the range. Patch size and quota granularity *are* separable, but through `w`, not through the assignment cost.
+**Measured correction — the contiguity bonus does not work.** Because cells are assigned in global danger order, a cell's already-assigned neighbours are the ones at slightly lower `D` — exactly the ones the `danger_preferred` term would have given the same biome anyway, so the bonus only reinforces a decision already made. Sweeping it from 0.00 to 0.80 changes the output not at all, to four significant figures, with narrow bands or wide. Do not reach for it.
+
+**Patch size is a knob again, through a repair pass.** After assignment, swap biome *labels* between pairs of cells: move a boundary cell into a neighbouring biome, and pay for it by moving some cell of that biome back. Every biome's cell count is unchanged by construction, so presence cannot break, and only the area difference between the two cells drifts — held inside a budget. Reject a swap that leaves a cell outside its new danger band, creates a forbidden border, or exceeds the drift budget; accept when contiguity gained outweighs danger displacement.
+
+Measured over 96 seeds, it roughly triples mean patch area wherever it is applied, and quota accuracy does not move:
+
+| config | no repair | 4 passes | quota err |
+| --- | --- | --- | --- |
+| `w` 0.20, 4.5 km feature | 4.5 cells / 1.45 km² | 11.5 cells / 3.72 km² | 3.5% |
+| `w` 0.60, 2 km feature | 1.9 cells / 0.62 km² | 7.4 cells / 2.40 km² | 3.9% |
+| `w` 0.60, 9 km feature | 3.8 cells / 1.24 km² | 11.4 cells / 3.67 km² | 3.6% |
+
+It converges by about four passes and costs well under a second over 200 seeds. The price is paid in radial ordering: Spearman falls from 1.00 to 0.92–0.99, still far above the 0.8 the harness asserts. So patch size and quota granularity are independent knobs after all, as this section originally claimed — just not through the mechanism it named, and `w` remains the control for how strongly the world reads as radial.
 
 Rule of thumb: `cells ≈ 15 × biome_count / land_fraction`, then check the implied cell diameter lands between 1 km and 2.5 km. **This undersizes R = 10 km by about 4×.** The estimate assumes the quota error is centred; it is not, so ~245 cells misses the ±10% requirement on every seed even with the half-cell gate. Budget ~920 cells (0.32 km² each) at R = 10 km. R = 20 km passes at the figure below.
 

@@ -758,6 +758,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--radius") && i + 1 < argc) wp.radius = static_cast<float>(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--w") && i + 1 < argc)      wp.danger_w = static_cast<float>(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--contiguity") && i + 1 < argc) ap.contiguity_bonus = static_cast<float>(std::atof(argv[++i]));
+        else if (!std::strcmp(argv[i], "--repair") && i + 1 < argc)    ap.repair_passes = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--repair-danger") && i + 1 < argc) ap.repair_danger_weight = static_cast<float>(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--offset") && i + 1 < argc) wp.land_offset = static_cast<float>(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--sweep"))                  sweep = true;
         else if (!std::strcmp(argv[i], "--detail"))                 detail = true;

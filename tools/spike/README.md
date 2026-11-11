@@ -214,6 +214,40 @@ the widened bands now permit legally. So this is a correctness fix with no
 effect on how the world looks — and in particular it does **not** help the
 dartboard problem in §5, which is entirely about `w`.
 
+### 7. Patch size is a knob again — repair pass
+
+§3 left patch size with no working control: the contiguity bonus is inert, so
+the only thing moving it was `w`, which is also the control for how radial the
+world reads. Wanting small coherent zones meant turning `w` up, which bought
+granularity by *fragmenting* the assignment — granularity as noise rather than
+as places.
+
+`--repair N` adds a post-pass that swaps biome **labels** between pairs of
+cells. A boundary cell moves into a neighbouring biome and pays for it by
+moving some cell of that biome back, so every biome's cell count is identical
+before and after. Presence cannot break. Only the area difference between the
+two cells drifts, inside a budget. Swaps that leave a cell outside its new
+danger band, create a forbidden border, or exceed the budget are rejected.
+
+| passes | mean patch | quota err | Spearman mean/min |
+| --- | --- | --- | --- |
+| 0 | 1.9 cells / 0.62 km² | 3.9% | 1.00 / 0.98 |
+| 1 | 4.9 cells / 1.59 km² | 3.9% | 0.99 / 0.95 |
+| 2 | 6.4 cells / 2.05 km² | 3.9% | 0.99 / 0.93 |
+| **4** | **7.4 cells / 2.40 km²** | **3.9%** | **0.99 / 0.95** |
+| 8 | 7.7 cells / 2.49 km² | 3.9% | 0.99 / 0.93 |
+| 16 | 7.8 cells / 2.50 km² | 3.9% | 0.99 / 0.93 |
+
+Measured at `w = 0.60`, 2 km danger feature, 96 seeds. It converges by about
+four passes, triples patch area at every `(w, feature)` pair tried, leaves
+quota error untouched, and costs well under a second over 200 seeds.
+
+The price is radial ordering: Spearman 1.00 → 0.92–0.99, still comfortably
+above the 0.8 the harness asserts. That is the real trade — not quota, which
+the label-swap construction protects, but how strongly calm-to-hostile reads.
+
+**Off by default** (`repair_passes = 0`). Turning it on moves every seed.
+
 ## What this implies for A2
 
 - The half-cell gate is in and is the default. Done.

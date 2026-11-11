@@ -36,6 +36,142 @@ float placement_cost(size_t b,
     return cost;
 }
 
+int same_neighbours(int cell, const CellGraph& g, const std::vector<int>& biome) {
+    const int b = biome[cell];
+    int n = 0;
+    for (int k = g.offset[cell]; k < g.offset[cell + 1]; ++k) {
+        if (biome[g.list[k]] == b) ++n;
+    }
+    return n;
+}
+
+bool adjacent(int a, int b, const CellGraph& g) {
+    for (int k = g.offset[a]; k < g.offset[a + 1]; ++k) {
+        if (g.list[k] == b) return true;
+    }
+    return false;
+}
+
+// Does this cell's current biome border anything it is forbidden to?
+bool forbidden_any(int cell, const CellGraph& g, const std::vector<int>& biome,
+                   const ArchetypeTable& t) {
+    const int b = biome[cell];
+    if (b < 0) return false;
+    for (int k = g.offset[cell]; k < g.offset[cell + 1]; ++k) {
+        const int nb = biome[g.list[k]];
+        if (nb < 0) continue;
+        if ((t[b].adjacency_mask >> nb) & 1u) return true;
+    }
+    return false;
+}
+
+// Grow contiguous patches at constant quota by swapping biome labels between
+// pairs of cells. A swap moves cell i to a neighbouring biome -- which is what
+// grows the patch -- and pays for it by moving some cell j of that biome back,
+// so neither biome's cell count changes. Only the area difference between i
+// and j drifts, and that is held inside a budget.
+//
+// Rejected outright: a swap that puts either cell outside its new danger band,
+// that creates a forbidden border, or that would push a biome's area drift past
+// the budget. Accepted when the contiguity gained outweighs the danger
+// displacement, so the radial ordering survives the rearrangement.
+void repair_patches(const std::vector<CellRecord>& cells,
+                    const CellGraph& graph,
+                    const ArchetypeTable& table,
+                    const AssignParams& params,
+                    std::vector<int>& biome,
+                    AssignStats& stats) {
+    const int    n  = static_cast<int>(cells.size());
+    const size_t nb = table.size();
+
+    double total_land = 0.0;
+    int    land_n = 0;
+    for (int i = 0; i < n; ++i) {
+        if (!cells[i].is_land) continue;
+        total_land += cells[i].land_area;
+        ++land_n;
+    }
+    if (land_n == 0) return;
+    const double budget = static_cast<double>(params.repair_quota_budget) * (total_land / land_n);
+
+    std::vector<double> drift(nb, 0.0);
+    std::vector<std::vector<int> > members(nb);
+
+    for (int pass = 0; pass < params.repair_passes; ++pass) {
+        for (size_t b = 0; b < nb; ++b) members[b].clear();
+        for (int i = 0; i < n; ++i) {
+            if (biome[i] >= 0) members[biome[i]].push_back(i);
+        }
+
+        int swapped = 0;
+        for (int i = 0; i < n; ++i) {
+            const int bi = biome[i];
+            if (bi < 0) continue;
+
+            for (int k = graph.offset[i]; k < graph.offset[i + 1]; ++k) {
+                const int bp = biome[graph.list[k]];
+                if (bp < 0 || bp == bi) continue;
+
+                // consider each neighbouring biome once
+                bool seen = false;
+                for (int k2 = graph.offset[i]; k2 < k; ++k2) {
+                    if (biome[graph.list[k2]] == bp) { seen = true; break; }
+                }
+                if (seen) continue;
+
+                if (cells[i].danger < table[bp].danger_band_min ||
+                    cells[i].danger > table[bp].danger_band_max) continue;
+
+                int   best_j = -1;
+                float best_gain = 0.0f;
+
+                for (size_t m = 0; m < members[bp].size(); ++m) {
+                    const int j = members[bp][m];
+                    if (j == i || biome[j] != bp) continue;   // membership may be stale
+                    if (cells[j].danger < table[bi].danger_band_min ||
+                        cells[j].danger > table[bi].danger_band_max) continue;
+
+                    const double ai = cells[i].land_area, aj = cells[j].land_area;
+                    if (std::fabs(drift[bi] - ai + aj) > budget) continue;
+                    if (std::fabs(drift[bp] - aj + ai) > budget) continue;
+
+                    const int before = same_neighbours(i, graph, biome) +
+                                       same_neighbours(j, graph, biome);
+                    biome[i] = bp; biome[j] = bi;
+                    int after = same_neighbours(i, graph, biome) +
+                                same_neighbours(j, graph, biome);
+                    if (adjacent(i, j, graph) && biome[i] == biome[j]) after -= 1;
+                    const bool bad = forbidden_any(i, graph, biome, table) ||
+                                     forbidden_any(j, graph, biome, table);
+                    biome[i] = bi; biome[j] = bp;
+                    if (bad) continue;
+
+                    const float dd =
+                        std::fabs(cells[i].danger - table[bp].danger_preferred) +
+                        std::fabs(cells[j].danger - table[bi].danger_preferred) -
+                        std::fabs(cells[i].danger - table[bi].danger_preferred) -
+                        std::fabs(cells[j].danger - table[bp].danger_preferred);
+
+                    const float gain = static_cast<float>(after - before) -
+                                       params.repair_danger_weight * dd;
+                    if (gain > best_gain) { best_gain = gain; best_j = j; }
+                }
+
+                if (best_j >= 0) {
+                    drift[bi] += cells[best_j].land_area - cells[i].land_area;
+                    drift[bp] += cells[i].land_area - cells[best_j].land_area;
+                    biome[i] = bp;
+                    biome[best_j] = bi;
+                    ++swapped;
+                    ++stats.swaps;
+                    break;
+                }
+            }
+        }
+        if (swapped == 0) break;
+    }
+}
+
 }  // namespace
 
 void assign_biomes(const std::vector<CellRecord>& cells,
@@ -142,6 +278,10 @@ void assign_biomes(const std::vector<CellRecord>& cells,
 
     if (!land.empty()) {
         stats.mean_candidates = static_cast<float>(static_cast<double>(total_candidates) / land.size());
+    }
+
+    if (params.repair_passes > 0) {
+        repair_patches(cells, graph, table, params, out_biome, stats);
     }
 }
 
