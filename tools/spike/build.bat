@@ -24,5 +24,8 @@ cl /nologo /O2 /std:c++17 /EHsc /W3 /MT /D_CRT_SECURE_NO_WARNINGS ^
    /Fe:build\wgslgen.exe /Fo:build\ /link /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 
-build\wgslgen.exe worldgen\shaders\noise.h build\noise.wgsl
+if not exist tools\mapview\src\generated mkdir tools\mapview\src\generated
+build\wgslgen.exe worldgen\shaders\noise.h tools\mapview\src\generated\noise.wgsl
+if errorlevel 1 exit /b 1
+build\wgslgen.exe worldgen\shaders\field.h tools\mapview\src\generated\field.wgsl
 exit /b %errorlevel%

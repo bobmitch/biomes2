@@ -13,6 +13,9 @@
 //   - no structs, pointers, references, overloads or templates
 //   - float literals carry the f suffix; unsigned literals carry u
 //   - only the builtins declared in field_types.h
+//   - parenthesise any mix of bitwise and arithmetic operators. WGSL rejects
+//     it outright rather than applying C's precedence, and the C++ build will
+//     not warn you, so the mapview shader compile is where this gets caught.
 //
 // Noise is an analytic integer hash, never a permutation texture: texture
 // filtering is not bit-reproducible across backends (CLAUDE.md invariant 3).
@@ -27,8 +30,12 @@ uint pcg(uint v) {
     return (word >> 22u) ^ word;
 }
 
+// The parentheses around each multiply are required, not stylistic: WGSL
+// refuses to infer precedence when * and ^ are mixed, where C would silently
+// apply its own. Parenthesising matches C's grouping exactly, so the C++ and
+// HLSL builds are unchanged.
 uint hash2i(int x, int y, uint seed) {
-    return pcg(asuint(x) * 0x9E3779B1u ^ pcg(asuint(y) * 0x85EBCA77u ^ seed));
+    return pcg((asuint(x) * 0x9E3779B1u) ^ pcg((asuint(y) * 0x85EBCA77u) ^ seed));
 }
 
 // 16 gradients on the unit circle, indexed by hash. A table, not a texture.

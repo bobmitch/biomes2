@@ -62,20 +62,16 @@ struct WorldParams {
     float warp_freq         = 1.0f / 6000.0f;
 };
 
-// Layer 0 stand-in: continent mask and edge taper.
+// Thin adapters onto the canonical field function in worldgen/shaders/field.h.
+// The arithmetic lives there so the spike, the engine and mapview cannot drift
+// apart -- these only unpack WorldParams into the scalars the dialect takes.
 static inline float layer0_height(float x, float z, float r, const WorldParams& wp, uint32_t seed) {
-    return fbm(x * wp.continent_freq, z * wp.continent_freq,
-               wp.continent_octaves, 2.0f, 0.5f, seed)
-         + wp.land_offset
-         + wp.centre_bias * (1.0f - wg_smoothstep(0.0f, 0.25f, r))
-         - wp.edge_drop   * wg_smoothstep(0.80f, 1.0f, r);
+    return ::layer0_height(x, z, r, wp.continent_freq, wp.continent_octaves,
+                           wp.centre_bias, wp.edge_drop, wp.land_offset, seed);
 }
 
-// Layer 1: danger on normalised AREA, not normalised radius.
 static inline float layer1_danger(float x, float z, float r, const WorldParams& wp, uint32_t seed) {
-    const float r2 = r * r;
-    return wg_saturate(r2 + wp.danger_w * fbm(x * wp.danger_freq, z * wp.danger_freq,
-                                           wp.danger_octaves, 2.0f, 0.5f, seed));
+    return ::layer1_danger(x, z, r, wp.danger_w, wp.danger_freq, wp.danger_octaves, seed);
 }
 
 // --- layer 2: blue-noise scatter (Bridson) ---------------------------------
@@ -747,6 +743,8 @@ int main(int argc, char** argv) {
     bool sweep_bands = false;
     bool sweep_w = false;
     bool detail = false;
+    bool dump = false;
+    uint64_t dump_world_seed = 0;
     bool sheet = false;
     bool adjacency = false;
     int  tile = 192;
@@ -773,6 +771,10 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--tile") && i + 1 < argc)   tile = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--test-adjacency"))         adjacency = true;
         else if (!std::strcmp(argv[i], "--danger-feat") && i + 1 < argc) wp.danger_freq = 1.0f / static_cast<float>(std::atof(argv[++i]));
+        else if (!std::strcmp(argv[i], "--dump-seeds") && i + 1 < argc) {
+            dump_world_seed = std::strtoull(argv[++i], nullptr, 10);
+            dump = true;
+        }
     }
 
     ArchetypeTable table;
@@ -783,6 +785,36 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("archetypes: %d biomes, invariants OK\n", static_cast<int>(table.size()));
+
+    if (dump) {
+        // The CPU side of the ADR-001 tolerance check. Samples exactly as
+        // tools/mapview's kernel does, so the two land fractions are directly
+        // comparable. It cannot be a hash: WGSL 15.7.5 rules that out.
+        const uint32_t s_cont = feature_seed(dump_world_seed, FEATURE_CONTINENT);
+        const uint32_t s_dang = feature_seed(dump_world_seed, FEATURE_DANGER);
+        const float R = wp.radius;
+        const int   G = wp.grid;
+        const float step = 2.0f * R / G;
+        long long land = 0, disc = 0;
+        for (int gj = 0; gj < G; ++gj) {
+            const float z = -R + (gj + 0.5f) * step;
+            for (int gi = 0; gi < G; ++gi) {
+                const float x = -R + (gi + 0.5f) * step;
+                const float rr = std::sqrt(x * x + z * z) / R;
+                if (rr > 1.0f) continue;
+                ++disc;
+                if (layer0_height(x, z, rr, wp, s_cont) > wp.sea_level) ++land;
+            }
+        }
+        std::printf("\nworld seed %llu, %d^2 grid, R = %.0f m\n",
+                    static_cast<unsigned long long>(dump_world_seed), G, R);
+        std::printf("  seed continent  0x%08x\n", s_cont);
+        std::printf("  seed danger     0x%08x\n", s_dang);
+        std::printf("  land fraction   %.2f%%  (%lld of %lld samples)\n",
+                    disc > 0 ? 100.0 * static_cast<double>(land) / static_cast<double>(disc) : 0.0,
+                    land, disc);
+        return 0;
+    }
 
     if (sheet) {
         std::printf("contact sheet: 64 seeds, %dpx tiles, w = %.2f, R = %.0fkm\n",

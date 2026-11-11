@@ -12,7 +12,7 @@
 //     the CPU at world init.
 // ---------------------------------------------------------------------------
 #pragma once
-#include "../../worldgen/shaders/noise.h"
+#include "../../worldgen/shaders/field.h"
 
 #include <cstdint>
 
