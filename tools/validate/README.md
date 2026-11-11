@@ -14,13 +14,17 @@ tools\validate\build.bat && build\validate.exe
   land fraction      PASS   mean 55.4%, target 55% +/- 5
   adjacency          PASS   0 seeds break an authored adjacency rule
   edge taper         PASS   0 seeds with land past r=0.95 or a rim above the void
-  foot connect       PASS   worst seed reaches 83.8% of land on foot, threshold 75%
+  home landmass      PASS   smallest spawn landmass 460 cells, floor 16
   boat connect       PASS   0 seeds with a biome unreachable by sea
+  islandness         n/a    2.2 landmasses/seed (max 7), spawn landmass holds 98.7% of land (min 76.0%)
   spawn              PASS   0 seeds without a coastal spawn in the calmest biome
   throughput         PASS   267 ns/sample, scalar CPU reference
   golden seeds       PASS   8 seeds pinned at generator_version 1
   contact sheet      PASS   build/contact_sheet.bmp
 ```
+
+The `islandness` row is deliberately `n/a`. It is a reading, like the contact
+sheet — see §8.
 
 **Golden hashes are a gate, not a formality.** Any change to `worldgen/` moves
 them and the build goes red. Revert, or decide the world should move and bump
@@ -44,13 +48,14 @@ One check the design doc wants is **not** asserted yet: **LOD agreement**,
 which needs octave dropping at Nyquist. Asserting it now would measure the
 wrong thing and report false confidence.
 
-Two thresholds are judgement calls worth knowing about. **Foot connectivity**
-is 75%, not 100%, because islands are a designed feature and some land is
-legitimately unreachable on foot — boat connectivity carries the "every biome
-reachable" requirement. **Throughput** is gated at 400 ns/sample as a
-regression guard; the design doc's 20 ns is a serial-equivalent budget for the
-complete field function on the shipping path, and a scalar CPU reference build
-of layers 0–1 cannot be judged against it.
+Two thresholds are judgement calls worth knowing about. **Home landmass** is
+16 cells, about two mean biome patches — a guard against spawning on a bare
+rock, not a requirement for a mainland (§8 explains why that distinction
+matters, and what the 75% foot-connectivity assertion it replaced was really
+doing). **Throughput** is gated at 400 ns/sample as a regression guard; the
+design doc's 20 ns is a serial-equivalent budget for the complete field
+function on the shipping path, and a scalar CPU reference build of layers 0–1
+cannot be judged against it.
 
 ---
 
@@ -76,7 +81,8 @@ build\validate.exe --test-adjacency      # are adjacency rules honoured?
 ```
 
 Useful flags: `--w`, `--danger-feat <metres>`, `--cellarea <m2>`, `--mode 0|1|2`,
-`--tile <px>`, `--out <path>`.
+`--tile <px>`, `--out <path>`, `--land-offset <f>` (§8 — the islandness lever;
+it moves the world, so expect land fraction and the golden hashes to go red).
 
 The contact sheet is written as an uncompressed 24-bit BMP. A PNG writer needs
 zlib framing and CRCs, which is more code than a debug image justifies, and the
@@ -319,6 +325,130 @@ feature. Those three go together: the small feature gives granular zones, `w`
 breaks the radial banding, and the repair pass is what stops the first two
 reading as noise. Changing any of them moves every seed, which is free only
 until A3 pins the golden hashes.
+
+### 8. The world is a Pangaea on every seed, and an assertion was holding it there
+
+The contact sheet reads as one continent on every seed. That is not a tuning
+accident — it is the land-fraction target sitting on the wrong side of a
+percolation threshold, with a validation assertion that had quietly made the
+result a pass condition.
+
+**Land shape is entirely layer 0.** `world.cpp` defines land as
+`layer0_height(...) > sea_level`; nothing downstream moves a coastline, since
+layer 4 fades the biome profiles out at the shore precisely so it cannot. So
+islandness has exactly four controls: `land_offset`, `continent_freq`,
+`continent_octaves` and `centre_floor`.
+
+Sweeping `land_offset`, measuring connected components of land pixels at
+768², 12 seeds per row:
+
+| `land_offset` | land % | biggest mass, % of land | worst seed | masses ≥ 1 km² |
+| --- | --- | --- | --- | --- |
+| **0.17 (shipping)** | **55.4%** | **99.4%** | **97.7%** | **1.2** |
+| 0.14 | 51.6% | 96.6% | 83.7% | 1.5 |
+| 0.10 | 47.5% | 94.4% | 83.6% | 1.9 |
+| 0.07 | 44.5% | 88.4% | 74.0% | 2.6 |
+| 0.04 | 41.5% | 84.6% | 47.6% | 3.5 |
+| 0.00 | 37.5% | 78.2% | 47.9% | 3.9 |
+| −0.08 | 29.4% | 64.2% | 32.4% | 5.6 |
+
+At the shipping offset, **12 seeds out of 12 are a single continent holding
+99% of all land.** The transition is sharp and sits between 0.06 and 0.10 —
+2D percolation flips around 45% area fraction, and the 55% land target is
+comfortably on the connected side of it. The land-fraction goal and any
+sailing-led design are the same dial pointed in opposite directions.
+
+**Finer continent noise does not help**, which is worth knowing before anyone
+spends a day on it. Re-solving `land_offset` to hold 55% land at each
+frequency:
+
+| feature size | biggest mass | masses |
+| --- | --- | --- |
+| 9000 m | 95.7% | 1.3 |
+| 5200 m (shipping) | 99.3% | 1.2 |
+| 2200 m | 99.2% | 1.3 |
+
+Still one continent, just a wigglier one. Percolation depends on area
+fraction, not feature scale.
+
+**Seed-to-seed variety is free near the threshold.** At `land_offset = 0.07`,
+with no per-seed parameter at all, seeds separate on their own — seed 9 gives
+one 149 km² continent, seed 1 gives `99, 21, 7, 6`. Five of twelve stay
+continental. The variance is already in the noise; the current offset is high
+enough to crush it.
+
+`centre_floor` is a second, independent dial, inert at 55% land but
+load-bearing near the threshold:
+
+| offset | floor | biggest % | worst seed | smallest home mass |
+| --- | --- | --- | --- | --- |
+| 0.07 | 0.20 | 88.4% | 74% | 99 km² |
+| 0.07 | 0.00 | 81.5% | 46% | 62 km² |
+| 0.00 | 0.20 | 78.2% | 48% | 57 km² |
+| 0.00 | 0.00 | 59.0% | 42% | 47 km² |
+
+So the two compose: `land_offset` breaks the world up, `centre_floor`
+decides whether you still spawn on a mainland worth leaving. Below about 0.0
+the floor saturates — it is a `wg_smax`, so it stops biting once it is under
+the noise floor.
+
+#### What was asserted, and why it was wrong
+
+`foot connect` asserted that a flood fill from spawn over land cells reached
+≥ 75% of all land. Three things were wrong with it:
+
+1. **The threshold was never derived.** The design doc's validation table
+   left it as a literal `X%`. 75% was filled in at implementation time, set
+   just under what the world then produced (the worst seed measured 83.8%),
+   and both commit `44c764b` and this README called it a judgement call.
+2. **It did not test what it claimed.** The doc's "catches" column says
+   *biomes stranded behind cliffs*, but the fill consults `is_land` and never
+   slope. It was measuring ocean separation while wearing a cliff detector's
+   label. Cliffs are already covered by the slope budget.
+3. **It forbade a feature this document asks for.** Layer 3's spec calls for
+   island clusters drawn from the same quota pool, and calls a biome landing
+   island-only "free seed variety at no cost". An archipelago fails a 75%
+   foot-connectivity gate by construction.
+
+It is now split in two. **`home landmass`** asserts the spawn landmass holds
+≥ 16 cells — roughly two mean biome patches (§7), enough to start a game on,
+and a bar an archipelago clears easily. **`islandness`** reports landmass
+count and the spawn landmass's share of land, and asserts nothing. Which of
+those a world should be is a feel judgement taken on the contact sheet, the
+same way `w` was settled in §5.
+
+Verified by running the harness at `--land-offset 0.04`, 48 seeds — a world
+averaging 4.4 landmasses with the spawn landmass down to 39.3% on the worst
+seed:
+
+```
+  home landmass      PASS   smallest spawn landmass 151 cells, floor 16
+  boat connect       PASS   0 seeds with a biome unreachable by sea
+  islandness         n/a    4.4 landmasses/seed (max 10), spawn landmass holds 86.5% of land (min 39.3%)
+  spawn              PASS   0 seeds without a coastal spawn in the calmest biome
+  slope budget       PASS   worst seed has 78.8% of land under 30 degrees
+  land fraction      FAIL   mean 41.7%, target 55% +/- 5
+  golden seeds       FAIL   8 of 8 moved: revert, or bump generator_version
+```
+
+Everything that is a genuine requirement passes. The only two failures are
+the land-fraction target — a real design decision, taken deliberately or not
+at all — and the golden hashes, which is the gate working.
+
+#### What is not done here
+
+The world has **not** been moved. `land_offset` is still 0.17 and the golden
+hashes are untouched, because choosing how islandy the world should be is
+exactly the kind of call this project takes by looking rather than by
+assertion. `build\view.exe` now has a **land offset** slider with a live
+landmass readout for making it, and the harness takes `--land-offset` for
+measuring it across seeds.
+
+Island clusters themselves remain unimplemented: `assign.cpp` skips ocean
+cells in both passes, and `allow_island` is parsed from `archetypes.json` and
+never read. Lowering `land_offset` today gives you more coastline and more
+islands, but those islands get their biomes from the ordinary land assignment
+— there is no island-specific placement, and no biome can land island-only.
 
 ## What this implies for A2
 
