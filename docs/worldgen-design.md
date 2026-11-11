@@ -91,7 +91,7 @@ Use OpenSimplex2 or simplex-family noise, not classic Perlin. Perlin's axis-alig
 
 ### Layer 1 — danger field
 
-`D(p) = saturate(r + w · fbm_low(p.xz))`, with `w` around 0.15–0.25 and a feature size of 3–6 km.
+`D(p) = saturate(r² + w · fbm_low(p.xz))`, where `r²` is normalised **area**, not normalised radius — see the area budget section below, which is the authority on this. A feature size of 3–6 km, and `w` around 0.15–0.25; note that range was first quoted against the radius form and is worth re-deriving once the biome map is on screen.
 
 This is the "distance from centre" axis, softened. The wobble buys an occasional hostile pocket within sight of spawn and a calm valley at the rim — the thing that stops a radially-ordered world from reading as a dartboard. `w` is the single most important feel parameter in the generator; expose it prominently in the prototype.
 
