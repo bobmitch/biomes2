@@ -1458,6 +1458,26 @@ int main(int argc, char** argv) {
         // Localises a cross-platform divergence to a layer. Each hash covers
         // one more stage than the last, so the first column that differs
         // between two platforms is where the determinism broke.
+        {
+            // Layer 4 is the first consumer of floats parsed out of
+            // archetypes.json. If this differs, the divergence is in strtod,
+            // not in the field function.
+            uint64_t th = 0xCBF29CE484222325ull;
+            for (size_t b = 0; b < table.size(); ++b) {
+                const float f[12] = {
+                    table[b].area_fraction, table[b].danger_band_min, table[b].danger_band_max,
+                    table[b].danger_preferred, table[b].base_elevation, table[b].amplitude,
+                    table[b].lacunarity, table[b].gain, table[b].ridge_blend,
+                    table[b].flatness, table[b].overhang_strength, table[b].cave_density };
+                for (int q = 0; q < 12; ++q) {
+                    uint32_t bits;
+                    std::memcpy(&bits, &f[q], 4);
+                    th = fnv1a(th, bits);
+                }
+                th = fnv1a(th, table[b].octaves);
+            }
+            std::printf("archetype table hash: %016llx\n", static_cast<unsigned long long>(th));
+        }
         std::printf("seed  layer0            +layer1           +layer4(base)     +layer5(carved)   segs\n");
         for (uint64_t ws = 0; ws < 8; ++ws) {
             WorldParams cw = wp;
