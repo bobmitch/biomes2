@@ -27,6 +27,13 @@
 using namespace worldgen;
 using namespace view;
 
+// The spawn landmass must hold at least this many cells to be worth starting
+// a game on: about two mean biome patches (7.6 cells, README section 7). It
+// catches a world that spawns the player on a bare rock and nothing else --
+// in particular it does NOT require a mainland, because island starts are a
+// designed outcome and the design doc asks for island clusters outright.
+static const int kHomeMinCells = 16;
+
 // --- per-seed evaluation ---------------------------------------------------
 struct SeedResult {
     int   cells = 0, land_cells = 0;
@@ -41,7 +48,12 @@ struct SeedResult {
     float max_h_outer = 0.0f;   // edge taper: highest sample past r = 0.95
     float rim_height = 0.0f;    // highest layer-0 sample on the r = 1 ring
     bool  taper_ok = false;     // both of those below sea level
-    float foot_reach = 0.0f;    // land cells reachable on foot from spawn
+    // Islandness. These are MEASURED and printed; only the degeneracy guard
+    // below is asserted. See tools/validate/README.md section 8 for why the
+    // old >= 75% foot-connectivity assertion was retired.
+    float home_share = 0.0f;    // share of land cells on the spawn landmass
+    int   home_cells = 0;       // cells on the spawn landmass
+    int   landmasses = 0;       // connected land components on the cell graph
     bool  boat_all_biomes = false;
     int   spawn_cell = -1;
     bool  spawn_coastal = false;
@@ -166,29 +178,43 @@ static SeedResult eval_seed(uint64_t world_seed,
         out.spawn_calmest = (best >= 0);
     }
 
-    // --- connectivity ---
-    // On foot: land cells only. By boat: land plus ocean, which must reach
-    // every biome or some of them are on islands nobody can get to.
+    // --- landmasses and connectivity ---
+    // Every connected component of land cells, not just the spawn one. The
+    // count and the spawn landmass's share are how islandness is measured:
+    // one component holding ~100% is a Pangaea, several is an archipelago.
+    // Neither is a failure. By boat is the real requirement -- land plus
+    // ocean must reach every biome, or some of them are on islands nobody
+    // can get to.
+    {
+        std::vector<int> comp(n, -1);
+        std::vector<int> stack;
+        int land_total = 0;
+        for (int i = 0; i < n; ++i) if (cells[i].is_land) ++land_total;
+        for (int i = 0; i < n; ++i) {
+            if (!cells[i].is_land || comp[i] >= 0) continue;
+            const int id = out.landmasses++;
+            int size = 0;
+            comp[i] = id;
+            stack.push_back(i);
+            while (!stack.empty()) {
+                const int c = stack.back(); stack.pop_back();
+                ++size;
+                for (int k = graph.offset[c]; k < graph.offset[c + 1]; ++k) {
+                    const int nb2 = graph.list[k];
+                    if (comp[nb2] >= 0 || !cells[nb2].is_land) continue;
+                    comp[nb2] = id;
+                    stack.push_back(nb2);
+                }
+            }
+            if (out.spawn_cell >= 0 && comp[out.spawn_cell] == id) out.home_cells = size;
+        }
+        out.home_share = land_total > 0
+                       ? static_cast<float>(out.home_cells) / land_total : 0.0f;
+    }
+
     if (out.spawn_cell >= 0) {
         std::vector<char> seen(n, 0);
         std::vector<int> stack;
-        stack.push_back(out.spawn_cell);
-        seen[out.spawn_cell] = 1;
-        int reached = 0, land_total = 0;
-        while (!stack.empty()) {
-            const int c = stack.back(); stack.pop_back();
-            ++reached;
-            for (int k = graph.offset[c]; k < graph.offset[c + 1]; ++k) {
-                const int nb2 = graph.list[k];
-                if (seen[nb2] || !cells[nb2].is_land) continue;
-                seen[nb2] = 1;
-                stack.push_back(nb2);
-            }
-        }
-        for (int i = 0; i < n; ++i) if (cells[i].is_land) ++land_total;
-        out.foot_reach = land_total > 0 ? static_cast<float>(reached) / land_total : 0.0f;
-
-        std::fill(seen.begin(), seen.end(), 0);
         stack.push_back(out.spawn_cell);
         seen[out.spawn_cell] = 1;
         std::vector<char> biome_seen(nb, 0);
@@ -331,13 +357,17 @@ struct Summary {
     int land_failures = 0;       // |land - 0.55| > 0.05
     int adjacency_failures = 0;  // seeds with >= 1 authored-rule violation
     int taper_failures = 0;      // land past r = 0.95, or a rim above the void
-    int foot_failures = 0;       // spawn cannot walk to most of the land
+    int home_failures = 0;       // spawn landmass too small to be playable
     int boat_failures = 0;       // a biome unreachable even by sea
     int spawn_failures = 0;      // no spawn, not coastal, or not calmest
     int slope_failures = 0;      // under 60% of land walkable
     int river_failures = 0;      // no rivers, or one that climbs or never reaches the sea
     float mean_river_segments = 0.0f;
-    float min_foot_reach = 2.0f;
+    float min_home_share = 2.0f;     // islandness: measured, not asserted
+    float mean_home_share = 0.0f;
+    float mean_landmasses = 0.0f;
+    int   max_landmasses = 0;
+    int   min_home_cells = 1 << 30;
     float min_slope_gentle = 2.0f;
     float mean_cells = 0, mean_land_cells = 0, mean_land_frac = 0;
     float mean_quota_err = 0, max_quota_err = 0, p95_quota_err = 0;
@@ -375,18 +405,23 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
         if (std::fabs(r.land_fraction - 0.55f) > 0.05f) ++sm.land_failures;
         if (r.adj_violations > 0) ++sm.adjacency_failures;
         if (!r.taper_ok) ++sm.taper_failures;
-        // Not 100%: islands are a designed feature, so some land is legitimately
-        // unreachable on foot. This is a regression guard on the mainland being
-        // whole, with boat connectivity carrying the "every biome reachable"
-        // requirement.
-        if (r.foot_reach < 0.75f) ++sm.foot_failures;
+        // A DEGENERACY guard, not a connectivity requirement: the spawn
+        // landmass has to hold enough land to start a game on. An archipelago
+        // passes it by design, which is the point -- the design doc wants
+        // island clusters (layer 3) and the old >= 75% foot-connectivity
+        // assertion quietly forbade them. README section 8 has the history.
+        if (r.home_cells < kHomeMinCells) ++sm.home_failures;
         if (!r.boat_all_biomes) ++sm.boat_failures;
         if (r.spawn_cell < 0 || !r.spawn_coastal || !r.spawn_calmest) ++sm.spawn_failures;
         if (r.slope_gentle < 0.60f) ++sm.slope_failures;
         if (r.river_segments == 0 || r.river_ascending > 0 ||
             r.river_paths_to_ocean != r.river_paths_total) ++sm.river_failures;
         sm.mean_river_segments += r.river_segments;
-        sm.min_foot_reach = std::min(sm.min_foot_reach, r.foot_reach);
+        sm.min_home_share = std::min(sm.min_home_share, r.home_share);
+        sm.mean_home_share += r.home_share;
+        sm.mean_landmasses += r.landmasses;
+        sm.max_landmasses = std::max(sm.max_landmasses, r.landmasses);
+        sm.min_home_cells = std::min(sm.min_home_cells, r.home_cells);
         sm.min_slope_gentle = std::min(sm.min_slope_gentle, r.slope_gentle);
         sm.mean_cells += r.cells;
         sm.mean_land_cells += r.land_cells;
@@ -408,6 +443,7 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
     sm.mean_patch_cells *= inv; sm.mean_patch_km2 *= inv;
     sm.mean_relaxed *= inv; sm.mean_overflow *= inv; sm.mean_candidates *= inv;
     sm.mean_river_segments *= inv;
+    sm.mean_home_share *= inv; sm.mean_landmasses *= inv;
     std::sort(errs.begin(), errs.end());
     sm.p95_quota_err = errs[std::min<size_t>(errs.size() - 1, static_cast<size_t>(errs.size() * 0.95))];
     return sm;
@@ -716,6 +752,12 @@ int main(int argc, char** argv) {
             closeup_seed = std::strtoull(argv[++i], nullptr, 10);
         }
         else if (!std::strcmp(argv[i], "--danger-feat") && i + 1 < argc) wp.danger_freq = 1.0f / static_cast<float>(std::atof(argv[++i]));
+        // The islandness lever. Land fraction sits just above the percolation
+        // threshold at the shipping 0.17, which is why every seed is a single
+        // continent; see README section 8. Sweeping this moves the world, so
+        // the land-fraction and golden checks will go red -- that is the gate
+        // working, not a reason to --bless.
+        else if (!std::strcmp(argv[i], "--land-offset") && i + 1 < argc) wp.land_offset = static_cast<float>(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--dump-seeds") && i + 1 < argc) {
             dump_world_seed = std::strtoull(argv[++i], nullptr, 10);
             dump = true;
@@ -1017,11 +1059,20 @@ int main(int argc, char** argv) {
         std::snprintf(d, sizeof(d), "%d seeds with land past r=0.95 or a rim above the void",
                       s.taper_failures);
         line("edge taper", s.taper_failures == 0, d);
-        std::snprintf(d, sizeof(d), "worst seed reaches %.1f%% of land on foot, threshold 75%% "
-                      "(islands are expected)", 100.0 * s.min_foot_reach);
-        line("foot connect", s.foot_failures == 0, d);
+        std::snprintf(d, sizeof(d), "smallest spawn landmass %d cells, floor %d "
+                      "(a degeneracy guard, not a mainland requirement)",
+                      s.min_home_cells, kHomeMinCells);
+        line("home landmass", s.home_failures == 0, d);
         std::snprintf(d, sizeof(d), "%d seeds with a biome unreachable by sea", s.boat_failures);
         line("boat connect", s.boat_failures == 0, d);
+        // Measured, never asserted. Whether a world should read as one
+        // continent or as an archipelago is a design decision taken by eye on
+        // the contact sheet, exactly as w was -- see README section 8.
+        std::snprintf(d, sizeof(d), "%.1f landmasses/seed (max %d), spawn landmass holds "
+                      "%.1f%% of land (min %.1f%%)",
+                      s.mean_landmasses, s.max_landmasses,
+                      100.0 * s.mean_home_share, 100.0 * s.min_home_share);
+        std::printf("  %-18s %-6s %s\n", "islandness", "n/a", d);
         std::snprintf(d, sizeof(d), "%d seeds without a coastal spawn in the calmest biome",
                       s.spawn_failures);
         line("spawn", s.spawn_failures == 0, d);
@@ -1058,7 +1109,7 @@ int main(int argc, char** argv) {
         const bool all = s.presence_failures == 0 && s.quota_failures == 0 &&
                          s.radial_failures == 0 && s.land_failures == 0 &&
                          s.adjacency_failures == 0 && s.taper_failures == 0 &&
-                         s.foot_failures == 0 && s.boat_failures == 0 &&
+                         s.home_failures == 0 && s.boat_failures == 0 &&
                          s.spawn_failures == 0 && s.slope_failures == 0 &&
                          s.river_failures == 0 &&
                          ns <= 400.0 && golden_ok && sheet_ok;

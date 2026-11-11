@@ -136,6 +136,8 @@ Sorting by danger before assigning is what produces the radial ordering; the quo
 
 Cells left over in ocean become island clusters, drawn from the same quota pool. A biome occasionally landing island-only is free seed variety at no cost.
 
+> **Not implemented.** `assign.cpp` skips every ocean cell outright (`if (!cells[i].is_land) continue;`, both passes), so no cell is ever placed in water and no biome can land island-only. The per-biome `allow_island` flag below is parsed out of `archetypes.json` and authored on all nine biomes, but nothing reads it. This is the single largest gap between this document and the generator, and it is why the world currently has no island gameplay to speak of: not a design decision, just a layer that only ever learned to paint land.
+
 ### Layer 4 — height composition
 
 Each biome supplies a height profile: base elevation, amplitude, octave count, and a warp between ridged and billowy. Final height is a weighted blend of the neighbouring cells' profiles, weighted by smoothed distance to the cell boundary.
@@ -237,6 +239,7 @@ struct BiomeArchetype {
     float  danger_preferred;   // target D; drives the assignment cost
     uint   adjacency_mask;     // bitmask of biomes this one must not border
     bool   allow_island;       // may be placed on an ocean cell cluster
+                               // PARSED BUT DORMANT -- nothing reads it yet
 
     // --- height profile (layer 4) ---
     float  base_elevation;     // metres above sea level at the cell centre
@@ -455,14 +458,17 @@ The harness runs the generator headless over N seeds at coarse resolution — a 
 | Adjacency | No cell borders a biome its `adjacency_mask` forbids | Rules silently ignored; a danger field fast-varying enough that the ordering can no longer keep forbidden pairs apart |
 | Land fraction | Within ±5% of target, all seeds | Continent mask drifting with parameter edits |
 | Edge taper | No land above sea level past `r = 0.95`; terrain below void threshold at `r = 1.0` | Taper too weak for an unusual seed |
-| Foot connectivity | Flood fill from spawn over walkable land reaches ≥ X% of land cells | Biomes stranded behind cliffs |
+| Home landmass | The spawn landmass holds ≥ 16 cells, about two mean biome patches | A world that spawns the player on a bare rock |
 | Boat connectivity | Flood fill over land + navigable water reaches 100% of biomes | Unreachable islands |
+| Islandness | Landmass count and the spawn landmass's share of land, **measured and printed, never asserted** | Nothing — it is a reading, not a gate |
 | Slope budget | ≥ 60% of land under 30° | Amplitude or octave settings making a biome unwalkable |
 | Spawn quality | Spawn point is flat, coastal, in the calmest biome, deterministic | Spawn logic regressions |
 | River sanity | Every traced river is monotonically descending and terminates in ocean | Carving order bugs; endorheic basins |
 | LOD agreement | Height at every LOD matches LOD 0 within that LOD's voxel size | Octaves not dropped at Nyquist |
 | Determinism | Hash of the sample grid is stable across runs and platforms, **for the C++ build**; GPU paths are compared within a tolerance instead | Non-deterministic iteration order; fast-math |
 | Throughput | Nanoseconds per field sample, tracked over time | Silent cost creep in the field function |
+
+**Foot connectivity was removed from this table, and that is a correction rather than a relaxation.** It read *"flood fill from spawn over walkable land reaches ≥ X% of land cells"*, catching *"biomes stranded behind cliffs"* — with `X` left as a literal placeholder. The implementation filled it in at 75%, picked to sit just under what the world happened to produce, and flood-filled on `is_land` without consulting slope at all. So it never tested cliffs; it tested whether the world was one continent, and quietly made Pangaea a pass condition. Cliffs are already covered by the slope budget, and "every biome reachable" by boat connectivity. What remains is a floor on the spawn landmass being big enough to play on, plus islandness as a *reading*. See [`tools/validate/README.md`](../tools/validate/README.md) §8 for the measurement that found this.
 
 ### Golden seeds
 

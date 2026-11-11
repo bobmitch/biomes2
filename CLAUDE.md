@@ -97,10 +97,22 @@ cmake --preset dev && cmake --build --preset dev
 ## Testing
 
 `tools/validate` runs 200 seeds and exits non-zero on any failure. It asserts
-presence, quota, radial ordering, land fraction, adjacency, edge taper, foot
-and boat connectivity, spawn, slope budget, throughput and the golden hashes,
-and emits a 64-seed contact sheet — look at it. Automated checks cannot tell you whether a
-world is interesting.
+presence, quota, radial ordering, land fraction, adjacency, edge taper, home
+landmass, boat connectivity, spawn, slope budget, river sanity, throughput and
+the golden hashes, and emits a 64-seed contact sheet — look at it. Automated
+checks cannot tell you whether a world is interesting.
+
+It also *measures and prints* **islandness** — landmass count, and the share
+of land on the spawn landmass — and asserts nothing about it. That is
+deliberate. An earlier `foot connect` check asserted ≥75% of land be walkable
+from spawn, which made a single continent a pass condition and forbade the
+island clusters layer 3 is specified to produce; the design doc had left the
+threshold as a literal `X%`. Whether a world should read as one continent or
+an archipelago is a feel call made on the contact sheet, not an assertion.
+`tools/validate/README.md` §8 has the measurement. **`land_offset` is the
+lever** (`--land-offset`, and a slider in `view.exe`): land fraction currently
+sits just above the percolation threshold, which is why every seed is a
+Pangaea.
 
 It also emits a shaded-relief sheet with `--relief`, and a single seed rendered
 large with `--closeup <seed>`. Use the close-up for anything narrower than a
