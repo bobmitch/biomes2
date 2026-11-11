@@ -23,6 +23,7 @@
 #include "worldgen/world.h"
 #include "tools/shared/render.h"
 
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -31,7 +32,14 @@ using namespace view;
 
 namespace {
 
-enum { ID_SEED_PREV = 100, ID_SEED_NEXT, ID_W, ID_FEAT, ID_MODE, ID_REPAIR };
+enum { ID_SEED_PREV = 100, ID_SEED_NEXT, ID_W, ID_FEAT, ID_MODE, ID_REPAIR, ID_LANDOFF };
+
+// land_offset maps onto an integer trackbar as (pos - 100) / 1000, so the bar
+// spans -0.100 to +0.300. The shipping 0.17 sits near the top of that, which
+// is the point: the interesting range is all BELOW it.
+const int LANDOFF_BIAS = 100;
+const int LANDOFF_MIN  = 0;      // -0.100
+const int LANDOFF_MAX  = 400;    // +0.300
 
 const int PANEL = 232;
 const int PREVIEW_PX = 220;    // while dragging
@@ -51,13 +59,55 @@ struct App {
     std::vector<unsigned char> bgra;  // tile*tile*4, what Windows blits
     int tile = 0;
 
-    HWND hwnd = 0, w_bar = 0, feat_bar = 0, mode_box = 0, status = 0;
+    HWND hwnd = 0, w_bar = 0, feat_bar = 0, mode_box = 0, land_bar = 0, status = 0;
+
+    // Islandness of the world on screen, recomputed on every rebuild.
+    int landmasses = 0;
+    int biggest_pct = 0;  // share of land cells on the LARGEST landmass
+                          // (the harness reports the spawn one; the viewer
+                          // has no spawn, and on one continent they agree)
 };
 
 App g;
 
+// Connected components of land cells. The same measurement the harness
+// prints as "islandness" -- here so the land_offset slider shows its effect
+// as a number and not only as a shape. Whether a world should be one
+// continent or an archipelago is a judgement made by looking; this is the
+// readout that makes looking quantitative.
+void measure_islandness() {
+    const std::vector<CellRecord>& cells = g.world.cells;
+    const CellGraph& graph = g.world.graph;
+    const int n = static_cast<int>(cells.size());
+    std::vector<int> comp(n, -1);
+    std::vector<int> stack;
+    int land_total = 0, biggest = 0;
+    for (int i = 0; i < n; ++i) if (cells[i].is_land) ++land_total;
+    g.landmasses = 0;
+    for (int i = 0; i < n; ++i) {
+        if (!cells[i].is_land || comp[i] >= 0) continue;
+        const int id = g.landmasses++;
+        int size = 0;
+        comp[i] = id;
+        stack.push_back(i);
+        while (!stack.empty()) {
+            const int c = stack.back(); stack.pop_back();
+            ++size;
+            for (int k = graph.offset[c]; k < graph.offset[c + 1]; ++k) {
+                const int nb = graph.list[k];
+                if (comp[nb] >= 0 || !cells[nb].is_land) continue;
+                comp[nb] = id;
+                stack.push_back(nb);
+            }
+        }
+        if (size > biggest) biggest = size;
+    }
+    g.biggest_pct = land_total > 0 ? (100 * biggest) / land_total : 0;
+}
+
 void rebuild_world() {
     g.world = build_world(g.seed, g.wp, g.table, g.ap);
+    measure_islandness();
     g.world_dirty = false;
 }
 
@@ -79,14 +129,24 @@ void render(int px) {
 }
 
 void set_status() {
-    char buf[256];
-    wsprintfA(buf, "seed %llu   w %d.%02d   feature %d m   cells %d   rivers %d   render %d px",
-              static_cast<unsigned long long>(g.seed),
-              static_cast<int>(g.wp.danger_w), static_cast<int>(g.wp.danger_w * 100) % 100,
-              static_cast<int>(1.0f / g.wp.danger_freq),
-              static_cast<int>(g.world.pts.size()),
-              static_cast<int>(g.world.rivers.size()),
-              g.rendered_px);
+    // std::snprintf, NOT wsprintfA: the latter supports no %f and mishandles
+    // %llu, which silently shifts every argument after it. That cost an
+    // access violation the moment a %s was added to this string.
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "seed %llu   w %.2f   feature %d m\r\n"
+                  "cells %d   rivers %d   render %d px\r\n"
+                  "\r\nland offset %+.3f   land %.0f%%\r\n"
+                  "landmasses %d   biggest holds %d%% of land",
+                  static_cast<unsigned long long>(g.seed),
+                  static_cast<double>(g.wp.danger_w),
+                  static_cast<int>(1.0f / g.wp.danger_freq),
+                  static_cast<int>(g.world.pts.size()),
+                  static_cast<int>(g.world.rivers.size()),
+                  g.rendered_px,
+                  static_cast<double>(g.wp.land_offset),
+                  100.0 * g.world.land_fraction,
+                  g.landmasses, g.biggest_pct);
     SetWindowTextA(g.status, buf);
 }
 
@@ -103,6 +163,8 @@ void read_controls() {
     g.wp.danger_w = static_cast<float>(w10) / 100.0f;
     const int feat = static_cast<int>(SendMessage(g.feat_bar, TBM_GETPOS, 0, 0));
     g.wp.danger_freq = 1.0f / static_cast<float>(feat);
+    const int off = static_cast<int>(SendMessage(g.land_bar, TBM_GETPOS, 0, 0));
+    g.wp.land_offset = static_cast<float>(off - LANDOFF_BIAS) / 1000.0f;
     g.mode = static_cast<ViewMode>(SendMessage(g.mode_box, CB_GETCURSEL, 0, 0));
 }
 
@@ -164,6 +226,16 @@ void build_controls(HWND h) {
                                8, y, PANEL - 16, 28, h, (HMENU)ID_FEAT, 0, 0);
     SendMessage(g.feat_bar, TBM_SETRANGE, TRUE, MAKELPARAM(1500, 14000));
     SendMessage(g.feat_bar, TBM_SETPOS, TRUE, static_cast<LPARAM>(1.0f / g.wp.danger_freq));
+    y += 36;
+
+    // The islandness lever. Below about +0.08 the land fraction crosses the
+    // percolation threshold and the single continent starts breaking up.
+    label(h, "land offset (islandness)", y); y += 18;
+    g.land_bar = CreateWindowA(TRACKBAR_CLASSA, "", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
+                               8, y, PANEL - 16, 28, h, (HMENU)ID_LANDOFF, 0, 0);
+    SendMessage(g.land_bar, TBM_SETRANGE, TRUE, MAKELPARAM(LANDOFF_MIN, LANDOFF_MAX));
+    SendMessage(g.land_bar, TBM_SETPOS, TRUE,
+                static_cast<LPARAM>(g.wp.land_offset * 1000.0f) + LANDOFF_BIAS);
     y += 36;
 
     label(h, "view", y); y += 18;
