@@ -18,7 +18,7 @@
 // ---------------------------------------------------------------------------
 #include "../../worldgen/assign/assign.h"
 #include "../../worldgen/assign/archetypes.h"
-#include "noise_standin.h"
+#include "host_support.h"
 
 #include <algorithm>
 #include <cmath>
@@ -67,14 +67,14 @@ static inline float layer0_height(float x, float z, float r, const WorldParams& 
     return fbm(x * wp.continent_freq, z * wp.continent_freq,
                wp.continent_octaves, 2.0f, 0.5f, seed)
          + wp.land_offset
-         + wp.centre_bias * (1.0f - smoothstep(0.0f, 0.25f, r))
-         - wp.edge_drop   * smoothstep(0.80f, 1.0f, r);
+         + wp.centre_bias * (1.0f - wg_smoothstep(0.0f, 0.25f, r))
+         - wp.edge_drop   * wg_smoothstep(0.80f, 1.0f, r);
 }
 
 // Layer 1: danger on normalised AREA, not normalised radius.
 static inline float layer1_danger(float x, float z, float r, const WorldParams& wp, uint32_t seed) {
     const float r2 = r * r;
-    return saturate(r2 + wp.danger_w * fbm(x * wp.danger_freq, z * wp.danger_freq,
+    return wg_saturate(r2 + wp.danger_w * fbm(x * wp.danger_freq, z * wp.danger_freq,
                                            wp.danger_octaves, 2.0f, 0.5f, seed));
 }
 
@@ -618,7 +618,7 @@ static void render_tile(const SeedWorld& w, const WorldParams& wp,
             } else {
                 const float h = layer0_height(x, z, rr, wp, w.s_cont);
                 if (h <= wp.sea_level) {
-                    const float d = saturate(-h * 1.2f);      // deeper water, darker
+                    const float d = wg_saturate(-h * 1.2f);      // deeper water, darker
                     c[0] = static_cast<unsigned char>(46 - 30 * d);
                     c[1] = static_cast<unsigned char>(78 - 46 * d);
                     c[2] = static_cast<unsigned char>(130 - 62 * d);
