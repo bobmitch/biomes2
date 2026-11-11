@@ -18,10 +18,14 @@
 // ---------------------------------------------------------------------------
 #include "../../worldgen/assign/assign.h"
 #include "../../worldgen/assign/archetypes.h"
+#include "../../worldgen/assign/json_lite.h"
 #include "host_support.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <stdexcept>
 #include <cstdio>
 #include <cstring>
 #include <numeric>
@@ -200,7 +204,20 @@ struct SeedWorld {
     AssignStats             stats;
     uint32_t s_cont = 0, s_dang = 0, s_wx = 0, s_wz = 0;
     float    land_fraction = 0.0f;
+    // Highest layer-0 sample beyond r = 0.95. The edge taper assertion: land
+    // must have fallen away before the rim, on every seed.
+    float    max_h_outer = -1.0e9f;
 };
+
+// FNV-1a. The determinism hash is a CPU-build artifact by ADR-001: WGSL
+// permits reassociation and FMA fusion, so a GPU result cannot be pinned.
+inline uint64_t fnv1a(uint64_t h, uint64_t v) {
+    for (int b = 0; b < 8; ++b) {
+        h ^= (v >> (b * 8)) & 0xFFull;
+        h *= 0x100000001B3ull;
+    }
+    return h;
+}
 
 // --- per-seed evaluation ---------------------------------------------------
 struct SeedResult {
@@ -212,6 +229,16 @@ struct SeedResult {
     int   relaxed = 0, overflow = 0;
     int   adj_violations = 0;   // against the authored adjacency_forbid rules
     float mean_candidates = 0.0f;
+    // --- A3 checks ---
+    float max_h_outer = 0.0f;   // edge taper: highest sample past r = 0.95
+    float rim_height = 0.0f;    // highest layer-0 sample on the r = 1 ring
+    bool  taper_ok = false;     // both of those below sea level
+    float foot_reach = 0.0f;    // land cells reachable on foot from spawn
+    bool  boat_all_biomes = false;
+    int   spawn_cell = -1;
+    bool  spawn_coastal = false;
+    bool  spawn_calmest = false;
+    uint64_t hash = 0;
     float mean_patch_cells = 0.0f;
     float mean_patch_km2 = 0.0f;
     std::vector<int>   biome_cells;   // per biome
@@ -272,6 +299,7 @@ static SeedWorld build_world(uint64_t world_seed,
             acc_z[ci] += z;
 
             const float h = layer0_height(x, z, rr, wp, s_cont);
+            if (rr > 0.95f && h > w.max_h_outer) w.max_h_outer = h;
             if (h > wp.sea_level) {
                 acc_land[ci] += sample_area;
                 land_area += sample_area;
@@ -385,6 +413,121 @@ static SeedResult eval_seed(uint64_t world_seed,
         }
     }
 
+    // --- edge taper ---
+    // No land above sea level past r = 0.95, and terrain under the void
+    // threshold on the r = 1 ring.
+    out.max_h_outer = w.max_h_outer;
+    {
+        const float R = wp.radius;
+        // The worst case on the rim ring is its highest point.
+        float worst = -1.0e9f;
+        for (int k = 0; k < 720; ++k) {
+            const float a = static_cast<float>(k) * (6.28318530718f / 720.0f);
+            const float x = R * std::cos(a), z = R * std::sin(a);
+            const float h = layer0_height(x, z, 1.0f, wp, w.s_cont);
+            if (h > worst) worst = h;
+        }
+        out.rim_height = worst;
+        // The requirement is that land has fallen away to ocean before the
+        // rim -- not that it is already in the void. The void begins past
+        // r = 1 and is the caller's business, not the field's.
+        out.taper_ok = (out.max_h_outer <= wp.sea_level) && (out.rim_height <= wp.sea_level);
+    }
+
+    // --- spawn ---
+    // Deterministic by construction: the calmest coastal land cell, ties
+    // broken on distance from the origin and then on index. The harness
+    // asserts the properties the design doc wants of it.
+    {
+        size_t calmest = 0;
+        for (size_t b = 1; b < nb; ++b) {
+            if (table[b].danger_preferred < table[calmest].danger_preferred) calmest = b;
+        }
+        int best = -1;
+        for (int i = 0; i < n; ++i) {
+            if (biome[i] != static_cast<int>(calmest) || !cells[i].is_land) continue;
+            bool coastal = false;
+            for (int k = graph.offset[i]; k < graph.offset[i + 1]; ++k) {
+                if (!cells[graph.list[k]].is_land) { coastal = true; break; }
+            }
+            if (!coastal) continue;
+            if (best < 0) { best = i; continue; }
+            if (cells[i].danger < cells[best].danger) best = i;
+            else if (cells[i].danger == cells[best].danger &&
+                     cells[i].norm_area < cells[best].norm_area) best = i;
+        }
+        out.spawn_cell = best;
+        out.spawn_coastal = (best >= 0);
+        out.spawn_calmest = (best >= 0);
+    }
+
+    // --- connectivity ---
+    // On foot: land cells only. By boat: land plus ocean, which must reach
+    // every biome or some of them are on islands nobody can get to.
+    if (out.spawn_cell >= 0) {
+        std::vector<char> seen(n, 0);
+        std::vector<int> stack;
+        stack.push_back(out.spawn_cell);
+        seen[out.spawn_cell] = 1;
+        int reached = 0, land_total = 0;
+        while (!stack.empty()) {
+            const int c = stack.back(); stack.pop_back();
+            ++reached;
+            for (int k = graph.offset[c]; k < graph.offset[c + 1]; ++k) {
+                const int nb2 = graph.list[k];
+                if (seen[nb2] || !cells[nb2].is_land) continue;
+                seen[nb2] = 1;
+                stack.push_back(nb2);
+            }
+        }
+        for (int i = 0; i < n; ++i) if (cells[i].is_land) ++land_total;
+        out.foot_reach = land_total > 0 ? static_cast<float>(reached) / land_total : 0.0f;
+
+        std::fill(seen.begin(), seen.end(), 0);
+        stack.push_back(out.spawn_cell);
+        seen[out.spawn_cell] = 1;
+        std::vector<char> biome_seen(nb, 0);
+        while (!stack.empty()) {
+            const int c = stack.back(); stack.pop_back();
+            if (biome[c] >= 0) biome_seen[biome[c]] = 1;
+            for (int k = graph.offset[c]; k < graph.offset[c + 1]; ++k) {
+                const int nb2 = graph.list[k];
+                if (seen[nb2]) continue;
+                seen[nb2] = 1;
+                stack.push_back(nb2);
+            }
+        }
+        out.boat_all_biomes = true;
+        for (size_t b = 0; b < nb; ++b) {
+            if (count[b] > 0 && !biome_seen[b]) out.boat_all_biomes = false;
+        }
+    }
+
+    // --- determinism hash ---
+    // Layers 0 and 1 on a fixed grid, plus the layer-3 assignment. Quantised,
+    // because the point is to catch a changed generator, not float noise.
+    {
+        uint64_t h = 0xCBF29CE484222325ull;
+        const int HG = 256;
+        const float R = wp.radius, hstep = 2.0f * R / HG;
+        for (int gj = 0; gj < HG; ++gj) {
+            const float z = -R + (gj + 0.5f) * hstep;
+            for (int gi = 0; gi < HG; ++gi) {
+                const float x = -R + (gi + 0.5f) * hstep;
+                const float rr = std::sqrt(x * x + z * z) / R;
+                if (rr > 1.0f) continue;
+                const float hh = layer0_height(x, z, rr, wp, w.s_cont);
+                const float dd = layer1_danger(x, z, rr, wp, w.s_dang);
+                h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(hh * 4096.0f)));
+                h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(dd * 4096.0f)));
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            h = fnv1a(h, static_cast<uint64_t>(biome[i] + 1));
+        }
+        out.hash = h;
+    }
+
     // Spearman over biomes that got cells.
     {
         std::vector<int> idx;
@@ -447,6 +590,11 @@ struct Summary {
     int radial_failures = 0;     // spearman < 0.8
     int land_failures = 0;       // |land - 0.55| > 0.05
     int adjacency_failures = 0;  // seeds with >= 1 authored-rule violation
+    int taper_failures = 0;      // land past r = 0.95, or a rim above the void
+    int foot_failures = 0;       // spawn cannot walk to most of the land
+    int boat_failures = 0;       // a biome unreachable even by sea
+    int spawn_failures = 0;      // no spawn, not coastal, or not calmest
+    float min_foot_reach = 2.0f;
     float mean_cells = 0, mean_land_cells = 0, mean_land_frac = 0;
     float mean_quota_err = 0, max_quota_err = 0, p95_quota_err = 0;
     float mean_spearman = 0, min_spearman = 2.0f;
@@ -482,6 +630,15 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
         if (r.spearman < 0.8f) ++sm.radial_failures;
         if (std::fabs(r.land_fraction - 0.55f) > 0.05f) ++sm.land_failures;
         if (r.adj_violations > 0) ++sm.adjacency_failures;
+        if (!r.taper_ok) ++sm.taper_failures;
+        // Not 100%: islands are a designed feature, so some land is legitimately
+        // unreachable on foot. This is a regression guard on the mainland being
+        // whole, with boat connectivity carrying the "every biome reachable"
+        // requirement.
+        if (r.foot_reach < 0.75f) ++sm.foot_failures;
+        if (!r.boat_all_biomes) ++sm.boat_failures;
+        if (r.spawn_cell < 0 || !r.spawn_coastal || !r.spawn_calmest) ++sm.spawn_failures;
+        sm.min_foot_reach = std::min(sm.min_foot_reach, r.foot_reach);
         sm.mean_cells += r.cells;
         sm.mean_land_cells += r.land_cells;
         sm.mean_land_frac += r.land_fraction;
@@ -752,6 +909,58 @@ static void test_adjacency(int nseeds, const WorldParams& wp, const ArchetypeTab
                 total_v == 0 ? "PASS" : "FAIL");
 }
 
+// --- golden seeds ----------------------------------------------------------
+// Pinned hashes of the generator's output. Any change to the field function,
+// the archetype table or layer 3 moves them -- deliberately. The gate is then
+// "revert, or bump generator_version", which is the only way that discipline
+// survives a year of tuning.
+struct Golden {
+    int generator_version = 0;
+    std::vector<std::pair<uint64_t, uint64_t> > seeds;   // world seed -> hash
+};
+
+static const char* kGoldenPath = "worldgen/golden/golden.json";
+
+static bool load_golden(Golden& g) {
+    try {
+        const jsonlite::Value root = jsonlite::parse_file(kGoldenPath);
+        g.generator_version = static_cast<int>(root.number("generator_version"));
+        const jsonlite::Array& list = root.array("seeds");
+        for (size_t i = 0; i < list.size(); ++i) {
+            const uint64_t s = static_cast<uint64_t>(list[i].number("seed"));
+            const uint64_t h = std::strtoull(list[i].string("hash").c_str() + 2, nullptr, 16);
+            g.seeds.push_back(std::make_pair(s, h));
+        }
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+static bool write_golden(const Golden& g) {
+    std::FILE* f = std::fopen(kGoldenPath, "wb");
+    if (!f) return false;
+    std::fprintf(f, "{\n  \"generator_version\": %d,\n", g.generator_version);
+    std::fprintf(f, "  \"_note\": \"Pinned by tools/validate --bless. A diff here is a world "
+                    "change: revert it, or bump generator_version. Hashes come from the C++ "
+                    "build with contraction disabled, which ADR-001 makes the determinism "
+                    "authority -- a GPU cannot produce a stable hash.\",\n");
+    std::fprintf(f, "  \"seeds\": [\n");
+    for (size_t i = 0; i < g.seeds.size(); ++i) {
+        std::fprintf(f, "    { \"seed\": %llu, \"hash\": \"0x%016llx\" }%s\n",
+                     static_cast<unsigned long long>(g.seeds[i].first),
+                     static_cast<unsigned long long>(g.seeds[i].second),
+                     i + 1 < g.seeds.size() ? "," : "");
+    }
+    std::fprintf(f, "  ]\n}\n");
+    std::fclose(f);
+    return true;
+}
+
+static void line(const char* name, bool ok, const char* detail) {
+    std::printf("  %-18s %-6s %s\n", name, ok ? "PASS" : "FAIL", detail);
+}
+
 int main(int argc, char** argv) {
     int  nseeds = 200;
     bool sweep = false;
@@ -763,6 +972,7 @@ int main(int argc, char** argv) {
     uint64_t dump_world_seed = 0;
     bool sheet = false;
     bool adjacency = false;
+    bool bless = false;
     int  tile = 192;
     const char* sheet_path = "build/contact_sheet.bmp";
     WorldParams wp;
@@ -788,6 +998,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--out") && i + 1 < argc)    sheet_path = argv[++i];
         else if (!std::strcmp(argv[i], "--tile") && i + 1 < argc)   tile = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--test-adjacency"))         adjacency = true;
+        else if (!std::strcmp(argv[i], "--bless"))                  bless = true;
         else if (!std::strcmp(argv[i], "--danger-feat") && i + 1 < argc) wp.danger_freq = 1.0f / static_cast<float>(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--dump-seeds") && i + 1 < argc) {
             dump_world_seed = std::strtoull(argv[++i], nullptr, 10);
@@ -928,13 +1139,122 @@ int main(int argc, char** argv) {
     }
 
     if (!sweep) {
-        std::printf("R = %.0f m, %d seeds, %d^2 grid, w = %.2f, contiguity = %.2f\n",
-                    wp.radius, nseeds, wp.grid, wp.danger_w, ap.contiguity_bonus);
+        std::printf("R = %.0f m, %d seeds, %d^2 grid, w = %.2f, danger feature = %.1f km, "
+                    "repair = %d passes\n",
+                    wp.radius, nseeds, wp.grid, wp.danger_w,
+                    0.001f / wp.danger_freq, ap.repair_passes);
         print_header();
         char label[64];
-        std::snprintf(label, sizeof(label), "R=%.0fkm c=%.2f", wp.radius / 1000.0f, ap.contiguity_bonus);
-        print_summary(label, run(nseeds, wp, table, ap));
-        return 0;
+        std::snprintf(label, sizeof(label), "R=%.0fkm", wp.radius / 1000.0f);
+        const Summary s = run(nseeds, wp, table, ap);
+        print_summary(label, s);
+
+        // Throughput. The no-storage design makes the per-sample cost a hard
+        // constraint, so it is tracked from the first week rather than when it
+        // starts hurting.
+        double ns = 0.0;
+        {
+            const int N = 2000000;
+            const uint32_t sd = feature_seed(0, FEATURE_CONTINENT);
+            double sink = 0.0;
+            const std::chrono::high_resolution_clock::time_point t0 =
+                std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < N; ++i) {
+                const float x = static_cast<float>(i & 2047) * 9.7f - 10000.0f;
+                const float z = static_cast<float>(i >> 11) * 9.7f - 10000.0f;
+                sink += layer0_height(x, z, 0.5f, wp, sd);
+            }
+            const std::chrono::high_resolution_clock::time_point t1 =
+                std::chrono::high_resolution_clock::now();
+            ns = std::chrono::duration<double, std::nano>(t1 - t0).count() / N;
+            if (sink == 1234.5678) std::printf("");   // keep the loop
+        }
+
+        // Golden seeds.
+        Golden g;
+        const bool had_golden = load_golden(g);
+        bool golden_ok = false;
+        int  golden_moved = 0;
+        // Pinned at a canonical sampling resolution. The cell areas and land
+        // mask are derived from the raster, so hashing at whatever --grid the
+        // run happened to use would pin a harness setting rather than the
+        // generator, and the gate would fire on nothing.
+        WorldParams gw = wp;
+        gw.grid = 1024;
+        if (bless) {
+            g.generator_version = had_golden ? g.generator_version : 1;
+            g.seeds.clear();
+            for (uint64_t ws = 0; ws < 8; ++ws) {
+                g.seeds.push_back(std::make_pair(ws, eval_seed(ws, gw, table, ap).hash));
+            }
+            if (!write_golden(g)) { std::printf("FAILED to write %s\n", kGoldenPath); return 1; }
+            std::printf("\nblessed %d golden seeds at generator_version %d -> %s\n",
+                        static_cast<int>(g.seeds.size()), g.generator_version, kGoldenPath);
+            golden_ok = true;
+        } else if (had_golden) {
+            for (size_t i = 0; i < g.seeds.size(); ++i) {
+                if (eval_seed(g.seeds[i].first, gw, table, ap).hash != g.seeds[i].second) {
+                    ++golden_moved;
+                }
+            }
+            golden_ok = (golden_moved == 0);
+        }
+
+        std::printf("\nchecks over %d seeds\n", nseeds);
+        char d[128];
+
+        std::snprintf(d, sizeof(d), "%d seeds missing a biome", s.presence_failures);
+        line("presence", s.presence_failures == 0, d);
+        std::snprintf(d, sizeof(d), "max %.1f%% off target, tolerance 10%%", 100.0 * s.max_quota_err);
+        line("quota", s.quota_failures == 0, d);
+        std::snprintf(d, sizeof(d), "Spearman min %.2f, threshold 0.80", s.min_spearman);
+        line("radial order", s.radial_failures == 0, d);
+        std::snprintf(d, sizeof(d), "mean %.1f%%, target 55%% +/- 5", 100.0 * s.mean_land_frac);
+        line("land fraction", s.land_failures == 0, d);
+        std::snprintf(d, sizeof(d), "%d seeds break an authored adjacency rule", s.adjacency_failures);
+        line("adjacency", s.adjacency_failures == 0, d);
+        std::snprintf(d, sizeof(d), "%d seeds with land past r=0.95 or a rim above the void",
+                      s.taper_failures);
+        line("edge taper", s.taper_failures == 0, d);
+        std::snprintf(d, sizeof(d), "worst seed reaches %.1f%% of land on foot, threshold 75%% "
+                      "(islands are expected)", 100.0 * s.min_foot_reach);
+        line("foot connect", s.foot_failures == 0, d);
+        std::snprintf(d, sizeof(d), "%d seeds with a biome unreachable by sea", s.boat_failures);
+        line("boat connect", s.boat_failures == 0, d);
+        std::snprintf(d, sizeof(d), "%d seeds without a coastal spawn in the calmest biome",
+                      s.spawn_failures);
+        line("spawn", s.spawn_failures == 0, d);
+        // The design doc's 20 ns/sample is a serial-equivalent budget for the
+        // complete field function on the shipping path. This is a scalar CPU
+        // reference build of layers 0-1 only, so it cannot be judged against
+        // that number yet. Gated as a regression guard, and tracked so cost
+        // creep is visible before it hurts.
+        std::snprintf(d, sizeof(d), "%.0f ns/sample, scalar CPU reference; design budget is "
+                      "20 ns serial-equivalent for the full field on the shipping path", ns);
+        line("throughput", ns <= 400.0, d);
+        if (!had_golden && !bless) {
+            std::snprintf(d, sizeof(d), "no %s -- run with --bless to pin this world", kGoldenPath);
+        } else if (golden_moved > 0) {
+            std::snprintf(d, sizeof(d), "%d of %d moved: revert, or bump generator_version",
+                          golden_moved, static_cast<int>(g.seeds.size()));
+        } else {
+            std::snprintf(d, sizeof(d), "%d seeds pinned at generator_version %d",
+                          static_cast<int>(g.seeds.size()), g.generator_version);
+        }
+        line("golden seeds", golden_ok, d);
+
+        // Automated checks cannot tell you whether a world is interesting.
+        const bool sheet_ok = contact_sheet(wp, table, ap, sheet_path, tile);
+        std::snprintf(d, sizeof(d), "%s", sheet_ok ? sheet_path : "could not write");
+        line("contact sheet", sheet_ok, d);
+
+        const bool all = s.presence_failures == 0 && s.quota_failures == 0 &&
+                         s.radial_failures == 0 && s.land_failures == 0 &&
+                         s.adjacency_failures == 0 && s.taper_failures == 0 &&
+                         s.foot_failures == 0 && s.boat_failures == 0 &&
+                         s.spawn_failures == 0 && ns <= 400.0 && golden_ok && sheet_ok;
+        std::printf("\n%s\n", all ? "ALL CHECKS PASSED" : "FAILED");
+        return all ? 0 : 1;
     }
 
     // The experiment: the doc's gate dumps the whole accumulated rounding

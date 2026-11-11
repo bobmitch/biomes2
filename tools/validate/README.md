@@ -1,5 +1,54 @@
 # Validation harness
 
+CI entry point. Runs 200 seeds, asserts every check it can, pins the world
+against golden hashes, emits a contact sheet, and exits non-zero on failure.
+
+```bash
+tools\validate\build.bat && build\validate.exe
+```
+
+```
+  presence           PASS   0 seeds missing a biome
+  quota              PASS   max 8.2% off target, tolerance 10%
+  radial order       PASS   Spearman min 0.93, threshold 0.80
+  land fraction      PASS   mean 55.4%, target 55% +/- 5
+  adjacency          PASS   0 seeds break an authored adjacency rule
+  edge taper         PASS   0 seeds with land past r=0.95 or a rim above the void
+  foot connect       PASS   worst seed reaches 83.8% of land on foot, threshold 75%
+  boat connect       PASS   0 seeds with a biome unreachable by sea
+  spawn              PASS   0 seeds without a coastal spawn in the calmest biome
+  throughput         PASS   267 ns/sample, scalar CPU reference
+  golden seeds       PASS   8 seeds pinned at generator_version 1
+  contact sheet      PASS   build/contact_sheet.bmp
+```
+
+**Golden hashes are a gate, not a formality.** Any change to `worldgen/` moves
+them and the build goes red. Revert, or decide the world should move and bump
+`generator_version` in `worldgen/golden/golden.json`, then `--bless`. Hashes
+are taken at a canonical 1024² sampling grid so they pin the generator rather
+than whatever `--grid` a run happened to use, and they come from this C++ build
+with contraction disabled — [ADR-001](../../docs/adr-001-field-function-authority.md)
+makes it the determinism authority, because WGSL permits reassociation and FMA
+fusion and so cannot produce a stable hash at all.
+
+Three checks the design doc wants are **not** asserted yet, deliberately rather
+than by oversight: **slope budget** needs metre-scale heights (layer 4),
+**LOD agreement** needs octave dropping at Nyquist (not implemented), and
+**river sanity** needs layer 5. Asserting them against layers 0–3 would measure
+the wrong thing and report false confidence.
+
+Two thresholds are judgement calls worth knowing about. **Foot connectivity**
+is 75%, not 100%, because islands are a designed feature and some land is
+legitimately unreachable on foot — boat connectivity carries the "every biome
+reachable" requirement. **Throughput** is gated at 400 ns/sample as a
+regression guard; the design doc's 20 ns is a serial-equivalent budget for the
+complete field function on the shipping path, and a scalar CPU reference build
+of layers 0–1 cannot be judged against it.
+
+---
+
+## How the checks were arrived at
+
 A headless measurement of the claim the whole design rests on: *every biome,
 every seed, within ±10% of its quota, ordered calm-to-hostile*. No graphics —
 it scatters cells, rasterises the disc for real cell areas and a land mask,
