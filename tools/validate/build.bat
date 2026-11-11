@@ -1,5 +1,6 @@
 @echo off
-REM Builds the validation harness. Run from the repository root.
+REM Builds the validation harness and the native viewer. Run from the
+REM repository root.
 REM
 REM A thin wrapper over CMakeLists.txt rather than its own compiler invocation:
 REM the golden hashes are sensitive to floating-point flags, so a second set of

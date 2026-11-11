@@ -17,9 +17,9 @@ foreach(cfg "" _DEBUG _RELEASE _RELWITHDEBINFO _MINSIZEREL)
   set(CMAKE_RUNTIME_OUTPUT_DIRECTORY${cfg} ${PROJECT_SOURCE_DIR}/build)
 endforeach()
 
-# Never fast-math. FMA contraction breaks CPU/GPU parity (CLAUDE.md invariant
-# 8), and this build is the determinism authority for the golden hashes
-# (ADR-001) -- a GPU cannot produce a stable hash at all.
+# Never fast-math. FMA contraction breaks CPU/GPU parity, and this build is
+# the determinism authority for the golden hashes (ADR-001) -- a GPU cannot
+# produce a stable hash at all.
 function(worldgen_strict_fp target)
   if(MSVC)
     target_compile_options(${target} PRIVATE /fp:precise /W3 /D_CRT_SECURE_NO_WARNINGS)
@@ -30,43 +30,26 @@ endfunction()
 
 find_package(Threads REQUIRED)
 
-# Layer 3. Portable C++, no host dependencies.
-add_library(worldgen_assign STATIC
+# The generator: the field function, the cell scatter, world build, layer 3.
+# Everything upstream of the golden hash lives here and nothing else does.
+add_library(worldgen STATIC
   worldgen/assign/assign.cpp
-  worldgen/assign/archetypes.cpp)
-worldgen_strict_fp(worldgen_assign)
+  worldgen/assign/archetypes.cpp
+  worldgen/world.cpp)
+target_include_directories(worldgen PUBLIC ${PROJECT_SOURCE_DIR})
+target_link_libraries(worldgen PUBLIC Threads::Threads)
+worldgen_strict_fp(worldgen)
 
 # The CI gate.
 add_executable(validate tools/validate/validate.cpp)
-target_link_libraries(validate PRIVATE worldgen_assign Threads::Threads)
+target_link_libraries(validate PRIVATE worldgen)
 worldgen_strict_fp(validate)
 
-# Emits WGSL from the field-function dialect. No strict-fp needed: it moves
-# text around and evaluates nothing.
-add_executable(wgslgen tools/wgslgen/wgslgen.cpp)
-if(MSVC)
-  target_compile_options(wgslgen PRIVATE /W3 /D_CRT_SECURE_NO_WARNINGS)
+# The native viewer (ADR-002). Windows-only by design: it is a debug tool, it
+# links the shipping generator directly, and CI is headless so determinism
+# coverage does not depend on it.
+if(WIN32 AND EXISTS ${PROJECT_SOURCE_DIR}/tools/view/view.cpp)
+  add_executable(view WIN32 tools/view/view.cpp)
+  target_link_libraries(view PRIVATE worldgen comctl32)
+  worldgen_strict_fp(view)
 endif()
-
-# Generating the WGSL is part of building, so a dialect change the generator
-# cannot handle fails here rather than in a browser later.
-#
-# A real OUTPUT/DEPENDS rule rather than a POST_BUILD hook: POST_BUILD only
-# fires when wgslgen itself relinks, so editing worldgen/shaders/ left the
-# generated WGSL silently stale -- which is precisely the drift the generated
-# -not-hand-written decision exists to prevent.
-set(GEN_DIR ${PROJECT_SOURCE_DIR}/tools/mapview/src/generated)
-set(DIALECT_SOURCES
-  ${PROJECT_SOURCE_DIR}/worldgen/shaders/noise.h
-  ${PROJECT_SOURCE_DIR}/worldgen/shaders/field.h)
-
-add_custom_command(
-  OUTPUT ${GEN_DIR}/noise.wgsl ${GEN_DIR}/field.wgsl
-  COMMAND ${CMAKE_COMMAND} -E make_directory ${GEN_DIR}
-  COMMAND wgslgen ${PROJECT_SOURCE_DIR}/worldgen/shaders/noise.h ${GEN_DIR}/noise.wgsl
-  COMMAND wgslgen ${PROJECT_SOURCE_DIR}/worldgen/shaders/field.h ${GEN_DIR}/field.wgsl
-  DEPENDS wgslgen ${DIALECT_SOURCES}
-  COMMENT "Generating WGSL from worldgen/shaders/")
-
-add_custom_target(wgsl ALL DEPENDS ${GEN_DIR}/noise.wgsl ${GEN_DIR}/field.wgsl)
-add_dependencies(validate wgsl)

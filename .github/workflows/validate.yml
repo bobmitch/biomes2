@@ -13,7 +13,7 @@ on:
     paths:
       - 'worldgen/**'
       - 'tools/validate/**'
-      - 'tools/wgslgen/**'
+      - 'tools/view/**'
       - 'engine/**'
       - 'CMakeLists.txt'
       - '.github/workflows/validate.yml'
@@ -21,7 +21,7 @@ on:
     paths:
       - 'worldgen/**'
       - 'tools/validate/**'
-      - 'tools/wgslgen/**'
+      - 'tools/view/**'
       - 'engine/**'
       - 'CMakeLists.txt'
       - '.github/workflows/validate.yml'
