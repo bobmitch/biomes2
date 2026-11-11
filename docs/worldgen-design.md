@@ -296,6 +296,10 @@ There is still only one *source* — the dialect — so this is not two implemen
 2. Pin golden hashes to the CPU build, and compare CPU to GPU within a tolerance. Never by hash: that comparison cannot be made exact, by specification.
 3. Where a GPU result must feed a decision, keep the decision tolerant of a few centimetres.
 
+**No libm anywhere upstream of the hash.** `pow`, `exp`, `log`, `sin` and `cos` are not exactly specified, and glibc disagrees with the MSVC CRT by an ULP. That is enough: `cos`/`sin` in the cell scatter moved cell positions by an ULP, too little to change which cell is nearest but enough to perturb a blend weight, move a height across a quantisation boundary, and relocate a river. It cost three golden seeds in eight. Use rejection sampling normalised with `sqrt` for directions, and rational curves for shaping.
+
+The dangerous part is that `generator_version` 1 and 2 passed CI **by luck** — the jitter was already there, and the heights simply happened not to straddle a quantum on those eight seeds. A determinism property that holds by luck is indistinguishable from one that holds, until it isn't. Bisect a divergence with per-layer component hashes rather than reasoning about it: the first layer whose hash differs is the answer, and in this case every plausible suspect upstream was innocent.
+
 **Measured: the CPU path is bit-identical across compilers and platforms.** The golden hashes are blessed by MSVC on Windows and verified by GCC on Linux in CI, and they match exactly — as do every other figure the harness reports, to the digit. So "stable across runs and platforms" is a demonstrated property of the C++ build rather than an aspiration, and the golden-seed gate means something. It is checked on every commit touching `worldgen/`, which is the only way it stays true.
 
 This says nothing about the GPU path, which §15.7.5 puts permanently out of reach of an exact comparison.

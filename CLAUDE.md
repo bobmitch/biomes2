@@ -53,13 +53,19 @@ cmake --preset dev && cmake --build --preset dev
    determinism authority: golden hashes come from it, and CPU-to-GPU agreement
    is a TOLERANCE comparison, never a hash — WGSL §15.7.5 permits
    reassociation and fusion with no opt-out, so an exact check is impossible.
-9. The field function uses ONLY `+ - * /`, `sqrt`, `floor` and comparisons.
-   No `pow`, `exp`, `log`, `sin` or `cos`: libm transcendentals are not
-   exactly specified and glibc disagrees with the MSVC CRT by an ULP. Layer 5
-   is a discrete function of the heightfield, so one ULP moves a river — this
-   broke three of eight golden seeds across platforms and only the two-OS CI
-   matrix caught it. Shape curves are built from arithmetic; see
-   `flatness_curve` in `worldgen/shaders/field.h` for the pattern.
+9. EVERYTHING THAT FEEDS THE GOLDEN HASH uses only `+ - * /`, `sqrt`, `floor`
+   and comparisons — the field function AND the layer-2 scatter AND layer 3.
+   No `pow`, `exp`, `log`, `sin`, `cos` or `atan`: libm is not exactly
+   specified and glibc disagrees with the MSVC CRT by an ULP.
+   It is not a theoretical worry. `cos`/`sin` in the cell scatter moved cell
+   positions by an ULP, which was far too little to change which cell is
+   nearest but enough to perturb the layer-4 blend weights, which moved a
+   height across a quantum, which moved a river. Three golden seeds in eight,
+   and versions 1 and 2 had passed CI *by luck* because the heights happened
+   not to straddle a quantum. Only the two-OS matrix ever catches this.
+   For directions use rejection sampling normalised with `sqrt`; for shape
+   curves use a rational like `flatness_curve` in `worldgen/shaders/field.h`.
+   Metrics that never reach the hash (the slope check's `atan`) are exempt.
 
 ## Gotchas that have bitten us
 
