@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "_note": "The generator knows nothing about what these mean. 'name' is for humans and diagnostics only; nothing branches on it. Layer 3 reads the placement block; the height/volumetric/surface blocks are the layer 4-6 contract and are not consumed yet.",
+  "sea_level": 0.0,
+  "biomes": [
+    {
+      "name": "meadows",
+      "area_fraction": 0.14, "danger_band": [0.00, 0.22], "danger_preferred": 0.06,
+      "adjacency_forbid": ["glacier", "rift"], "allow_island": true,
+      "base_elevation": 12.0, "amplitude": 18.0, "octaves": 4, "lacunarity": 2.0, "gain": 0.50, "ridge_blend": 0.05, "flatness": 1.60,
+      "overhang_strength": 0.00, "cave_density": 0.25, "cave_depth_band": [8.0, 120.0],
+      "material_id": 0, "water_level_offset": 0.0
+    },
+    {
+      "name": "forest",
+      "area_fraction": 0.14, "danger_band": [0.04, 0.34], "danger_preferred": 0.17,
+      "adjacency_forbid": [], "allow_island": true,
+      "base_elevation": 20.0, "amplitude": 38.0, "octaves": 5, "lacunarity": 2.0, "gain": 0.50, "ridge_blend": 0.20, "flatness": 1.25,
+      "overhang_strength": 0.10, "cave_density": 0.35, "cave_depth_band": [10.0, 160.0],
+      "material_id": 1, "water_level_offset": 0.0
+    },
+    {
+      "name": "wetland",
+      "area_fraction": 0.10, "danger_band": [0.12, 0.42], "danger_preferred": 0.28,
+      "adjacency_forbid": [], "allow_island": true,
+      "base_elevation": 3.0, "amplitude": 8.0, "octaves": 4, "lacunarity": 2.1, "gain": 0.45, "ridge_blend": 0.00, "flatness": 2.40,
+      "overhang_strength": 0.00, "cave_density": 0.10, "cave_depth_band": [6.0, 60.0],
+      "material_id": 2, "water_level_offset": 0.0
+    },
+    {
+      "name": "highland",
+      "area_fraction": 0.11, "danger_band": [0.22, 0.52], "danger_preferred": 0.38,
+      "adjacency_forbid": [], "allow_island": false,
+      "base_elevation": 90.0, "amplitude": 140.0, "octaves": 6, "lacunarity": 2.0, "gain": 0.52, "ridge_blend": 0.70, "flatness": 0.85,
+      "overhang_strength": 0.35, "cave_density": 0.45, "cave_depth_band": [20.0, 260.0],
+      "material_id": 3, "water_level_offset": 0.0
+    },
+    {
+      "name": "badlands",
+      "area_fraction": 0.11, "danger_band": [0.32, 0.62], "danger_preferred": 0.48,
+      "adjacency_forbid": [], "allow_island": true,
+      "base_elevation": 45.0, "amplitude": 70.0, "octaves": 5, "lacunarity": 2.2, "gain": 0.48, "ridge_blend": 0.55, "flatness": 1.10,
+      "overhang_strength": 0.45, "cave_density": 0.40, "cave_depth_band": [12.0, 180.0],
+      "material_id": 4, "water_level_offset": 0.0
+    },
+    {
+      "name": "taiga",
+      "area_fraction": 0.11, "danger_band": [0.42, 0.72], "danger_preferred": 0.58,
+      "adjacency_forbid": [], "allow_island": false,
+      "base_elevation": 55.0, "amplitude": 60.0, "octaves": 5, "lacunarity": 2.0, "gain": 0.50, "ridge_blend": 0.30, "flatness": 1.20,
+      "overhang_strength": 0.15, "cave_density": 0.30, "cave_depth_band": [10.0, 150.0],
+      "material_id": 5, "water_level_offset": 0.0
+    },
+    {
+      "name": "ashlands",
+      "area_fraction": 0.10, "danger_band": [0.52, 0.82], "danger_preferred": 0.68,
+      "adjacency_forbid": [], "allow_island": true,
+      "base_elevation": 35.0, "amplitude": 85.0, "octaves": 5, "lacunarity": 2.3, "gain": 0.55, "ridge_blend": 0.80, "flatness": 0.95,
+      "overhang_strength": 0.55, "cave_density": 0.55, "cave_depth_band": [15.0, 220.0],
+      "material_id": 6, "water_level_offset": 0.0
+    },
+    {
+      "name": "glacier",
+      "area_fraction": 0.10, "danger_band": [0.64, 0.92], "danger_preferred": 0.79,
+      "adjacency_forbid": ["meadows"], "allow_island": true,
+      "base_elevation": 110.0, "amplitude": 95.0, "octaves": 5, "lacunarity": 2.0, "gain": 0.48, "ridge_blend": 0.45, "flatness": 1.05,
+      "overhang_strength": 0.25, "cave_density": 0.35, "cave_depth_band": [18.0, 200.0],
+      "material_id": 7, "water_level_offset": 0.0
+    },
+    {
+      "name": "rift",
+      "area_fraction": 0.09, "danger_band": [0.74, 1.00], "danger_preferred": 0.90,
+      "adjacency_forbid": ["meadows"], "allow_island": false,
+      "base_elevation": 70.0, "amplitude": 165.0, "octaves": 6, "lacunarity": 2.1, "gain": 0.56, "ridge_blend": 0.90, "flatness": 0.75,
+      "overhang_strength": 0.70, "cave_density": 0.70, "cave_depth_band": [25.0, 320.0],
+      "material_id": 8, "water_level_offset": 0.0
+    }
+  ]
+}
