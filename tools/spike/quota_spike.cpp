@@ -138,50 +138,31 @@ static std::vector<std::pair<float, float> > scatter_cells(const WorldParams& wp
     return pts;
 }
 
-// --- per-seed evaluation ---------------------------------------------------
-struct SeedResult {
-    int   cells = 0, land_cells = 0;
-    float land_fraction = 0.0f;
-    float max_quota_err = 0.0f;   // max |relative error| over biomes
-    float spearman = 0.0f;
-    int   missing_biomes = 0;
-    int   relaxed = 0, overflow = 0;
-    float mean_candidates = 0.0f;
-    float mean_patch_cells = 0.0f;
-    float mean_patch_km2 = 0.0f;
-    std::vector<int>   biome_cells;   // per biome
-    std::vector<float> biome_share;   // per biome, share of land area
-};
+// --- cell lookup -----------------------------------------------------------
+// The design doc's bucket grid, sized for ~2 cells per bucket. Shared by the
+// rasteriser and the contact-sheet renderer so the two cannot disagree about
+// which cell a point falls in.
+struct CellLookup {
+    int   B = 0;
+    float bucket = 0.0f, R = 0.0f;
+    std::vector<std::vector<int> > buckets;
 
-static SeedResult eval_seed(uint64_t world_seed,
-                            const WorldParams& wp,
-                            const ArchetypeTable& table,
-                            const AssignParams& ap) {
-    SeedResult out;
-
-    const uint32_t s_cont = feature_seed(world_seed, FEATURE_CONTINENT);
-    const uint32_t s_dang = feature_seed(world_seed, FEATURE_DANGER);
-    const uint32_t s_cell = feature_seed(world_seed, FEATURE_CELLS);
-    const uint32_t s_wx   = feature_seed(world_seed, FEATURE_WARP_X);
-    const uint32_t s_wz   = feature_seed(world_seed, FEATURE_WARP_Z);
-
-    const std::vector<std::pair<float, float> > pts = scatter_cells(wp, s_cell);
-    const int n = static_cast<int>(pts.size());
-    out.cells = n;
-    if (n == 0) return out;
-
-    // Bucket grid for nearest-cell lookup, ~2 cells per bucket.
-    const int B = std::max(4, static_cast<int>(std::ceil(std::sqrt(n / 2.0))));
-    const float R = wp.radius;
-    const float bucket = 2.0f * R / B;
-    std::vector<std::vector<int> > buckets(static_cast<size_t>(B) * B);
-    for (int i = 0; i < n; ++i) {
-        const int bx = std::min(B - 1, std::max(0, static_cast<int>((pts[i].first  + R) / bucket)));
-        const int bz = std::min(B - 1, std::max(0, static_cast<int>((pts[i].second + R) / bucket)));
-        buckets[static_cast<size_t>(bz) * B + bx].push_back(i);
+    void build(const std::vector<std::pair<float, float> >& p, float radius) {
+        R = radius;
+        const int n = static_cast<int>(p.size());
+        B = std::max(4, static_cast<int>(std::ceil(std::sqrt(n / 2.0))));
+        bucket = 2.0f * R / B;
+        buckets.assign(static_cast<size_t>(B) * B, std::vector<int>());
+        for (int i = 0; i < n; ++i) {
+            const int bx = std::min(B - 1, std::max(0, static_cast<int>((p[i].first  + R) / bucket)));
+            const int bz = std::min(B - 1, std::max(0, static_cast<int>((p[i].second + R) / bucket)));
+            buckets[static_cast<size_t>(bz) * B + bx].push_back(i);
+        }
     }
 
-    auto nearest = [&](float x, float z) {
+    // pts passed in rather than held, so a copied or moved CellLookup cannot
+    // end up pointing at a dead vector.
+    int nearest(const std::vector<std::pair<float, float> >& pts, float x, float z) const {
         const int bx = std::min(B - 1, std::max(0, static_cast<int>((x + R) / bucket)));
         const int bz = std::min(B - 1, std::max(0, static_cast<int>((z + R) / bucket)));
         int   best = -1;
@@ -208,7 +189,60 @@ static SeedResult eval_seed(uint64_t world_seed,
             }
         }
         return best;
-    };
+    }
+};
+
+// Everything one seed produces, up to and including the assignment. The
+// metrics, the contact sheet and the adjacency test all read this rather than
+// rebuilding the world three different ways.
+struct SeedWorld {
+    std::vector<std::pair<float, float> > pts;
+    CellLookup              lookup;
+    std::vector<CellRecord> cells;
+    CellGraph               graph;
+    std::vector<int>        biome;
+    AssignStats             stats;
+    uint32_t s_cont = 0, s_dang = 0, s_wx = 0, s_wz = 0;
+    float    land_fraction = 0.0f;
+};
+
+// --- per-seed evaluation ---------------------------------------------------
+struct SeedResult {
+    int   cells = 0, land_cells = 0;
+    float land_fraction = 0.0f;
+    float max_quota_err = 0.0f;   // max |relative error| over biomes
+    float spearman = 0.0f;
+    int   missing_biomes = 0;
+    int   relaxed = 0, overflow = 0;
+    float mean_candidates = 0.0f;
+    float mean_patch_cells = 0.0f;
+    float mean_patch_km2 = 0.0f;
+    std::vector<int>   biome_cells;   // per biome
+    std::vector<float> biome_share;   // per biome, share of land area
+};
+
+static SeedWorld build_world(uint64_t world_seed,
+                             const WorldParams& wp,
+                             const ArchetypeTable& table,
+                             const AssignParams& ap) {
+    SeedWorld w;
+
+    w.s_cont = feature_seed(world_seed, FEATURE_CONTINENT);
+    w.s_dang = feature_seed(world_seed, FEATURE_DANGER);
+    w.s_wx   = feature_seed(world_seed, FEATURE_WARP_X);
+    w.s_wz   = feature_seed(world_seed, FEATURE_WARP_Z);
+    const uint32_t s_cont = w.s_cont, s_dang = w.s_dang, s_wx = w.s_wx, s_wz = w.s_wz;
+    const uint32_t s_cell = feature_seed(world_seed, FEATURE_CELLS);
+
+    w.pts = scatter_cells(wp, s_cell);
+    const std::vector<std::pair<float, float> >& pts = w.pts;
+    const int n = static_cast<int>(pts.size());
+    if (n == 0) return w;
+
+    const float R = wp.radius;
+    w.lookup.build(pts, R);
+    const CellLookup& lookup = w.lookup;
+    auto nearest = [&](float x, float z) { return lookup.nearest(pts, x, z); };
 
     // Rasterise the disc: real cell areas, real land mask, real adjacency.
     const int   G = wp.grid;
@@ -258,10 +292,11 @@ static SeedResult eval_seed(uint64_t world_seed,
         row_prev.swap(row_cur);
     }
 
-    out.land_fraction = disc_area > 0.0 ? static_cast<float>(land_area / disc_area) : 0.0f;
+    w.land_fraction = disc_area > 0.0 ? static_cast<float>(land_area / disc_area) : 0.0f;
 
     // Build cell records from the rasterised truth.
-    std::vector<CellRecord> cells(n);
+    w.cells.resize(n);
+    std::vector<CellRecord>& cells = w.cells;
     for (int i = 0; i < n; ++i) {
         CellRecord& c = cells[i];
         c.total_area = static_cast<float>(acc_total[i]);
@@ -278,7 +313,7 @@ static SeedResult eval_seed(uint64_t world_seed,
         c.is_land   = c.total_area > 0.0f && c.land_area > 0.5f * c.total_area;
     }
 
-    CellGraph graph;
+    CellGraph& graph = w.graph;
     graph.offset.resize(n + 1, 0);
     for (int i = 0; i < n; ++i) {
         graph.offset[i] = static_cast<int>(graph.list.size());
@@ -287,9 +322,28 @@ static SeedResult eval_seed(uint64_t world_seed,
     graph.offset[n] = static_cast<int>(graph.list.size());
 
     // --- the thing under test ---
-    std::vector<int> biome;
-    AssignStats stats;
-    assign_biomes(cells, graph, table, ap, biome, stats);
+    assign_biomes(cells, graph, table, ap, w.biome, w.stats);
+    return w;
+}
+
+// --- per-seed metrics ------------------------------------------------------
+static SeedResult eval_seed(uint64_t world_seed,
+                            const WorldParams& wp,
+                            const ArchetypeTable& table,
+                            const AssignParams& ap) {
+    SeedResult out;
+    const SeedWorld w = build_world(world_seed, wp, table, ap);
+
+    out.cells         = static_cast<int>(w.pts.size());
+    out.land_fraction = w.land_fraction;
+
+    const int n = static_cast<int>(w.cells.size());
+    if (n == 0) return out;
+
+    const std::vector<CellRecord>& cells = w.cells;
+    const CellGraph&               graph = w.graph;
+    const std::vector<int>&        biome = w.biome;
+    const AssignStats&             stats = w.stats;
 
     out.land_cells      = stats.land_cells;
     out.relaxed         = stats.relaxed_cells;
@@ -475,6 +529,217 @@ static void print_detail(const WorldParams& wp, const ArchetypeTable& table,
     std::printf("relaxed %d, overflow %d\n", r.relaxed, r.overflow);
 }
 
+// --- dependency-free image output ------------------------------------------
+// 24-bit uncompressed BMP. Chosen over PNG because a PNG writer needs zlib
+// framing and CRCs, which is more code than a debug image is worth, and the
+// harness is meant to stay dependency-free. Convert in CI if an artifact
+// viewer insists on PNG.
+static bool write_bmp(const char* path, int w, int h, const std::vector<unsigned char>& rgb) {
+    const int      row_raw = w * 3;
+    const int      pad     = (4 - (row_raw % 4)) % 4;
+    const int      row     = row_raw + pad;
+    const uint32_t bytes   = static_cast<uint32_t>(row) * static_cast<uint32_t>(h);
+    const uint32_t offset  = 14 + 40;
+
+    std::FILE* f = std::fopen(path, "wb");
+    if (!f) return false;
+
+    unsigned char hdr[14 + 40];
+    std::memset(hdr, 0, sizeof(hdr));
+    hdr[0] = 'B'; hdr[1] = 'M';
+    const auto put32 = [](unsigned char* p, uint32_t v) {
+        p[0] = v & 255u; p[1] = (v >> 8) & 255u; p[2] = (v >> 16) & 255u; p[3] = (v >> 24) & 255u;
+    };
+    const auto put16 = [](unsigned char* p, uint16_t v) { p[0] = v & 255u; p[1] = (v >> 8) & 255u; };
+    put32(hdr +  2, offset + bytes);
+    put32(hdr + 10, offset);
+    put32(hdr + 14, 40);
+    put32(hdr + 18, static_cast<uint32_t>(w));
+    put32(hdr + 22, static_cast<uint32_t>(h));   // positive height = bottom-up
+    put16(hdr + 26, 1);
+    put16(hdr + 28, 24);
+    put32(hdr + 34, bytes);
+    put32(hdr + 38, 2835);
+    put32(hdr + 42, 2835);
+    std::fwrite(hdr, 1, sizeof(hdr), f);
+
+    std::vector<unsigned char> line(static_cast<size_t>(row), 0);
+    for (int y = h - 1; y >= 0; --y) {           // BMP rows run bottom-up
+        for (int x = 0; x < w; ++x) {
+            const size_t s = (static_cast<size_t>(y) * w + x) * 3;
+            line[x * 3 + 0] = rgb[s + 2];        // B
+            line[x * 3 + 1] = rgb[s + 1];        // G
+            line[x * 3 + 2] = rgb[s + 0];        // R
+        }
+        std::fwrite(line.data(), 1, static_cast<size_t>(row), f);
+    }
+    std::fclose(f);
+    return true;
+}
+
+// Debug palette. Deliberately here rather than in archetypes.json: the design
+// doc puts presentation explicitly outside the archetype contract, and the
+// generator must not grow a dependency on what a biome looks like.
+static void biome_colour(int b, unsigned char* c) {
+    static const unsigned char kP[9][3] = {
+        {126, 200,  80}, { 34, 110,  50}, { 90, 125,  95},
+        {150, 140, 120}, {196, 124,  58}, { 66, 132, 124},
+        {152,  54,  44}, {219, 232, 245}, {112,  60, 146}
+    };
+    if (b < 0) { c[0] = 70; c[1] = 70; c[2] = 70; return; }  // land in an ocean cell
+    if (b < 9) { c[0] = kP[b][0]; c[1] = kP[b][1]; c[2] = kP[b][2]; return; }
+    // Fallback for tables larger than the hand-picked set: golden-angle hues.
+    const float hue = static_cast<float>(b) * 137.507f;
+    const float hh  = (hue - std::floor(hue / 360.0f) * 360.0f) / 60.0f;
+    const float xx  = 1.0f - std::fabs(hh - std::floor(hh / 2.0f) * 2.0f - 1.0f);
+    float r = 0, g = 0, bl = 0;
+    const int s = static_cast<int>(hh);
+    if (s == 0) { r = 1; g = xx; } else if (s == 1) { r = xx; g = 1; }
+    else if (s == 2) { g = 1; bl = xx; } else if (s == 3) { g = xx; bl = 1; }
+    else if (s == 4) { r = xx; bl = 1; } else { r = 1; bl = xx; }
+    c[0] = static_cast<unsigned char>(40 + 190 * r);
+    c[1] = static_cast<unsigned char>(40 + 190 * g);
+    c[2] = static_cast<unsigned char>(40 + 190 * bl);
+}
+
+static void render_tile(const SeedWorld& w, const WorldParams& wp,
+                        std::vector<unsigned char>& img, int img_w,
+                        int ox, int oy, int tile) {
+    const float R    = wp.radius;
+    const float step = 2.0f * R / tile;
+    for (int py = 0; py < tile; ++py) {
+        const float z = -R + (py + 0.5f) * step;
+        for (int px = 0; px < tile; ++px) {
+            const float x  = -R + (px + 0.5f) * step;
+            const float rr = std::sqrt(x * x + z * z) / R;
+            unsigned char c[3];
+            if (rr > 1.0f) {
+                c[0] = 10; c[1] = 12; c[2] = 18;              // void past the terminator
+            } else {
+                const float h = layer0_height(x, z, rr, wp, w.s_cont);
+                if (h <= wp.sea_level) {
+                    const float d = saturate(-h * 1.2f);      // deeper water, darker
+                    c[0] = static_cast<unsigned char>(46 - 30 * d);
+                    c[1] = static_cast<unsigned char>(78 - 46 * d);
+                    c[2] = static_cast<unsigned char>(130 - 62 * d);
+                } else {
+                    const float wx = x + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wx);
+                    const float wz = z + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wz);
+                    const int   ci = w.lookup.nearest(w.pts, wx, wz);
+                    biome_colour(ci >= 0 ? w.biome[ci] : -1, c);
+                }
+            }
+            const size_t d = (static_cast<size_t>(oy + py) * img_w + (ox + px)) * 3;
+            img[d + 0] = c[0]; img[d + 1] = c[1]; img[d + 2] = c[2];
+        }
+    }
+}
+
+// 64 seeds, one biome map each, one image. Automated checks cannot tell you
+// whether a world is interesting -- and Spearman reads 1.00 in every config we
+// have tried, so it will never tell us whether w is right either.
+static bool contact_sheet(const WorldParams& wp, const ArchetypeTable& table,
+                          const AssignParams& ap, const char* path, int tile) {
+    const int cols = 8, rows = 8, gap = 2;
+    const int W = cols * tile + (cols + 1) * gap;
+    const int H = rows * tile + (rows + 1) * gap;
+    std::vector<unsigned char> img(static_cast<size_t>(W) * H * 3, 26);
+
+    unsigned nthreads = std::thread::hardware_concurrency();
+    if (nthreads == 0) nthreads = 4;
+    nthreads = std::min<unsigned>(nthreads, 64u);
+
+    std::vector<std::thread> pool;
+    for (unsigned t = 0; t < nthreads; ++t) {
+        pool.push_back(std::thread([&, t]() {
+            for (int s = static_cast<int>(t); s < 64; s += static_cast<int>(nthreads)) {
+                const SeedWorld w = build_world(0x5EEDull * 1000003ull + static_cast<uint64_t>(s),
+                                                wp, table, ap);
+                const int ox = gap + (s % cols) * (tile + gap);
+                const int oy = gap + (s / cols) * (tile + gap);
+                render_tile(w, wp, img, W, ox, oy, tile);
+            }
+        }));
+    }
+    for (size_t i = 0; i < pool.size(); ++i) pool[i].join();
+
+    return write_bmp(path, W, H, img);
+}
+
+// --- adjacency test --------------------------------------------------------
+// The constraints in archetypes.json are currently honoured only by accident:
+// the candidate set is ~1, so the cost function never gets to apply the
+// penalty. This picks the two biomes whose danger bands overlap most, forbids
+// them from bordering, and counts how often that rule is broken.
+static void test_adjacency(int nseeds, const WorldParams& wp, const ArchetypeTable& base,
+                           const AssignParams& ap, float band_scale, bool header) {
+    ArchetypeTable table = base;
+    for (size_t b = 0; b < table.biomes.size(); ++b) {
+        BiomeArchetype& a = table.biomes[b];
+        const float lo = a.danger_preferred - (a.danger_preferred - a.danger_band_min) * band_scale;
+        const float hi = a.danger_preferred + (a.danger_band_max - a.danger_preferred) * band_scale;
+        a.danger_band_min = std::max(0.0f, lo);
+        a.danger_band_max = std::min(1.0f, hi);
+    }
+
+    int   pi = -1, pj = -1;
+    float best_overlap = -1.0f;
+    for (size_t i = 0; i < table.size(); ++i) {
+        for (size_t j = i + 1; j < table.size(); ++j) {
+            const float ov = std::min(table[i].danger_band_max, table[j].danger_band_max) -
+                             std::max(table[i].danger_band_min, table[j].danger_band_min);
+            if (ov > best_overlap) { best_overlap = ov; pi = static_cast<int>(i); pj = static_cast<int>(j); }
+        }
+    }
+    table.biomes[pi].adjacency_mask |= (1u << pj);
+    table.biomes[pj].adjacency_mask |= (1u << pi);
+
+    std::vector<int> viol(nseeds, 0), borders(nseeds, 0);
+    unsigned nthreads = std::thread::hardware_concurrency();
+    if (nthreads == 0) nthreads = 4;
+    nthreads = std::min<unsigned>(nthreads, static_cast<unsigned>(nseeds));
+
+    std::vector<std::thread> pool;
+    for (unsigned t = 0; t < nthreads; ++t) {
+        pool.push_back(std::thread([&, t]() {
+            for (int s = static_cast<int>(t); s < nseeds; s += static_cast<int>(nthreads)) {
+                const SeedWorld w = build_world(0x5EEDull * 1000003ull + static_cast<uint64_t>(s),
+                                                wp, table, ap);
+                const int n = static_cast<int>(w.cells.size());
+                for (int i = 0; i < n; ++i) {
+                    if (w.biome[i] < 0) continue;
+                    for (int k = w.graph.offset[i]; k < w.graph.offset[i + 1]; ++k) {
+                        const int j = w.graph.list[k];
+                        if (j <= i || w.biome[j] < 0) continue;
+                        ++borders[s];
+                        if ((table[w.biome[i]].adjacency_mask >> w.biome[j]) & 1u) ++viol[s];
+                    }
+                }
+            }
+        }));
+    }
+    for (size_t i = 0; i < pool.size(); ++i) pool[i].join();
+
+    long long total_v = 0, total_b = 0;
+    int seeds_with = 0;
+    for (int s = 0; s < nseeds; ++s) {
+        total_v += viol[s];
+        total_b += borders[s];
+        if (viol[s] > 0) ++seeds_with;
+    }
+
+    if (header) {
+        std::printf("\nforbidding %s <-> %s (band overlap %.2f), %d seeds\n",
+                    table[pi].name.c_str(), table[pj].name.c_str(), best_overlap, nseeds);
+        std::printf("%-12s %10s %10s %12s %8s\n",
+                    "bands", "borders", "violations", "seeds w/ any", "verdict");
+        std::printf("%s\n", std::string(56, '-').c_str());
+    }
+    std::printf("x%-11.1f %10lld %10lld %9d/%-3d %8s\n",
+                band_scale, total_b, total_v, seeds_with, nseeds,
+                total_v == 0 ? "PASS" : "FAIL");
+}
+
 int main(int argc, char** argv) {
     int  nseeds = 200;
     bool sweep = false;
@@ -482,6 +747,10 @@ int main(int argc, char** argv) {
     bool sweep_bands = false;
     bool sweep_w = false;
     bool detail = false;
+    bool sheet = false;
+    bool adjacency = false;
+    int  tile = 192;
+    const char* sheet_path = "build/contact_sheet.bmp";
     WorldParams wp;
     AssignParams ap;
 
@@ -499,6 +768,11 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--sweep-cells"))            sweep_cells = true;
         else if (!std::strcmp(argv[i], "--sweep-bands"))            sweep_bands = true;
         else if (!std::strcmp(argv[i], "--sweep-w"))                sweep_w = true;
+        else if (!std::strcmp(argv[i], "--contact-sheet"))          sheet = true;
+        else if (!std::strcmp(argv[i], "--out") && i + 1 < argc)    sheet_path = argv[++i];
+        else if (!std::strcmp(argv[i], "--tile") && i + 1 < argc)   tile = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--test-adjacency"))         adjacency = true;
+        else if (!std::strcmp(argv[i], "--danger-feat") && i + 1 < argc) wp.danger_freq = 1.0f / static_cast<float>(std::atof(argv[++i]));
     }
 
     ArchetypeTable table;
@@ -509,6 +783,24 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("archetypes: %d biomes, invariants OK\n", static_cast<int>(table.size()));
+
+    if (sheet) {
+        std::printf("contact sheet: 64 seeds, %dpx tiles, w = %.2f, R = %.0fkm\n",
+                    tile, wp.danger_w, wp.radius / 1000.0f);
+        if (!contact_sheet(wp, table, ap, sheet_path, tile)) {
+            std::printf("FAILED to write %s\n", sheet_path);
+            return 1;
+        }
+        std::printf("wrote %s\n", sheet_path);
+        return 0;
+    }
+
+    if (adjacency) {
+        test_adjacency(nseeds, wp, table, ap, 1.0f, true);
+        test_adjacency(nseeds, wp, table, ap, 2.0f, false);
+        test_adjacency(nseeds, wp, table, ap, 3.0f, false);
+        return 0;
+    }
 
     if (sweep_w) {
         // If the contiguity bonus is not what clumps cells into patches, the
