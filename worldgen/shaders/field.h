@@ -44,4 +44,65 @@ float layer1_danger(float x, float z, float r, float w, float freq, int octaves,
     return wg_saturate(r2 + w * fbm(x * freq, z * freq, octaves, 2.0f, 0.5f, seed));
 }
 
+// --- layer 4: height composition -------------------------------------------
+//
+// Blend the resulting HEIGHTS across a cell boundary, never the noise
+// parameters. Interpolating octave counts and lacunarity produces mush at
+// exactly the place the player is looking, so each neighbouring cell's profile
+// is evaluated in full and only the metres are mixed.
+//
+// Parameters arrive as loose scalars because the dialect has no structs. At
+// eleven arguments this is at the edge of what reads: see the note in
+// tools/validate/README.md before adding a twelfth.
+
+// fBm with a warp from rolling to ridged. ridge_blend 0 is plain fBm; 1 is
+// ridged peaks. Not a blend of billow against ridged -- those are mirror
+// images of each other and cancel to a flat field at the midpoint.
+float fbm_shaped(float x, float y, int octaves, float lacunarity, float gain, float ridge_blend, uint seed) {
+    float amp = 1.0f;
+    float freq = 1.0f;
+    float sum = 0.0f;
+    float norm = 0.0f;
+    for (int o = 0; o < octaves; o = o + 1) {
+        const float n = simplex2(x * freq, y * freq, seed + asuint(o) * 0x9E3779B1u);
+        const float ridged = 1.0f - 2.0f * abs(n);
+        const float v = n * (1.0f - ridge_blend) + ridged * ridge_blend;
+        sum = sum + amp * v;
+        norm = norm + amp;
+        amp = amp * gain;
+        freq = freq * lacunarity;
+    }
+    if (norm > 0.0f) { return sum / norm; }
+    return 0.0f;
+}
+
+// One biome's profile, in metres. flatness is a power curve applied after
+// shaping: above 1 pushes ground towards the base elevation and makes plains,
+// below 1 makes peaks.
+float layer4_profile(float x, float z, float freq, float base_elevation, float amplitude, int octaves, float lacunarity, float gain, float ridge_blend, float flatness, uint seed) {
+    const float n = fbm_shaped(x * freq, z * freq, octaves, lacunarity, gain, ridge_blend, seed);
+    const float t = wg_saturate(n * 0.5f + 0.5f);
+    const float shaped = pow(t, flatness);
+    return base_elevation + amplitude * (shaped * 2.0f - 1.0f);
+}
+
+// Weighted mix of up to four neighbouring cells' heights. Weights come from
+// smoothed distance to the cell boundary and are the caller's business: which
+// cells are near a point is an index question, not a field one.
+float layer4_blend(float h0, float w0, float h1, float w1, float h2, float w2, float h3, float w3) {
+    const float wsum = w0 + w1 + w2 + w3;
+    if (wsum > 0.0f) {
+        return (h0 * w0 + h1 * w1 + h2 * w2 + h3 * w3) / wsum;
+    }
+    return h0;
+}
+
+// Final ground height in metres: the biome profiles laid over the shared
+// continental base, faded out as the continent mask drops to sea level so the
+// coastline does not step.
+float layer4_height(float continent, float continent_scale, float blended, float sea_level) {
+    const float land = wg_smoothstep(sea_level, sea_level + 0.12f, continent);
+    return continent * continent_scale + blended * land;
+}
+
 #endif

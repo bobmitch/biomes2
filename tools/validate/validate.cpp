@@ -64,6 +64,11 @@ struct WorldParams {
     // layer 2
     float warp_amp          = 1300.0f;    // ~one cell radius
     float warp_freq         = 1.0f / 6000.0f;
+
+    // layer 4
+    float continent_scale   = 140.0f;     // metres per unit of continent mask
+    float biome_freq        = 1.0f / 900.0f;
+    float blend_width       = 500.0f;     // metres of cross-boundary height blend
 };
 
 // Thin adapters onto the canonical field function in worldgen/shaders/field.h.
@@ -160,6 +165,57 @@ struct CellLookup {
         }
     }
 
+    // The four nearest cells, for the layer-4 height blend. Returns how many
+    // were found. A 5x5 bucket neighbourhood spans several cell spacings at
+    // ~2 cells per bucket, so it reaches far enough; the ring search below is
+    // the fallback when it does not.
+    int nearest4(const std::vector<std::pair<float, float> >& pts, float x, float z,
+                 int* idx, float* dist) const {
+        float best_d[4] = {3.4e38f, 3.4e38f, 3.4e38f, 3.4e38f};
+        int   best_i[4] = {-1, -1, -1, -1};
+        const int bx = std::min(B - 1, std::max(0, static_cast<int>((x + R) / bucket)));
+        const int bz = std::min(B - 1, std::max(0, static_cast<int>((z + R) / bucket)));
+        for (int j = bz - 2; j <= bz + 2; ++j) {
+            if (j < 0 || j >= B) continue;
+            for (int i = bx - 2; i <= bx + 2; ++i) {
+                if (i < 0 || i >= B) continue;
+                const std::vector<int>& bk = buckets[static_cast<size_t>(j) * B + i];
+                for (size_t m = 0; m < bk.size(); ++m) {
+                    const float dx = pts[bk[m]].first - x, dz = pts[bk[m]].second - z;
+                    const float d2 = dx * dx + dz * dz;
+                    for (int s = 0; s < 4; ++s) {
+                        if (d2 < best_d[s]) {
+                            for (int t = 3; t > s; --t) {
+                                best_d[t] = best_d[t - 1];
+                                best_i[t] = best_i[t - 1];
+                            }
+                            best_d[s] = d2;
+                            best_i[s] = bk[m];
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        int found = 0;
+        for (int s = 0; s < 4; ++s) {
+            if (best_i[s] < 0) continue;
+            idx[found] = best_i[s];
+            dist[found] = std::sqrt(best_d[s]);
+            ++found;
+        }
+        if (found == 0) {
+            const int one = nearest(pts, x, z);
+            if (one >= 0) {
+                idx[0] = one;
+                const float dx = pts[one].first - x, dz = pts[one].second - z;
+                dist[0] = std::sqrt(dx * dx + dz * dz);
+                found = 1;
+            }
+        }
+        return found;
+    }
+
     // pts passed in rather than held, so a copied or moved CellLookup cannot
     // end up pointing at a dead vector.
     int nearest(const std::vector<std::pair<float, float> >& pts, float x, float z) const {
@@ -202,7 +258,7 @@ struct SeedWorld {
     CellGraph               graph;
     std::vector<int>        biome;
     AssignStats             stats;
-    uint32_t s_cont = 0, s_dang = 0, s_wx = 0, s_wz = 0;
+    uint32_t s_cont = 0, s_dang = 0, s_wx = 0, s_wz = 0, s_height = 0;
     float    land_fraction = 0.0f;
     // Highest layer-0 sample beyond r = 0.95. The edge taper assertion: land
     // must have fallen away before the rim, on every seed.
@@ -217,6 +273,40 @@ inline uint64_t fnv1a(uint64_t h, uint64_t v) {
         h *= 0x100000001B3ull;
     }
     return h;
+}
+
+// --- layer 4 ----------------------------------------------------------------
+// Ground height in metres. Which cells are near a point is an index question,
+// so the lookup and the weights live here; every metre of the result comes
+// from worldgen/shaders/field.h.
+static float terrain_height(const SeedWorld& w, const WorldParams& wp,
+                            const ArchetypeTable& table, float x, float z, float r) {
+    const float cont = layer0_height(x, z, r, wp, w.s_cont);
+
+    const float wx = x + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wx);
+    const float wz = z + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wz);
+
+    int   idx[4];
+    float dist[4];
+    const int found = w.lookup.nearest4(w.pts, wx, wz, idx, dist);
+
+    float h[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float wt[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int k = 0; k < found; ++k) {
+        const int b = w.biome[idx[k]];
+        if (b < 0) continue;
+        const BiomeArchetype& a = table[b];
+        h[k] = layer4_profile(x, z, wp.biome_freq, a.base_elevation, a.amplitude,
+                              static_cast<int>(a.octaves), a.lacunarity, a.gain,
+                              a.ridge_blend, a.flatness, w.s_height);
+        // Smoothed distance to the boundary: the gap between this cell and the
+        // nearest one, which is twice the distance to the bisector.
+        const float t = 1.0f - (dist[k] - dist[0]) / wp.blend_width;
+        wt[k] = t > 0.0f ? t * t : 0.0f;
+    }
+
+    const float blended = layer4_blend(h[0], wt[0], h[1], wt[1], h[2], wt[2], h[3], wt[3]);
+    return layer4_height(cont, wp.continent_scale, blended, wp.sea_level);
 }
 
 // --- per-seed evaluation ---------------------------------------------------
@@ -238,6 +328,7 @@ struct SeedResult {
     int   spawn_cell = -1;
     bool  spawn_coastal = false;
     bool  spawn_calmest = false;
+    float slope_gentle = 1.0f;  // share of land under 30 degrees
     uint64_t hash = 0;
     float mean_patch_cells = 0.0f;
     float mean_patch_km2 = 0.0f;
@@ -255,6 +346,7 @@ static SeedWorld build_world(uint64_t world_seed,
     w.s_dang = feature_seed(world_seed, FEATURE_DANGER);
     w.s_wx   = feature_seed(world_seed, FEATURE_WARP_X);
     w.s_wz   = feature_seed(world_seed, FEATURE_WARP_Z);
+    w.s_height = feature_seed(world_seed, FEATURE_HEIGHT);
     const uint32_t s_cont = w.s_cont, s_dang = w.s_dang, s_wx = w.s_wx, s_wz = w.s_wz;
     const uint32_t s_cell = feature_seed(world_seed, FEATURE_CELLS);
 
@@ -503,6 +595,34 @@ static SeedResult eval_seed(uint64_t world_seed,
         }
     }
 
+    // --- slope budget ---
+    // Measured over a 4 m baseline, not the sampling step: walkability is a
+    // local property, and a 100 m baseline would average every cliff away.
+    {
+        const int   SG = 192;
+        const float R = wp.radius, ss = 2.0f * R / SG, e = 4.0f;
+        int land_n = 0, gentle = 0;
+        for (int gj = 0; gj < SG; ++gj) {
+            const float z = -R + (gj + 0.5f) * ss;
+            for (int gi = 0; gi < SG; ++gi) {
+                const float x = -R + (gi + 0.5f) * ss;
+                const float rr = std::sqrt(x * x + z * z) / R;
+                if (rr > 1.0f) continue;
+                if (layer0_height(x, z, rr, wp, w.s_cont) <= wp.sea_level) continue;
+                ++land_n;
+                const float h0 = terrain_height(w, wp, table, x, z, rr);
+                const float hx = terrain_height(w, wp, table, x + e, z,
+                                                std::sqrt((x + e) * (x + e) + z * z) / R);
+                const float hz = terrain_height(w, wp, table, x, z + e,
+                                                std::sqrt(x * x + (z + e) * (z + e)) / R);
+                const float gx = (hx - h0) / e, gz = (hz - h0) / e;
+                const float deg = std::atan(std::sqrt(gx * gx + gz * gz)) * (180.0f / 3.14159265f);
+                if (deg < 30.0f) ++gentle;
+            }
+        }
+        out.slope_gentle = land_n > 0 ? static_cast<float>(gentle) / land_n : 1.0f;
+    }
+
     // --- determinism hash ---
     // Layers 0 and 1 on a fixed grid, plus the layer-3 assignment. Quantised,
     // because the point is to catch a changed generator, not float noise.
@@ -518,8 +638,10 @@ static SeedResult eval_seed(uint64_t world_seed,
                 if (rr > 1.0f) continue;
                 const float hh = layer0_height(x, z, rr, wp, w.s_cont);
                 const float dd = layer1_danger(x, z, rr, wp, w.s_dang);
+                const float tt = terrain_height(w, wp, table, x, z, rr);
                 h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(hh * 4096.0f)));
                 h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(dd * 4096.0f)));
+                h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(tt * 64.0f)));
             }
         }
         for (int i = 0; i < n; ++i) {
@@ -594,7 +716,9 @@ struct Summary {
     int foot_failures = 0;       // spawn cannot walk to most of the land
     int boat_failures = 0;       // a biome unreachable even by sea
     int spawn_failures = 0;      // no spawn, not coastal, or not calmest
+    int slope_failures = 0;      // under 60% of land walkable
     float min_foot_reach = 2.0f;
+    float min_slope_gentle = 2.0f;
     float mean_cells = 0, mean_land_cells = 0, mean_land_frac = 0;
     float mean_quota_err = 0, max_quota_err = 0, p95_quota_err = 0;
     float mean_spearman = 0, min_spearman = 2.0f;
@@ -638,7 +762,9 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
         if (r.foot_reach < 0.75f) ++sm.foot_failures;
         if (!r.boat_all_biomes) ++sm.boat_failures;
         if (r.spawn_cell < 0 || !r.spawn_coastal || !r.spawn_calmest) ++sm.spawn_failures;
+        if (r.slope_gentle < 0.60f) ++sm.slope_failures;
         sm.min_foot_reach = std::min(sm.min_foot_reach, r.foot_reach);
+        sm.min_slope_gentle = std::min(sm.min_slope_gentle, r.slope_gentle);
         sm.mean_cells += r.cells;
         sm.mean_land_cells += r.land_cells;
         sm.mean_land_frac += r.land_fraction;
@@ -771,6 +897,63 @@ static void biome_colour(int b, unsigned char* c) {
     c[2] = static_cast<unsigned char>(40 + 190 * bl);
 }
 
+// Shaded relief. The A4 exit criterion is whether this reads as a world
+// rather than as noise, and that is not a thing an assertion can answer.
+static void render_relief_tile(const SeedWorld& w, const WorldParams& wp,
+                               const ArchetypeTable& table,
+                               std::vector<unsigned char>& img, int img_w,
+                               int ox, int oy, int tile) {
+    const float R = wp.radius;
+    const float step = 2.0f * R / tile;
+    const float e = 6.0f;                       // metres, for the normal
+    const float lx = -0.55f, lz = -0.55f, ly = 0.63f;   // light from the north-west
+    for (int py = 0; py < tile; ++py) {
+        const float z = -R + (py + 0.5f) * step;
+        for (int px = 0; px < tile; ++px) {
+            const float x  = -R + (px + 0.5f) * step;
+            const float rr = std::sqrt(x * x + z * z) / R;
+            unsigned char c[3];
+            if (rr > 1.0f) {
+                c[0] = 10; c[1] = 12; c[2] = 18;
+            } else {
+                const float h0 = terrain_height(w, wp, table, x, z, rr);
+                if (h0 <= 0.0f) {
+                    const float d = wg_saturate(-h0 / 160.0f);
+                    c[0] = static_cast<unsigned char>(46 - 30 * d);
+                    c[1] = static_cast<unsigned char>(78 - 46 * d);
+                    c[2] = static_cast<unsigned char>(130 - 62 * d);
+                } else {
+                    const float hx = terrain_height(w, wp, table, x + e, z,
+                                                    std::sqrt((x + e) * (x + e) + z * z) / R);
+                    const float hz = terrain_height(w, wp, table, x, z + e,
+                                                    std::sqrt(x * x + (z + e) * (z + e)) / R);
+                    const float gx = (hx - h0) / e, gz = (hz - h0) / e;
+                    const float inv = 1.0f / std::sqrt(gx * gx + gz * gz + 1.0f);
+                    const float shade = wg_saturate((-gx * lx - gz * lz + ly) * inv * 1.25f);
+                    const float t = wg_saturate(h0 / 220.0f);
+                    float r3, g3, b3;
+                    if (t < 0.4f) {
+                        const float u = t / 0.4f;
+                        r3 = 0.36f + 0.18f * u; g3 = 0.54f - 0.06f * u; b3 = 0.30f + 0.02f * u;
+                    } else if (t < 0.78f) {
+                        const float u = (t - 0.4f) / 0.38f;
+                        r3 = 0.54f + 0.08f * u; g3 = 0.48f - 0.04f * u; b3 = 0.32f + 0.04f * u;
+                    } else {
+                        const float u = (t - 0.78f) / 0.22f;
+                        r3 = 0.62f + 0.30f * u; g3 = 0.44f + 0.50f * u; b3 = 0.36f + 0.58f * u;
+                    }
+                    const float s = 0.30f + 0.80f * shade;
+                    c[0] = static_cast<unsigned char>(wg_saturate(r3 * s) * 255.0f);
+                    c[1] = static_cast<unsigned char>(wg_saturate(g3 * s) * 255.0f);
+                    c[2] = static_cast<unsigned char>(wg_saturate(b3 * s) * 255.0f);
+                }
+            }
+            const size_t d = (static_cast<size_t>(oy + py) * img_w + (ox + px)) * 3;
+            img[d + 0] = c[0]; img[d + 1] = c[1]; img[d + 2] = c[2];
+        }
+    }
+}
+
 static void render_tile(const SeedWorld& w, const WorldParams& wp,
                         std::vector<unsigned char>& img, int img_w,
                         int ox, int oy, int tile) {
@@ -808,7 +991,8 @@ static void render_tile(const SeedWorld& w, const WorldParams& wp,
 // whether a world is interesting -- and Spearman reads 1.00 in every config we
 // have tried, so it will never tell us whether w is right either.
 static bool contact_sheet(const WorldParams& wp, const ArchetypeTable& table,
-                          const AssignParams& ap, const char* path, int tile) {
+                          const AssignParams& ap, const char* path, int tile,
+                          bool relief = false) {
     const int cols = 8, rows = 8, gap = 2;
     const int W = cols * tile + (cols + 1) * gap;
     const int H = rows * tile + (rows + 1) * gap;
@@ -826,7 +1010,8 @@ static bool contact_sheet(const WorldParams& wp, const ArchetypeTable& table,
                                                 wp, table, ap);
                 const int ox = gap + (s % cols) * (tile + gap);
                 const int oy = gap + (s / cols) * (tile + gap);
-                render_tile(w, wp, img, W, ox, oy, tile);
+                if (relief) render_relief_tile(w, wp, table, img, W, ox, oy, tile);
+                else        render_tile(w, wp, img, W, ox, oy, tile);
             }
         }));
     }
@@ -973,6 +1158,7 @@ int main(int argc, char** argv) {
     bool sheet = false;
     bool adjacency = false;
     bool bless = false;
+    bool relief = false;
     int  tile = 192;
     const char* sheet_path = "build/contact_sheet.bmp";
     WorldParams wp;
@@ -999,6 +1185,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--tile") && i + 1 < argc)   tile = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--test-adjacency"))         adjacency = true;
         else if (!std::strcmp(argv[i], "--bless"))                  bless = true;
+        else if (!std::strcmp(argv[i], "--relief"))                 relief = true;
         else if (!std::strcmp(argv[i], "--danger-feat") && i + 1 < argc) wp.danger_freq = 1.0f / static_cast<float>(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--dump-seeds") && i + 1 < argc) {
             dump_world_seed = std::strtoull(argv[++i], nullptr, 10);
@@ -1048,7 +1235,7 @@ int main(int argc, char** argv) {
     if (sheet) {
         std::printf("contact sheet: 64 seeds, %dpx tiles, w = %.2f, R = %.0fkm\n",
                     tile, wp.danger_w, wp.radius / 1000.0f);
-        if (!contact_sheet(wp, table, ap, sheet_path, tile)) {
+        if (!contact_sheet(wp, table, ap, sheet_path, tile, relief)) {
             std::printf("FAILED to write %s\n", sheet_path);
             return 1;
         }
@@ -1229,6 +1416,9 @@ int main(int argc, char** argv) {
         // reference build of layers 0-1 only, so it cannot be judged against
         // that number yet. Gated as a regression guard, and tracked so cost
         // creep is visible before it hurts.
+        std::snprintf(d, sizeof(d), "worst seed has %.1f%% of land under 30 degrees, threshold 60%%",
+                      100.0 * s.min_slope_gentle);
+        line("slope budget", s.slope_failures == 0, d);
         std::snprintf(d, sizeof(d), "%.0f ns/sample, scalar CPU reference; design budget is "
                       "20 ns serial-equivalent for the full field on the shipping path", ns);
         line("throughput", ns <= 400.0, d);
@@ -1252,7 +1442,8 @@ int main(int argc, char** argv) {
                          s.radial_failures == 0 && s.land_failures == 0 &&
                          s.adjacency_failures == 0 && s.taper_failures == 0 &&
                          s.foot_failures == 0 && s.boat_failures == 0 &&
-                         s.spawn_failures == 0 && ns <= 400.0 && golden_ok && sheet_ok;
+                         s.spawn_failures == 0 && s.slope_failures == 0 &&
+                         ns <= 400.0 && golden_ok && sheet_ok;
         std::printf("\n%s\n", all ? "ALL CHECKS PASSED" : "FAILED");
         return all ? 0 : 1;
     }

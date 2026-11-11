@@ -48,17 +48,25 @@ if(MSVC)
   target_compile_options(wgslgen PRIVATE /W3 /D_CRT_SECURE_NO_WARNINGS)
 endif()
 
-# Generating the WGSL is part of building, so a dialect change that the
-# generator cannot handle fails here rather than in a browser later.
-add_custom_command(TARGET wgslgen POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E make_directory
-          ${PROJECT_SOURCE_DIR}/tools/mapview/src/generated
-  COMMAND $<TARGET_FILE:wgslgen>
-          ${PROJECT_SOURCE_DIR}/worldgen/shaders/noise.h
-          ${PROJECT_SOURCE_DIR}/tools/mapview/src/generated/noise.wgsl
-  COMMAND $<TARGET_FILE:wgslgen>
-          ${PROJECT_SOURCE_DIR}/worldgen/shaders/field.h
-          ${PROJECT_SOURCE_DIR}/tools/mapview/src/generated/field.wgsl
+# Generating the WGSL is part of building, so a dialect change the generator
+# cannot handle fails here rather than in a browser later.
+#
+# A real OUTPUT/DEPENDS rule rather than a POST_BUILD hook: POST_BUILD only
+# fires when wgslgen itself relinks, so editing worldgen/shaders/ left the
+# generated WGSL silently stale -- which is precisely the drift the generated
+# -not-hand-written decision exists to prevent.
+set(GEN_DIR ${PROJECT_SOURCE_DIR}/tools/mapview/src/generated)
+set(DIALECT_SOURCES
+  ${PROJECT_SOURCE_DIR}/worldgen/shaders/noise.h
+  ${PROJECT_SOURCE_DIR}/worldgen/shaders/field.h)
+
+add_custom_command(
+  OUTPUT ${GEN_DIR}/noise.wgsl ${GEN_DIR}/field.wgsl
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${GEN_DIR}
+  COMMAND wgslgen ${PROJECT_SOURCE_DIR}/worldgen/shaders/noise.h ${GEN_DIR}/noise.wgsl
+  COMMAND wgslgen ${PROJECT_SOURCE_DIR}/worldgen/shaders/field.h ${GEN_DIR}/field.wgsl
+  DEPENDS wgslgen ${DIALECT_SOURCES}
   COMMENT "Generating WGSL from worldgen/shaders/")
 
-add_dependencies(validate wgslgen)
+add_custom_target(wgsl ALL DEPENDS ${GEN_DIR}/noise.wgsl ${GEN_DIR}/field.wgsl)
+add_dependencies(validate wgsl)

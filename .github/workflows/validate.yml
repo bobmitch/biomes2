@@ -55,11 +55,19 @@ jobs:
         shell: bash
         run: ./build/validate --seeds 200 --grid 1024
 
-      - name: Upload contact sheet
-        # Automated checks cannot tell you whether a world is interesting.
+      - name: Render shaded relief
+        if: always()
+        shell: bash
+        run: ./build/validate --contact-sheet --relief --grid 512 --tile 220 --out build/relief.bmp
+
+      - name: Upload contact sheets
+        # Automated checks cannot tell you whether a world is interesting, and
+        # they cannot tell you whether the relief reads as terrain either.
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: contact-sheet-${{ matrix.os }}
-          path: build/contact_sheet.bmp
+          name: contact-sheets-${{ matrix.os }}
+          path: |
+            build/contact_sheet.bmp
+            build/relief.bmp
           if-no-files-found: warn

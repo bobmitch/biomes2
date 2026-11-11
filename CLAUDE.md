@@ -72,13 +72,13 @@ cmake --preset dev && cmake --build --preset dev
 
 `tools/validate` runs 200 seeds and exits non-zero on any failure. It asserts
 presence, quota, radial ordering, land fraction, adjacency, edge taper, foot
-and boat connectivity, spawn, throughput and the golden hashes, and emits a
-64-seed contact sheet — look at it. Automated checks cannot tell you whether a
+and boat connectivity, spawn, slope budget, throughput and the golden hashes,
+and emits a 64-seed contact sheet — look at it. Automated checks cannot tell you whether a
 world is interesting.
 
-Not yet asserted, and why: **slope budget** needs metre-scale heights, which
-arrive with layer 4; **LOD agreement** needs octave dropping at Nyquist, which
-is not implemented; **river sanity** needs layer 5.
+It also emits a shaded-relief sheet with `--relief`. Not yet asserted, and
+why: **LOD agreement** needs octave dropping at Nyquist, which is not
+implemented; **river sanity** needs layer 5.
 
 **Golden hashes are pinned.** Any change to `worldgen/` moves them and the run
 fails. That is the gate working: either revert, or bump `generator_version` in

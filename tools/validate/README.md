@@ -31,11 +31,13 @@ with contraction disabled — [ADR-001](../../docs/adr-001-field-function-author
 makes it the determinism authority, because WGSL permits reassociation and FMA
 fusion and so cannot produce a stable hash at all.
 
-Three checks the design doc wants are **not** asserted yet, deliberately rather
-than by oversight: **slope budget** needs metre-scale heights (layer 4),
-**LOD agreement** needs octave dropping at Nyquist (not implemented), and
-**river sanity** needs layer 5. Asserting them against layers 0–3 would measure
-the wrong thing and report false confidence.
+`--relief` renders the same 64 seeds as shaded relief instead of biome colour.
+CI uploads both.
+
+Two checks the design doc wants are **not** asserted yet, deliberately rather
+than by oversight: **LOD agreement** needs octave dropping at Nyquist (not
+implemented), and **river sanity** needs layer 5. Asserting them now would
+measure the wrong thing and report false confidence.
 
 Two thresholds are judgement calls worth knowing about. **Foot connectivity**
 is 75%, not 100%, because islands are a designed feature and some land is

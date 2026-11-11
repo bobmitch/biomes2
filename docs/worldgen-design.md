@@ -142,6 +142,10 @@ Each biome supplies a height profile: base elevation, amplitude, octave count, a
 
 **Blend the resulting heights over a shared continental base — do not blend the noise parameters.** Interpolating octave counts and lacunarity produces mush at every boundary, and the boundary is exactly where the player is looking.
 
+**As built.** The four nearest cells are evaluated in full and only their metres are mixed, weighted by `(1 - Δd/blend_width)²` where `Δd` is the gap to the nearest cell — a proxy for distance to the bisector. The continental mask is scaled to metres and the biome relief is faded in across the shoreline so the coast does not step. `ridge_blend` warps plain fBm towards ridged, rather than mixing billowy against ridged: those two are mirror images and cancel to a flat field at the midpoint.
+
+Which cells are near a point is an index question, not a field one, so the lookup and the weights sit in the caller while every metre comes out of the dialect. That split is what lets the harness and the GPU share the arithmetic without sharing a spatial index.
+
 ### Layer 5 — rivers
 
 After the heightfield is defined, trace steepest-descent paths from high cells to the ocean on a coarse grid (256² over the world is ample), then carve the result with a distance-to-polyline SDF subtracted from the height.

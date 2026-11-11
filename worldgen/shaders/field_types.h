@@ -48,6 +48,8 @@ inline int  asint(int v) { return v; }
 using std::floor;
 using std::sqrt;
 using std::clamp;
+using std::abs;    // the float overload; HLSL and WGSL have it as a builtin
+using std::pow;
 
 #endif  // __cplusplus
 #endif  // WORLDGEN_FIELD_TYPES_H

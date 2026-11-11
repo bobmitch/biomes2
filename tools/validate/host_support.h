@@ -25,7 +25,8 @@ enum FeatureId : uint32_t {
     FEATURE_DANGER    = 2u,
     FEATURE_CELLS     = 3u,
     FEATURE_WARP_X    = 4u,
-    FEATURE_WARP_Z    = 5u
+    FEATURE_WARP_Z    = 5u,
+    FEATURE_HEIGHT    = 6u
 };
 
 inline uint64_t hash64(uint64_t x) {
