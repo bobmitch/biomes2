@@ -47,6 +47,16 @@
       }
       button { cursor: pointer; }
       button:hover { border-color: var(--accent); }
+      input[type="range"] {
+        padding: 0;
+        height: 20px;
+        border: none;
+        background: transparent;
+        accent-color: var(--accent);
+        cursor: pointer;
+      }
+      .rowlabel { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+      .rowlabel span:last-child { color: var(--accent); text-transform: none; letter-spacing: 0; }
       .row { display: flex; gap: 6px; }
       .row > input { flex: 1; min-width: 0; }
       .row > button { flex: 0 0 34px; }
@@ -95,6 +105,24 @@
           <option value="2">Raw fBm</option>
           <option value="3" selected>Layer-0 height</option>
         </select>
+      </div>
+
+      <div class="group">
+        <label class="rowlabel" for="w"><span>Danger wobble · w</span><span id="wv">0.20</span></label>
+        <input id="w" type="range" min="0" max="1" step="0.01" value="0.20" />
+
+        <label class="rowlabel" for="feat"><span>Danger feature size</span><span id="featv">4.5 km</span></label>
+        <input id="feat" type="range" min="1500" max="14000" step="250" value="4500" />
+
+        <button id="reset">Reset to repo defaults</button>
+        <p class="note">
+          These two only change the danger field, so the view switches to that
+          layer when you move them. <code>w</code> is how far the noise may
+          drag a location away from its distance-from-centre: at 0 the world is
+          a perfect dartboard. Raising it breaks the rings but also shreds
+          biomes into confetti unless the feature size rises with it — and that
+          half of the trade cannot be seen here until A2 puts biomes on screen.
+        </p>
       </div>
 
       <div class="group">

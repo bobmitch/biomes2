@@ -14,6 +14,8 @@ const RES = 2048;
 
 // World parameters, matching tools/spike's defaults so the two can be compared
 // directly. These move into a shared data file when A2 brings the tuning UI.
+// dangerW and dangerFreq are the slider defaults and what Reset restores; the
+// live values come from the sliders, not from here.
 const WORLD = {
   radius: 10000,
   continentFreq: 1 / 5200,
@@ -48,6 +50,7 @@ function featureSeed(worldSeed: bigint, featureId: bigint): number {
 }
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+const readRange = (id: string) => Number($<HTMLInputElement>(id).value);
 
 function fail(message: string): never {
   const box = $('error');
@@ -169,10 +172,27 @@ async function main() {
   const zeros = new Uint32Array([0, 0]);
 
   let busy = false;
+  let pending = false;
 
+  // A slider drag fires faster than a render completes. Coalesce rather than
+  // drop, or the value you let go on is not the one left on screen.
   async function render() {
-    if (busy) return;
+    if (busy) {
+      pending = true;
+      return;
+    }
     busy = true;
+    try {
+      do {
+        pending = false;
+        await renderOnce();
+      } while (pending);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function renderOnce() {
     const started = performance.now();
 
     const worldSeed = readSeed();
@@ -184,8 +204,8 @@ async function main() {
     f32[2] = WORLD.centreFloor;
     f32[3] = WORLD.edgeDrop;
     f32[4] = WORLD.landOffset;
-    f32[5] = WORLD.dangerW;
-    f32[6] = WORLD.dangerFreq;
+    f32[5] = readRange('w');
+    f32[6] = 1 / readRange('feat');
     f32[7] = WORLD.seaLevel;
     i32[8] = WORLD.continentOctaves;
     i32[9] = WORLD.dangerOctaves;
@@ -239,8 +259,6 @@ async function main() {
     $('radius').textContent = `${(WORLD.radius / 1000).toFixed(0)} km`;
     $('sc').textContent = `0x${seedContinent.toString(16).padStart(8, '0')}`;
     $('sd').textContent = `0x${seedDanger.toString(16).padStart(8, '0')}`;
-
-    busy = false;
   }
 
   function readSeed(): bigint {
@@ -259,11 +277,33 @@ async function main() {
     void render();
   }
 
+  function syncLabels() {
+    $('wv').textContent = readRange('w').toFixed(2);
+    $('featv').textContent = `${(readRange('feat') / 1000).toFixed(1)} km`;
+  }
+
+  function onTune() {
+    syncLabels();
+    // Nothing but the danger field reads these two, so dragging them while
+    // looking at any other layer would show nothing happening at all.
+    const layer = $<HTMLSelectElement>('layer');
+    if (layer.value !== '1') layer.value = '1';
+    void render();
+  }
+
   $('seed').addEventListener('change', () => void render());
   $('prev').addEventListener('click', () => stepSeed(-1n));
   $('next').addEventListener('click', () => stepSeed(1n));
   $('layer').addEventListener('change', () => void render());
+  $('w').addEventListener('input', onTune);
+  $('feat').addEventListener('input', onTune);
+  $('reset').addEventListener('click', () => {
+    $<HTMLInputElement>('w').value = String(WORLD.dangerW);
+    $<HTMLInputElement>('feat').value = String(Math.round(1 / WORLD.dangerFreq));
+    onTune();
+  });
 
+  syncLabels();
   await render();
 }
 
