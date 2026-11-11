@@ -7,7 +7,8 @@ Procedural voxel world generator for a bounded disc world. Full design in
 
 | Path | What |
 | --- | --- |
-| `worldgen/shaders/` | The field function. Restricted WGSL, ports 1:1 to HLSL. |
+| `worldgen/shaders/` | The field function. Restricted C dialect: compiles as C++ and HLSL. |
+| `tools/wgslgen/` | Emits WGSL from the dialect. See `docs/adr-001-*`. |
 | `worldgen/assign/` | Quota assignment (layer 3). Portable C++, no host deps. |
 | `worldgen/data/` | `archetypes.json` — the biome table. All tuning lives here. |
 | `worldgen/golden/` | Pinned seed hashes. Changes must be deliberate. |
@@ -32,9 +33,12 @@ cmake --preset dev && cmake --build --preset dev
 ## Invariants — breaking one of these is a bug, not a tradeoff
 
 1. `worldgen/` imports nothing from `tools/` or `engine/`.
-2. The field function is a RESTRICTED WGSL SUBSET: plain functions over
-   vec/float plus a small set of structs. No WGSL-only idioms, no pointers. It
-   is translated mechanically to HLSL; anything clever there costs us twice.
+2. The field function is a RESTRICTED C DIALECT that compiles unmodified as
+   C++ and as HLSL; `tools/wgslgen` emits the WGSL. One statement per line,
+   functional casts, no structs/pointers/overloads, only the builtins in
+   `field_types.h`. Never hand-edit generated WGSL. Kernel code
+   (`surface_nets`, anything with workgroup memory, atomics or barriers) is
+   OUTSIDE the dialect and stays hand-written per backend.
 3. Noise is an analytic integer hash. Never a permutation texture — those are
    not bit-reproducible across our two backends.
 4. Per-feature seeds: `hash64(world_seed ^ FEATURE_ID)`. Never thread one RNG
@@ -45,7 +49,10 @@ cmake --preset dev && cmake --build --preset dev
 7. No biome names in shader or engine code. The generator reads
    `archetypes.json` and knows nothing about meaning.
 8. Never compile the field function with fast-math. FMA contraction breaks
-   CPU/GPU parity.
+   CPU/GPU parity. The C++ build (`/fp:precise`, `-ffp-contract=off`) is the
+   determinism authority: golden hashes come from it, and CPU-to-GPU agreement
+   is a TOLERANCE comparison, never a hash — WGSL §15.7.5 permits
+   reassociation and fusion with no opt-out, so an exact check is impossible.
 
 ## Gotchas that have bitten us
 

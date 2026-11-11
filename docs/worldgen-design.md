@@ -12,7 +12,7 @@ A single-seed, radially-structured voxel world of 10–20 km radius, generated a
 | Radial banding | Equal-**area** rings, `r_k = R·√(k/N)` | Disk area grows as r²; linear rings give the inner band a few percent of the world |
 | Base terrain storage | None — regenerated on demand from the field function | A 20 km world at 0.5 m is 6.4×10⁹ columns; even the heightmap can't be precomputed |
 | SVDAG contents | Player edits only, as a sparse delta over the function | Edits dedup extremely well; noise terrain does not |
-| Field function language | WGSL, ported to HLSL; one source of truth | It ends up in a compute shader regardless — write it there from day one |
+| Field function language | A restricted C-like dialect that compiles unmodified as C++ and HLSL; WGSL generated from it ([ADR-001](adr-001-field-function-authority.md)) | WGSL permits reassociation and FMA fusion with no opt-out (§15.7.5), so it cannot be the determinism authority. C++ can, and HLSL is the same text behind a vector header |
 | Prototype environment | Browser (WebGPU) for worldgen, C++ for the voxel pipeline | They de-risk different things and neither translates to the other's environment |
 | Repository | One repo, several build systems | The shader source is shared verbatim by both tracks; a repo boundary through it guarantees drift |
 | Physics shapes | `HeightFieldShape` by default, `MeshShape` only for overhangs and edited chunks | Cooking and query cost differ by an order of magnitude, and most chunks are 2.5D |
@@ -254,11 +254,13 @@ Use an analytic integer hash — PCG or a small xxhash variant — rather than a
 
 ### CPU/GPU parity
 
-**Prefer a single authority: the GPU generates, the CPU reads back.** If anything on the CPU must evaluate terrain independently — server-side validation, spawn placement, pathfinding — you now have two implementations of a float-heavy function that must agree, and they will not. Mitigations, in order of preference:
+**The CPU build is the authority** ([ADR-001](adr-001-field-function-authority.md)). This reverses the obvious arrangement, and the reason is that the GPU cannot hold still: WGSL §15.7.5 lets an implementation reassociate and fuse at will, with no opt-out, so a GPU result is not reproducible across backends and cannot anchor a golden hash. A CPU build with `-ffp-contract=off` and no `/fp:fast` can.
 
-1. Don't. Read back what the GPU produced.
-2. If you must, compile the same source for both and disable fast-math on the CPU build (`-ffp-contract=off`, no `/fp:fast`). Fused multiply-add is the usual culprit.
-3. Accept divergence and only use the CPU path for decisions tolerant of a few centimetres.
+There is still only one *source* — the dialect — so this is not two implementations. In order of preference:
+
+1. Compile the one source for both. HLSL is the same text; WGSL is generated.
+2. Pin golden hashes to the CPU build, and compare CPU to GPU within a tolerance. Never by hash: that comparison cannot be made exact, by specification.
+3. Where a GPU result must feed a decision, keep the decision tolerant of a few centimetres.
 
 ### Generator versioning
 
@@ -416,7 +418,7 @@ The harness runs the generator headless over N seeds at coarse resolution — a 
 | Spawn quality | Spawn point is flat, coastal, in the calmest biome, deterministic | Spawn logic regressions |
 | River sanity | Every traced river is monotonically descending and terminates in ocean | Carving order bugs; endorheic basins |
 | LOD agreement | Height at every LOD matches LOD 0 within that LOD's voxel size | Octaves not dropped at Nyquist |
-| Determinism | Hash of the sample grid is stable across runs and platforms | Non-deterministic iteration order; fast-math |
+| Determinism | Hash of the sample grid is stable across runs and platforms, **for the C++ build**; GPU paths are compared within a tolerance instead | Non-deterministic iteration order; fast-math |
 | Throughput | Nanoseconds per field sample, tracked over time | Silent cost creep in the field function |
 
 ### Golden seeds
@@ -464,19 +466,21 @@ No dates here; velocity is unknown. The ordering and the exit criteria are the c
 
 | # | Milestone | Exit criterion |
 | --- | --- | --- |
-| M1 | Port the field function WGSL → HLSL; swap out the trivial field | Walking the real generated world in the engine |
+| M1 | Compile the dialect field function as HLSL; swap out the trivial field | Walking the real generated world in the engine |
 | M2 | Golden seeds and version pinning wired into the C++ build | Changing a generator parameter fails the build until the version is bumped |
 
 ### Keeping the merge small
 
 M1 is the only coupling between the tracks, and its cost is decided months earlier by how the field function is written. Keep it cheap:
 
-- Write the field function in a **restricted WGSL subset** that maps directly to HLSL. No WGSL-only idioms, no pointer gymnastics, plain functions over `vec`/`float` and a small struct set.
+- Write the field function in the **restricted C-like dialect** of [ADR-001](adr-001-field-function-authority.md): it compiles unmodified as C++ and as HLSL, and `tools/wgslgen` emits the WGSL. No pointers, no structs, plain functions over `float`/`float2` and a small builtin set.
 - Keep it in its own directory with no dependency on either host.
 - All tuning lives in the archetype data file, not in the shader.
-- Verify the port by hash: the same seed must produce the same sample-grid hash through both paths.
+- Verify the engine port by hash — but **only CPU against CPU**. The C++ build with `-ffp-contract=off` is the determinism authority, and a CPU-to-GPU comparison can only ever be a tolerance check: WGSL §15.7.5 permits reassociation and FMA fusion at the implementation's discretion, with no way to switch them off.
 
-Done that way the port is a mechanical translation plus a hash comparison. Done badly it is a rewrite, and the browser prototype stops paying for itself.
+Done that way there is no port at all for HLSL — it is the same text — and the WGSL is a build product that cannot drift. Done badly it is a rewrite, and the browser prototype stops paying for itself.
+
+**Kernel code is excluded.** `surface_nets.wgsl` and anything else using workgroup memory, atomics, storage buffers or barriers stays hand-written per backend. It never needs CPU evaluation, so the dialect would cost without buying anything — and those are precisely the constructs that would make a small generator impossible.
 
 ## Repository structure: one project, not two
 
@@ -485,11 +489,13 @@ Done that way the port is a mechanical translation plus a hash comparison. Done 
 ```
 /
 ├─ worldgen/                 # the shared source of truth
-│  ├─ shaders/
-│  │  ├─ noise.wgsl          # hash noise, fbm, ridged
-│  │  ├─ field.wgsl          # layers 0,1,4,5,6
-│  │  ├─ cells.wgsl          # layer 2 lookup
-│  │  └─ surface_nets.wgsl   # meshing kernel
+│  ├─ shaders/               # dialect: compiles as C++ and HLSL, generates WGSL
+│  │  ├─ field_types.h       # the C++ half of the dialect
+│  │  ├─ noise.h             # hash noise, fbm, ridged
+│  │  ├─ field.h             # layers 0,1,4,5,6
+│  │  ├─ cells.h             # layer 2 lookup
+│  │  └─ surface_nets.wgsl   # meshing kernel -- hand-written per backend,
+│  │                         # outside the dialect (ADR-001 scope)
 │  ├─ assign/                # layer 3, portable C++, no host deps
 │  ├─ data/archetypes.json   # the biome table
 │  └─ golden/                # pinned seed hashes
@@ -548,7 +554,7 @@ Recommendation: **build the brick hash map at B6, instrument it, and promote to 
 | LOD octave fading insufficient | Medium — terrain morphs on approach | LOD-agreement assertion in the harness; analytic filtering if fading is not enough |
 | Heightfield → mesh transition on first edit | Medium — a pop or a one-frame hole | Classify and cook the mesh before retiring the heightfield; swap in one step |
 | Warp amplitude mismatched to cell size | Low — boundaries read as geometric | Keep warp amplitude near cell radius; visible immediately in the map view |
-| WGSL/HLSL numerical divergence | Low, but silent | Integer hash noise; sample-grid hash compared across both paths in CI |
+| GPU/CPU numerical divergence | Low, but silent, and cannot be eliminated | Integer hash noise; one dialect source so there is nothing to drift; CPU-to-GPU compared within a tolerance in CI, since §15.7.5 rules out an exact check |
 | 20 km world reads as empty | Low now, high later | Build at 10 km; keep R a parameter; revisit with real content density |
 
 ### Open questions
