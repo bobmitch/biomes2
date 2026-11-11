@@ -10,7 +10,7 @@
 struct Params {
     radius: f32,
     continent_freq: f32,
-    centre_bias: f32,
+    centre_floor: f32,
     edge_drop: f32,
     land_offset: f32,
     danger_w: f32,
@@ -80,7 +80,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
 
         if (r <= 1.0) {
             let h = layer0_height(x, z, r, P.continent_freq, P.continent_octaves,
-                                  P.centre_bias, P.edge_drop, P.land_offset, P.seed_continent);
+                                  P.centre_floor, P.edge_drop, P.land_offset, P.seed_continent);
             let is_land = h > P.sea_level;
 
             atomicAdd(&wg_disc, 1u);

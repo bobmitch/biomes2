@@ -62,5 +62,5 @@ three backends.
 The land-fraction readout is the other half of that check. It should match
 `build\quota_spike.exe --dump-seeds <seed> --grid 2048` — the CPU build is the
 determinism authority, and this is the tolerance comparison ADR-001 requires.
-At world seed 0 both report 54.03%. It can never be an exact hash comparison:
+At world seed 0 both report 54.33%. It can never be an exact hash comparison:
 WGSL §15.7.5 permits reassociation and FMA fusion with no opt-out.

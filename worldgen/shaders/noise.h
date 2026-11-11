@@ -126,4 +126,14 @@ float wg_smoothstep(float e0, float e1, float v) {
     return t * t * (3.0f - 2.0f * t);
 }
 
+// Smooth maximum, k controlling the width of the rounded join. Layer 0 uses it
+// to state the home-landmass guarantee as a FLOOR rather than a LIFT: a lift
+// adds height everywhere near the centre, which makes the world centre the
+// highest point on almost every seed; a floor only raises ground that was
+// already below it, and leaves the peaks to the noise.
+float wg_smax(float a, float b, float k) {
+    const float d = a - b;
+    return 0.5f * (a + b + sqrt(d * d + k)) - 0.5f * sqrt(k);
+}
+
 #endif

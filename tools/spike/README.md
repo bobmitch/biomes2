@@ -40,8 +40,15 @@ All figures R = 10 km, 200 seeds, 1024² sample grid, 9 biomes, ~235 cells.
 
 | Config | mean err | p95 | max | seeds failing ±10% |
 | --- | --- | --- | --- | --- |
-| As specified in the design doc | 44.1% | 62.7% | 78.5% | **200 / 200** |
-| With the half-cell gate, 0.32 km² cells | 3.9% | 6.8% | 10.3% | 1 / 200 |
+| As specified in the design doc | 41.8% | 62.3% | 67.5% | **200 / 200** |
+| With the half-cell gate, 0.32 km² cells | 3.5% | 7.0% | 8.9% | 0 / 200 |
+
+> Figures in §1 were re-measured after layer 0 became a floor rather than a
+> dome, which lifted land fraction to 55.4% and so gave each biome a few more
+> cells. The tables in §2–§6 below predate that change. Their conclusions are
+> unaffected — they are about layer 3 and the danger field, neither of which
+> touches the continent mask — but the absolute land fractions in them read
+> about half a point low.
 
 This is a systematic bias, not granularity noise. `--detail` shows the shape of
 it: every biome overshoots a little (+1.5% to +9.3%), and the entire

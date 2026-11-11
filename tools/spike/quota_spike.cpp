@@ -45,7 +45,7 @@ struct WorldParams {
     // layer 0 stand-in
     float continent_freq    = 1.0f / 5200.0f;
     int   continent_octaves = 5;
-    float centre_bias       = 0.70f;      // A
+    float centre_floor      = 0.20f;      // home-landmass floor, not a lift
     float edge_drop         = 1.60f;      // B
     float sea_level         = 0.0f;
     // Stand-in only: shifts the continent mask to hit the 55% land target.
@@ -67,7 +67,7 @@ struct WorldParams {
 // apart -- these only unpack WorldParams into the scalars the dialect takes.
 static inline float layer0_height(float x, float z, float r, const WorldParams& wp, uint32_t seed) {
     return ::layer0_height(x, z, r, wp.continent_freq, wp.continent_octaves,
-                           wp.centre_bias, wp.edge_drop, wp.land_offset, seed);
+                           wp.centre_floor, wp.edge_drop, wp.land_offset, seed);
 }
 
 static inline float layer1_danger(float x, float z, float r, const WorldParams& wp, uint32_t seed) {

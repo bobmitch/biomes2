@@ -81,11 +81,21 @@ Seven layers, each independently tunable and independently testable. Layers 0–
 
 Normalise `r = length(p.xz) / R`, then:
 
-$$
-h_{base} = \mathrm{fbm}(p_{xz} \cdot f_c) + A \cdot \bigl(1 - \mathrm{smoothstep}(0,\,0.25,\,r)\bigr) - B \cdot \mathrm{smoothstep}(0.80,\,1.0,\,r)
-$$
+```
+base   = fbm(p.xz * f_c) + o
+t      = smoothstep(0, 0.40, r)
+h_base = lerp(smax(base, F, k), base, t) - B * smoothstep(0.80, 1.0, r)
 
-The fBm term is 4–6 octaves with a base feature size of 2–8 km. The second term guarantees a home landmass at the centre regardless of seed. The third is the taper. Past `r = 1.0`, subtract a large constant so terrain drops away into void — the Valheim world-edge waterfall, which is the cheapest honest terminator.
+smax(a, b, k) = 0.5*(a + b + sqrt((a-b)^2 + k)) - 0.5*sqrt(k)
+```
+
+The fBm term is 4–6 octaves with a base feature size of 2–8 km. The `smax` term guarantees a home landmass at the centre regardless of seed. The last is the taper. Past `r = 1.0`, subtract a large constant so terrain drops away into void — the Valheim world-edge waterfall, which is the cheapest honest terminator.
+
+**The home-landmass guarantee is a floor, not a lift, and that distinction is the whole of it.** An earlier draft used an additive dome, `A·(1 - smoothstep(0, 0.25, r))` with `A = 0.70`. Against a continent fBm with a standard deviation of 0.224 that is a +3.1σ bias at the origin, so the world's highest point landed within 640 m of the centre on **59 of 64 seeds**, and within `r < 0.25` on all 64. Every seed grew the same mountain in the same place. A floor only raises ground that was already below it, so the peaks stay where the noise put them: peaks inside `r < 0.25` fall to 2/64, and the central disc becomes *more* reliably land (90.6% → 95.6%), because a floor is a more direct statement of the thing actually wanted.
+
+Blend the floor out across `r` rather than letting `F` fall to zero. `smax(base, 0, k)` is a soft ReLU, and using it world-wide clamps every ocean to a uniform shelf — measured interior ocean depth collapses sevenfold.
+
+Relief is therefore layer 4's job, via the per-biome profiles, which is where it is controllable per biome. A mountain *near* spawn belongs in layer 3's adjacency cost, where it lands somewhere different each seed; a layer-0 dome puts it in the same place forever.
 
 Use OpenSimplex2 or simplex-family noise, not classic Perlin. Perlin's axis-aligned gradient artifacts are invisible at 10 m and glaring at 5 km, which is exactly the scale this layer works at.
 

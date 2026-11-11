@@ -1,5 +1,13 @@
 # Starter prompt
 
+> **Historical. A1 is delivered; this prompt has been spent.** Kept as a record
+> of what was asked for. Two things in it are now known wrong and were changed
+> deliberately: the layer-0 centre term is a floor rather than an additive
+> dome, and the field function is not written in WGSL. See the design doc and
+> [ADR-001](adr-001-field-function-authority.md) for what replaced them. The
+> live sliders were also deferred to A2 on purpose — see
+> [`tools/mapview/README.md`](../tools/mapview/README.md).
+
 Paste into a fresh session in an empty repository. It bootstraps the tree and
 delivers Track A milestone A1. Design reference: `docs/worldgen-design.md`.
 

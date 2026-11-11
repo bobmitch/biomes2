@@ -17,7 +17,7 @@ const RES = 2048;
 const WORLD = {
   radius: 10000,
   continentFreq: 1 / 5200,
-  centreBias: 0.7,
+  centreFloor: 0.2,
   edgeDrop: 1.6,
   landOffset: 0.17,
   dangerW: 0.2,
@@ -181,7 +181,7 @@ async function main() {
 
     f32[0] = WORLD.radius;
     f32[1] = WORLD.continentFreq;
-    f32[2] = WORLD.centreBias;
+    f32[2] = WORLD.centreFloor;
     f32[3] = WORLD.edgeDrop;
     f32[4] = WORLD.landOffset;
     f32[5] = WORLD.dangerW;
