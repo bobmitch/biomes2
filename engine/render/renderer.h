@@ -1,19 +1,20 @@
 // ---------------------------------------------------------------------------
-// B1: device, swapchain, and one fullscreen pass.
+// Device, swapchain, and the frame.
 //
 // Deliberately not a "graphics abstraction". Everything here is the minimum
-// D3D12 that B2 will build on -- descriptor heaps, per-frame command
-// allocators and fence-value synchronisation -- and nothing is wrapped until
+// D3D12 the rest of Track B builds on -- descriptor heaps, per-frame command
+// allocators, fence-value synchronisation -- and nothing is wrapped until
 // there are two callers to justify the wrapper. See ADR-003 for why D3D12.
 // ---------------------------------------------------------------------------
 #ifndef ENGINE_RENDERER_H
 #define ENGINE_RENDERER_H
 
 #include "engine/meshing/chunk_mesher.h"
+#include "engine/streaming/streamer.h"
 
 #include <windows.h>
 #include <d3d12.h>
-#include <dxgi1_4.h>
+#include <dxgi1_6.h>
 #include <wrl/client.h>
 
 #include <string>
@@ -27,6 +28,11 @@ using Microsoft::WRL::ComPtr;
 // because getting allocator recycling wrong is invisible until it is not.
 static const UINT kFrameCount = 2;
 
+// The design's cap on remeshing per frame. Without it, flying into an unloaded
+// region meshes everything at once and the frame that does it is the one the
+// player notices.
+static const UINT kMeshBudgetPerFrame = 8;
+
 struct ViewConstants {
     float cam_pos[3];    float time;
     float cam_fwd[3];    float aspect;
@@ -34,62 +40,70 @@ struct ViewConstants {
     float cam_up[3];     float pad0;
 };
 
-// What the frame draws. Both render the same field from the same camera; the
-// only intended difference is that one marches it and the other draws the
-// triangles the mesher built from it. Any other difference is a meshing bug,
-// which is the entire reason the raymarch survives into B2 instead of being
-// deleted once there is a mesh.
+// What the frame draws. Raymarch and Mesh render the same field from the same
+// camera; the only intended difference is that one marches it and the other
+// draws triangles built from it. Any other difference is a meshing bug, which
+// is why the raymarch survives rather than being deleted once there is a mesh.
+// The raymarch is not streamed -- it is the whole field, always.
 enum class Mode { Raymarch, Mesh, Overlay };
+
+struct FrameStats {
+    size_t resident = 0, pending = 0, free_slots = 0;
+    UINT   vertices = 0, indices = 0, overflowed = 0;
+    UINT   meshed_this_frame = 0;
+    double mesh_ms = 0.0;
+};
 
 class Renderer {
 public:
     // Returns false and fills `error` rather than throwing: the caller puts it
     // in a message box, which is the only diagnostic a windowed app has before
     // there is anything on screen.
-    bool init(HWND hwnd, std::string& error);
+    // debug_layer turns on D3D12 validation regardless of build config and
+    // makes drain_debug_messages useful. Validation is the only way to see a
+    // state or binding mistake: the symptom otherwise is an empty screen.
+    bool init(HWND hwnd, std::string& error, bool debug_layer = false);
+
+    // Writes every validation message produced so far to a file.
+    void drain_debug_messages(const char* path);
+    void dump_draw_args(const char* path);
     void render(const ViewConstants& view);
-
-    void set_mode(Mode m) { mode_ = m; }
-    Mode mode() const { return mode_; }
-
-    // Meshes the one chunk B2 is about and reports what it cost. Runs once:
-    // the trivial field does not change, and remeshing a static chunk every
-    // frame would measure the wrong thing.
-    bool mesh_chunk(std::string& error);
-    // Max and mean |density| at the meshed vertices, in metres. A vertex that
-    // sits on the isosurface reads zero; surface nets averages edge crossings
-    // rather than solving for the surface, so a small residual is expected and
-    // a large one means the mesh is not the field's surface.
-    bool check_against_field(float& max_err, float& mean_err, UINT& checked);
-
-    UINT   mesh_vertices() const { return mesh_vertices_; }
-    UINT   mesh_indices()  const { return mesh_indices_; }
-    double mesh_ms()       const { return mesh_ms_; }
-
-    // Render one frame and write the back buffer to a 24-bit BMP, without
-    // presenting or needing the window to be visible. Reads the render target
-    // itself rather than the desktop, so it captures what this program drew
-    // and nothing else.
     bool capture(const ViewConstants& view, const char* path, std::string& error);
     void resize(UINT width, UINT height);
     void shutdown();
 
-    // Recompiles the shader from disk. Keeping this reachable from B1 means
-    // the shader edit loop never has to be rebuilt later, and B2's kernel work
-    // is mostly shader editing.
+    // Recompiles every shader from disk. The whole of Track B's remaining work
+    // is shader editing, so this stays reachable.
     bool reload_shaders(std::string& error);
 
+    // Off for benchmarking: with vsync on, every measurement reads 60 and
+    // says nothing about how much headroom there is.
+    void set_vsync(bool on) { vsync_ = on; }
+    bool tearing_available() const { return tearing_ok_; }
+    void set_mode(Mode m) { mode_ = m; }
+    Mode mode() const { return mode_; }
+
+    const FrameStats& stats() const { return stats_; }
+
+    // Max and mean |density| at the vertices of slot 0, in metres. A vertex on
+    // the isosurface reads zero; surface nets averages edge crossings rather
+    // than solving for the surface, so a small residual is expected and a
+    // large one means the mesh is not the field's surface.
+    bool check_against_field(float& max_err, float& mean_err, UINT& checked);
+
 private:
-    bool create_device(std::string& error);
+    bool create_device(std::string& error, bool debug_layer);
     bool create_swapchain(HWND hwnd, std::string& error);
     bool create_rtvs(std::string& error);
+    bool create_depth(std::string& error);
     bool create_pipeline(std::string& error);
     bool create_mesh_pipeline(std::string& error);
-    bool create_depth(std::string& error);
+    void record_frame(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HANDLE rtv);
     void record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HANDLE rtv);
     void wait_for_gpu();
     void next_frame();
 
+    ComPtr<ID3D12InfoQueue>           info_queue_;
     ComPtr<IDXGIFactory4>             factory_;
     ComPtr<ID3D12Device>              device_;
     ComPtr<ID3D12CommandQueue>        queue_;
@@ -101,17 +115,16 @@ private:
     ComPtr<ID3D12RootSignature>       root_;
     ComPtr<ID3D12PipelineState>       pso_;
 
-    // B2
-    ComPtr<ID3D12DescriptorHeap>  dsv_heap_;
-    ComPtr<ID3D12Resource>        depth_;
-    ComPtr<ID3D12RootSignature>   mesh_root_;
-    ComPtr<ID3D12PipelineState>   mesh_pso_, mesh_wire_pso_;
+    ComPtr<ID3D12DescriptorHeap>   dsv_heap_;
+    ComPtr<ID3D12Resource>         depth_;
+    ComPtr<ID3D12RootSignature>    mesh_root_;
+    ComPtr<ID3D12PipelineState>    mesh_pso_, mesh_wire_pso_;
     ComPtr<ID3D12CommandSignature> cmd_sig_;
+
     ChunkMesher mesher_;
-    Mode   mode_ = Mode::Raymarch;
-    UINT   mesh_vertices_ = 0, mesh_indices_ = 0;
-    double mesh_ms_ = 0.0;
-    bool   meshed_ = false;
+    Streamer    streamer_;
+    FrameStats  stats_;
+    Mode        mode_ = Mode::Mesh;
 
     ComPtr<ID3D12Fence> fence_;
     HANDLE              fence_event_ = nullptr;
@@ -121,6 +134,8 @@ private:
     UINT rtv_stride_ = 0;
     UINT width_ = 0, height_ = 0;
     bool ready_ = false;
+    bool vsync_ = true;
+    bool tearing_ok_ = false;
 };
 
 }  // namespace engine

@@ -62,17 +62,37 @@ void uav_barrier(ID3D12GraphicsCommandList* cmd, ID3D12Resource* a, ID3D12Resour
     if (n) cmd->ResourceBarrier(n, bs);
 }
 
+void transition(ID3D12GraphicsCommandList* cmd, ID3D12Resource* r,
+                D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = from;
+    b.Transition.StateAfter = to;
+    cmd->ResourceBarrier(1, &b);
+}
+
+struct ChunkConstants {
+    float origin[3];
+    float voxel;
+    UINT  slot;
+    UINT  vbase;
+    UINT  ibase;
+    UINT  slot_caps;
+};
+
 }  // namespace
 
 bool ChunkMesher::init(ID3D12Device* device, UINT64 timestamp_freq, std::string& error) {
     timestamp_freq_ = timestamp_freq;
+
     // One root parameter for the chunk constants and six root UAVs. No
-    // descriptor heap: root descriptors are enough for plain buffers, and a
-    // heap is machinery B3 can introduce when there is something to index.
+    // descriptor heap: root descriptors are enough for plain buffers.
     D3D12_ROOT_PARAMETER params[7] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
-    params[0].Constants.Num32BitValues = 4;      // origin.xyz, voxel
+    params[0].Constants.Num32BitValues = sizeof(ChunkConstants) / 4;
     for (UINT i = 0; i < 6; ++i) {
         params[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
         params[1 + i].Descriptor.ShaderRegister = i;
@@ -95,19 +115,29 @@ bool ChunkMesher::init(ID3D12Device* device, UINT64 timestamp_freq, std::string&
     if (FAILED(hr)) { error = hr_text("CreateRootSignature (mesher)", hr); return false; }
 
     const D3D12_RESOURCE_STATES ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    // Scratch, one chunk's worth, reused by every chunk. Meshing serialises on
+    // it, which at the measured 0.016 ms a chunk is cheaper than the memory
+    // per-chunk scratch would cost.
     if (!make_buffer(device, UINT64(kChunkCorners) * kChunkCorners * kChunkCorners * 4,
-                     ua, density_, error, "density buffer")) return false;
+                     ua, density_, error, "density scratch")) return false;
     if (!make_buffer(device, UINT64(kChunkCells) * kChunkCells * kChunkCells * 4,
-                     ua, cell_vertex_, error, "cell-vertex buffer")) return false;
-    if (!make_buffer(device, UINT64(kMaxVertices) * sizeof(MeshVertex),
-                     ua, vertices_, error, "vertex buffer")) return false;
-    if (!make_buffer(device, UINT64(kMaxIndices) * 4,
-                     ua, indices_, error, "index buffer")) return false;
-    if (!make_buffer(device, 16, ua, counters_, error, "counter buffer")) return false;
-    if (!make_buffer(device, 32, ua, draw_args_, error, "draw-args buffer")) return false;
-    if (!make_readback(device, 16, stats_readback_, error, "stats readback")) return false;
-    if (!make_readback(device, UINT64(kMaxVertices) * sizeof(MeshVertex),
+                     ua, cell_vertex_, error, "cell-vertex scratch")) return false;
+
+    if (!make_buffer(device, UINT64(kSlots) * kSlotVertices * sizeof(MeshVertex),
+                     ua, vertices_, error, "vertex pool")) return false;
+    if (!make_buffer(device, UINT64(kSlots) * kSlotIndices * 4,
+                     ua, indices_, error, "index pool")) return false;
+    if (!make_buffer(device, UINT64(kSlots) * 2 * 4, ua, counters_, error,
+                     "counter buffer")) return false;
+    if (!make_buffer(device, UINT64(kSlots) * 5 * 4, ua, draw_args_, error,
+                     "draw-args buffer")) return false;
+
+    if (!make_readback(device, UINT64(kSlots) * 2 * 4, counter_readback_, error,
+                       "counter readback")) return false;
+    if (!make_readback(device, UINT64(kSlotVertices) * sizeof(MeshVertex),
                        vertex_readback_, error, "vertex readback")) return false;
+    if (!make_readback(device, UINT64(kSlots) * 5 * 4, args_readback_, error,
+                       "args readback")) return false;
 
     D3D12_QUERY_HEAP_DESC qh = {};
     qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
@@ -120,62 +150,73 @@ bool ChunkMesher::init(ID3D12Device* device, UINT64 timestamp_freq, std::string&
 }
 
 bool ChunkMesher::reload_shaders(ID3D12Device* device, std::string& error) {
-    struct Build {
-        const char* entry;
-        ComPtr<ID3D12PipelineState> pso;
-    } builds[] = {
-        {"cs_clear",    {}},
-        {"cs_density",  {}},
-        {"cs_vertices", {}},
-        {"cs_quads",    {}},
-        {"cs_args",     {}},
-    };
-
-    ComPtr<ID3D12PipelineState> clear_pso;
-    for (int i = 0; i < 5; ++i) {
+    const char* entries[6] = {"cs_clear", "cs_density", "cs_vertices",
+                              "cs_quads", "cs_args", "cs_retire"};
+    ComPtr<ID3D12PipelineState> built[6];
+    for (int i = 0; i < 6; ++i) {
         ComPtr<ID3DBlob> blob;
-        if (!compile_shader(kKernelPath, builds[i].entry, "cs_5_1", blob, error)) return false;
+        if (!compile_shader(kKernelPath, entries[i], "cs_5_1", blob, error)) return false;
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
         pd.pRootSignature = root_.Get();
         pd.CS.pShaderBytecode = blob->GetBufferPointer();
         pd.CS.BytecodeLength = blob->GetBufferSize();
-        const HRESULT hr = device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&builds[i].pso));
+        const HRESULT hr = device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&built[i]));
         if (FAILED(hr)) {
             error = hr_text("CreateComputePipelineState", hr);
-            error += std::string(" for ") + builds[i].entry;
+            error += std::string(" for ") + entries[i];
             return false;
         }
     }
     // Swapped in only once every kernel compiled, so a bad edit leaves the
-    // previous set intact.
-    pso_clear_    = builds[0].pso;
-    pso_density_  = builds[1].pso;
-    pso_vertices_ = builds[2].pso;
-    pso_quads_    = builds[3].pso;
-    pso_args_     = builds[4].pso;
+    // previous set intact rather than taking the window down.
+    pso_clear_    = built[0];
+    pso_density_  = built[1];
+    pso_vertices_ = built[2];
+    pso_quads_    = built[3];
+    pso_args_     = built[4];
+    pso_retire_   = built[5];
     return true;
 }
 
-void ChunkMesher::record(ID3D12GraphicsCommandList* cmd, const float origin[3], float voxel) {
-    cmd->SetComputeRootSignature(root_.Get());
-    float consts[4] = {origin[0], origin[1], origin[2], voxel};
-    cmd->SetComputeRoot32BitConstants(0, 4, consts, 0);
-    cmd->SetComputeRootUnorderedAccessView(1, density_->GetGPUVirtualAddress());
-    cmd->SetComputeRootUnorderedAccessView(2, cell_vertex_->GetGPUVirtualAddress());
-    cmd->SetComputeRootUnorderedAccessView(3, vertices_->GetGPUVirtualAddress());
-    cmd->SetComputeRootUnorderedAccessView(4, indices_->GetGPUVirtualAddress());
-    cmd->SetComputeRootUnorderedAccessView(5, counters_->GetGPUVirtualAddress());
-    cmd->SetComputeRootUnorderedAccessView(6, draw_args_->GetGPUVirtualAddress());
+namespace {
+void bind_pool(ID3D12GraphicsCommandList* cmd, ID3D12RootSignature* root,
+               const ChunkConstants& c,
+               ID3D12Resource* density, ID3D12Resource* cell_vertex,
+               ID3D12Resource* vertices, ID3D12Resource* indices,
+               ID3D12Resource* counters, ID3D12Resource* args) {
+    cmd->SetComputeRootSignature(root);
+    cmd->SetComputeRoot32BitConstants(0, sizeof(ChunkConstants) / 4, &c, 0);
+    cmd->SetComputeRootUnorderedAccessView(1, density->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(2, cell_vertex->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(3, vertices->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(4, indices->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(5, counters->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(6, args->GetGPUVirtualAddress());
+}
+}  // namespace
 
-    cmd->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+void ChunkMesher::record_mesh(ID3D12GraphicsCommandList* cmd, UINT slot,
+                              const float origin[3], float voxel) {
+    ChunkConstants c = {};
+    c.origin[0] = origin[0];
+    c.origin[1] = origin[1];
+    c.origin[2] = origin[2];
+    c.voxel = voxel;
+    c.slot = slot;
+    c.vbase = slot * kSlotVertices;
+    c.ibase = slot * kSlotIndices;
+    c.slot_caps = (kSlotVertices & 0xFFFFu) | ((kSlotIndices & 0xFFFFu) << 16);
+
+    bind_pool(cmd, root_.Get(), c, density_.Get(), cell_vertex_.Get(),
+              vertices_.Get(), indices_.Get(), counters_.Get(), draw_args_.Get());
 
     cmd->SetPipelineState(pso_clear_.Get());
     cmd->Dispatch(1, 1, 1);
     uav_barrier(cmd, counters_.Get(), nullptr);
 
     // 33 corners over 4-wide groups is 9 groups with a tail; the kernel bounds
-    // checks rather than padding the buffer, because the odd corner count is
-    // the design's and will not change.
+    // checks rather than padding, because the odd corner count is the design's
+    // and will not change.
     const UINT cg = (kChunkCorners + 3) / 4;
     cmd->SetPipelineState(pso_density_.Get());
     cmd->Dispatch(cg, cg, cg);
@@ -194,90 +235,107 @@ void ChunkMesher::record(ID3D12GraphicsCommandList* cmd, const float origin[3], 
     cmd->SetPipelineState(pso_args_.Get());
     cmd->Dispatch(1, 1, 1);
     uav_barrier(cmd, draw_args_.Get(), nullptr);
-
-    cmd->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
 }
 
-void ChunkMesher::record_transition_to_draw(ID3D12GraphicsCommandList* cmd) {
-    D3D12_RESOURCE_BARRIER b[3] = {};
-    for (int i = 0; i < 3; ++i) {
-        b[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        b[i].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    }
+void ChunkMesher::record_retire(ID3D12GraphicsCommandList* cmd, UINT slot) {
+    ChunkConstants c = {};
+    c.slot = slot;
+    bind_pool(cmd, root_.Get(), c, density_.Get(), cell_vertex_.Get(),
+              vertices_.Get(), indices_.Get(), counters_.Get(), draw_args_.Get());
+    cmd->SetPipelineState(pso_retire_.Get());
+    cmd->Dispatch(1, 1, 1);
+    uav_barrier(cmd, draw_args_.Get(), nullptr);
+}
+
+void ChunkMesher::record_to_draw(ID3D12GraphicsCommandList* cmd) {
+    const D3D12_RESOURCE_STATES ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     // Vertices are read through a root SRV in the vertex shader rather than
-    // bound as a vertex buffer: SV_VertexID already resolves through the index
-    // buffer, so there is no input layout to keep in sync with a struct.
-    b[0].Transition.pResource = vertices_.Get();
-    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    b[1].Transition.pResource = indices_.Get();
-    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_INDEX_BUFFER;
-    b[2].Transition.pResource = draw_args_.Get();
-    b[2].Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
-    cmd->ResourceBarrier(3, b);
+    // bound as a vertex buffer: with an index buffer bound, SV_VertexID is
+    // already the resolved vertex, so there is no input layout to keep in sync.
+    transition(cmd, vertices_.Get(), ua, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(cmd, indices_.Get(), ua, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+    transition(cmd, draw_args_.Get(), ua, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
 }
 
-void ChunkMesher::record_readback(ID3D12GraphicsCommandList* cmd) {
-    D3D12_RESOURCE_BARRIER b = {};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = counters_.Get();
-    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    cmd->ResourceBarrier(1, &b);
-    cmd->CopyBufferRegion(stats_readback_.Get(), 0, counters_.Get(), 0, 16);
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    cmd->ResourceBarrier(1, &b);
-
-    // The vertices too, while they are still in UNORDERED_ACCESS and before
-    // record_transition_to_draw hands them to the vertex shader.
-    D3D12_RESOURCE_BARRIER vb = {};
-    vb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    vb.Transition.pResource = vertices_.Get();
-    vb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    vb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    vb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    cmd->ResourceBarrier(1, &vb);
-    cmd->CopyBufferRegion(vertex_readback_.Get(), 0, vertices_.Get(), 0,
-                          UINT64(kMaxVertices) * sizeof(MeshVertex));
-    vb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    vb.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    cmd->ResourceBarrier(1, &vb);
-
-    cmd->ResolveQueryData(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2,
-                          timestamp_readback_.Get(), 0);
+void ChunkMesher::record_to_compute(ID3D12GraphicsCommandList* cmd) {
+    const D3D12_RESOURCE_STATES ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    transition(cmd, vertices_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, ua);
+    transition(cmd, indices_.Get(), D3D12_RESOURCE_STATE_INDEX_BUFFER, ua);
+    transition(cmd, draw_args_.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, ua);
 }
 
-bool ChunkMesher::read_stats(ID3D12Device*, UINT& verts, UINT& inds, double& ms) {
-    verts = 0; inds = 0; ms = 0.0;
+void ChunkMesher::record_counter_copy(ID3D12GraphicsCommandList* cmd) {
+    transition(cmd, counters_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmd->CopyBufferRegion(counter_readback_.Get(), 0, counters_.Get(), 0,
+                          UINT64(kSlots) * 2 * 4);
+    transition(cmd, counters_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    void* p = nullptr;
-    D3D12_RANGE r = {0, 16};
-    if (FAILED(stats_readback_->Map(0, &r, &p))) return false;
-    const UINT* c = static_cast<const UINT*>(p);
-    verts = c[0];
-    inds = c[1];
-    D3D12_RANGE none = {0, 0};
-    stats_readback_->Unmap(0, &none);
-
-    if (timestamp_freq_ != 0) {
-        D3D12_RANGE tr = {0, 16};
-        if (SUCCEEDED(timestamp_readback_->Map(0, &tr, &p))) {
-            const UINT64* t = static_cast<const UINT64*>(p);
-            if (t[1] > t[0]) {
-                ms = 1000.0 * double(t[1] - t[0]) / double(timestamp_freq_);
-            }
-            timestamp_readback_->Unmap(0, &none);
-        }
-    }
-    return true;
+    transition(cmd, draw_args_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmd->CopyBufferRegion(args_readback_.Get(), 0, draw_args_.Get(), 0,
+                          UINT64(kSlots) * 5 * 4);
+    transition(cmd, draw_args_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 }
 
-bool ChunkMesher::read_vertices(UINT count, std::vector<MeshVertex>& out) {
+void ChunkMesher::read_draw_args(UINT first, UINT count, std::vector<UINT>& out) {
     out.clear();
+    void* p = nullptr;
+    D3D12_RANGE r = {0, SIZE_T(kSlots) * 5 * 4};
+    if (FAILED(args_readback_->Map(0, &r, &p))) return;
+    const UINT* a = static_cast<const UINT*>(p);
+    for (UINT s = first; s < first + count && s < kSlots; ++s) {
+        for (int k = 0; k < 5; ++k) out.push_back(a[s * 5 + k]);
+    }
+    D3D12_RANGE none = {0, 0};
+    args_readback_->Unmap(0, &none);
+}
+
+void ChunkMesher::read_counts(UINT& verts, UINT& inds, UINT& overflowed) {
+    verts = 0; inds = 0; overflowed = 0;
+    void* p = nullptr;
+    D3D12_RANGE r = {0, SIZE_T(kSlots) * 2 * 4};
+    if (FAILED(counter_readback_->Map(0, &r, &p))) return;
+    const UINT* c = static_cast<const UINT*>(p);
+    for (UINT s = 0; s < kSlots; ++s) {
+        const UINT v = c[s * 2 + 0], i = c[s * 2 + 1];
+        // The kernel keeps incrementing past the cap and drops the write, so a
+        // counter above the cap is exactly the overflow signal.
+        if (v > kSlotVertices || i > kSlotIndices) ++overflowed;
+        verts += v < kSlotVertices ? v : kSlotVertices;
+        inds += i < kSlotIndices ? i : kSlotIndices;
+    }
+    D3D12_RANGE none = {0, 0};
+    counter_readback_->Unmap(0, &none);
+}
+
+UINT ChunkMesher::slot_vertex_count(UINT slot) {
+    if (slot >= kSlots) return 0;
+    void* p = nullptr;
+    D3D12_RANGE r = {0, SIZE_T(kSlots) * 2 * 4};
+    if (FAILED(counter_readback_->Map(0, &r, &p))) return 0;
+    const UINT n = static_cast<const UINT*>(p)[slot * 2];
+    D3D12_RANGE none = {0, 0};
+    counter_readback_->Unmap(0, &none);
+    return n < kSlotVertices ? n : kSlotVertices;
+}
+
+void ChunkMesher::record_vertex_copy(ID3D12GraphicsCommandList* cmd) {
+    transition(cmd, vertices_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmd->CopyBufferRegion(vertex_readback_.Get(), 0, vertices_.Get(), 0,
+                          UINT64(kSlotVertices) * sizeof(MeshVertex));
+    transition(cmd, vertices_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+bool ChunkMesher::read_vertices(UINT slot, UINT count, std::vector<MeshVertex>& out) {
+    out.clear();
+    if (slot != 0) return false;   // only slot 0 is copied back
     if (count == 0) return true;
-    if (count > kMaxVertices) count = kMaxVertices;
+    if (count > kSlotVertices) count = kSlotVertices;
     void* p = nullptr;
     D3D12_RANGE r = {0, SIZE_T(count) * sizeof(MeshVertex)};
     if (FAILED(vertex_readback_->Map(0, &r, &p))) return false;
@@ -286,6 +344,26 @@ bool ChunkMesher::read_vertices(UINT count, std::vector<MeshVertex>& out) {
     D3D12_RANGE none = {0, 0};
     vertex_readback_->Unmap(0, &none);
     return true;
+}
+
+void ChunkMesher::record_timestamp(ID3D12GraphicsCommandList* cmd, UINT which) {
+    cmd->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, which);
+}
+
+void ChunkMesher::resolve_timestamps(ID3D12GraphicsCommandList* cmd) {
+    cmd->ResolveQueryData(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2,
+                          timestamp_readback_.Get(), 0);
+}
+
+void ChunkMesher::read_timestamps() {
+    if (timestamp_freq_ == 0) return;
+    void* p = nullptr;
+    D3D12_RANGE r = {0, 16};
+    if (FAILED(timestamp_readback_->Map(0, &r, &p))) return;
+    const UINT64* t = static_cast<const UINT64*>(p);
+    if (t[1] > t[0]) last_mesh_ms_ = 1000.0 * double(t[1] - t[0]) / double(timestamp_freq_);
+    D3D12_RANGE none = {0, 0};
+    timestamp_readback_->Unmap(0, &none);
 }
 
 }  // namespace engine

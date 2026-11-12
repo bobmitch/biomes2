@@ -37,6 +37,28 @@ WG_FN float trivial_height(float x, float z) {
          + 3.0f * sin(x * 0.21f + z * 0.17f);
 }
 
+// The band of heights any surface can occupy, conservatively. Streaming needs
+// this: without it, residency has to consider every chunk through the full
+// +/-512 m vertical extent and mesh each one to discover it is empty, which at
+// LOD 0 is sixty-four chunks per column instead of two.
+//
+// M1 INHERITS THIS REQUIREMENT. The real generator must be able to bound its
+// own output over a region -- cheaply and conservatively -- or streaming it
+// costs a full 33^3 field evaluation per empty chunk. A global bound like this
+// one is the weakest version that works; a per-column bound from the layer-0
+// mask and the biome amplitudes would prune far harder.
+// C++ only, deliberately. It is a host-side streaming question -- which chunks
+// are worth meshing -- and nothing in the kernel asks it. Keeping it out of
+// the dialect also avoids inventing an `out` parameter convention that C++ and
+// HLSL spell differently, for one function that does not need to be shared.
+#ifdef __cplusplus
+inline void trivial_band(float& lo, float& hi) {
+    // Ground is 9 + 3 either side of zero; the sphere reaches y = 26 + 13.
+    lo = -13.0f;
+    hi = 40.0f;
+}
+#endif
+
 // density > 0 is rock, < 0 is air, and the sign change is the surface -- the
 // same convention layer 6 uses, so surface nets does not care which field it
 // is fed.

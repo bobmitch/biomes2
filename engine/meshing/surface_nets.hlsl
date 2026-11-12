@@ -1,5 +1,6 @@
 // ---------------------------------------------------------------------------
-// B2: GPU surface nets over one chunk.
+// GPU surface nets. B2 meshed one chunk; B3 meshes many into slots of a shared
+// pool, so the whole resident world is one ExecuteIndirect.
 //
 // Hand-written per backend, and deliberately NOT in the ADR-001 dialect --
 // that ADR excludes kernel code by name, because workgroup memory, atomics and
@@ -12,22 +13,31 @@
 // every sign-changing edge joining the four cells around it. Dual contouring's
 // QEF solve gives sharper creases and needs the Hermite data and a 3x3 solve
 // per cell; the design document's terrain is noise, which has no creases to
-// preserve, so the solve would cost without buying anything. If hard-edged
-// player edits ever need it, this is where it goes.
+// preserve, so the solve would cost without buying anything.
 // ---------------------------------------------------------------------------
 
 #include "engine/field/trivial_field.h"
 
-// 32 voxels at 0.5 m is the design's 16 m chunk; 33 corners is its 35,937
-// field samples per chunk. Fixed here rather than passed: changing them is a
-// change to the streaming design, not a runtime parameter. LOD changes the
-// voxel size, not the counts.
-static const uint kCells   = 32;
-static const uint kCorners = 33;
+// A chunk OWNS 32 cells; neighbouring chunk origins are 32 voxels apart. It
+// MESHES 33, one ghost layer on the high side, because the quad joining its
+// last cell to the neighbour's first belongs to neither chunk and leaves a
+// one-cell crack otherwise. The ghost vertices duplicate the neighbour's, at
+// the same positions from the same field, so the surfaces meet exactly.
+//
+// LOD changes the voxel SIZE, never these counts -- a coarser level is the
+// same 32 cells over more metres, which is what lets one kernel serve every
+// level.
+static const uint kOwnedCells = 32;
+static const uint kCells      = 33;   // owned + one ghost layer
+static const uint kCorners    = 34;
 
 cbuffer ChunkConstants : register(b0) {
     float3 chunk_origin;   // world position of corner (0,0,0)
-    float  voxel;          // metres per voxel
+    float  voxel;          // metres per voxel at this LOD
+    uint   slot;           // which slot of the pool this chunk owns
+    uint   vbase;          // first vertex of the slot
+    uint   ibase;          // first index of the slot
+    uint   slot_caps;      // vertex cap in the low 16 bits, index cap in the high
 };
 
 struct Vertex {
@@ -35,15 +45,15 @@ struct Vertex {
     float3 nrm;
 };
 
-RWStructuredBuffer<float>  g_density     : register(u0);   // kCorners^3
-RWStructuredBuffer<uint>   g_cell_vertex : register(u1);   // kCells^3, 0xFFFFFFFF = none
-RWStructuredBuffer<Vertex> g_vertices    : register(u2);
-RWStructuredBuffer<uint>   g_indices     : register(u3);
-RWStructuredBuffer<uint>   g_counters    : register(u4);   // [0] vertices, [1] indices
-RWStructuredBuffer<uint>   g_draw_args   : register(u5);   // DrawIndexedInstanced
+RWStructuredBuffer<float>  g_density     : register(u0);   // scratch, kCorners^3
+RWStructuredBuffer<uint>   g_cell_vertex : register(u1);   // scratch, kCells^3
+RWStructuredBuffer<Vertex> g_vertices    : register(u2);   // pool
+RWStructuredBuffer<uint>   g_indices     : register(u3);   // pool
+RWStructuredBuffer<uint>   g_counters    : register(u4);   // 2 per slot
+RWStructuredBuffer<uint>   g_draw_args   : register(u5);   // 5 per slot
 
-static const uint kMaxVertices = 40000;
-static const uint kMaxIndices  = 600000;
+uint vertex_cap() { return slot_caps & 0xFFFFu; }
+uint index_cap()  { return (slot_caps >> 16) & 0xFFFFu; }
 
 uint corner_index(uint3 c) { return (c.z * kCorners + c.y) * kCorners + c.x; }
 uint cell_index(uint3 c)   { return (c.z * kCells   + c.y) * kCells   + c.x; }
@@ -53,7 +63,7 @@ float3 corner_world(uint3 c) {
 }
 
 // ---------------------------------------------------------------------------
-// Pass 0 -- zero the append counters.
+// Pass 0 -- zero this slot's append counters.
 //
 // A kernel rather than ClearUnorderedAccessViewUint, which needs the UAV in
 // both a shader-visible and a non-shader-visible descriptor heap. Two heaps
@@ -61,8 +71,15 @@ float3 corner_world(uint3 c) {
 // ---------------------------------------------------------------------------
 [numthreads(1, 1, 1)]
 void cs_clear(uint3 id : SV_DispatchThreadID) {
-    g_counters[0] = 0;
-    g_counters[1] = 0;
+    g_counters[slot * 2u + 0u] = 0;
+    g_counters[slot * 2u + 1u] = 0;
+}
+
+// Retire a slot: an all-zero draw is skipped by the command processor, so an
+// evicted chunk costs nothing but its place in the indirect argument array.
+[numthreads(1, 1, 1)]
+void cs_retire(uint3 id : SV_DispatchThreadID) {
+    for (uint i = 0; i < 5u; ++i) g_draw_args[slot * 5u + i] = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +116,7 @@ uint3 unit_axis(uint a) {
 // the gradient points into the solid. B1 learned this the visible way, by
 // lighting the overhang on its underside. Taken from the analytic field rather
 // than from the sampled grid so the mesh's shading matches the raymarch it is
-// being checked against.
+// checked against.
 float3 field_normal(float3 p) {
     const float e = 0.5f * voxel;
     const float dx = trivial_density(p.x + e, p.y, p.z) - trivial_density(p.x - e, p.y, p.z);
@@ -148,15 +165,17 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
     const float3 local = sum / float(n);
     const float3 world = chunk_origin + (float3(id) + local) * voxel;
 
-    uint slot;
-    InterlockedAdd(g_counters[0], 1u, slot);
-    if (slot >= kMaxVertices) return;   // buffer full; pass 3 drops the quads
+    uint local_slot;
+    InterlockedAdd(g_counters[slot * 2u + 0u], 1u, local_slot);
+    if (local_slot >= vertex_cap()) return;   // slot full; pass 3 drops the quads
 
     Vertex v;
     v.pos = world;
     v.nrm = field_normal(world);
-    g_vertices[slot] = v;
-    g_cell_vertex[ci] = slot;
+    g_vertices[vbase + local_slot] = v;
+    // Slot-relative, so the draw's BaseVertexLocation does the rebasing and an
+    // index never has to be rewritten when a chunk moves slot.
+    g_cell_vertex[ci] = local_slot;
 }
 
 // ---------------------------------------------------------------------------
@@ -166,8 +185,8 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
 void cs_quads(uint3 id : SV_DispatchThreadID) {
     if (any(id >= kCells)) return;
     // An edge's four cells are at -1 in the two axes it does not run along, so
-    // the lower faces of the chunk have no quads. That is the chunk seam, and
-    // it is B3's problem (skirts), not a bug here.
+    // the chunk's low faces still have no quads -- those belong to the
+    // neighbour, which reaches them with its own ghost layer.
     if (any(id < 1u)) return;
 
     const float d0 = g_density[corner_index(id)];
@@ -196,8 +215,8 @@ void cs_quads(uint3 id : SV_DispatchThreadID) {
             c11 == 0xFFFFFFFFu || c01 == 0xFFFFFFFFu) continue;
 
         uint base;
-        InterlockedAdd(g_counters[1], 6u, base);
-        if (base + 6u > kMaxIndices) return;
+        InterlockedAdd(g_counters[slot * 2u + 1u], 6u, base);
+        if (base + 6u > index_cap()) return;
 
         // Wind so the front face is the one on the air side. Which end of the
         // edge is solid decides that, so the two cases are mirrored.
@@ -210,28 +229,47 @@ void cs_quads(uint3 id : SV_DispatchThreadID) {
         // rendering the same chunk with CULL_NONE and with CULL_BACK and
         // comparing the covered pixel count -- equal means every triangle
         // faces the camera, and anything less means some are inverted.
+        // ABSOLUTE indices into the pool, not slot-relative.
+        //
+        // The tidy version of this stores slot-relative indices and lets the
+        // draw's BaseVertexLocation rebase them. That relies on SV_VertexID
+        // including BaseVertexLocation, which is a property of the input
+        // assembler's vertex fetch -- and this shader has no input layout, it
+        // reads a StructuredBuffer by SV_VertexID. Every chunk then read slot
+        // 0's range, which is empty, so 662,000 triangles collapsed to the
+        // origin and the screen was blank while every counter looked right.
+        //
+        // Adding vbase here costs nothing and depends on no convention. The
+        // only consequence is that indices are tied to the slot they were
+        // meshed into, which is already true: a chunk is remeshed whenever it
+        // becomes resident.
+        const uint o = ibase + base;
+        const uint v00 = vbase + c00, v10 = vbase + c10;
+        const uint v11 = vbase + c11, v01 = vbase + c01;
         if (s0) {
-            g_indices[base + 0] = c00; g_indices[base + 1] = c11; g_indices[base + 2] = c10;
-            g_indices[base + 3] = c00; g_indices[base + 4] = c01; g_indices[base + 5] = c11;
+            g_indices[o + 0] = v00; g_indices[o + 1] = v11; g_indices[o + 2] = v10;
+            g_indices[o + 3] = v00; g_indices[o + 4] = v01; g_indices[o + 5] = v11;
         } else {
-            g_indices[base + 0] = c00; g_indices[base + 1] = c10; g_indices[base + 2] = c11;
-            g_indices[base + 3] = c00; g_indices[base + 4] = c11; g_indices[base + 5] = c01;
+            g_indices[o + 0] = v00; g_indices[o + 1] = v10; g_indices[o + 2] = v11;
+            g_indices[o + 3] = v00; g_indices[o + 4] = v11; g_indices[o + 5] = v01;
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Pass 4 -- publish the counts as indirect draw arguments.
+// Pass 4 -- publish this slot's counts as indirect draw arguments.
 //
-// One thread. This exists so the CPU never has to read the counter back to
-// know how much to draw: a readback here would stall the frame, and the
-// design's whole streaming story is built on not doing that.
+// One thread. This exists so the CPU never has to read a counter back to know
+// how much to draw: a readback here would stall the frame, and the design's
+// whole streaming story is built on not doing that. With one argument entry
+// per slot, the entire resident world is a single ExecuteIndirect.
 // ---------------------------------------------------------------------------
 [numthreads(1, 1, 1)]
 void cs_args(uint3 id : SV_DispatchThreadID) {
-    g_draw_args[0] = min(g_counters[1], kMaxIndices);   // IndexCountPerInstance
-    g_draw_args[1] = 1;                                 // InstanceCount
-    g_draw_args[2] = 0;                                 // StartIndexLocation
-    g_draw_args[3] = 0;                                 // BaseVertexLocation
-    g_draw_args[4] = 0;                                 // StartInstanceLocation
+    const uint n = min(g_counters[slot * 2u + 1u], index_cap());
+    g_draw_args[slot * 5u + 0u] = n;       // IndexCountPerInstance
+    g_draw_args[slot * 5u + 1u] = 1;       // InstanceCount
+    g_draw_args[slot * 5u + 2u] = ibase;   // StartIndexLocation
+    g_draw_args[slot * 5u + 3u] = 0;       // BaseVertexLocation: indices are absolute
+    g_draw_args[slot * 5u + 4u] = 0;       // StartInstanceLocation
 }

@@ -17,8 +17,8 @@ namespace {
 const char* kShaderPath = "engine/render/shaders/trivial_raymarch.hlsl";
 const char* kMeshShaderPath = "engine/render/shaders/mesh.hlsl";
 
-const float kNearPlane = 0.05f;
-const float kFarPlane  = 600.0f;
+const float kNearPlane = 0.2f;
+const float kFarPlane  = 2400.0f;
 
 struct MeshConstants {
     float view_proj[16];
@@ -27,6 +27,12 @@ struct MeshConstants {
     float wire;
     float pad1[3];
 };
+
+std::string hr_text(const char* what, HRESULT hr) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "%s failed: 0x%08lX", what, static_cast<unsigned long>(hr));
+    return buf;
+}
 
 // Row-vector convention throughout: clip = pos * view * proj, and the matrix
 // is declared row_major in the shader. HLSL packs cbuffer matrices as
@@ -61,18 +67,12 @@ void build_view_proj(const ViewConstants& v, float out[16]) {
     const float w = h / (v.aspect > 0.0f ? v.aspect : 1.0f);
     const float n = kNearPlane, f = kFarPlane;
     const float proj[16] = {
-        w,    0.0f, 0.0f,          0.0f,
-        0.0f, h,    0.0f,          0.0f,
-        0.0f, 0.0f, f / (f - n),   1.0f,
+        w,    0.0f, 0.0f,             0.0f,
+        0.0f, h,    0.0f,             0.0f,
+        0.0f, 0.0f, f / (f - n),      1.0f,
         0.0f, 0.0f, -n * f / (f - n), 0.0f
     };
     mat_mul(view, proj, out);
-}
-
-std::string hr_text(const char* what, HRESULT hr) {
-    char buf[256];
-    std::snprintf(buf, sizeof(buf), "%s failed: 0x%08lX", what, static_cast<unsigned long>(hr));
-    return buf;
 }
 
 // 24-bit BMP, bottom-up. Same container tools/validate writes, for the same
@@ -109,9 +109,11 @@ bool write_bmp(const char* path, int w, int h, const unsigned char* bgr) {
 
 }  // namespace
 
-bool Renderer::create_device(std::string& error) {
+bool Renderer::create_device(std::string& error, bool debug_layer) {
     UINT factory_flags = 0;
-#ifdef _DEBUG
+#ifndef _DEBUG
+    if (debug_layer)
+#endif
     {
         ComPtr<ID3D12Debug> dbg;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
@@ -119,7 +121,6 @@ bool Renderer::create_device(std::string& error) {
             factory_flags |= DXGI_CREATE_FACTORY_DEBUG;
         }
     }
-#endif
     HRESULT hr = CreateDXGIFactory2(factory_flags, IID_PPV_ARGS(&factory_));
     if (FAILED(hr)) { error = hr_text("CreateDXGIFactory2", hr); return false; }
 
@@ -142,9 +143,10 @@ bool Renderer::create_device(std::string& error) {
         return false;
     }
 
+    device_.As(&info_queue_);
+
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    qd.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
     hr = device_->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_));
     if (FAILED(hr)) { error = hr_text("CreateCommandQueue", hr); return false; }
     return true;
@@ -158,6 +160,22 @@ bool Renderer::create_swapchain(HWND hwnd, std::string& error) {
     if (width_ == 0) width_ = 1;
     if (height_ == 0) height_ = 1;
 
+    // Tearing has to be asked for here as well as at present time, and it is
+    // the only way to measure past the refresh rate -- Present(0, 0) on a
+    // flip-model swapchain still waits for the vertical blank. The first
+    // flight measurement read a median of 16.66 ms, which is the refresh
+    // interval to three figures and says nothing about headroom.
+    {
+        ComPtr<IDXGIFactory5> f5;
+        if (SUCCEEDED(factory_.As(&f5))) {
+            BOOL allow = FALSE;
+            if (SUCCEEDED(f5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                                                  &allow, sizeof(allow)))) {
+                tearing_ok_ = allow == TRUE;
+            }
+        }
+    }
+
     DXGI_SWAP_CHAIN_DESC1 sd = {};
     sd.BufferCount = kFrameCount;
     sd.Width = width_;
@@ -166,6 +184,7 @@ bool Renderer::create_swapchain(HWND hwnd, std::string& error) {
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sd.SampleDesc.Count = 1;
+    if (tearing_ok_) sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 
     ComPtr<IDXGISwapChain1> sc1;
     HRESULT hr = factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd, &sd,
@@ -183,7 +202,6 @@ bool Renderer::create_swapchain(HWND hwnd, std::string& error) {
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.NumDescriptors = kFrameCount;
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_));
     if (FAILED(hr)) { error = hr_text("CreateDescriptorHeap", hr); return false; }
     rtv_stride_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -240,6 +258,64 @@ bool Renderer::create_depth(std::string& error) {
     return true;
 }
 
+bool Renderer::create_pipeline(std::string& error) {
+    if (!root_) {
+        D3D12_ROOT_PARAMETER param = {};
+        param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        param.Constants.ShaderRegister = 0;
+        param.Constants.Num32BitValues = sizeof(ViewConstants) / 4;
+
+        D3D12_ROOT_SIGNATURE_DESC rsd = {};
+        rsd.NumParameters = 1;
+        rsd.pParameters = &param;
+        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+        ComPtr<ID3DBlob> sig, sig_err;
+        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1,
+                                                 &sig, &sig_err);
+        if (FAILED(hr)) {
+            error = "root signature: ";
+            error += sig_err ? static_cast<const char*>(sig_err->GetBufferPointer())
+                             : hr_text("D3D12SerializeRootSignature", hr).c_str();
+            return false;
+        }
+        hr = device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                                          IID_PPV_ARGS(&root_));
+        if (FAILED(hr)) { error = hr_text("CreateRootSignature", hr); return false; }
+    }
+
+    ComPtr<ID3DBlob> vs, ps;
+    if (!compile_shader(kShaderPath, "vs_main", "vs_5_1", vs, error)) return false;
+    if (!compile_shader(kShaderPath, "ps_main", "ps_5_1", ps, error)) return false;
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = root_.Get();
+    pd.VS.pShaderBytecode = vs->GetBufferPointer();
+    pd.VS.BytecodeLength  = vs->GetBufferSize();
+    pd.PS.pShaderBytecode = ps->GetBufferPointer();
+    pd.PS.BytecodeLength  = ps->GetBufferSize();
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    for (UINT i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+        pd.BlendState.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    pd.DepthStencilState.DepthEnable = FALSE;
+    pd.SampleMask = UINT_MAX;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    pd.SampleDesc.Count = 1;
+
+    ComPtr<ID3D12PipelineState> pso;
+    const HRESULT hr = device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+    if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState", hr); return false; }
+    pso_ = pso;
+    return true;
+}
+
 bool Renderer::create_mesh_pipeline(std::string& error) {
     if (!mesh_root_) {
         D3D12_ROOT_PARAMETER params[2] = {};
@@ -269,9 +345,9 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
                                           IID_PPV_ARGS(&mesh_root_));
         if (FAILED(hr)) { error = hr_text("CreateRootSignature (mesh)", hr); return false; }
 
-        // The draw count comes from a buffer the kernel wrote, so the CPU
-        // never learns it. No root arguments change per draw, so the signature
-        // needs no root signature of its own.
+        // One indirect argument per slot, so the entire resident world is one
+        // ExecuteIndirect. No root argument changes between slots, so the
+        // signature needs no root signature of its own.
         D3D12_INDIRECT_ARGUMENT_DESC arg = {};
         arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
         D3D12_COMMAND_SIGNATURE_DESC csd = {};
@@ -334,207 +410,18 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
     return true;
 }
 
-// Evaluated here in C++ from the same header the kernel compiles as HLSL.
-// If these two ever disagree beyond tolerance, the dialect has drifted and M1
-// is in trouble -- which is the thing ADR-001 says to check by tolerance and
-// never by hash.
-bool Renderer::check_against_field(float& max_err, float& mean_err, UINT& checked) {
-    max_err = 0.0f;
-    mean_err = 0.0f;
-    checked = 0;
-    std::vector<MeshVertex> verts;
-    if (!mesher_.read_vertices(mesh_vertices_, verts)) return false;
-    double sum = 0.0;
-    for (size_t i = 0; i < verts.size(); ++i) {
-        const float d = trivial_density(verts[i].pos[0], verts[i].pos[1], verts[i].pos[2]);
-        const float a = d < 0.0f ? -d : d;
-        if (a > max_err) max_err = a;
-        sum += a;
-    }
-    checked = static_cast<UINT>(verts.size());
-    if (checked) mean_err = static_cast<float>(sum / checked);
-    return true;
-}
-
-bool Renderer::mesh_chunk(std::string& error) {
-    // One chunk at the origin: 32 voxels of 0.5 m, so [-8, 8] in x and z, and
-    // the trivial field's surface stays inside [-8, 8] in y over that span.
-    const float voxel = 0.5f;
-    const float origin[3] = {-8.0f, -8.0f, -8.0f};
-
-    allocators_[frame_]->Reset();
-    cmd_->Reset(allocators_[frame_].Get(), nullptr);
-    mesher_.record(cmd_.Get(), origin, voxel);
-    mesher_.record_readback(cmd_.Get());
-    mesher_.record_transition_to_draw(cmd_.Get());
-    cmd_->Close();
-    ID3D12CommandList* lists[] = {cmd_.Get()};
-    queue_->ExecuteCommandLists(1, lists);
-    wait_for_gpu();
-
-    if (!mesher_.read_stats(device_.Get(), mesh_vertices_, mesh_indices_, mesh_ms_)) {
-        error = "could not read meshing stats";
-        return false;
-    }
-    meshed_ = true;
-    return true;
-}
-
-bool Renderer::create_pipeline(std::string& error) {
-    // One root parameter: the view constants, inline. No descriptor tables
-    // yet -- B2 adds them when there is a buffer to point at.
-    D3D12_ROOT_PARAMETER param = {};
-    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    param.Constants.ShaderRegister = 0;
-    param.Constants.RegisterSpace = 0;
-    param.Constants.Num32BitValues = sizeof(ViewConstants) / 4;
-
-    D3D12_ROOT_SIGNATURE_DESC rsd = {};
-    rsd.NumParameters = 1;
-    rsd.pParameters = &param;
-    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-
-    ComPtr<ID3DBlob> sig, sig_err;
-    HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1,
-                                             &sig, &sig_err);
-    if (FAILED(hr)) {
-        error = "root signature: ";
-        error += sig_err ? static_cast<const char*>(sig_err->GetBufferPointer())
-                         : hr_text("D3D12SerializeRootSignature", hr).c_str();
-        return false;
-    }
-    hr = device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
-                                      IID_PPV_ARGS(&root_));
-    if (FAILED(hr)) { error = hr_text("CreateRootSignature", hr); return false; }
-
-    return reload_shaders(error);
-}
-
 bool Renderer::reload_shaders(std::string& error) {
-    ComPtr<ID3DBlob> vs, ps;
-    if (!compile_shader(kShaderPath, "vs_main", "vs_5_1", vs, error)) return false;
-    if (!compile_shader(kShaderPath, "ps_main", "ps_5_1", ps, error)) return false;
-
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
-    pd.pRootSignature = root_.Get();
-    pd.VS.pShaderBytecode = vs->GetBufferPointer();
-    pd.VS.BytecodeLength  = vs->GetBufferSize();
-    pd.PS.pShaderBytecode = ps->GetBufferPointer();
-    pd.PS.BytecodeLength  = ps->GetBufferSize();
-
-    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pd.RasterizerState.DepthClipEnable = TRUE;
-
-    for (UINT i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
-        pd.BlendState.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    }
-    pd.DepthStencilState.DepthEnable = FALSE;
-    pd.DepthStencilState.StencilEnable = FALSE;
-    pd.SampleMask = UINT_MAX;
-    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    pd.SampleDesc.Count = 1;
-
-    ComPtr<ID3D12PipelineState> pso;
-    const HRESULT hr = device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
-    if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState", hr); return false; }
-
-    // Only swapped in once the new one exists, so a bad edit leaves the last
-    // good pipeline running instead of taking the window down.
     if (ready_) wait_for_gpu();
-    pso_ = pso;
-
-    if (ready_) {
-        // Reloading the raymarch alone would let the two views drift apart,
-        // and the mesh kernels are the ones being edited at B2.
-        if (!mesher_.reload_shaders(device_.Get(), error)) return false;
-        if (!create_mesh_pipeline(error)) return false;
-        if (!mesh_chunk(error)) return false;
-    }
+    if (!create_pipeline(error)) return false;
+    if (!mesher_.reload_shaders(device_.Get(), error)) return false;
+    if (!create_mesh_pipeline(error)) return false;
+    // Everything resident was built by the old kernel, so start again.
+    streamer_.init();
     return true;
 }
 
-void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HANDLE rtv) {
-    D3D12_VIEWPORT vp = {};
-    vp.Width = static_cast<float>(width_);
-    vp.Height = static_cast<float>(height_);
-    vp.MaxDepth = 1.0f;
-    D3D12_RECT scissor = {0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
-    cmd_->RSSetViewports(1, &vp);
-    cmd_->RSSetScissorRects(1, &scissor);
-
-    const D3D12_CPU_DESCRIPTOR_HANDLE dsv =
-        dsv_heap_->GetCPUDescriptorHandleForHeapStart();
-    cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-    cmd_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-    cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-    if (mode_ == Mode::Overlay && meshed_) {
-        // Raymarch underneath...
-        cmd_->SetPipelineState(pso_.Get());
-        cmd_->SetGraphicsRootSignature(root_.Get());
-        cmd_->SetGraphicsRoot32BitConstants(0, sizeof(ViewConstants) / 4, &view, 0);
-        cmd_->DrawInstanced(3, 1, 0, 0);
-
-        // ...and the mesh's edges on top of it.
-        MeshConstants mc = {};
-        build_view_proj(view, mc.view_proj);
-        mc.cam_pos[0] = view.cam_pos[0];
-        mc.cam_pos[1] = view.cam_pos[1];
-        mc.cam_pos[2] = view.cam_pos[2];
-        mc.far_plane = kFarPlane;
-        mc.wire = 1.0f;
-        cmd_->SetPipelineState(mesh_wire_pso_.Get());
-        cmd_->SetGraphicsRootSignature(mesh_root_.Get());
-        cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
-        cmd_->SetGraphicsRootShaderResourceView(
-            1, mesher_.vertices()->GetGPUVirtualAddress());
-        D3D12_INDEX_BUFFER_VIEW wibv = {};
-        wibv.BufferLocation = mesher_.indices()->GetGPUVirtualAddress();
-        wibv.SizeInBytes = kMaxIndices * 4;
-        wibv.Format = DXGI_FORMAT_R32_UINT;
-        cmd_->IASetIndexBuffer(&wibv);
-        cmd_->ExecuteIndirect(cmd_sig_.Get(), 1, mesher_.draw_args(), 0, nullptr, 0);
-    } else if (mode_ == Mode::Mesh && meshed_) {
-        MeshConstants mc = {};
-        build_view_proj(view, mc.view_proj);
-        mc.cam_pos[0] = view.cam_pos[0];
-        mc.cam_pos[1] = view.cam_pos[1];
-        mc.cam_pos[2] = view.cam_pos[2];
-        mc.far_plane = kFarPlane;
-
-        // The mesh does not cover the screen, so the sky has to be cleared
-        // rather than drawn. Same colour the raymarch's horizon fades to, so
-        // the two images differ only where the geometry does.
-        const float sky[4] = {0.40f, 0.50f, 0.66f, 1.0f};
-        cmd_->ClearRenderTargetView(rtv, sky, 0, nullptr);
-
-        cmd_->SetPipelineState(mesh_pso_.Get());
-        cmd_->SetGraphicsRootSignature(mesh_root_.Get());
-        cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
-        cmd_->SetGraphicsRootShaderResourceView(
-            1, mesher_.vertices()->GetGPUVirtualAddress());
-
-        D3D12_INDEX_BUFFER_VIEW ibv = {};
-        ibv.BufferLocation = mesher_.indices()->GetGPUVirtualAddress();
-        ibv.SizeInBytes = kMaxIndices * 4;
-        ibv.Format = DXGI_FORMAT_R32_UINT;
-        cmd_->IASetIndexBuffer(&ibv);
-
-        cmd_->ExecuteIndirect(cmd_sig_.Get(), 1, mesher_.draw_args(), 0, nullptr, 0);
-    } else {
-        cmd_->SetPipelineState(pso_.Get());
-        cmd_->SetGraphicsRootSignature(root_.Get());
-        cmd_->SetGraphicsRoot32BitConstants(0, sizeof(ViewConstants) / 4, &view, 0);
-        cmd_->DrawInstanced(3, 1, 0, 0);
-    }
-}
-
-bool Renderer::init(HWND hwnd, std::string& error) {
-    if (!create_device(error)) return false;
+bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
+    if (!create_device(error, debug_layer)) return false;
     if (!create_swapchain(hwnd, error)) return false;
     if (!create_rtvs(error)) return false;
 
@@ -563,12 +450,26 @@ bool Renderer::init(HWND hwnd, std::string& error) {
     queue_->GetTimestampFrequency(&tsfreq);
     if (!mesher_.init(device_.Get(), tsfreq, error)) return false;
     if (!create_mesh_pipeline(error)) return false;
+    streamer_.init();
+
+    // Every slot starts retired, so a slot that has never been meshed draws
+    // nothing instead of whatever the allocation happened to contain.
+    allocators_[frame_]->Reset();
+    cmd_->Reset(allocators_[frame_].Get(), nullptr);
+    for (UINT s = 0; s < kSlots; ++s) mesher_.record_retire(cmd_.Get(), s);
+    // Leave the pool in the states a frame BEGINS in. Every frame transitions
+    // draw -> compute -> draw, so if init left the buffers in UNORDERED_ACCESS
+    // the first frame's transition would declare a StateBefore that is not the
+    // state they are in. That is undefined behaviour, and on this driver it
+    // silently produced an empty screen while the counters showed half a
+    // million triangles meshed.
+    mesher_.record_to_draw(cmd_.Get());
+    cmd_->Close();
+    ID3D12CommandList* lists[] = {cmd_.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+    wait_for_gpu();
 
     ready_ = true;
-
-    // Mesh the chunk once, here, so the first frame already has geometry and
-    // the cost is reported before anything is drawn.
-    if (!mesh_chunk(error)) return false;
     return true;
 }
 
@@ -589,9 +490,7 @@ void Renderer::wait_for_gpu() {
 void Renderer::next_frame() {
     const UINT64 current = fence_values_[frame_];
     queue_->Signal(fence_.Get(), current);
-
     frame_ = swapchain_->GetCurrentBackBufferIndex();
-
     if (fence_->GetCompletedValue() < fence_values_[frame_]) {
         fence_->SetEventOnCompletion(fence_values_[frame_], fence_event_);
         WaitForSingleObject(fence_event_, INFINITE);
@@ -606,8 +505,9 @@ void Renderer::resize(UINT width, UINT height) {
     wait_for_gpu();
     for (UINT i = 0; i < kFrameCount; ++i) targets_[i].Reset();
 
-    const HRESULT hr = swapchain_->ResizeBuffers(kFrameCount, width, height,
-                                                 DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+    const HRESULT hr = swapchain_->ResizeBuffers(
+        kFrameCount, width, height, DXGI_FORMAT_R8G8B8A8_UNORM,
+        tearing_ok_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     if (FAILED(hr)) return;
 
     width_ = width;
@@ -619,8 +519,80 @@ void Renderer::resize(UINT width, UINT height) {
     create_depth(ignored);
 }
 
+void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HANDLE rtv) {
+    D3D12_VIEWPORT vp = {};
+    vp.Width = static_cast<float>(width_);
+    vp.Height = static_cast<float>(height_);
+    vp.MaxDepth = 1.0f;
+    D3D12_RECT scissor = {0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+    cmd_->RSSetViewports(1, &vp);
+    cmd_->RSSetScissorRects(1, &scissor);
+
+    const D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+    cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    cmd_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    MeshConstants mc = {};
+    build_view_proj(view, mc.view_proj);
+    mc.cam_pos[0] = view.cam_pos[0];
+    mc.cam_pos[1] = view.cam_pos[1];
+    mc.cam_pos[2] = view.cam_pos[2];
+    mc.far_plane = kFarPlane;
+
+    D3D12_INDEX_BUFFER_VIEW ibv = {};
+    ibv.BufferLocation = mesher_.indices()->GetGPUVirtualAddress();
+    ibv.SizeInBytes = kSlots * kSlotIndices * 4;
+    ibv.Format = DXGI_FORMAT_R32_UINT;
+
+    if (mode_ == Mode::Raymarch || mode_ == Mode::Overlay) {
+        cmd_->SetPipelineState(pso_.Get());
+        cmd_->SetGraphicsRootSignature(root_.Get());
+        cmd_->SetGraphicsRoot32BitConstants(0, sizeof(ViewConstants) / 4, &view, 0);
+        cmd_->DrawInstanced(3, 1, 0, 0);
+    } else {
+        // The mesh does not cover the screen, so the sky is cleared rather
+        // than drawn. Same colour the raymarch's horizon fades to, so the two
+        // images differ only where the geometry does.
+        const float sky[4] = {0.40f, 0.50f, 0.66f, 1.0f};
+        cmd_->ClearRenderTargetView(rtv, sky, 0, nullptr);
+    }
+
+    if (mode_ == Mode::Mesh || mode_ == Mode::Overlay) {
+        const bool wire = (mode_ == Mode::Overlay);
+        mc.wire = wire ? 1.0f : 0.0f;
+        cmd_->SetPipelineState(wire ? mesh_wire_pso_.Get() : mesh_pso_.Get());
+        cmd_->SetGraphicsRootSignature(mesh_root_.Get());
+        cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
+        cmd_->SetGraphicsRootShaderResourceView(
+            1, mesher_.vertices()->GetGPUVirtualAddress());
+        cmd_->IASetIndexBuffer(&ibv);
+        // One command per slot. A retired or never-used slot has all-zero
+        // arguments and the command processor skips it, which is cheaper than
+        // compacting the array every time a chunk moves.
+        cmd_->ExecuteIndirect(cmd_sig_.Get(), kSlots, mesher_.draw_args(), 0, nullptr, 0);
+    }
+}
+
+void Renderer::record_frame(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HANDLE rtv) {
+    // Streaming first, in compute, then the draw reads what it produced.
+    mesher_.record_to_compute(cmd_.Get());
+    mesher_.record_timestamp(cmd_.Get(), 0);
+    stats_.meshed_this_frame =
+        streamer_.record_work(cmd_.Get(), mesher_, kMeshBudgetPerFrame);
+    mesher_.record_timestamp(cmd_.Get(), 1);
+    mesher_.resolve_timestamps(cmd_.Get());
+    mesher_.record_counter_copy(cmd_.Get());
+    mesher_.record_vertex_copy(cmd_.Get());
+    mesher_.record_to_draw(cmd_.Get());
+
+    record_scene(view, rtv);
+}
+
 void Renderer::render(const ViewConstants& view) {
     if (!ready_) return;
+
+    streamer_.update(view.cam_pos[0], view.cam_pos[1], view.cam_pos[2]);
 
     allocators_[frame_]->Reset();
     cmd_->Reset(allocators_[frame_].Get(), nullptr);
@@ -635,7 +607,7 @@ void Renderer::render(const ViewConstants& view) {
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     rtv.ptr += static_cast<SIZE_T>(frame_) * rtv_stride_;
-    record_scene(view, rtv);
+    record_frame(view, rtv);
 
     D3D12_RESOURCE_BARRIER to_present = to_rt;
     to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -646,12 +618,44 @@ void Renderer::render(const ViewConstants& view) {
     ID3D12CommandList* lists[] = {cmd_.Get()};
     queue_->ExecuteCommandLists(1, lists);
 
-    swapchain_->Present(1, 0);
+    const UINT present_flags = (!vsync_ && tearing_ok_) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    swapchain_->Present(vsync_ ? 1 : 0, present_flags);
     next_frame();
+
+    // Read a frame or two stale, deliberately: waiting on these would be a
+    // stall in the thing being measured.
+    mesher_.read_timestamps();
+    mesher_.read_counts(stats_.vertices, stats_.indices, stats_.overflowed);
+    stats_.mesh_ms = mesher_.last_mesh_ms();
+    stats_.resident = streamer_.resident_count();
+    stats_.pending = streamer_.pending_count();
+    stats_.free_slots = streamer_.free_slot_count();
 }
 
 bool Renderer::capture(const ViewConstants& view, const char* path, std::string& error) {
     if (!ready_) { error = "renderer not initialised"; return false; }
+
+    // Fill residency before capturing: a single frame would otherwise show
+    // only the eight chunks the per-frame budget allows.
+    for (int pass = 0; pass < 400; ++pass) {
+        streamer_.update(view.cam_pos[0], view.cam_pos[1], view.cam_pos[2]);
+        if (streamer_.pending_count() == 0 && pass > 0) break;
+        allocators_[frame_]->Reset();
+        cmd_->Reset(allocators_[frame_].Get(), nullptr);
+        mesher_.record_to_compute(cmd_.Get());
+        streamer_.record_work(cmd_.Get(), mesher_, 64);
+        mesher_.record_counter_copy(cmd_.Get());
+        mesher_.record_vertex_copy(cmd_.Get());
+        mesher_.record_to_draw(cmd_.Get());
+        cmd_->Close();
+        ID3D12CommandList* ls[] = {cmd_.Get()};
+        queue_->ExecuteCommandLists(1, ls);
+        wait_for_gpu();
+    }
+    mesher_.read_counts(stats_.vertices, stats_.indices, stats_.overflowed);
+    stats_.resident = streamer_.resident_count();
+    stats_.pending = streamer_.pending_count();
+    stats_.free_slots = streamer_.free_slot_count();
 
     const D3D12_RESOURCE_DESC rd = targets_[frame_]->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
@@ -721,7 +725,7 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
     if (FAILED(hr)) { error = hr_text("Map (readback)", hr); return false; }
 
     // R8G8B8A8 to packed BGR. The row pitch is aligned to 256 bytes and is
-    // almost never the image width, so the rows are copied one at a time.
+    // almost never the image width, so rows are copied one at a time.
     std::vector<unsigned char> bgr(static_cast<size_t>(width_) * height_ * 3);
     const unsigned char* base = static_cast<const unsigned char*>(mapped);
     for (UINT y = 0; y < height_; ++y) {
@@ -741,6 +745,78 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
         return false;
     }
     return true;
+}
+
+// Evaluated here in C++ from the same header the kernel compiles as HLSL. If
+// these two ever disagree beyond tolerance, the dialect has drifted and M1 is
+// in trouble -- which is the thing ADR-001 says to check by tolerance and
+// never by hash.
+bool Renderer::check_against_field(float& max_err, float& mean_err, UINT& checked) {
+    max_err = 0.0f;
+    mean_err = 0.0f;
+    checked = 0;
+    const UINT n = mesher_.slot_vertex_count(0);
+    std::vector<MeshVertex> verts;
+    if (!mesher_.read_vertices(0, n, verts)) return false;
+    double sum = 0.0;
+    for (size_t i = 0; i < verts.size(); ++i) {
+        const float d = trivial_density(verts[i].pos[0], verts[i].pos[1], verts[i].pos[2]);
+        const float a = d < 0.0f ? -d : d;
+        if (a > max_err) max_err = a;
+        sum += a;
+    }
+    checked = static_cast<UINT>(verts.size());
+    if (checked) mean_err = static_cast<float>(sum / checked);
+    return true;
+}
+
+void Renderer::drain_debug_messages(const char* path) {
+    FILE* f = std::fopen(path, "w");
+    if (!f) return;
+    if (!info_queue_) {
+        std::fprintf(f, "no info queue: the debug layer is not enabled\n");
+        std::fclose(f);
+        return;
+    }
+    const UINT64 n = info_queue_->GetNumStoredMessages();
+    std::fprintf(f, "%llu validation messages\n", static_cast<unsigned long long>(n));
+    for (UINT64 i = 0; i < n; ++i) {
+        SIZE_T len = 0;
+        info_queue_->GetMessage(i, nullptr, &len);
+        std::vector<char> buf(len);
+        D3D12_MESSAGE* m = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+        if (SUCCEEDED(info_queue_->GetMessage(i, m, &len))) {
+            std::fprintf(f, "[%d] %s\n", int(m->Severity), m->pDescription);
+        }
+    }
+    std::fclose(f);
+}
+
+void Renderer::dump_draw_args(const char* path) {
+    FILE* f = std::fopen(path, "w");
+    if (!f) return;
+    std::vector<UINT> a;
+    mesher_.read_draw_args(0, kSlots, a);
+    UINT nonzero = 0, total = 0, biggest = 0, biggest_slot = 0;
+    for (size_t s = 0; s * 5 + 4 < a.size(); ++s) {
+        const UINT n = a[s * 5 + 0];
+        if (!n) continue;
+        ++nonzero;
+        total += n;
+        if (n > biggest) { biggest = n; biggest_slot = UINT(s); }
+    }
+    std::fprintf(f, "slots with a non-empty draw: %u of %u\n", nonzero, kSlots);
+    std::fprintf(f, "indices across all draws: %u (%u triangles)\n", total, total / 3);
+    std::fprintf(f, "biggest slot %u with %u indices\n", biggest_slot, biggest);
+    std::fprintf(f, "\nslot  idxcount inst startidx basevtx startinst\n");
+    UINT shown = 0;
+    for (size_t s = 0; s * 5 + 4 < a.size() && shown < 12; ++s) {
+        if (!a[s * 5 + 0]) continue;
+        ++shown;
+        std::fprintf(f, "%4zu  %8u %4u %8u %7u %9u\n", s,
+                     a[s*5+0], a[s*5+1], a[s*5+2], a[s*5+3], a[s*5+4]);
+    }
+    std::fclose(f);
 }
 
 void Renderer::shutdown() {
