@@ -853,6 +853,7 @@ int main(int argc, char** argv) {
     bool relief = false;
     bool closeup = false;
     bool components = false;
+    bool cave_access = false;
     bool section = false;
     uint64_t section_seed = 0;
     float section_width = 4000.0f;
@@ -887,6 +888,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--bless"))                  bless = true;
         else if (!std::strcmp(argv[i], "--relief"))                 relief = true;
         else if (!std::strcmp(argv[i], "--components"))              components = true;
+        else if (!std::strcmp(argv[i], "--cave-access"))             cave_access = true;
         else if (!std::strcmp(argv[i], "--section") && i + 1 < argc) {
             section = true;
             section_seed = std::strtoull(argv[++i], nullptr, 10);
@@ -922,6 +924,61 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("archetypes: %d biomes, invariants OK\n", static_cast<int>(table.size()));
+
+    if (cave_access) {
+        // Walk each land column down from above and find the first air below
+        // the first solid. That depth is the thickness of the rind sealing
+        // the cave system off from the surface.
+        std::printf("cave access over %d seeds: depth of the first subsurface air\n", nseeds);
+        int  cols = 0, with_air = 0;
+        int  bucket[6] = {0, 0, 0, 0, 0, 0};   // <1, <2, <5, <10, <25, >=25 m
+        float shallowest = 1.0e9f;
+        for (int sd = 0; sd < nseeds; ++sd) {
+            const SeedWorld cw = build_world(static_cast<uint64_t>(sd), wp, table, ap);
+            const float R = wp.radius;
+            const int   N = 11;
+            for (int gj = 0; gj < N; ++gj) {
+                const float z = -R + (gj + 0.5f) * (2.0f * R / N);
+                for (int gi = 0; gi < N; ++gi) {
+                    const float x = -R + (gi + 0.5f) * (2.0f * R / N);
+                    const float rr = std::sqrt(x * x + z * z) / R;
+                    if (rr > 1.0f) continue;
+                    const float surf = terrain_height(cw, wp, table, x, z, rr);
+                    if (surf <= wp.sea_level) continue;
+
+                    // First solid going down, then first air below it.
+                    float first_solid = 1.0e9f;
+                    float first_air = 1.0e9f;
+                    for (int k = 0; k <= 900; ++k) {
+                        const float y = surf + 60.0f - 1.0f * k;
+                        const bool solid = terrain_density(cw, wp, table, x, y, z) > 0.0f;
+                        if (solid && first_solid > 1.0e8f) first_solid = y;
+                        if (!solid && first_solid < 1.0e8f) { first_air = y; break; }
+                    }
+                    if (first_solid > 1.0e8f) continue;
+                    ++cols;
+                    if (first_air > 1.0e8f) continue;
+                    ++with_air;
+                    const float depth = first_solid - first_air;
+                    if (depth < shallowest) shallowest = depth;
+                    if (depth < 1.0f) ++bucket[0];
+                    else if (depth < 2.0f) ++bucket[1];
+                    else if (depth < 5.0f) ++bucket[2];
+                    else if (depth < 10.0f) ++bucket[3];
+                    else if (depth < 25.0f) ++bucket[4];
+                    else ++bucket[5];
+                }
+            }
+        }
+        std::printf("land columns sampled: %d, with subsurface air below them: %d (%.1f%%)\n",
+                    cols, with_air, cols > 0 ? 100.0 * with_air / cols : 0.0);
+        std::printf("shallowest rind anywhere: %.1f m\n", shallowest);
+        std::printf("rind thickness  <1m %d   <2m %d   <5m %d   <10m %d   <25m %d   >=25m %d\n",
+                    bucket[0], bucket[1], bucket[2], bucket[3], bucket[4], bucket[5]);
+        std::printf("\nA rind that never reaches zero means no cave touches the surface:\n"
+                    "the system is sealed and needs entrances designed in.\n");
+        return 0;
+    }
 
     if (section) {
         const int W = 1400, H = 300;
