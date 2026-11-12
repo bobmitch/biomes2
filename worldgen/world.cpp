@@ -108,8 +108,8 @@ std::vector<std::pair<float, float> > scatter_cells(const WorldParams& wp, uint3
 // so the lookup and the weights live here; every metre of the result comes
 // from worldgen/shaders/field.h.
 float terrain_base(const SeedWorld& w, const WorldParams& wp,
-                            const ArchetypeTable& table, float x, float z, float r) {
-    const float cont = layer0_height(x, z, r, wp, w.s_cont);
+                   const ArchetypeTable& table, float x, float z, float r, float voxel) {
+    const float cont = layer0_height(x, z, r, wp, w.s_cont, voxel);
 
     const float wx = x + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wx);
     const float wz = z + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wz);
@@ -124,7 +124,7 @@ float terrain_base(const SeedWorld& w, const WorldParams& wp,
         const int b = w.biome[idx[k]];
         if (b < 0) continue;
         const BiomeArchetype& a = table[b];
-        h[k] = layer4_profile(x, z, wp.biome_freq, profile_of(a), w.s_height);
+        h[k] = layer4_profile(x, z, wp.biome_freq, profile_of(a), w.s_height, voxel);
         // Smoothed distance to the boundary: the gap between this cell and the
         // nearest one, which is twice the distance to the bisector.
         const float t = 1.0f - (dist[k] - dist[0]) / wp.blend_width;
@@ -170,8 +170,8 @@ float nearest_river(const SeedWorld& w, const WorldParams& wp,
 // against terrain_base, so this is the one place the two must not be confused:
 // carving the surface the rivers were traced on would feed back on itself.
 float terrain_height(const SeedWorld& w, const WorldParams& wp,
-                            const ArchetypeTable& table, float x, float z, float r) {
-    const float h = terrain_base(w, wp, table, x, z, r);
+                     const ArchetypeTable& table, float x, float z, float r, float voxel) {
+    const float h = terrain_base(w, wp, table, x, z, r, voxel);
     float rw = 0.0f, rd = 0.0f;
     const float dist = nearest_river(w, wp, x, z, rw, rd);
     if (dist >= rw) return h;

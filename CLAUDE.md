@@ -98,8 +98,8 @@ cmake --preset dev && cmake --build --preset dev
 
 `tools/validate` runs 200 seeds and exits non-zero on any failure. It asserts
 presence, quota, radial ordering, land fraction, adjacency, edge taper, home
-landmass, boat connectivity, spawn, slope budget, river sanity, throughput and
-the golden hashes, and emits a 64-seed contact sheet — look at it. Automated
+landmass, boat connectivity, spawn, slope budget, river sanity, LOD agreement,
+throughput and the golden hashes, and emits a 64-seed contact sheet — look at it. Automated
 checks cannot tell you whether a world is interesting.
 
 It also *measures and prints* **islandness** — landmass count, and the share
@@ -121,8 +121,20 @@ It also emits a shaded-relief sheet with `--relief`, and a single seed rendered
 large with `--closeup <seed>`. Use the close-up for anything narrower than a
 few hundred metres: a contact-sheet tile is ~87 m per pixel, so rivers are
 sub-pixel there and an axis-aligned drainage network looked perfectly fine on
-it. Not yet asserted: **LOD agreement**, which needs octave dropping at
-Nyquist.
+it.
+
+**LOD agreement is asserted.** Octave weights fall to zero between four and
+two voxels of period, faded rather than cut, and the harness checks that
+every LOD from 0.5 m to 64 m matches LOD 0 within its own voxel size. The
+worst case is currently 0.41 of a voxel. Normalise by the FULL amplitude,
+never the faded one: rescaling the survivors changes the shape of what
+remains, which is the thing LOD agreement forbids.
+
+Note what the check does and does not catch. Cutting octaves ten times too
+early takes it to 4.09 and fails, so it bites on over-aggressive dropping.
+It did NOT notice normalising by the faded amplitude, because that error is
+smaller than the worst case already present — it is a guard against the loud
+version of the bug, not the quiet one.
 
 **Golden hashes are pinned.** Any change to `worldgen/` moves them and the run
 fails. That is the gate working: either revert, or bump `generator_version` in

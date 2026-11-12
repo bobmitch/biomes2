@@ -29,8 +29,8 @@
 // The floor is blended out across r rather than driven to zero, because
 // wg_smax(base, 0, k) is a soft ReLU and would clamp every ocean in the world
 // to a uniform shelf -- interior ocean depth collapses sevenfold if you do.
-WG_FN float layer0_height(float x, float z, float r, float freq, int octaves, float centre_floor, float edge_drop, float land_offset, uint seed) {
-    const float base = fbm(x * freq, z * freq, octaves, 2.0f, 0.5f, seed) + land_offset;
+WG_FN float layer0_height(float x, float z, float r, float freq, int octaves, float centre_floor, float edge_drop, float land_offset, uint seed, float voxel) {
+    const float base = fbm_lod(x * freq, z * freq, octaves, 2.0f, 0.5f, seed, 1.0f / freq, voxel) + land_offset;
     const float t = wg_smoothstep(0.0f, 0.40f, r);
     const float lifted = wg_smax(base, centre_floor, 0.01f) * (1.0f - t) + base * t;
     return lifted - edge_drop * wg_smoothstep(0.80f, 1.0f, r);
@@ -58,7 +58,7 @@ WG_FN float layer1_danger(float x, float z, float r, float w, float freq, int oc
 // fBm with a warp from rolling to ridged. ridge_blend 0 is plain fBm; 1 is
 // ridged peaks. Not a blend of billow against ridged -- those are mirror
 // images of each other and cancel to a flat field at the midpoint.
-WG_FN float fbm_shaped(float x, float y, int octaves, float lacunarity, float gain, float ridge_blend, uint seed) {
+WG_FN float fbm_shaped(float x, float y, int octaves, float lacunarity, float gain, float ridge_blend, uint seed, float base_period, float voxel) {
     float amp = 1.0f;
     float freq = 1.0f;
     float sum = 0.0f;
@@ -67,7 +67,8 @@ WG_FN float fbm_shaped(float x, float y, int octaves, float lacunarity, float ga
         const float n = simplex2(x * freq, y * freq, seed + asuint(o) * 0x9E3779B1u);
         const float ridged = 1.0f - 2.0f * abs(n);
         const float v = n * (1.0f - ridge_blend) + ridged * ridge_blend;
-        sum = sum + amp * v;
+        const float w = octave_weight(base_period / freq, voxel);
+        sum = sum + amp * w * v;
         norm = norm + amp;
         amp = amp * gain;
         freq = freq * lacunarity;
@@ -106,8 +107,8 @@ struct BiomeProfile {
 };
 
 // One biome's profile, in metres.
-WG_FN float layer4_profile(float x, float z, float freq, BiomeProfile p, uint seed) {
-    const float n = fbm_shaped(x * freq, z * freq, p.octaves, p.lacunarity, p.gain, p.ridge_blend, seed);
+WG_FN float layer4_profile(float x, float z, float freq, BiomeProfile p, uint seed, float voxel) {
+    const float n = fbm_shaped(x * freq, z * freq, p.octaves, p.lacunarity, p.gain, p.ridge_blend, seed, 1.0f / freq, voxel);
     const float t = wg_saturate(n * 0.5f + 0.5f);
     const float shaped = flatness_curve(t, p.flatness);
     return p.base_elevation + p.amplitude * (shaped * 2.0f - 1.0f);

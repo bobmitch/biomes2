@@ -466,7 +466,7 @@ The harness runs the generator headless over N seeds at coarse resolution — a 
 | Slope budget | ≥ 60% of land under 30° | Amplitude or octave settings making a biome unwalkable |
 | Spawn quality | Spawn point is flat, coastal, in the calmest biome, deterministic | Spawn logic regressions |
 | River sanity | Every traced river is monotonically descending and terminates in ocean | Carving order bugs; endorheic basins |
-| LOD agreement | Height at every LOD matches LOD 0 within that LOD's voxel size | Octaves not dropped at Nyquist |
+| LOD agreement | Height at every LOD matches LOD 0 within that LOD's voxel size. Worst case 0.41 of a voxel across 0.5–64 m | Octaves not dropped at Nyquist. Catches dropping too much; blind to a normalisation error smaller than the existing worst case |
 | Determinism | Hash of the sample grid is stable across runs and platforms, **for the C++ build**; GPU paths are compared within a tolerance instead | Non-deterministic iteration order; fast-math |
 | Throughput | Nanoseconds per field sample, tracked over time | Silent cost creep in the field function |
 

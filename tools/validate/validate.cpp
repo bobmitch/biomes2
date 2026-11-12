@@ -60,6 +60,7 @@ struct SeedResult {
     bool  spawn_coastal = false;
     bool  spawn_calmest = false;
     float slope_gentle = 1.0f;  // share of land under 30 degrees
+    float lod_worst = 0.0f;     // worst |h(LOD) - h(0)| as a multiple of that voxel
     int   river_segments = 0;
     int   river_paths_total = 0, river_paths_to_ocean = 0, river_ascending = 0;
     uint64_t hash = 0;
@@ -268,6 +269,35 @@ static SeedResult eval_seed(uint64_t world_seed,
         out.slope_gentle = land_n > 0 ? static_cast<float>(gentle) / land_n : 1.0f;
     }
 
+    // --- LOD agreement ---
+    // The design doc calls this a correctness property, not a performance
+    // tweak: if a chunk meshed at 2 m disagrees with the same ground meshed at
+    // 0.5 m, terrain visibly changes shape as the player walks towards it.
+    // Reported as a multiple of the LOD's own voxel size, so 1.0 is the limit.
+    {
+        const float R = wp.radius;
+        const int   LG = 22;
+        const float ls = 2.0f * R / LG;
+        float worst = 0.0f;
+        for (int gj = 0; gj < LG; ++gj) {
+            const float z = -R + (gj + 0.5f) * ls;
+            for (int gi = 0; gi < LG; ++gi) {
+                const float x = -R + (gi + 0.5f) * ls;
+                const float rr = std::sqrt(x * x + z * z) / R;
+                if (rr > 1.0f) continue;
+                const float h0 = terrain_height(w, wp, table, x, z, rr, 0.0f);
+                float voxel = 0.5f;
+                for (int L = 0; L < 8; ++L) {          // 0.5 m through 64 m
+                    const float hl = terrain_height(w, wp, table, x, z, rr, voxel);
+                    const float ratio = std::fabs(hl - h0) / voxel;
+                    if (ratio > worst) worst = ratio;
+                    voxel = voxel * 2.0f;
+                }
+            }
+        }
+        out.lod_worst = worst;
+    }
+
     // --- determinism hash ---
     // Layers 0 and 1 on a fixed grid, plus the layer-3 assignment. Quantised,
     // because the point is to catch a changed generator, not float noise.
@@ -362,6 +392,8 @@ struct Summary {
     int boat_failures = 0;       // a biome unreachable even by sea
     int spawn_failures = 0;      // no spawn, not coastal, or not calmest
     int slope_failures = 0;      // under 60% of land walkable
+    int lod_failures = 0;        // a LOD disagreeing by more than its voxel
+    float max_lod_worst = 0.0f;
     int river_failures = 0;      // no rivers, or one that climbs or never reaches the sea
     float mean_river_segments = 0.0f;
     float min_home_share = 2.0f;     // islandness: measured, not asserted
@@ -416,6 +448,8 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
         if (!r.boat_all_biomes) ++sm.boat_failures;
         if (r.spawn_cell < 0 || !r.spawn_coastal || !r.spawn_calmest) ++sm.spawn_failures;
         if (r.slope_gentle < 0.60f) ++sm.slope_failures;
+        if (r.lod_worst > 1.0f) ++sm.lod_failures;
+        sm.max_lod_worst = std::max(sm.max_lod_worst, r.lod_worst);
         if (r.river_segments == 0 || r.river_ascending > 0 ||
             r.river_paths_to_ocean != r.river_paths_total) ++sm.river_failures;
         sm.mean_river_segments += r.river_segments;
@@ -886,7 +920,8 @@ int main(int argc, char** argv) {
                     // the ridge warp) versus the cell lookup alone (integers
                     // and sqrt only).
                     const float sn = fbm_shaped(x * cw.biome_freq, z * cw.biome_freq,
-                                                5, 2.0f, 0.5f, 0.5f, cwld.s_height);
+                                                5, 2.0f, 0.5f, 0.5f, cwld.s_height,
+                                                1.0f / cw.biome_freq, 0.0f);
                     int li[4]; float ld[4];
                     const float wxx = x + cw.warp_amp * fbm(x * cw.warp_freq, z * cw.warp_freq, 2, 2.0f, 0.5f, cwld.s_wx);
                     const float wzz = z + cw.warp_amp * fbm(x * cw.warp_freq, z * cw.warp_freq, 2, 2.0f, 0.5f, cwld.s_wz);
@@ -1160,6 +1195,9 @@ int main(int argc, char** argv) {
         std::snprintf(d, sizeof(d), "worst seed has %.1f%% of land under 30 degrees, threshold 60%%",
                       100.0 * s.min_slope_gentle);
         line("slope budget", s.slope_failures == 0, d);
+        std::snprintf(d, sizeof(d), "worst LOD differs from LOD 0 by %.2f of its voxel "
+                      "(limit 1.00)", s.max_lod_worst);
+        line("LOD agreement", s.lod_failures == 0, d);
         std::snprintf(d, sizeof(d), "%.0f segments/seed, all descending and reaching the sea",
                       s.mean_river_segments);
         line("river sanity", s.river_failures == 0, d);
@@ -1188,7 +1226,7 @@ int main(int argc, char** argv) {
                          s.home_failures == 0 && s.boat_failures == 0 &&
                          s.spawn_failures == 0 && s.slope_failures == 0 &&
                          land_mean_ok &&
-                         s.river_failures == 0 &&
+                         s.river_failures == 0 && s.lod_failures == 0 &&
                          ns <= 400.0 && golden_ok && sheet_ok;
         std::printf("\n%s\n", all ? "ALL CHECKS PASSED" : "FAILED");
         return all ? 0 : 1;

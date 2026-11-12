@@ -100,21 +100,6 @@ WG_FN float simplex2(float x, float y, uint seed) {
     return 70.0f * n;
 }
 
-WG_FN float fbm(float x, float y, int octaves, float lacunarity, float gain, uint seed) {
-    float amp = 1.0f;
-    float freq = 1.0f;
-    float sum = 0.0f;
-    float norm = 0.0f;
-    for (int o = 0; o < octaves; o = o + 1) {
-        sum = sum + amp * simplex2(x * freq, y * freq, seed + asuint(o) * 0x9E3779B1u);
-        norm = norm + amp;
-        amp = amp * gain;
-        freq = freq * lacunarity;
-    }
-    if (norm > 0.0f) { return sum / norm; }
-    return 0.0f;
-}
-
 // Spelled out rather than using the HLSL/WGSL builtins: the C++ build is the
 // determinism authority, so the arithmetic has to be ours, not the backend's.
 WG_FN float wg_saturate(float v) {
@@ -135,5 +120,48 @@ WG_FN float wg_smax(float a, float b, float k) {
     const float d = a - b;
     return 0.5f * (a + b + sqrt(d * d + k)) - 0.5f * sqrt(k);
 }
+
+// How much of an octave survives at a given voxel size. An octave whose world
+// period is below twice the voxel spacing cannot be represented there, so
+// sampling it produces detail the LOD cannot hold and the same ground meshed
+// finer disagrees. Faded out between four voxels and two rather than cut: a
+// hard cut pops on the LOD transition, a fade is invisible and costs a
+// multiply.
+//
+// voxel <= 0 means "no LOD", every octave at full weight. That path returns
+// exactly 1.0f, so multiplying by it is bit-identical to not having it --
+// which is why adding LOD moved no golden hash.
+WG_FN float octave_weight(float period, float voxel) {
+    if (voxel <= 0.0f) { return 1.0f; }
+    return wg_smoothstep(2.0f, 4.0f, period / voxel);
+}
+
+// base_period is the world size of octave 0, in metres. It is passed rather
+// than derived because x and y arrive already multiplied by the base
+// frequency, and recomputing that product here would round differently.
+WG_FN float fbm_lod(float x, float y, int octaves, float lacunarity, float gain, uint seed, float base_period, float voxel) {
+    float amp = 1.0f;
+    float freq = 1.0f;
+    float sum = 0.0f;
+    float norm = 0.0f;
+    for (int o = 0; o < octaves; o = o + 1) {
+        const float w = octave_weight(base_period / freq, voxel);
+        sum = sum + amp * w * simplex2(x * freq, y * freq, seed + asuint(o) * 0x9E3779B1u);
+        // Normalise by the FULL amplitude, not the faded one. Rescaling the
+        // survivors would change the shape of what remains, which is exactly
+        // what LOD agreement forbids: a coarse sample must be the fine one
+        // with its high frequencies removed, not a different world.
+        norm = norm + amp;
+        amp = amp * gain;
+        freq = freq * lacunarity;
+    }
+    if (norm > 0.0f) { return sum / norm; }
+    return 0.0f;
+}
+
+WG_FN float fbm(float x, float y, int octaves, float lacunarity, float gain, uint seed) {
+    return fbm_lod(x, y, octaves, lacunarity, gain, seed, 1.0f, 0.0f);
+}
+
 
 #endif

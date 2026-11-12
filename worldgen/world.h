@@ -104,9 +104,10 @@ struct WorldParams {
 // Thin adapters onto the canonical field function in worldgen/shaders/field.h.
 // The arithmetic lives there so the harness, the engine and mapview cannot drift
 // apart -- these only unpack WorldParams into the scalars the dialect takes.
-static inline float layer0_height(float x, float z, float r, const WorldParams& wp, uint32_t seed) {
+// voxel is the LOD sample spacing in metres; 0 means full detail.
+static inline float layer0_height(float x, float z, float r, const WorldParams& wp, uint32_t seed, float voxel = 0.0f) {
     return ::layer0_height(x, z, r, wp.continent_freq, wp.continent_octaves,
-                           wp.centre_floor, wp.edge_drop, wp.land_offset, seed);
+                           wp.centre_floor, wp.edge_drop, wp.land_offset, seed, voxel);
 }
 
 static inline float layer1_danger(float x, float z, float r, const WorldParams& wp, uint32_t seed) {
@@ -268,7 +269,8 @@ std::vector<std::pair<float, float> > scatter_cells(const WorldParams& wp, uint3
 // Ground height before the drainage is carved. build_rivers traces against
 // this; carving the surface the rivers were traced on would feed back.
 float terrain_base(const SeedWorld& w, const WorldParams& wp,
-                   const ArchetypeTable& table, float x, float z, float r);
+                   const ArchetypeTable& table, float x, float z, float r,
+                   float voxel = 0.0f);
 
 // Distance to the nearest river segment, with that channel's shape.
 float nearest_river(const SeedWorld& w, const WorldParams& wp,
@@ -276,7 +278,8 @@ float nearest_river(const SeedWorld& w, const WorldParams& wp,
 
 // Ground height with the drainage carved in.
 float terrain_height(const SeedWorld& w, const WorldParams& wp,
-                     const ArchetypeTable& table, float x, float z, float r);
+                     const ArchetypeTable& table, float x, float z, float r,
+                     float voxel = 0.0f);
 
 void build_rivers(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table);
 
