@@ -16,21 +16,41 @@
 #include <wrl/client.h>
 
 #include <cstdio>
+#include <map>
 #include <string>
 
 namespace engine {
 
 using Microsoft::WRL::ComPtr;
 
-// Resolves #include against the repository root rather than against the
-// including file. A shader says `#include "engine/field/trivial_field.h"`,
-// which is the same spelling the C++ side uses -- one path convention for the
-// dialect headers instead of a different relative walk from each consumer.
+// Resolves #include the way a C++ compiler does: relative to the INCLUDING
+// FILE first, then against the repository root.
+//
+// The second rule alone is not enough, and M1 found that out immediately.
+// A shader can say `#include "engine/field/trivial_field.h"`, the same
+// spelling the C++ side uses -- but worldgen/shaders/field.h says
+// `#include "noise.h"`, because that is how a header refers to its sibling
+// and the C++ build has never needed anything else. ADR-001's claim that
+// "HLSL is the same text" holds; what does not come for free is the include
+// SEARCH, and a handler that only knows one root cannot open a sibling.
+//
+// D3DCompile hands Open the parent's buffer pointer rather than its path, so
+// the directory each buffer came from is remembered on the way out.
 class RootInclude : public ID3DInclude {
 public:
-    HRESULT __stdcall Open(D3D_INCLUDE_TYPE, LPCSTR name, LPCVOID,
+    HRESULT __stdcall Open(D3D_INCLUDE_TYPE, LPCSTR name, LPCVOID parent,
                            LPCVOID* out_data, UINT* out_bytes) override {
-        FILE* f = std::fopen(name, "rb");
+        std::string path;
+        if (parent) {
+            std::map<const void*, std::string>::const_iterator it = dirs_.find(parent);
+            if (it != dirs_.end() && !it->second.empty()) {
+                const std::string sibling = it->second + "/" + name;
+                if (exists(sibling)) path = sibling;
+            }
+        }
+        if (path.empty()) path = name;   // repository root
+
+        FILE* f = std::fopen(path.c_str(), "rb");
         if (!f) return E_FAIL;
         std::fseek(f, 0, SEEK_END);
         const long n = std::ftell(f);
@@ -40,17 +60,39 @@ public:
         std::fclose(f);
         *out_data = buf;
         *out_bytes = static_cast<UINT>(got);
+        dirs_[buf] = directory_of(path);
         return S_OK;
     }
     HRESULT __stdcall Close(LPCVOID data) override {
+        dirs_.erase(data);
         delete[] static_cast<const char*>(data);
         return S_OK;
     }
+
+    // The top-level file's directory, so its own includes resolve as siblings
+    // too. D3DCompileFromFile never calls Open for the entry file itself.
+    void set_root_file(const std::string& path) { root_dir_ = directory_of(path); }
+
+private:
+    static bool exists(const std::string& p) {
+        FILE* f = std::fopen(p.c_str(), "rb");
+        if (!f) return false;
+        std::fclose(f);
+        return true;
+    }
+    static std::string directory_of(const std::string& p) {
+        const size_t slash = p.find_last_of("/\\");
+        return slash == std::string::npos ? std::string() : p.substr(0, slash);
+    }
+
+    std::map<const void*, std::string> dirs_;
+    std::string root_dir_;
 };
 
 inline bool compile_shader(const char* path, const char* entry, const char* target,
                            ComPtr<ID3DBlob>& out, std::string& error) {
     RootInclude inc;
+    inc.set_root_file(path);
     UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
 #ifdef _DEBUG
     flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;

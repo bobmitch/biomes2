@@ -16,6 +16,7 @@
 //   F2          write a capture to build/shot.bmp
 // ---------------------------------------------------------------------------
 #include "engine/render/renderer.h"
+#include "engine/render/shader_compile.h"
 #include "engine/camera.h"
 #include "engine/physics/physics_world.h"
 #include "engine/field/trivial_field.h"
@@ -221,6 +222,28 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         start_overlay = cl.find("--overlay") != std::string::npos;
         start_raymarch = cl.find("--raymarch") != std::string::npos;
         debug_layer = cl.find("--debuglayer") != std::string::npos;
+    }
+
+    // --check-dialect answers ADR-001's central question and nothing else:
+    // does the real field function compile as HLSL? It needs no device, no
+    // window and no world, so it runs before any of them exist.
+    if (std::string(cmdline ? cmdline : "").find("--check-dialect") != std::string::npos) {
+        engine::ComPtr<ID3DBlob> blob;
+        std::string err;
+        const bool ok = engine::compile_shader("engine/field/dialect_probe.hlsl",
+                                               "cs_probe", "cs_5_1", blob, err);
+        if (FILE* f = std::fopen("build/dialect_check.txt", "w")) {
+            std::fprintf(f, "compiling worldgen/shaders/field.h as HLSL: %s\n",
+                         ok ? "OK" : "FAILED");
+            if (ok) {
+                std::fprintf(f, "bytecode: %zu bytes\n",
+                             size_t(blob->GetBufferSize()));
+            } else {
+                std::fprintf(f, "\n%s\n", err.c_str());
+            }
+            std::fclose(f);
+        }
+        return ok ? 0 : 1;
     }
 
     WNDCLASSA wc = {};
