@@ -185,6 +185,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     double walk_seconds = 0.0;
     double overhang_seconds = 0.0;
     double dig_seconds = 0.0;
+    bool mode_dig_save = false, mode_dig_verify = false, mode_dig_stress = false;
     bool flight_vsync = false;
     {
         const std::string cl = cmdline ? cmdline : "";
@@ -198,7 +199,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (shot_path.empty()) shot_path = "build/shot.bmp";
         }
         if (cl.find("--overhang") != std::string::npos) overhang_seconds = 14.0;
-        if (cl.find("--dig") != std::string::npos) dig_seconds = 20.0;
+        if (cl.find("--dig-save") != std::string::npos) mode_dig_save = true;
+        else if (cl.find("--dig-verify") != std::string::npos) mode_dig_verify = true;
+        else if (cl.find("--dig-stress") != std::string::npos) mode_dig_stress = true;
+        else if (cl.find("--dig") != std::string::npos) dig_seconds = 20.0;
         const size_t wk = cl.find("--walk");
         if (wk != std::string::npos) {
             walk_seconds = 8.0;
@@ -282,6 +286,191 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     }
 
     ShowWindow(hwnd, show);
+
+    // The three holes both runs use. Fixed so the two processes agree
+    // without passing anything but the measurement.
+    const float kHoleX[3] = {0.0f, 11.0f, 0.0f};
+    const float kHoleZ[3] = {0.0f, 0.0f, 11.0f};
+
+    if (mode_dig_save || mode_dig_verify) {
+        g_renderer.set_vsync(true);
+        g_walk = true;
+        g_physics.place_character(kHoleX[0], 20.0f, kHoleZ[0]);
+        g_physics.character_position(g_feet);
+
+        bool  mismatch = false;
+        std::string err;
+        if (mode_dig_verify) {
+            if (!g_renderer.load_edits("build/edits.bin", err, mismatch)) {
+                MessageBoxA(nullptr, err.c_str(), "Load failed", MB_OK | MB_ICONERROR);
+                return 1;
+            }
+        }
+
+        LARGE_INTEGER sfreq, sstart, sprev;
+        QueryPerformanceFrequency(&sfreq);
+        QueryPerformanceCounter(&sstart);
+        sprev = sstart;
+
+        bool dug = false, saved = false;
+        double settled = 0.0;
+        const double run_for = 14.0;
+
+        for (;;) {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&m);
+                DispatchMessageA(&m);
+            }
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            const double total = double(now.QuadPart - sstart.QuadPart) / double(sfreq.QuadPart);
+            const double dt = double(now.QuadPart - sprev.QuadPart) / double(sfreq.QuadPart);
+            sprev = now;
+            if (total >= run_for) break;
+
+            sync_physics_terrain();
+
+            if (mode_dig_save && !dug && total >= 4.0) {
+                dug = true;
+                for (int h = 0; h < 3; ++h) {
+                    g_renderer.dig(kHoleX[h], g_feet[1] - 2.0f, kHoleZ[h], 3.5f, -4.0f, 1);
+                }
+            }
+            if (mode_dig_save && dug && !saved && total >= 9.0) {
+                saved = true;
+                if (!g_renderer.save_edits("build/edits.bin", err)) {
+                    MessageBoxA(nullptr, err.c_str(), "Save failed", MB_OK | MB_ICONERROR);
+                    return 1;
+                }
+            }
+
+            g_physics.update(float(dt), 0.0f, 0.0f, false);
+            g_physics.character_position(g_feet);
+            if (total > 12.0) settled = g_feet[1];
+
+            g_camera.x = g_feet[0];
+            g_camera.y = g_feet[1] + kEyeAboveFeet;
+            g_camera.z = g_feet[2];
+
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            const float w = float(cr.right - cr.left), h2 = float(cr.bottom - cr.top);
+            if (w < 1.0f || h2 < 1.0f) continue;
+            engine::ViewConstants v = {};
+            fill_view(g_camera, w, h2, float(total), v);
+            g_renderer.render(v);
+        }
+
+        const engine::FrameStats st = g_renderer.stats();
+        if (mode_dig_save) {
+            if (FILE* f = std::fopen("build/dig_save.txt", "w")) {
+                std::fprintf(f, "%.6f\n", settled);
+                std::fprintf(f, "three holes dug, saved to build/edits.bin\n");
+                std::fprintf(f, "overlay: %zu bricks, %zu edited voxels\n",
+                             st.edit_bricks, g_renderer.edits().edited_voxels());
+                std::fclose(f);
+            }
+        } else {
+            double expected = 0.0;
+            if (FILE* f = std::fopen("build/dig_save.txt", "r")) {
+                if (std::fscanf(f, "%lf", &expected) != 1) expected = 0.0;
+                std::fclose(f);
+            }
+            if (FILE* f = std::fopen("build/dig_verify.txt", "w")) {
+                std::fprintf(f, "a SEPARATE process: loaded build/edits.bin and measured\n\n");
+                std::fprintf(f, "the save run came to rest at %.3f m\n", expected);
+                std::fprintf(f, "this run came to rest at      %.3f m\n", settled);
+                std::fprintf(f, "difference: %.4f m -- the edits %s\n",
+                             settled - expected,
+                             (settled - expected < 0.05 && settled - expected > -0.05)
+                                 ? "SURVIVED the restart"
+                                 : "did NOT survive the restart");
+                std::fprintf(f, "\noverlay after loading: %zu bricks, %zu edited voxels\n",
+                             st.edit_bricks, g_renderer.edits().edited_voxels());
+                std::fprintf(f, "field id matched the save: %s\n", mismatch ? "NO" : "yes");
+                std::fclose(f);
+            }
+        }
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return 0;
+    }
+
+    if (mode_dig_stress) {
+        // More bricks than the pool holds, then fly past them all.
+        //
+        // Spread in three dimensions at 9 m, which is just over a brick's 8 m,
+        // so each hole lands in its own. A line of holes 3 m apart shares
+        // bricks between neighbours and produced 364 of them from 240 holes --
+        // nowhere near enough to make the pager evict anything.
+        g_renderer.set_vsync(false);
+        int kHoles = 0;
+        for (int iy = 0; iy < 6; ++iy) {
+            for (int iz = 0; iz < 13; ++iz) {
+                for (int ix = 0; ix < 13; ++ix) {
+                    const float x = float(ix) * 9.0f - 54.0f;
+                    const float y = float(iy) * 9.0f - 10.0f;
+                    const float z = float(iz) * 9.0f - 54.0f;
+                    g_renderer.dig(x, y, z, 3.0f, -4.0f, 1);
+                    ++kHoles;
+                }
+            }
+        }
+
+        LARGE_INTEGER tf, t0, tp;
+        QueryPerformanceFrequency(&tf);
+        QueryPerformanceCounter(&t0);
+        tp = t0;
+        g_camera.x = -140.0f; g_camera.y = 25.0f; g_camera.z = 0.0f;
+        g_camera.yaw = 1.5708f; g_camera.pitch = -0.3f;
+
+        for (;;) {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&m);
+                DispatchMessageA(&m);
+            }
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            const double total = double(now.QuadPart - t0.QuadPart) / double(tf.QuadPart);
+            const double dt = double(now.QuadPart - tp.QuadPart) / double(tf.QuadPart);
+            tp = now;
+            if (total >= 16.0) break;
+            // Orbit the dug region so chunks all round it are meshed and every
+            // brick is asked for at some point.
+            const float a = float(total) * 0.6f;
+            g_camera.x = std::cos(a) * 95.0f;
+            g_camera.z = std::sin(a) * 95.0f;
+            g_camera.yaw = a + 3.14159f;
+
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            const float w = float(cr.right - cr.left), h2 = float(cr.bottom - cr.top);
+            if (w < 1.0f || h2 < 1.0f) continue;
+            engine::ViewConstants v = {};
+            fill_view(g_camera, w, h2, float(total), v);
+            g_renderer.render(v);
+            (void)dt;
+        }
+
+        const engine::FrameStats st = g_renderer.stats();
+        if (FILE* f = std::fopen("build/dig_stress.txt", "w")) {
+            std::fprintf(f, "%d holes on a 9 m lattice, then orbited\n\n", kHoles);
+            std::fprintf(f, "overlay: %zu bricks, %zu edited voxels, %.1f MB\n",
+                         st.edit_bricks, g_renderer.edits().edited_voxels(),
+                         double(st.edit_bytes) / (1024.0 * 1024.0));
+            std::fprintf(f, "GPU pool: %zu of %u slots leased\n",
+                         st.bricks_resident, engine::kMaxBricks);
+            std::fprintf(f, "evictions: %llu\n", st.brick_evictions);
+            std::fprintf(f, "bricks a frame could not page in at all: %llu\n",
+                         st.brick_misses);
+            std::fclose(f);
+        }
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return 0;
+    }
 
     if (dig_seconds > 0.0) {
         g_renderer.set_vsync(true);

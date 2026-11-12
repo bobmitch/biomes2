@@ -12,6 +12,7 @@
 #include "engine/meshing/chunk_mesher.h"
 #include "engine/streaming/streamer.h"
 #include "engine/svdag/brick_store.h"
+#include "engine/svdag/brick_pager.h"
 
 #include <vector>
 
@@ -67,6 +68,11 @@ struct FrameStats {
     size_t edit_bytes = 0;
     UINT   bricks_uploaded = 0;
     size_t chunks_invalidated = 0;
+    size_t edit_voxels = 0;
+    size_t bricks_resident = 0;
+    unsigned long long brick_evictions = 0;
+    unsigned long long brick_misses = 0;
+    unsigned long long brick_upload_deferrals = 0;
     UINT   readback_latency_frames = 0;
     float  height_residual_max = 0.0f;
     double height_residual_mean = 0.0;
@@ -113,6 +119,13 @@ public:
     BrickStore& edits() { return edits_; }
     bool dig(float x, float y, float z, float radius, float strength,
              unsigned char material);
+
+
+    // Persistence. Saving writes only the voxels the player actually edited;
+    // loading throws away every resident chunk, because the terrain they were
+    // meshed from has just changed underneath them.
+    bool save_edits(const char* path, std::string& error) const;
+    bool load_edits(const char* path, std::string& error, bool& field_mismatch);
 
     // Height patches that arrived through the readback ring this frame, and
     // the chunks whose patches are no longer valid. Drained by the caller and
@@ -180,7 +193,9 @@ private:
     ChunkMesher mesher_;
     Streamer    streamer_;
     BrickStore  edits_;
+    BrickPager  pager_;
     std::vector<BrickKey> dirty_bricks_;
+    std::vector<BrickKey> brick_uploads_;
     std::vector<PatchEvent> patches_added_;
     std::vector<MeshPatchEvent> mesh_patches_added_;
     std::vector<ChunkKey>   patches_removed_;

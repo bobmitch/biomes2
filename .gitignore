@@ -41,3 +41,4 @@ tools/mapview/src/generated/
 
 # Claude Code personal settings (permission rules), not team-wide
 .claude/settings.local.json
+build/edits.bin

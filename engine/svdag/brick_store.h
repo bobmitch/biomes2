@@ -20,6 +20,7 @@
 #define ENGINE_BRICK_STORE_H
 
 #include <cstdint>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -52,13 +53,28 @@ struct BrickKeyHash {
     }
 };
 
+// No GPU slot is held here. A slot is a LEASE the pager hands out, not part
+// of a brick's identity: the pool is finite and the store is not.
 struct Brick {
     float    density[kBrickVoxels];
     uint8_t  material[kBrickVoxels];
     uint32_t edited[kBrickMaskWords];   // which voxels this brick actually owns
-    uint32_t slot;                      // its place in the GPU pool
-    bool     dirty;                     // needs re-uploading
 };
+
+// A brick's place in the GPU pool, while it has one.
+struct BrickLease {
+    uint32_t slot;
+    uint64_t last_used;   // frame number, for eviction
+    bool     uploaded;    // the pool holds this brick's current contents
+};
+
+// What a save file records about the world it was made in. The trivial field
+// has no generator version; M1 must put the real one here, because the saved
+// edits are absolute but the terrain AROUND them is generated, and a silent
+// generator change moves that terrain out from under them.
+static const uint32_t kSaveMagic = 0x44453242u;   // "B2ED"
+static const uint32_t kSaveFormat = 1;
+static const uint32_t kTrivialFieldId = 0;
 
 class BrickStore {
 public:
@@ -72,13 +88,24 @@ public:
                      float strength, uint8_t material,
                      float out_min[3], float out_max[3]);
 
-    // Every brick overlapping a world box, as GPU pool slots.
+    // Every brick overlapping a world box, by key. Turning those into GPU
+    // slots is the pager's job.
     void bricks_in_box(const float lo[3], const float hi[3],
-                       std::vector<uint32_t>& out_slots,
-                       std::vector<int>& out_origins) const;
+                       std::vector<BrickKey>& out) const;
 
     size_t brick_count() const { return bricks_.size(); }
     size_t bytes() const { return bricks_.size() * sizeof(Brick); }
+
+    // Every brick, in no particular order. The pager walks this.
+    const std::unordered_map<BrickKey, Brick, BrickKeyHash>& all() const { return bricks_; }
+
+    // Only the voxels each brick owns are written, so a save is the size of
+    // the edits rather than the size of the bricks holding them.
+    bool save(const std::string& path, uint32_t field_id, std::string& error) const;
+    bool load(const std::string& path, uint32_t expect_field_id,
+              std::string& error, bool& field_mismatch);
+
+    size_t edited_voxels() const;
 
     // Bricks whose contents changed since the last upload.
     void take_dirty(std::vector<BrickKey>& out);
@@ -89,7 +116,6 @@ private:
 
     std::unordered_map<BrickKey, Brick, BrickKeyHash> bricks_;
     std::vector<BrickKey> dirty_;
-    uint32_t next_slot_ = 0;
 };
 
 }  // namespace engine

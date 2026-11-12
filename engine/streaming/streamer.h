@@ -22,6 +22,7 @@
 #include "engine/meshing/chunk_mesher.h"
 #include "engine/field/trivial_field.h"
 #include "engine/svdag/brick_store.h"
+#include "engine/svdag/brick_pager.h"
 
 #include <algorithm>
 #include <cmath>
@@ -226,46 +227,83 @@ public:
         }
     }
 
-    UINT record_work(ID3D12GraphicsCommandList* cmd, ChunkMesher& mesher, UINT budget,
-                     const BrickStore* edits) {
-        for (size_t i = 0; i < retire_.size(); ++i) mesher.record_retire(cmd, retire_[i]);
-        retire_.clear();
+    // What the edit overlay needs to answer "which bricks does this chunk
+    // read, and where are they in the pool".
+    struct EditContext {
+        const BrickStore* store = nullptr;
+        BrickPager*       pager = nullptr;
+        uint64_t          frame = 0;
+        std::vector<BrickKey>* uploads = nullptr;
+    };
 
-        last_meshed_.clear();
-        UINT done = 0;
-        for (size_t i = 0; i < queue_.size() && done < budget; ++i) {
+    // Choose this frame's chunks and page in the bricks they need. Records no
+    // GPU commands: the caller uploads what `uploads` names and only then
+    // calls record_planned.
+    UINT plan_work(ChunkMesher& mesher, UINT budget, EditContext& ctx) {
+        planned_.clear();
+        for (size_t i = 0; i < queue_.size() && planned_.size() < budget; ++i) {
             if (free_slots_.empty()) break;
             const ChunkKey& k = queue_[i].key;
             const UINT slot = free_slots_.back();
             free_slots_.pop_back();
-            const float S = lod_chunk_size(k.lod);
-            const float origin[3] = {float(k.x) * S, float(k.y) * S, float(k.z) * S};
 
-            // Which bricks this chunk could read. The span covers the ghost
-            // layer as well as the owned cells, or an edit in the last cell
-            // would be missed by the chunk that meshes it.
-            UINT bfirst = 0, bcount = 0;
-            if (edits && edits->brick_count() > 0) {
+            Planned p;
+            p.key = k;
+            p.slot = slot;
+            p.brick_first = 0;
+            p.brick_count = 0;
+
+            if (ctx.store && ctx.pager && ctx.store->brick_count() > 0) {
+                const float S = lod_chunk_size(k.lod);
+                const float origin[3] = {float(k.x) * S, float(k.y) * S, float(k.z) * S};
+                // The span covers the ghost layer as well as the owned cells,
+                // or an edit in the last cell would be missed by the chunk
+                // that meshes it.
                 const float span = lod_voxel(k.lod) * float(kChunkCells);
                 const float lo[3] = {origin[0], origin[1], origin[2]};
                 const float hi[3] = {origin[0] + span, origin[1] + span, origin[2] + span};
-                edits->bricks_in_box(lo, hi, brick_slots_, brick_origins_);
-                if (!brick_slots_.empty()) {
-                    bcount = static_cast<UINT>(brick_slots_.size());
-                    bfirst = mesher.push_brick_headers(brick_origins_.data(),
-                                                       brick_slots_.data(), bcount);
+                ctx.store->bricks_in_box(lo, hi, brick_keys_);
+                if (!brick_keys_.empty()) {
+                    ctx.pager->acquire(brick_keys_, ctx.frame, brick_slots_,
+                                       *ctx.uploads);
+                    brick_origins_.clear();
+                    for (size_t b = 0; b < brick_keys_.size(); ++b) {
+                        brick_origins_.push_back(brick_keys_[b].x);
+                        brick_origins_.push_back(brick_keys_[b].y);
+                        brick_origins_.push_back(brick_keys_[b].z);
+                    }
+                    p.brick_count = static_cast<UINT>(brick_slots_.size());
+                    p.brick_first = mesher.push_brick_headers(
+                        brick_origins_.data(), brick_slots_.data(), p.brick_count);
                 }
             }
-            mesher.record_mesh(cmd, slot, origin, lod_voxel(k.lod), bfirst, bcount);
+            planned_.push_back(p);
             resident_[k] = slot;
-            MeshedChunk mc;
-            mc.key = k;
-            mc.slot = slot;
-            last_meshed_.push_back(mc);
-            ++done;
         }
-        return done;
+        return static_cast<UINT>(planned_.size());
     }
+
+    // Retire first, then mesh what plan_work chose.
+    void record_planned(ID3D12GraphicsCommandList* cmd, ChunkMesher& mesher) {
+        for (size_t i = 0; i < retire_.size(); ++i) mesher.record_retire(cmd, retire_[i]);
+        retire_.clear();
+
+        last_meshed_.clear();
+        for (size_t i = 0; i < planned_.size(); ++i) {
+            const Planned& p = planned_[i];
+            const float S = lod_chunk_size(p.key.lod);
+            const float origin[3] = {float(p.key.x) * S, float(p.key.y) * S,
+                                     float(p.key.z) * S};
+            mesher.record_mesh(cmd, p.slot, origin, lod_voxel(p.key.lod),
+                               p.brick_first, p.brick_count);
+            MeshedChunk mc;
+            mc.key = p.key;
+            mc.slot = p.slot;
+            last_meshed_.push_back(mc);
+        }
+        planned_.clear();
+    }
+
 
     // What was meshed in the last record_work call, for the readback ring.
     struct MeshedChunk {
@@ -317,6 +355,14 @@ private:
     std::vector<MeshedChunk> last_meshed_;
     std::vector<ChunkKey>    retired_keys_;
     size_t last_invalidated_ = 0;
+    struct Planned {
+        ChunkKey key;
+        UINT     slot;
+        UINT     brick_first;
+        UINT     brick_count;
+    };
+    std::vector<Planned> planned_;
+    mutable std::vector<BrickKey> brick_keys_;
     mutable std::vector<uint32_t> brick_slots_;
     mutable std::vector<int>      brick_origins_;
 };

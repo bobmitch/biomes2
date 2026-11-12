@@ -69,7 +69,10 @@ static const UINT kBrickVoxelsGpu = 16 * 16 * 16;
 static const UINT kBrickMaskWordsGpu = kBrickVoxelsGpu / 32;
 // Per-dispatch brick lists, one run per chunk meshed this frame.
 static const UINT kMaxBrickHeaders = 4096;
-static const UINT kBrickUploadsPerFrame = 16;
+// Comfortably above what a burst of edits needs in one frame. The limit is
+// still real, so record_brick_upload reports when it is hit rather than
+// pretending the copy happened.
+static const UINT kBrickUploadsPerFrame = 64;
 
 // One height sample per corner of the chunk, ghost layer included, so
 // neighbouring shapes overlap by a cell instead of leaving a seam a character
@@ -119,7 +122,10 @@ public:
     // Append one chunk's brick list; returns where it starts.
     UINT push_brick_headers(const int* origins, const UINT* slots, UINT n);
     // Copy one brick's contents into the pool.
-    void record_brick_upload(ID3D12GraphicsCommandList* cmd, UINT slot,
+    // False when this frame has no staging room left: the caller must NOT
+    // record the brick as uploaded, or the pool keeps stale contents that
+    // nothing will ever correct.
+    bool record_brick_upload(ID3D12GraphicsCommandList* cmd, UINT slot,
                              const float* density, const UINT* mask);
     UINT bricks_uploaded_this_frame() const { return brick_uploads_; }
     // Zero a slot's draw arguments. An all-zero indirect draw is skipped.

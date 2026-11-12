@@ -289,9 +289,9 @@ UINT ChunkMesher::push_brick_headers(const int* origins, const UINT* slots, UINT
     return first;
 }
 
-void ChunkMesher::record_brick_upload(ID3D12GraphicsCommandList* cmd, UINT slot,
+bool ChunkMesher::record_brick_upload(ID3D12GraphicsCommandList* cmd, UINT slot,
                                       const float* density, const UINT* mask) {
-    if (slot >= kMaxBricks || brick_uploads_ >= kBrickUploadsPerFrame) return;
+    if (slot >= kMaxBricks || brick_uploads_ >= kBrickUploadsPerFrame) return false;
     const UINT i = brick_uploads_++;
     unsigned char* dst = brick_stage_cpu_ + size_t(i) * kBrickStageBytes;
     std::memcpy(dst, density, kBrickVoxelsGpu * 4);
@@ -312,6 +312,7 @@ void ChunkMesher::record_brick_upload(ID3D12GraphicsCommandList* cmd, UINT slot,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     transition(cmd, brick_mask_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    return true;
 }
 
 void ChunkMesher::record_mesh(ID3D12GraphicsCommandList* cmd, UINT slot,

@@ -451,6 +451,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     if (!mesher_.init(device_.Get(), tsfreq, error)) return false;
     if (!create_mesh_pipeline(error)) return false;
     streamer_.init();
+    pager_.init(kMaxBricks);
 
     // Every slot starts retired, so a slot that has never been meshed draws
     // nothing instead of whatever the allocation happened to contain.
@@ -748,18 +749,54 @@ void Renderer::record_frame(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     // Streaming first, in compute, then the draw reads what it produced.
     mesher_.record_to_compute(cmd_.Get());
     mesher_.record_timestamp(cmd_.Get(), 0);
-    // Dirty bricks first: a chunk meshed this frame must read the edit that
-    // caused it to be re-queued, not the version before it.
+    // Page, upload, then mesh. The order is the whole point: a dispatch that
+    // runs before its bricks are in the pool meshes against whatever was
+    // there, which looks correct for any brick that happened to be resident
+    // already and so fails only for new edits.
     mesher_.begin_frame_bricks();
     edits_.take_dirty(dirty_bricks_);
-    for (size_t i = 0; i < dirty_bricks_.size(); ++i) {
-        const Brick* b = edits_.find(dirty_bricks_[i]);
-        if (b) mesher_.record_brick_upload(cmd_.Get(), b->slot, b->density, b->edited);
+    for (size_t i = 0; i < dirty_bricks_.size(); ++i) pager_.invalidate(dirty_bricks_[i]);
+
+    brick_uploads_.clear();
+    Streamer::EditContext ctx;
+    ctx.store = &edits_;
+    ctx.pager = &pager_;
+    ctx.frame = frame_index_;
+    ctx.uploads = &brick_uploads_;
+    stats_.meshed_this_frame = streamer_.plan_work(mesher_, kMeshBudgetPerFrame, ctx);
+
+    for (size_t i = 0; i < brick_uploads_.size(); ++i) {
+        const Brick* b = edits_.find(brick_uploads_[i]);
+        if (!b) continue;
+        std::vector<BrickKey> one(1, brick_uploads_[i]);
+        std::vector<uint32_t> slots;
+        std::vector<BrickKey> ignored;
+        pager_.acquire(one, frame_index_, slots, ignored);
+        if (slots.empty()) continue;
+        if (mesher_.record_brick_upload(cmd_.Get(), slots[0], b->density, b->edited)) {
+            pager_.mark_uploaded(brick_uploads_[i]);
+        } else {
+            // No staging room this frame. The brick stays un-uploaded, and the
+            // chunks over it are thrown away again so they are re-meshed once
+            // it lands -- otherwise they keep the geometry they were meshed
+            // with, which is the terrain WITHOUT the edit, for good.
+            //
+            // Marking it uploaded anyway is what the first version did, and
+            // three holes dug in one frame needed exactly one brick more than
+            // the per-frame limit: the holes never appeared, and only showed
+            // up after a restart, when loading spread the uploads out.
+            const float s = float(kBrickSide) * kEditVoxel;
+            const float lo[3] = {float(brick_uploads_[i].x) * s,
+                                 float(brick_uploads_[i].y) * s,
+                                 float(brick_uploads_[i].z) * s};
+            const float hi[3] = {lo[0] + s, lo[1] + s, lo[2] + s};
+            streamer_.invalidate_box(lo, hi);
+            ++stats_.brick_upload_deferrals;
+        }
     }
     stats_.bricks_uploaded = mesher_.bricks_uploaded_this_frame();
 
-    stats_.meshed_this_frame =
-        streamer_.record_work(cmd_.Get(), mesher_, kMeshBudgetPerFrame, &edits_);
+    streamer_.record_planned(cmd_.Get(), mesher_);
     mesher_.record_timestamp(cmd_.Get(), 1);
     mesher_.resolve_timestamps(cmd_.Get());
     stage_heights();
@@ -788,6 +825,9 @@ void Renderer::render(const ViewConstants& view) {
     stats_.mesh_backlog = mesh_wanted_.size();
     stats_.edit_bricks = edits_.brick_count();
     stats_.edit_bytes = edits_.bytes();
+    stats_.bricks_resident = pager_.resident();
+    stats_.brick_evictions = pager_.evictions();
+    stats_.brick_misses = pager_.misses();
 
     allocators_[frame_]->Reset();
     cmd_->Reset(allocators_[frame_].Get(), nullptr);
@@ -840,7 +880,29 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
         cmd_->Reset(allocators_[frame_].Get(), nullptr);
         mesher_.record_to_compute(cmd_.Get());
         mesher_.begin_frame_bricks();
-        streamer_.record_work(cmd_.Get(), mesher_, 64, &edits_);
+        {
+            brick_uploads_.clear();
+            Streamer::EditContext cctx;
+            cctx.store = &edits_;
+            cctx.pager = &pager_;
+            cctx.frame = frame_index_;
+            cctx.uploads = &brick_uploads_;
+            streamer_.plan_work(mesher_, 64, cctx);
+            for (size_t i = 0; i < brick_uploads_.size(); ++i) {
+                const Brick* b = edits_.find(brick_uploads_[i]);
+                if (!b) continue;
+                std::vector<BrickKey> one(1, brick_uploads_[i]);
+                std::vector<uint32_t> slots;
+                std::vector<BrickKey> ignored;
+                pager_.acquire(one, frame_index_, slots, ignored);
+                    if (slots.empty()) continue;
+                if (mesher_.record_brick_upload(cmd_.Get(), slots[0], b->density,
+                                                b->edited)) {
+                    pager_.mark_uploaded(brick_uploads_[i]);
+                }
+            }
+            streamer_.record_planned(cmd_.Get(), mesher_);
+        }
         mesher_.record_counter_copy(cmd_.Get());
         mesher_.record_vertex_copy(cmd_.Get());
         mesher_.record_to_draw(cmd_.Get());
@@ -1014,6 +1076,21 @@ void Renderer::dump_draw_args(const char* path) {
                      a[s*5+0], a[s*5+1], a[s*5+2], a[s*5+3], a[s*5+4]);
     }
     std::fclose(f);
+}
+
+bool Renderer::save_edits(const char* path, std::string& error) const {
+    return edits_.save(path, kTrivialFieldId, error);
+}
+
+bool Renderer::load_edits(const char* path, std::string& error, bool& field_mismatch) {
+    if (!edits_.load(path, kTrivialFieldId, error, field_mismatch)) return false;
+    // Everything resident was meshed from terrain that has just changed, and
+    // every lease points at pool contents that are now wrong.
+    pager_.init(kMaxBricks);
+    const float lo[3] = {-1.0e9f, -1.0e9f, -1.0e9f};
+    const float hi[3] = {1.0e9f, 1.0e9f, 1.0e9f};
+    streamer_.invalidate_box(lo, hi);
+    return true;
 }
 
 bool Renderer::dig(float x, float y, float z, float radius, float strength,

@@ -1,6 +1,8 @@
 #include "engine/svdag/brick_store.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 namespace engine {
@@ -9,7 +11,7 @@ namespace {
 inline int floor_div(int a, int b) {
     // Voxel coordinates go negative -- the world is centred on the origin
     // (invariant 6) -- and C's integer division truncates toward zero, which
-    // puts voxel -1 and voxel 0 in the same brick.
+    // would put voxel -1 and voxel 0 in the same brick.
     return a >= 0 ? a / b : -(((-a) + b - 1) / b);
 }
 
@@ -20,6 +22,11 @@ inline int floor_mod(int a, int b) {
 
 inline int voxel_of(float w) {
     return static_cast<int>(std::floor(w / kEditVoxel));
+}
+
+template <typename T>
+bool read_pod(FILE* f, T& v) {
+    return std::fread(&v, sizeof(T), 1, f) == 1;
 }
 
 }  // namespace
@@ -36,8 +43,7 @@ Brick& BrickStore::touch(const BrickKey& k, bool& created) {
     std::memset(b.material, 0, sizeof(b.material));
     // density is left alone on purpose: a voxel whose edited bit is clear is
     // never read, and zeroing 4096 floats per brick would be work for nothing.
-    b.slot = next_slot_++;
-    b.dirty = true;
+    dirty_.push_back(k);
     return b;
 }
 
@@ -67,6 +73,11 @@ bool BrickStore::edit_sphere(float cx, float cy, float cz, float radius,
                 key.z = floor_div(vz, kBrickSide);
                 bool created = false;
                 Brick& b = touch(key, created);
+                if (!created) {
+                    // Re-edited: the pool's copy is stale either way, and the
+                    // list is deduplicated when it is drained.
+                    dirty_.push_back(key);
+                }
 
                 const int lx = floor_mod(vx, kBrickSide);
                 const int ly = floor_mod(vy, kBrickSide);
@@ -76,16 +87,10 @@ bool BrickStore::edit_sphere(float cx, float cy, float cz, float radius,
                 // Absolute, and feathered to the rim so the carve does not end
                 // in a step one voxel wide. The sign is what matters: negative
                 // is air, positive is rock.
-                const float t = radius > 0.0f ? d / radius : 1.0f;
+                const float t = d / radius;
                 b.density[li] = strength * (1.0f - t * t);
                 b.material[li] = material;
                 b.edited[li >> 5] |= (1u << (li & 31));
-                if (!b.dirty) {
-                    b.dirty = true;
-                    dirty_.push_back(key);
-                } else if (created) {
-                    dirty_.push_back(key);
-                }
                 any = true;
             }
         }
@@ -98,10 +103,8 @@ bool BrickStore::edit_sphere(float cx, float cy, float cz, float radius,
 }
 
 void BrickStore::bricks_in_box(const float lo[3], const float hi[3],
-                               std::vector<uint32_t>& out_slots,
-                               std::vector<int>& out_origins) const {
-    out_slots.clear();
-    out_origins.clear();
+                               std::vector<BrickKey>& out) const {
+    out.clear();
     if (bricks_.empty()) return;
 
     const int b0x = floor_div(voxel_of(lo[0]), kBrickSide);
@@ -116,13 +119,8 @@ void BrickStore::bricks_in_box(const float lo[3], const float hi[3],
             for (int bx = b0x; bx <= b1x; ++bx) {
                 BrickKey k;
                 k.x = bx; k.y = by; k.z = bz;
-                std::unordered_map<BrickKey, Brick, BrickKeyHash>::const_iterator it =
-                    bricks_.find(k);
-                if (it == bricks_.end()) continue;
-                out_slots.push_back(it->second.slot);
-                out_origins.push_back(bx);
-                out_origins.push_back(by);
-                out_origins.push_back(bz);
+                if (bricks_.find(k) == bricks_.end()) continue;
+                out.push_back(k);
             }
         }
     }
@@ -131,15 +129,121 @@ void BrickStore::bricks_in_box(const float lo[3], const float hi[3],
 void BrickStore::take_dirty(std::vector<BrickKey>& out) {
     out.clear();
     out.swap(dirty_);
-    for (size_t i = 0; i < out.size(); ++i) {
-        std::unordered_map<BrickKey, Brick, BrickKeyHash>::iterator it = bricks_.find(out[i]);
-        if (it != bricks_.end()) it->second.dirty = false;
-    }
+    // The same brick is pushed once per edited voxel, so the list is mostly
+    // duplicates. Sorting 500 entries to collapse them is cheaper than
+    // uploading one brick 500 times.
+    std::sort(out.begin(), out.end(), [](const BrickKey& a, const BrickKey& b) {
+        if (a.x != b.x) return a.x < b.x;
+        if (a.y != b.y) return a.y < b.y;
+        return a.z < b.z;
+    });
+    out.erase(std::unique(out.begin(), out.end()), out.end());
 }
 
 const Brick* BrickStore::find(const BrickKey& k) const {
     std::unordered_map<BrickKey, Brick, BrickKeyHash>::const_iterator it = bricks_.find(k);
     return it == bricks_.end() ? nullptr : &it->second;
+}
+
+size_t BrickStore::edited_voxels() const {
+    size_t n = 0;
+    for (std::unordered_map<BrickKey, Brick, BrickKeyHash>::const_iterator it = bricks_.begin();
+         it != bricks_.end(); ++it) {
+        for (int w = 0; w < kBrickMaskWords; ++w) {
+            uint32_t m = it->second.edited[w];
+            while (m) { m &= m - 1; ++n; }
+        }
+    }
+    return n;
+}
+
+bool BrickStore::save(const std::string& path, uint32_t field_id,
+                      std::string& error) const {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) { error = "could not open " + path + " for writing"; return false; }
+
+    const uint32_t magic = kSaveMagic, fmt = kSaveFormat;
+    const uint32_t count = static_cast<uint32_t>(bricks_.size());
+    std::fwrite(&magic, 4, 1, f);
+    std::fwrite(&fmt, 4, 1, f);
+    std::fwrite(&field_id, 4, 1, f);
+    std::fwrite(&count, 4, 1, f);
+
+    for (std::unordered_map<BrickKey, Brick, BrickKeyHash>::const_iterator it = bricks_.begin();
+         it != bricks_.end(); ++it) {
+        const int32_t kx = it->first.x, ky = it->first.y, kz = it->first.z;
+        std::fwrite(&kx, 4, 1, f);
+        std::fwrite(&ky, 4, 1, f);
+        std::fwrite(&kz, 4, 1, f);
+        std::fwrite(it->second.edited, 4, kBrickMaskWords, f);
+
+        // Only the voxels this brick owns. A dug hole touches a few hundred
+        // voxels in bricks of four thousand, so writing all of them would make
+        // the file around twenty times larger than the edits in it.
+        for (int i = 0; i < kBrickVoxels; ++i) {
+            if ((it->second.edited[i >> 5] & (1u << (i & 31))) == 0) continue;
+            std::fwrite(&it->second.density[i], 4, 1, f);
+            std::fwrite(&it->second.material[i], 1, 1, f);
+        }
+    }
+    std::fclose(f);
+    return true;
+}
+
+bool BrickStore::load(const std::string& path, uint32_t expect_field_id,
+                      std::string& error, bool& field_mismatch) {
+    field_mismatch = false;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { error = "could not open " + path; return false; }
+
+    uint32_t magic = 0, fmt = 0, field_id = 0, count = 0;
+    if (!read_pod(f, magic) || !read_pod(f, fmt) || !read_pod(f, field_id) ||
+        !read_pod(f, count)) {
+        std::fclose(f);
+        error = "truncated header in " + path;
+        return false;
+    }
+    if (magic != kSaveMagic) { std::fclose(f); error = path + " is not an edit file"; return false; }
+    if (fmt != kSaveFormat) {
+        std::fclose(f);
+        error = "edit file format " + std::to_string(fmt) + ", expected " +
+                std::to_string(kSaveFormat);
+        return false;
+    }
+    // Loaded anyway, but the caller is told. The edits are absolute, so they
+    // are still exactly what the player made -- it is the terrain AROUND them
+    // that a different field would have moved.
+    if (field_id != expect_field_id) field_mismatch = true;
+
+    bricks_.clear();
+    dirty_.clear();
+    for (uint32_t b = 0; b < count; ++b) {
+        int32_t kx = 0, ky = 0, kz = 0;
+        if (!read_pod(f, kx) || !read_pod(f, ky) || !read_pod(f, kz)) {
+            std::fclose(f);
+            error = "truncated brick in " + path;
+            return false;
+        }
+        BrickKey key;
+        key.x = kx; key.y = ky; key.z = kz;
+        bool created = false;
+        Brick& brick = touch(key, created);
+        if (std::fread(brick.edited, 4, kBrickMaskWords, f) != kBrickMaskWords) {
+            std::fclose(f);
+            error = "truncated mask in " + path;
+            return false;
+        }
+        for (int i = 0; i < kBrickVoxels; ++i) {
+            if ((brick.edited[i >> 5] & (1u << (i & 31))) == 0) continue;
+            if (!read_pod(f, brick.density[i]) || !read_pod(f, brick.material[i])) {
+                std::fclose(f);
+                error = "truncated voxels in " + path;
+                return false;
+            }
+        }
+    }
+    std::fclose(f);
+    return true;
 }
 
 }  // namespace engine
