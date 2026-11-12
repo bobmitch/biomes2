@@ -11,6 +11,7 @@
 
 #include "engine/meshing/chunk_mesher.h"
 #include "engine/streaming/streamer.h"
+#include "engine/svdag/brick_store.h"
 
 #include <vector>
 
@@ -62,6 +63,10 @@ struct FrameStats {
     unsigned long long chunks_needing_mesh = 0;
     unsigned long long mesh_shapes_delivered = 0;
     size_t mesh_backlog = 0;
+    size_t edit_bricks = 0;
+    size_t edit_bytes = 0;
+    UINT   bricks_uploaded = 0;
+    size_t chunks_invalidated = 0;
     UINT   readback_latency_frames = 0;
     float  height_residual_max = 0.0f;
     double height_residual_mean = 0.0;
@@ -102,6 +107,12 @@ public:
     Mode mode() const { return mode_; }
 
     const FrameStats& stats() const { return stats_; }
+
+    // The edit overlay. Digging goes through here, and the renderer takes care
+    // of uploading what changed and re-meshing what it touched.
+    BrickStore& edits() { return edits_; }
+    bool dig(float x, float y, float z, float radius, float strength,
+             unsigned char material);
 
     // Height patches that arrived through the readback ring this frame, and
     // the chunks whose patches are no longer valid. Drained by the caller and
@@ -168,6 +179,8 @@ private:
 
     ChunkMesher mesher_;
     Streamer    streamer_;
+    BrickStore  edits_;
+    std::vector<BrickKey> dirty_bricks_;
     std::vector<PatchEvent> patches_added_;
     std::vector<MeshPatchEvent> mesh_patches_added_;
     std::vector<ChunkKey>   patches_removed_;

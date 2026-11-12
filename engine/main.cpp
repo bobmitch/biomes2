@@ -184,6 +184,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     double flight_seconds = 0.0;
     double walk_seconds = 0.0;
     double overhang_seconds = 0.0;
+    double dig_seconds = 0.0;
     bool flight_vsync = false;
     {
         const std::string cl = cmdline ? cmdline : "";
@@ -197,6 +198,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (shot_path.empty()) shot_path = "build/shot.bmp";
         }
         if (cl.find("--overhang") != std::string::npos) overhang_seconds = 14.0;
+        if (cl.find("--dig") != std::string::npos) dig_seconds = 20.0;
         const size_t wk = cl.find("--walk");
         if (wk != std::string::npos) {
             walk_seconds = 8.0;
@@ -280,6 +282,156 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     }
 
     ShowWindow(hwnd, show);
+
+    if (dig_seconds > 0.0) {
+        g_renderer.set_vsync(true);
+        g_walk = true;
+        g_physics.place_character(0.0f, 20.0f, 0.0f);
+        g_physics.character_position(g_feet);
+        g_camera.yaw = 0.6f;
+        g_camera.pitch = -0.35f;
+
+        LARGE_INTEGER dfreq, dstart, dprev;
+        QueryPerformanceFrequency(&dfreq);
+        QueryPerformanceCounter(&dstart);
+        dprev = dstart;
+
+        double ground_before = 0.0, ground_after = 0.0, ground_returned = 0.0;
+        unsigned long long frames = 0, dig_frame = 0, fall_frame = 0;
+        bool dug = false, sent_away = false, brought_back = false, fell = false;
+        bool unsupported = false;
+        unsigned long long unsupported_frame = 0;
+        float dig_at[3] = {0.0f, 0.0f, 0.0f};
+
+        for (;;) {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&m);
+                DispatchMessageA(&m);
+            }
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            const double total = double(now.QuadPart - dstart.QuadPart) / double(dfreq.QuadPart);
+            const double dt = double(now.QuadPart - dprev.QuadPart) / double(dfreq.QuadPart);
+            dprev = now;
+            if (total >= dig_seconds) break;
+            ++frames;
+
+            sync_physics_terrain();
+
+            if (!dug && total >= 4.0) {
+                dug = true;
+                dig_frame = frames;
+                ground_before = g_feet[1];
+                dig_at[0] = g_feet[0];
+                dig_at[1] = g_feet[1] - 2.0f;
+                dig_at[2] = g_feet[2];
+                // Absolute density, strongly negative: this is air now,
+                // whatever the field says here.
+                g_renderer.dig(dig_at[0], dig_at[1], dig_at[2], 3.5f, -4.0f, 1);
+            }
+            // Two different things, and the first test conflated them. The
+            // moment the ground stops supporting the character is when physics
+            // has followed the edit. Falling a whole metre from rest under
+            // gravity of 22 takes another 18 frames all by itself, which is
+            // not latency, it is gravity.
+            if (dug && !unsupported && total > 4.0 && !g_physics.character_grounded()) {
+                unsupported = true;
+                unsupported_frame = frames;
+            }
+            if (dug && !fell && total > 4.0 && g_feet[1] < ground_before - 1.0) {
+                fell = true;
+                fall_frame = frames;
+            }
+            if (dug && !sent_away && total >= 9.0) {
+                sent_away = true;
+                ground_after = g_feet[1];
+                // Far enough that every chunk around the hole retires.
+                g_physics.place_character(400.0f, 60.0f, 400.0f);
+            }
+            if (sent_away && !brought_back && total >= 14.0) {
+                brought_back = true;
+                g_physics.place_character(dig_at[0], ground_before + 12.0f, dig_at[2]);
+            }
+
+            g_physics.update(float(dt), 0.0f, 0.0f, false);
+            g_physics.character_position(g_feet);
+            if (brought_back) ground_returned = g_feet[1];
+
+            g_camera.x = g_feet[0];
+            g_camera.y = g_feet[1] + kEyeAboveFeet;
+            g_camera.z = g_feet[2];
+
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
+            if (w < 1.0f || h < 1.0f) continue;
+            engine::ViewConstants v = {};
+            fill_view(g_camera, w, h, float(total), v);
+            g_renderer.render(v);
+        }
+
+        const engine::FrameStats st = g_renderer.stats();
+        if (FILE* f = std::fopen("build/dig.txt", "w")) {
+            std::fprintf(f, "dig a hole, %.0f s\n\n", dig_seconds);
+            std::fprintf(f, "ground under the character before digging: %.2f m\n",
+                         ground_before);
+            std::fprintf(f, "dug a sphere of radius 3.5 m centred 2 m below it\n");
+            if (unsupported) {
+                std::fprintf(f, "physics stopped supporting it %llu frames after the edit\n",
+                             unsupported_frame - dig_frame);
+            } else {
+                std::fprintf(f, "physics NEVER stopped supporting it\n");
+            }
+            if (fell) {
+                std::fprintf(f, "it had fallen a metre %llu frames after the edit\n",
+                             fall_frame - dig_frame);
+                std::fprintf(f, "  of which %llu are gravity, not latency\n",
+                             fall_frame - (unsupported ? unsupported_frame : dig_frame));
+            } else {
+                std::fprintf(f, "the character NEVER fell -- physics did not follow\n");
+            }
+            std::fprintf(f, "where it came to rest: %.2f m (%.2f m lower)\n",
+                         ground_after, ground_before - ground_after);
+            std::fprintf(f, "\nsent 400 m away so every chunk around the hole retired,\n");
+            std::fprintf(f, "then brought back and dropped in again:\n");
+            std::fprintf(f, "  it came to rest at %.2f m\n", ground_returned);
+            std::fprintf(f, "  the hole %s\n",
+                         ground_returned < ground_before - 1.0
+                             ? "SURVIVED the chunk being rebuilt"
+                             : "was LOST when the chunk was rebuilt");
+            std::fprintf(f, "\noverlay: %zu bricks, %zu bytes (%.1f KB)\n",
+                         st.edit_bricks, st.edit_bytes, double(st.edit_bytes) / 1024.0);
+            std::fprintf(f, "chunks thrown away by the edit: %zu\n",
+                         st.chunks_invalidated);
+            std::fprintf(f, "physics bodies: %zu\n", g_physics.body_count());
+            std::fclose(f);
+        }
+
+        // Captured in MESH mode, not the raymarch. The raymarch evaluates the
+        // analytic field, which has no hole in it -- the edit exists only in
+        // the overlay and therefore only in the meshed geometry.
+        {
+            engine::Camera c;
+            // Straight down from well above. An oblique camera near a
+            // hole keeps ending up inside the hillside beside it.
+            // 45 degrees from 30 m: steep enough to see into the pit, far
+            // enough that a 7 m hole is a fifth of the frame.
+            c.x = dig_at[0] + 21.0f;
+            c.y = dig_at[1] + 21.0f;
+            c.z = dig_at[2];
+            c.yaw = -1.5708f;
+            c.pitch = -0.785f;
+            engine::ViewConstants cv = {};
+            fill_view(c, 1280.0f, 720.0f, 0.0f, cv);
+            g_renderer.set_mode(engine::Mode::Mesh);
+            std::string e3;
+            g_renderer.capture(cv, "build/b6_dig.bmp", e3);
+        }
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return 0;
+    }
 
     if (overhang_seconds > 0.0) {
         // Straight north, under the sphere at (14, 26, -10) whose underside

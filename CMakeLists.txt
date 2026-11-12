@@ -101,7 +101,8 @@ if(WIN32 AND EXISTS ${PROJECT_SOURCE_DIR}/engine/main.cpp)
     engine/main.cpp
     engine/render/renderer.cpp
     engine/meshing/chunk_mesher.cpp
-    engine/physics/physics_world.cpp)
+    engine/physics/physics_world.cpp
+    engine/svdag/brick_store.cpp)
   target_include_directories(engine PRIVATE ${PROJECT_SOURCE_DIR})
   target_link_libraries(engine PRIVATE d3d12 dxgi d3dcompiler Jolt)
   if(MSVC)

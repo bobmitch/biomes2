@@ -80,7 +80,35 @@ struct ChunkConstants {
     UINT  vbase;
     UINT  ibase;
     UINT  slot_caps;
+    UINT  brick_first;
+    UINT  brick_count;
+    UINT  pad0;
+    UINT  pad1;
 };
+
+// One brick's bytes in the staging buffer: density then mask, so a single
+// memcpy pair fills an entry and two copies move it.
+const UINT kBrickStageBytes = kBrickVoxelsGpu * 4 + kBrickMaskWordsGpu * 4;
+
+bool make_upload(ID3D12Device* device, UINT64 bytes, ComPtr<ID3D12Resource>& out,
+                 std::string& error, const char* what) {
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = bytes;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_UNKNOWN;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    const HRESULT hr = device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                       D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                       nullptr, IID_PPV_ARGS(&out));
+    if (FAILED(hr)) { error = hr_text(what, hr); return false; }
+    return true;
+}
 
 }  // namespace
 
@@ -89,17 +117,17 @@ bool ChunkMesher::init(ID3D12Device* device, UINT64 timestamp_freq, std::string&
 
     // One root parameter for the chunk constants and six root UAVs. No
     // descriptor heap: root descriptors are enough for plain buffers.
-    D3D12_ROOT_PARAMETER params[9] = {};
+    D3D12_ROOT_PARAMETER params[12] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
     params[0].Constants.Num32BitValues = sizeof(ChunkConstants) / 4;
-    for (UINT i = 0; i < 8; ++i) {
+    for (UINT i = 0; i < 11; ++i) {
         params[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
         params[1 + i].Descriptor.ShaderRegister = i;
     }
 
     D3D12_ROOT_SIGNATURE_DESC rsd = {};
-    rsd.NumParameters = 9;
+    rsd.NumParameters = 12;
     rsd.pParameters = params;
 
     ComPtr<ID3DBlob> sig, sig_err;
@@ -152,6 +180,31 @@ bool ChunkMesher::init(ID3D12Device* device, UINT64 timestamp_freq, std::string&
     if (!make_buffer(device, UINT64(kSlots) * 4, ua, chunk_flags_, error,
                      "chunk flags")) return false;
 
+    if (!make_buffer(device, UINT64(kMaxBricks) * kBrickVoxelsGpu * 4, ua,
+                     brick_den_, error, "brick density pool")) return false;
+    if (!make_buffer(device, UINT64(kMaxBricks) * kBrickMaskWordsGpu * 4, ua,
+                     brick_mask_, error, "brick mask pool")) return false;
+    // The header list is small and rewritten every frame, so it is read
+    // straight out of an upload heap rather than copied into one more buffer.
+    if (!make_upload(device, UINT64(kMaxBrickHeaders) * 16, brick_hdr_, error,
+                     "brick headers")) return false;
+    if (!make_upload(device, UINT64(kBrickUploadsPerFrame) * kBrickStageBytes,
+                     brick_stage_, error, "brick staging")) return false;
+    {
+        void* p = nullptr;
+        D3D12_RANGE none = {0, 0};
+        if (FAILED(brick_hdr_->Map(0, &none, &p))) {
+            error = "could not map brick headers";
+            return false;
+        }
+        brick_hdr_cpu_ = static_cast<int*>(p);
+        if (FAILED(brick_stage_->Map(0, &none, &p))) {
+            error = "could not map brick staging";
+            return false;
+        }
+        brick_stage_cpu_ = static_cast<unsigned char*>(p);
+    }
+
     D3D12_QUERY_HEAP_DESC qh = {};
     qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
     qh.Count = 2;
@@ -198,7 +251,8 @@ void bind_pool(ID3D12GraphicsCommandList* cmd, ID3D12RootSignature* root,
                ID3D12Resource* density, ID3D12Resource* cell_vertex,
                ID3D12Resource* vertices, ID3D12Resource* indices,
                ID3D12Resource* counters, ID3D12Resource* args,
-               ID3D12Resource* heights, ID3D12Resource* flags) {
+               ID3D12Resource* heights, ID3D12Resource* flags,
+               ID3D12Resource* bhdr, ID3D12Resource* bden, ID3D12Resource* bmask) {
     cmd->SetComputeRootSignature(root);
     cmd->SetComputeRoot32BitConstants(0, sizeof(ChunkConstants) / 4, &c, 0);
     cmd->SetComputeRootUnorderedAccessView(1, density->GetGPUVirtualAddress());
@@ -209,11 +263,60 @@ void bind_pool(ID3D12GraphicsCommandList* cmd, ID3D12RootSignature* root,
     cmd->SetComputeRootUnorderedAccessView(6, args->GetGPUVirtualAddress());
     cmd->SetComputeRootUnorderedAccessView(7, heights->GetGPUVirtualAddress());
     cmd->SetComputeRootUnorderedAccessView(8, flags->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(9, bhdr->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(10, bden->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(11, bmask->GetGPUVirtualAddress());
 }
 }  // namespace
 
+void ChunkMesher::begin_frame_bricks() {
+    brick_hdr_cursor_ = 0;
+    brick_uploads_ = 0;
+}
+
+UINT ChunkMesher::push_brick_headers(const int* origins, const UINT* slots, UINT n) {
+    if (n == 0) return 0;
+    if (brick_hdr_cursor_ + n > kMaxBrickHeaders) return 0;
+    const UINT first = brick_hdr_cursor_;
+    for (UINT i = 0; i < n; ++i) {
+        int* e = brick_hdr_cpu_ + size_t(first + i) * 4;
+        e[0] = origins[i * 3 + 0];
+        e[1] = origins[i * 3 + 1];
+        e[2] = origins[i * 3 + 2];
+        e[3] = static_cast<int>(slots[i]);
+    }
+    brick_hdr_cursor_ += n;
+    return first;
+}
+
+void ChunkMesher::record_brick_upload(ID3D12GraphicsCommandList* cmd, UINT slot,
+                                      const float* density, const UINT* mask) {
+    if (slot >= kMaxBricks || brick_uploads_ >= kBrickUploadsPerFrame) return;
+    const UINT i = brick_uploads_++;
+    unsigned char* dst = brick_stage_cpu_ + size_t(i) * kBrickStageBytes;
+    std::memcpy(dst, density, kBrickVoxelsGpu * 4);
+    std::memcpy(dst + kBrickVoxelsGpu * 4, mask, kBrickMaskWordsGpu * 4);
+
+    transition(cmd, brick_den_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_DEST);
+    transition(cmd, brick_mask_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_DEST);
+    cmd->CopyBufferRegion(brick_den_.Get(), UINT64(slot) * kBrickVoxelsGpu * 4,
+                          brick_stage_.Get(), UINT64(i) * kBrickStageBytes,
+                          kBrickVoxelsGpu * 4);
+    cmd->CopyBufferRegion(brick_mask_.Get(), UINT64(slot) * kBrickMaskWordsGpu * 4,
+                          brick_stage_.Get(),
+                          UINT64(i) * kBrickStageBytes + kBrickVoxelsGpu * 4,
+                          kBrickMaskWordsGpu * 4);
+    transition(cmd, brick_den_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    transition(cmd, brick_mask_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
 void ChunkMesher::record_mesh(ID3D12GraphicsCommandList* cmd, UINT slot,
-                              const float origin[3], float voxel) {
+                              const float origin[3], float voxel,
+                              UINT brick_first, UINT brick_count) {
     ChunkConstants c = {};
     c.origin[0] = origin[0];
     c.origin[1] = origin[1];
@@ -223,10 +326,13 @@ void ChunkMesher::record_mesh(ID3D12GraphicsCommandList* cmd, UINT slot,
     c.vbase = slot * kSlotVertices;
     c.ibase = slot * kSlotIndices;
     c.slot_caps = (kSlotVertices & 0xFFFFu) | ((kSlotIndices & 0xFFFFu) << 16);
+    c.brick_first = brick_first;
+    c.brick_count = brick_count;
 
     bind_pool(cmd, root_.Get(), c, density_.Get(), cell_vertex_.Get(),
               vertices_.Get(), indices_.Get(), counters_.Get(), draw_args_.Get(),
-              heights_.Get(), chunk_flags_.Get());
+              heights_.Get(), chunk_flags_.Get(), brick_hdr_.Get(),
+              brick_den_.Get(), brick_mask_.Get());
 
     cmd->SetPipelineState(pso_clear_.Get());
     cmd->Dispatch(1, 1, 1);
@@ -267,7 +373,8 @@ void ChunkMesher::record_retire(ID3D12GraphicsCommandList* cmd, UINT slot) {
     c.slot = slot;
     bind_pool(cmd, root_.Get(), c, density_.Get(), cell_vertex_.Get(),
               vertices_.Get(), indices_.Get(), counters_.Get(), draw_args_.Get(),
-              heights_.Get(), chunk_flags_.Get());
+              heights_.Get(), chunk_flags_.Get(), brick_hdr_.Get(),
+              brick_den_.Get(), brick_mask_.Get());
     cmd->SetPipelineState(pso_retire_.Get());
     cmd->Dispatch(1, 1, 1);
     uav_barrier(cmd, draw_args_.Get(), nullptr);

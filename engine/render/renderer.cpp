@@ -748,8 +748,18 @@ void Renderer::record_frame(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     // Streaming first, in compute, then the draw reads what it produced.
     mesher_.record_to_compute(cmd_.Get());
     mesher_.record_timestamp(cmd_.Get(), 0);
+    // Dirty bricks first: a chunk meshed this frame must read the edit that
+    // caused it to be re-queued, not the version before it.
+    mesher_.begin_frame_bricks();
+    edits_.take_dirty(dirty_bricks_);
+    for (size_t i = 0; i < dirty_bricks_.size(); ++i) {
+        const Brick* b = edits_.find(dirty_bricks_[i]);
+        if (b) mesher_.record_brick_upload(cmd_.Get(), b->slot, b->density, b->edited);
+    }
+    stats_.bricks_uploaded = mesher_.bricks_uploaded_this_frame();
+
     stats_.meshed_this_frame =
-        streamer_.record_work(cmd_.Get(), mesher_, kMeshBudgetPerFrame);
+        streamer_.record_work(cmd_.Get(), mesher_, kMeshBudgetPerFrame, &edits_);
     mesher_.record_timestamp(cmd_.Get(), 1);
     mesher_.resolve_timestamps(cmd_.Get());
     stage_heights();
@@ -776,6 +786,8 @@ void Renderer::render(const ViewConstants& view) {
     consume_heights();
     consume_meshes();
     stats_.mesh_backlog = mesh_wanted_.size();
+    stats_.edit_bricks = edits_.brick_count();
+    stats_.edit_bytes = edits_.bytes();
 
     allocators_[frame_]->Reset();
     cmd_->Reset(allocators_[frame_].Get(), nullptr);
@@ -827,7 +839,8 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
         allocators_[frame_]->Reset();
         cmd_->Reset(allocators_[frame_].Get(), nullptr);
         mesher_.record_to_compute(cmd_.Get());
-        streamer_.record_work(cmd_.Get(), mesher_, 64);
+        mesher_.begin_frame_bricks();
+        streamer_.record_work(cmd_.Get(), mesher_, 64, &edits_);
         mesher_.record_counter_copy(cmd_.Get());
         mesher_.record_vertex_copy(cmd_.Get());
         mesher_.record_to_draw(cmd_.Get());
@@ -1001,6 +1014,15 @@ void Renderer::dump_draw_args(const char* path) {
                      a[s*5+0], a[s*5+1], a[s*5+2], a[s*5+3], a[s*5+4]);
     }
     std::fclose(f);
+}
+
+bool Renderer::dig(float x, float y, float z, float radius, float strength,
+                   unsigned char material) {
+    float lo[3], hi[3];
+    if (!edits_.edit_sphere(x, y, z, radius, strength, material, lo, hi)) return false;
+    streamer_.invalidate_box(lo, hi);
+    stats_.chunks_invalidated = streamer_.last_invalidated();
+    return true;
 }
 
 void Renderer::shutdown() {

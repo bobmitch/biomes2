@@ -38,7 +38,19 @@ cbuffer ChunkConstants : register(b0) {
     uint   vbase;          // first vertex of the slot
     uint   ibase;          // first index of the slot
     uint   slot_caps;      // vertex cap in the low 16 bits, index cap in the high
+    uint   brick_first;    // this chunk's run in the brick header array
+    uint   brick_count;
+    uint   pad0;
+    uint   pad1;
 };
+
+// The edit overlay. Edits live on the LOD 0 lattice whatever LOD is meshing,
+// so a coarse chunk point-samples them -- a dug hole aliases at distance
+// rather than disappearing.
+static const float kEditVoxel = 0.5f;
+static const int   kBrickSide = 16;
+static const uint  kBrickVoxels = 4096u;
+static const uint  kBrickMaskWords = 128u;
 
 struct Vertex {
     float3 pos;
@@ -53,6 +65,9 @@ RWStructuredBuffer<uint>   g_counters    : register(u4);   // 2 per slot
 RWStructuredBuffer<uint>   g_draw_args   : register(u5);   // 5 per slot
 RWStructuredBuffer<float>  g_heights     : register(u6);   // kCorners^2 per slot
 RWStructuredBuffer<uint>   g_chunk_flags : register(u7);   // 1 per slot
+RWStructuredBuffer<int4>   g_brick_hdr   : register(u8);   // (bx, by, bz, slot)
+RWStructuredBuffer<float>  g_brick_den   : register(u9);   // kBrickVoxels per slot
+RWStructuredBuffer<uint>   g_brick_mask  : register(u10);  // kBrickMaskWords per slot
 
 // A column with no surface in it. Jolt spells its equivalent
 // HeightFieldShapeConstants::cNoCollisionValue; the conversion happens on the
@@ -67,6 +82,40 @@ uint cell_index(uint3 c)   { return (c.z * kCells   + c.y) * kCells   + c.x; }
 
 float3 corner_world(uint3 c) {
     return chunk_origin + float3(c) * voxel;
+}
+
+// Integer floor-divide. The world is centred on the origin (invariant 6) so
+// voxel coordinates go negative, and HLSL's integer division truncates toward
+// zero -- which would put voxel -1 and voxel 0 in the same brick.
+int brick_of(int v) {
+    return v >= 0 ? (v / kBrickSide) : -(((-v) + kBrickSide - 1) / kBrickSide);
+}
+
+// The player's value at this point, if there is one.
+bool edited_density(float3 p, out float out_d) {
+    out_d = 0.0f;
+    if (brick_count == 0u) return false;
+
+    const int vx = (int)floor(p.x / kEditVoxel);
+    const int vy = (int)floor(p.y / kEditVoxel);
+    const int vz = (int)floor(p.z / kEditVoxel);
+    const int bx = brick_of(vx), by = brick_of(vy), bz = brick_of(vz);
+
+    for (uint i = 0; i < brick_count; ++i) {
+        const int4 hdr = g_brick_hdr[brick_first + i];
+        if (hdr.x != bx || hdr.y != by || hdr.z != bz) continue;
+        const uint lx = (uint)(vx - bx * kBrickSide);
+        const uint ly = (uint)(vy - by * kBrickSide);
+        const uint lz = (uint)(vz - bz * kBrickSide);
+        const uint li = (lz * 16u + ly) * 16u + lx;
+        const uint sl = (uint)hdr.w;
+        if ((g_brick_mask[sl * kBrickMaskWords + (li >> 5u)] & (1u << (li & 31u))) == 0u) {
+            return false;   // the brick exists but has no opinion here
+        }
+        out_d = g_brick_den[sl * kBrickVoxels + li];
+        return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -101,7 +150,12 @@ void cs_retire(uint3 id : SV_DispatchThreadID) {
 void cs_density(uint3 id : SV_DispatchThreadID) {
     if (any(id >= kCorners)) return;
     const float3 p = corner_world(id);
-    g_density[corner_index(id)] = trivial_density(p.x, p.y, p.z);
+    // The overlay wins where it has a value, because what it stores is
+    // absolute. Everywhere else -- which is almost everywhere -- the field
+    // answers and nothing was stored at all.
+    float e = 0.0f;
+    g_density[corner_index(id)] =
+        edited_density(p, e) ? e : trivial_density(p.x, p.y, p.z);
 }
 
 // The 12 edges of a cell, as pairs of corner indices. Corner bit 0 is x,

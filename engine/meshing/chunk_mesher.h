@@ -60,6 +60,17 @@ struct MeshVertex {
     float nrm[3];
 };
 
+// The edit overlay's pool. 1024 bricks of 16^3 is 16 MB of density and half a
+// megabyte of mask -- the "few tens of megabytes" the design document expects
+// a heavily played world to need, and the figure a DAG would have to beat
+// before it earns its complexity.
+static const UINT kMaxBricks = 1024;
+static const UINT kBrickVoxelsGpu = 16 * 16 * 16;
+static const UINT kBrickMaskWordsGpu = kBrickVoxelsGpu / 32;
+// Per-dispatch brick lists, one run per chunk meshed this frame.
+static const UINT kMaxBrickHeaders = 4096;
+static const UINT kBrickUploadsPerFrame = 16;
+
 // One height sample per corner of the chunk, ghost layer included, so
 // neighbouring shapes overlap by a cell instead of leaving a seam a character
 // could fall through.
@@ -98,7 +109,19 @@ public:
     // Mesh one chunk into one slot. The scratch buffers are shared, so these
     // serialise against each other -- see the barriers in the implementation.
     void record_mesh(ID3D12GraphicsCommandList* cmd, UINT slot,
-                     const float origin[3], float voxel);
+                     const float origin[3], float voxel,
+                     UINT brick_first, UINT brick_count);
+
+    // Reset the per-frame header cursor. The lists are rebuilt every frame
+    // because which bricks a chunk overlaps is cheap to recompute and stale
+    // entries would point at slots that have since been reused.
+    void begin_frame_bricks();
+    // Append one chunk's brick list; returns where it starts.
+    UINT push_brick_headers(const int* origins, const UINT* slots, UINT n);
+    // Copy one brick's contents into the pool.
+    void record_brick_upload(ID3D12GraphicsCommandList* cmd, UINT slot,
+                             const float* density, const UINT* mask);
+    UINT bricks_uploaded_this_frame() const { return brick_uploads_; }
     // Zero a slot's draw arguments. An all-zero indirect draw is skipped.
     void record_retire(ID3D12GraphicsCommandList* cmd, UINT slot);
 
@@ -170,6 +193,11 @@ private:
     ComPtr<ID3D12Resource> height_readback_[kReadbackRing];
     ComPtr<ID3D12Resource> flag_readback_[kReadbackRing];
     ComPtr<ID3D12Resource> mesh_readback_[kReadbackRing];
+    ComPtr<ID3D12Resource> brick_den_, brick_mask_, brick_hdr_, brick_stage_;
+    int*  brick_hdr_cpu_ = nullptr;     // persistently mapped, int4 per entry
+    unsigned char* brick_stage_cpu_ = nullptr;
+    UINT  brick_hdr_cursor_ = 0;
+    UINT  brick_uploads_ = 0;
 
     ComPtr<ID3D12QueryHeap> timestamps_;
     ComPtr<ID3D12Resource>  timestamp_readback_;

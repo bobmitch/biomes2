@@ -21,6 +21,7 @@
 
 #include "engine/meshing/chunk_mesher.h"
 #include "engine/field/trivial_field.h"
+#include "engine/svdag/brick_store.h"
 
 #include <algorithm>
 #include <cmath>
@@ -195,7 +196,38 @@ public:
     // meshed. The budget is the design's cap on remeshing per frame: without
     // it, walking into an unloaded region stalls for as long as it takes to
     // mesh everything at once.
-    UINT record_work(ID3D12GraphicsCommandList* cmd, ChunkMesher& mesher, UINT budget) {
+    // Throw away every resident chunk whose box the edit touched, so the next
+    // update queues them again and they are meshed against the overlay.
+    //
+    // The box is grown by ONE CELL, not one chunk. A chunk's mesh does depend
+    // on its ghost layer, but that layer is a single cell wide -- growing by a
+    // whole chunk invalidated a 3x3x3 neighbourhood at every LOD, which at
+    // LOD 4 is 768 m of world thrown away for a 7 m hole, and the re-meshing
+    // is what the character was waiting on before it could fall.
+    size_t last_invalidated() const { return last_invalidated_; }
+
+    void invalidate_box(const float lo[3], const float hi[3]) {
+        last_invalidated_ = 0;
+        for (std::unordered_map<ChunkKey, UINT, ChunkKeyHash>::iterator it = resident_.begin();
+             it != resident_.end();) {
+            const float S = lod_chunk_size(it->first.lod);
+            const float g = lod_voxel(it->first.lod);
+            const float x0 = float(it->first.x) * S - g, x1 = x0 + S + 2.0f * g;
+            const float y0 = float(it->first.y) * S - g, y1 = y0 + S + 2.0f * g;
+            const float z0 = float(it->first.z) * S - g, z1 = z0 + S + 2.0f * g;
+            const bool hit = !(hi[0] < x0 || lo[0] > x1 || hi[1] < y0 || lo[1] > y1 ||
+                               hi[2] < z0 || lo[2] > z1);
+            if (!hit) { ++it; continue; }
+            retire_.push_back(it->second);
+            retired_keys_.push_back(it->first);
+            free_slots_.push_back(it->second);
+            it = resident_.erase(it);
+            ++last_invalidated_;
+        }
+    }
+
+    UINT record_work(ID3D12GraphicsCommandList* cmd, ChunkMesher& mesher, UINT budget,
+                     const BrickStore* edits) {
         for (size_t i = 0; i < retire_.size(); ++i) mesher.record_retire(cmd, retire_[i]);
         retire_.clear();
 
@@ -208,7 +240,23 @@ public:
             free_slots_.pop_back();
             const float S = lod_chunk_size(k.lod);
             const float origin[3] = {float(k.x) * S, float(k.y) * S, float(k.z) * S};
-            mesher.record_mesh(cmd, slot, origin, lod_voxel(k.lod));
+
+            // Which bricks this chunk could read. The span covers the ghost
+            // layer as well as the owned cells, or an edit in the last cell
+            // would be missed by the chunk that meshes it.
+            UINT bfirst = 0, bcount = 0;
+            if (edits && edits->brick_count() > 0) {
+                const float span = lod_voxel(k.lod) * float(kChunkCells);
+                const float lo[3] = {origin[0], origin[1], origin[2]};
+                const float hi[3] = {origin[0] + span, origin[1] + span, origin[2] + span};
+                edits->bricks_in_box(lo, hi, brick_slots_, brick_origins_);
+                if (!brick_slots_.empty()) {
+                    bcount = static_cast<UINT>(brick_slots_.size());
+                    bfirst = mesher.push_brick_headers(brick_origins_.data(),
+                                                       brick_slots_.data(), bcount);
+                }
+            }
+            mesher.record_mesh(cmd, slot, origin, lod_voxel(k.lod), bfirst, bcount);
             resident_[k] = slot;
             MeshedChunk mc;
             mc.key = k;
@@ -268,6 +316,9 @@ private:
     std::vector<UINT>    free_slots_;
     std::vector<MeshedChunk> last_meshed_;
     std::vector<ChunkKey>    retired_keys_;
+    size_t last_invalidated_ = 0;
+    mutable std::vector<uint32_t> brick_slots_;
+    mutable std::vector<int>      brick_origins_;
 };
 
 }  // namespace engine
