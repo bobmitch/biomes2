@@ -22,6 +22,7 @@
 
 #include "worldgen/world.h"
 #include "tools/shared/render.h"
+#include "tools/shared/land_solve.h"
 
 #include <cstdio>
 #include <string>
@@ -34,12 +35,16 @@ namespace {
 
 enum { ID_SEED_PREV = 100, ID_SEED_NEXT, ID_W, ID_FEAT, ID_MODE, ID_REPAIR, ID_LANDOFF };
 
-// land_offset maps onto an integer trackbar as (pos - 100) / 1000, so the bar
-// spans -0.100 to +0.300. The shipping 0.17 sits near the top of that, which
-// is the point: the interesting range is all BELOW it.
-const int LANDOFF_BIAS = 100;
-const int LANDOFF_MIN  = 0;      // -0.100
-const int LANDOFF_MAX  = 400;    // +0.300
+// The islandness slider reads in LAND FRACTION, tenths of a percent, because
+// that is the number that decides whether the world is a continent or an
+// archipelago. land_offset is an opaque proxy for it.
+//
+// The offset is read off a calibration curve built at startup, so the solve is
+// GLOBAL: the slider sets the MEAN land fraction across seeds and leaves each
+// seed free to land above or below. Per-seed solving would flatten exactly the
+// spread the islandness comes from.
+const int LAND_MIN = 400;    // 40.0%
+const int LAND_MAX = 650;    // 65.0%
 
 const int PANEL = 232;
 const int PREVIEW_PX = 220;    // while dragging
@@ -50,6 +55,7 @@ struct App {
     AssignParams ap;
     ArchetypeTable table;
     SeedWorld    world;
+    LandCalibration calib;
     uint64_t     seed = 0;
     ViewMode     mode = VIEW_RELIEF;
     bool         world_dirty = true;
@@ -128,6 +134,12 @@ void render(int px) {
     g.rendered_px = px;
 }
 
+// Mean across seeds at the current offset -- what the slider is really set to,
+// as opposed to the one seed on screen, which is free to sit either side of it.
+float target_land() {
+    return g.calib.land_for_offset(g.wp.land_offset);
+}
+
 void set_status() {
     // std::snprintf, NOT wsprintfA: the latter supports no %f and mishandles
     // %llu, which silently shifts every argument after it. That cost an
@@ -136,7 +148,7 @@ void set_status() {
     std::snprintf(buf, sizeof(buf),
                   "seed %llu   w %.2f   feature %d m\r\n"
                   "cells %d   rivers %d   render %d px\r\n"
-                  "\r\nland offset %+.3f   land %.0f%%\r\n"
+                  "\r\nland target %.1f%% (offset %+.3f)   this seed %.0f%%\r\n"
                   "landmasses %d   biggest holds %d%% of land",
                   static_cast<unsigned long long>(g.seed),
                   static_cast<double>(g.wp.danger_w),
@@ -144,6 +156,7 @@ void set_status() {
                   static_cast<int>(g.world.pts.size()),
                   static_cast<int>(g.world.rivers.size()),
                   g.rendered_px,
+                  100.0 * static_cast<double>(target_land()),
                   static_cast<double>(g.wp.land_offset),
                   100.0 * g.world.land_fraction,
                   g.landmasses, g.biggest_pct);
@@ -163,8 +176,8 @@ void read_controls() {
     g.wp.danger_w = static_cast<float>(w10) / 100.0f;
     const int feat = static_cast<int>(SendMessage(g.feat_bar, TBM_GETPOS, 0, 0));
     g.wp.danger_freq = 1.0f / static_cast<float>(feat);
-    const int off = static_cast<int>(SendMessage(g.land_bar, TBM_GETPOS, 0, 0));
-    g.wp.land_offset = static_cast<float>(off - LANDOFF_BIAS) / 1000.0f;
+    const int land10 = static_cast<int>(SendMessage(g.land_bar, TBM_GETPOS, 0, 0));
+    g.wp.land_offset = g.calib.offset_for_land(static_cast<float>(land10) / 1000.0f);
     g.mode = static_cast<ViewMode>(SendMessage(g.mode_box, CB_GETCURSEL, 0, 0));
 }
 
@@ -230,12 +243,12 @@ void build_controls(HWND h) {
 
     // The islandness lever. Below about +0.08 the land fraction crosses the
     // percolation threshold and the single continent starts breaking up.
-    label(h, "land offset (islandness)", y); y += 18;
+    label(h, "land fraction % (islandness)", y); y += 18;
     g.land_bar = CreateWindowA(TRACKBAR_CLASSA, "", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
                                8, y, PANEL - 16, 28, h, (HMENU)ID_LANDOFF, 0, 0);
-    SendMessage(g.land_bar, TBM_SETRANGE, TRUE, MAKELPARAM(LANDOFF_MIN, LANDOFF_MAX));
+    SendMessage(g.land_bar, TBM_SETRANGE, TRUE, MAKELPARAM(LAND_MIN, LAND_MAX));
     SendMessage(g.land_bar, TBM_SETPOS, TRUE,
-                static_cast<LPARAM>(g.wp.land_offset * 1000.0f) + LANDOFF_BIAS);
+                static_cast<LPARAM>(target_land() * 1000.0f));
     y += 36;
 
     label(h, "view", y); y += 18;
@@ -310,6 +323,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     // cell areas slightly and so is NOT what the golden hashes are taken at,
     // but it halves the rebuild and nothing here is pinned.
     g.wp.grid = 512;
+
+    // Build the land-fraction curve before any control reads it. Two seconds
+    // once at startup, against about a second for every slider step if the
+    // offset were bisected on demand. Coarse on purpose -- it only has to be
+    // accurate enough to place a slider, and the harness is what measures.
+    g.calib.build(g.wp, 16, 192);
 
     WNDCLASSA wc;
     ZeroMemory(&wc, sizeof(wc));

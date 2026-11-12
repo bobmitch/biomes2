@@ -11,6 +11,7 @@
 #include "worldgen/world.h"
 #include "worldgen/assign/json_lite.h"
 #include "tools/shared/render.h"
+#include "tools/shared/land_solve.h"
 
 #include <algorithm>
 #include <chrono>
@@ -370,6 +371,7 @@ struct Summary {
     int   min_home_cells = 1 << 30;
     float min_slope_gentle = 2.0f;
     float mean_cells = 0, mean_land_cells = 0, mean_land_frac = 0;
+    float min_land_frac = 2.0f, max_land_frac = -1.0f, sd_land_frac = 0.0f;
     float mean_quota_err = 0, max_quota_err = 0, p95_quota_err = 0;
     float mean_spearman = 0, min_spearman = 2.0f;
     float mean_patch_cells = 0, mean_patch_km2 = 0;
@@ -395,7 +397,7 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
 
     Summary sm;
     sm.seeds = nseeds;
-    std::vector<float> errs;
+    std::vector<float> errs, lands;
     errs.reserve(nseeds);
     for (int s = 0; s < nseeds; ++s) {
         const SeedResult& r = results[s];
@@ -436,9 +438,17 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
         sm.mean_overflow += r.overflow;
         sm.mean_candidates += r.mean_candidates;
         errs.push_back(r.max_quota_err);
+        lands.push_back(r.land_fraction);
     }
     const float inv = 1.0f / nseeds;
     sm.mean_cells *= inv; sm.mean_land_cells *= inv; sm.mean_land_frac *= inv;
+    for (size_t i = 0; i < lands.size(); ++i) {
+        sm.min_land_frac = std::min(sm.min_land_frac, lands[i]);
+        sm.max_land_frac = std::max(sm.max_land_frac, lands[i]);
+        const double d = lands[i] - sm.mean_land_frac;
+        sm.sd_land_frac += static_cast<float>(d * d);
+    }
+    if (!lands.empty()) sm.sd_land_frac = std::sqrt(sm.sd_land_frac / lands.size());
     sm.mean_quota_err *= inv; sm.mean_spearman *= inv;
     sm.mean_patch_cells *= inv; sm.mean_patch_km2 *= inv;
     sm.mean_relaxed *= inv; sm.mean_overflow *= inv; sm.mean_candidates *= inv;
@@ -575,6 +585,37 @@ static bool single_relief(const WorldParams& wp, const ArchetypeTable& table,
     const SeedWorld w = build_world(seed, wp, table, ap);
     render_relief_tile(w, wp, table, img, tile, 0, 0, tile);
     return write_bmp(path, tile, tile, img);
+}
+
+
+// --- land fraction as a distribution ------------------------------------------
+// Solve one GLOBAL offset for a target mean, then report what the seeds
+// actually do around it. The spread is the product, not an error bar: the
+// worlds that break into archipelagos are this distribution's low tail.
+static void land_report_header() {
+    std::printf("\n%-8s %-9s %-26s %-11s %-21s %-10s\n",
+                "target", "offset", "land% mean/min/max/sd", "landmasses",
+                "spawn mass mean/worst", "quota max");
+    std::printf("%s\n", std::string(94, '-').c_str());
+}
+
+static void land_report_row(float target, int nseeds, const WorldParams& base,
+                            const ArchetypeTable& table, const AssignParams& ap) {
+    // The solve is cheap because it only needs layer 0, so it can afford more
+    // seeds than the full run below.
+    const float off = solve_land_offset(base, target, 24, 256);
+    WorldParams wp = base;
+    wp.land_offset = off;
+
+    const Summary s = run(nseeds, wp, table, ap);
+    std::printf("%6.1f%%  %+8.4f  %5.1f %5.1f %5.1f %5.2f     %4.1f (max %d)  %5.1f%% / %5.1f%%        %5.1f%%%s\n",
+                100.0 * target, off,
+                100.0 * s.mean_land_frac, 100.0 * s.min_land_frac,
+                100.0 * s.max_land_frac, 100.0 * s.sd_land_frac,
+                s.mean_landmasses, s.max_landmasses,
+                100.0 * s.mean_home_share, 100.0 * s.min_home_share,
+                100.0 * s.max_quota_err,
+                s.quota_failures > 0 ? "  QUOTA OVER" : "");
 }
 
 // --- adjacency test --------------------------------------------------------
@@ -718,6 +759,8 @@ int main(int argc, char** argv) {
     bool relief = false;
     bool closeup = false;
     bool components = false;
+    bool land_sweep = false;
+    float land_target = -1.0f;
     uint64_t closeup_seed = 0;
     int  tile = 192;
     const char* sheet_path = "build/contact_sheet.bmp";
@@ -758,6 +801,10 @@ int main(int argc, char** argv) {
         // the land-fraction and golden checks will go red -- that is the gate
         // working, not a reason to --bless.
         else if (!std::strcmp(argv[i], "--land-offset") && i + 1 < argc) wp.land_offset = static_cast<float>(std::atof(argv[++i]));
+        else if (!std::strcmp(argv[i], "--land-target") && i + 1 < argc) {
+            land_target = static_cast<float>(std::atof(argv[++i])) / 100.0f;
+        }
+        else if (!std::strcmp(argv[i], "--land-sweep")) land_sweep = true;
         else if (!std::strcmp(argv[i], "--dump-seeds") && i + 1 < argc) {
             dump_world_seed = std::strtoull(argv[++i], nullptr, 10);
             dump = true;
@@ -772,6 +819,26 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("archetypes: %d biomes, invariants OK\n", static_cast<int>(table.size()));
+
+    if (land_sweep) {
+        // The band worth choosing from. 56 is roughly where we ship; the low
+        // end is where quota granularity starts to bite.
+        const float targets[] = {0.56f, 0.54f, 0.52f, 0.50f, 0.48f, 0.46f};
+        std::printf("land fraction sweep, %d seeds per row, offset solved GLOBALLY for the mean\n",
+                    nseeds);
+        land_report_header();
+        for (int i = 0; i < 6; ++i) land_report_row(targets[i], nseeds, wp, table, ap);
+        std::printf("\nThe mean is the lever; the min column is where the islandness lives.\n");
+        return 0;
+    }
+
+    if (land_target >= 0.0f) {
+        std::printf("land fraction target %.1f%%, %d seeds, offset solved GLOBALLY for the mean\n",
+                    100.0 * land_target, nseeds);
+        land_report_header();
+        land_report_row(land_target, nseeds, wp, table, ap);
+        return 0;
+    }
 
     if (components) {
         // Localises a cross-platform divergence to a layer. Each hash covers
