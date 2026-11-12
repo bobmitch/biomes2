@@ -99,8 +99,9 @@ cmake --preset dev && cmake --build --preset dev
 `tools/validate` runs 200 seeds and exits non-zero on any failure. It asserts
 presence, quota, radial ordering, land fraction, adjacency, edge taper, home
 landmass, boat connectivity, spawn, slope budget, river sanity, LOD agreement,
-throughput and the golden hashes, and emits a 64-seed contact sheet — look at it. Automated
-checks cannot tell you whether a world is interesting.
+cave entrances, throughput and the golden hashes, and emits a 64-seed contact
+sheet — look at it. Automated checks cannot tell you whether a world is
+interesting.
 
 It also *measures and prints* **islandness** — landmass count, and the share
 of land on the spawn landmass — and asserts nothing about it. That is
@@ -135,6 +136,20 @@ early takes it to 4.09 and fails, so it bites on over-aggressive dropping.
 It did NOT notice normalising by the faded amplitude, because that error is
 smaller than the worst case already present — it is a guard against the loud
 version of the bug, not the quiet one.
+
+**The golden hash cannot see everything, and layer 7 proved it.** The hash
+samples a 1024² grid — one density sample per 156 m — and a world has ~24
+entrance shafts a few metres across. Adding the whole layer left all eight
+hashes byte for byte unchanged, which would have left every entrance free to
+drift through CI. The shaft buffer is now hashed directly. The general rule:
+**a layer whose features are smaller than the hash grid is invisible to it and
+must be pinned by its buffer.** Layer 5 escapes this only because 428 river
+segments per seed carve a wide enough area to land in the samples.
+
+The hash still does not see whether the shafts are *open*: disabling
+`entrance_carve` entirely leaves the stored geometry, and so the hash,
+unchanged. That is what the `cave entrances` check is for. Neither covers the
+layer alone — both mutants were tested.
 
 **Golden hashes are pinned.** Any change to `worldgen/` moves them and the run
 fails. That is the gate working: either revert, or bump `generator_version` in

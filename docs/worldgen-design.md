@@ -172,6 +172,30 @@ density(p) = height(p.xz) - p.y
 
 The critical property for LOD: this function must be *filterable*. Octave count has to fall with voxel size, or distant chunks will disagree with near chunks and pop on LOD transition. See the meshing section.
 
+`cave_field` is the intersection of two ridged 3D fields rather than the gyroid written above: a gyroid is sin and cos, and invariant 9 forbids libm upstream of the golden hash. Two ridged sheets meet in a line, and a line is a tunnel.
+
+### Layer 7 — cave entrances
+
+The depth mask in layer 6 is load-bearing in both directions. It stops caves opening onto cliff faces at random, and in doing so it seals the entire cave system. Measured over 12 seeds: 43% of land columns had air beneath them, 83% of those under 25 m or more of rock, and the shallowest rind anywhere was 1 m — never zero. The handful of near-breaches were not cave mouths either, only places where the layer-6 overhang term happened to drop real rock below the heightfield the mask is measured against.
+
+Loosening the mask is the wrong lever: it opens holes wherever the noise crests near grade, which is swiss cheese rather than entrances. Minecraft hit the same wall and answered it the same way — it *raises* density near the surface to suppress cheese caves and then adds a separate density term whose only job is cave entrances, plus carvers that are explicitly allowed to break through. Access is its own system.
+
+So shafts are traced on the CPU at world init, from a point on the surface downwards, asking layer 6 at every step whether it has broken into air yet:
+
+```
+pick a mouth on land, uniform in AREA
+walk down, wandering, 4 m per step, tilt 0.3..1.8 lateral metres per metre of drop
+  air shallower than entrance_min_depth is an overhang, not a cave — keep going
+  first sample with density <= 0 → keep the polyline
+  out of steps → discard the candidate
+```
+
+Nothing is stored that did not reach a cave, so surface-to-cave connectivity holds **by construction** — the same shape of argument as priority flood making rivers reach the sea, rather than tracing something plausible and asserting afterwards that it worked.
+
+The polyline is stored with a radius at each vertex: a wide bowl at the mouth, a narrow throat below it, chambers at intervals, and a taper into the cave. Evaluation follows layer 5's split — which segments are near a sample is a spatial index question and stays in the caller, the capsule SDF and the carve are in the dialect. The carve deliberately ignores `cave_depth_mask`, because breaching the surface is the whole point of the layer.
+
+Branches are dead ends on purpose. One side passage per trunk, sometimes, kept whether or not it reaches anything: the connectivity guarantee is carried by the trunk, and a passage that goes nowhere is a feature.
+
 ## Area budget and the equal-measure problem
 
 Disc area grows as r², so radial bands of equal *width* have wildly unequal *area*. With five linear bands the innermost gets 4% of the world and the outermost 36% — a ninefold difference, and the calm starting biomes are the ones that lose.
