@@ -15,7 +15,7 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32). Debug tool, Windows only. |
 | `tools/shared/` | Presentation, shared by the harness and the viewer. |
-| `engine/` | C++ runtime: svdag, meshing, streaming, physics, render. |
+| `engine/` | Track B runtime (D3D12, `docs/adr-003-*`). Built against the TRIVIAL field in `engine/field/`, never `worldgen/`, until M1. |
 
 **`worldgen/` is everything upstream of the golden hash; `tools/` is
 everything downstream.** That line is what makes invariant 9 checkable — the
@@ -32,8 +32,20 @@ build\view.exe
 ```
 
 ```bash
-cmake --preset dev && cmake --build --preset dev
+build\engine.exe
 ```
+
+`build.bat` is a thin wrapper over cmake and builds everything; there is no
+`CMakePresets.json`, and the `cmake --preset dev` line that used to be here had
+never worked. To drive cmake directly:
+
+```bash
+cmake -S . -B build/cmake -G Ninja && cmake --build build/cmake
+```
+
+`validate.exe`, `view.exe` and `engine.exe` all read data by paths relative to
+the repository root, so run them from there. `engine.exe --shot <path>` renders
+one frame at a fixed camera and writes a BMP without opening a window.
 
 ## Invariants — breaking one of these is a bug, not a tradeoff
 

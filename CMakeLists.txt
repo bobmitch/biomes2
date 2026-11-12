@@ -53,3 +53,22 @@ if(WIN32 AND EXISTS ${PROJECT_SOURCE_DIR}/tools/view/view.cpp)
   target_link_libraries(view PRIVATE worldgen comctl32)
   worldgen_strict_fp(view)
 endif()
+
+# Track B: the engine (ADR-003 -- Direct3D 12). Windows-only, like the viewer.
+# It does NOT link worldgen: Track B is built against the trivial analytic
+# field in engine/field/ precisely so that pipeline bugs are never confused
+# with worldgen bugs. M1 is where that changes.
+#
+# No strict-fp here on purpose. These flags exist to protect the golden
+# hashes, nothing in engine/ feeds them, and pinning the renderer's maths
+# would imply a determinism guarantee this binary does not make.
+if(WIN32 AND EXISTS ${PROJECT_SOURCE_DIR}/engine/main.cpp)
+  add_executable(engine WIN32
+    engine/main.cpp
+    engine/render/renderer.cpp)
+  target_include_directories(engine PRIVATE ${PROJECT_SOURCE_DIR})
+  target_link_libraries(engine PRIVATE d3d12 dxgi d3dcompiler)
+  if(MSVC)
+    target_compile_options(engine PRIVATE /W3 /D_CRT_SECURE_NO_WARNINGS)
+  endif()
+endif()
