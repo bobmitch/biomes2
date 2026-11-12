@@ -52,6 +52,7 @@ RWStructuredBuffer<uint>   g_indices     : register(u3);   // pool
 RWStructuredBuffer<uint>   g_counters    : register(u4);   // 2 per slot
 RWStructuredBuffer<uint>   g_draw_args   : register(u5);   // 5 per slot
 RWStructuredBuffer<float>  g_heights     : register(u6);   // kCorners^2 per slot
+RWStructuredBuffer<uint>   g_chunk_flags : register(u7);   // 1 per slot
 
 // A column with no surface in it. Jolt spells its equivalent
 // HeightFieldShapeConstants::cNoCollisionValue; the conversion happens on the
@@ -79,6 +80,7 @@ float3 corner_world(uint3 c) {
 void cs_clear(uint3 id : SV_DispatchThreadID) {
     g_counters[slot * 2u + 0u] = 0;
     g_counters[slot * 2u + 1u] = 0;
+    g_chunk_flags[slot] = 0;
 }
 
 // Retire a slot: an all-zero draw is skipped by the command processor, so an
@@ -280,22 +282,43 @@ void cs_heights(uint3 id : SV_DispatchThreadID) {
     if (id.x >= kCorners || id.y >= kCorners) return;
 
     float h = kNoSurface;
-    // Downwards from the top, so the first crossing found is the highest.
+    uint  floors = 0;     // air above, rock below: a surface you can stand on
+    uint  ceilings = 0;   // rock above, air below: the underside of something
+    // Downwards from the top, and the whole column is walked rather than
+    // stopping at the first floor, because what decides whether a heightfield
+    // can hold this chunk is the shape of the WHOLE column.
     for (uint j = kCorners - 1u; j >= 1u; --j) {
         const float above = g_density[corner_index(uint3(id.x, j, id.y))];
         const float below = g_density[corner_index(uint3(id.x, j - 1u, id.y))];
+        if (above > 0.0f && below <= 0.0f) ++ceilings;
         if (above <= 0.0f && below > 0.0f) {
-            // Linear crossing between the two samples, the same interpolation
-            // the mesher uses along an edge.
-            // t is the fraction from the SOLID sample (j-1) up to the air
-            // sample (j), so the height is measured from j-1, not down from j.
-            const float denom = below - above;
-            const float t = abs(denom) > 1e-12f ? saturate(below / denom) : 0.5f;
-            h = chunk_origin.y + (float(j - 1u) + t) * voxel;
-            break;
+            ++floors;
+            if (floors == 1u) {
+                // Linear crossing between the two samples, the same
+                // interpolation the mesher uses along an edge. t is the
+                // fraction from the SOLID sample (j-1) up to the air sample
+                // (j), so the height is measured from j-1, not down from j.
+                const float denom = below - above;
+                const float t = abs(denom) > 1e-12f ? saturate(below / denom) : 0.5f;
+                h = chunk_origin.y + (float(j - 1u) + t) * voxel;
+            }
         }
     }
     g_heights[slot * (kCorners * kCorners) + id.y * kCorners + id.x] = h;
+
+    // A heightfield says "rock below one height, air above", so it represents
+    // this column exactly only when the column is all air, all rock, or has a
+    // single floor and no ceiling.
+    //
+    // A CEILING is the decisive one, and counting only floors misses it. The
+    // underside of the trivial field's floating sphere is rock above air: no
+    // floor at all within that chunk, so a floors-only test called the whole
+    // world representable and classified 0 of 816 chunks as needing a mesh.
+    // It is exactly the case a heightfield fills in solid.
+    if (ceilings > 0u || floors > 1u) {
+        uint ignored;
+        InterlockedAdd(g_chunk_flags[slot], 1u, ignored);
+    }
 }
 
 // ---------------------------------------------------------------------------

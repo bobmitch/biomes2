@@ -596,6 +596,7 @@ void Renderer::stage_heights() {
         ++r.count;
     }
     mesher_.record_height_copy(cmd_.Get(), ring, slots, r.count);
+    mesher_.record_flag_copy(cmd_.Get(), ring, slots, r.count);
 }
 
 // Consume what was staged two frames ago. Two, because with two frames in
@@ -610,6 +611,7 @@ void Renderer::consume_heights() {
 
     const float* h = mesher_.mapped_heights(ring, r.count);
     if (!h) { r.count = 0; return; }
+    const UINT* flags = mesher_.mapped_flags(ring, r.count);
 
     stats_.readback_latency_frames = static_cast<UINT>(frame_index_ - r.frame);
     stats_.patches_this_frame = r.count;
@@ -647,11 +649,18 @@ void Renderer::consume_heights() {
         e.origin[1] = r.origin[p][1];
         e.origin[2] = r.origin[p][2];
         e.voxel = r.voxel[p];
+        e.multi_surface_columns = flags ? flags[p] : 0;
+        ++stats_.chunks_classified;
+        if (e.multi_surface_columns) {
+            ++stats_.chunks_needing_mesh;
+            mesh_wanted_.push_back(r.keys[p]);
+        }
         const float* src = h + size_t(p) * kHeightSamples;
         e.h.assign(src, src + kHeightSamples);
         patches_added_.push_back(e);
     }
 
+    if (flags) mesher_.unmap_flags(ring);
     mesher_.unmap_heights(ring);
     if (n) {
         const unsigned long long before = stats_.height_samples_checked;
@@ -663,6 +672,78 @@ void Renderer::consume_heights() {
     r.count = 0;
 }
 
+// Take what the classification asked for and copy those chunks' triangles.
+// A chunk that has since been retired is dropped rather than copied: its slot
+// may now hold a different chunk, and 163 KB of the wrong terrain is worse
+// than none.
+void Renderer::stage_meshes() {
+    const UINT ring = static_cast<UINT>(frame_index_ % kReadbackRing);
+    MeshRingRecord& m = mesh_ring_[ring];
+    m.count = 0;
+    m.frame = frame_index_;
+    if (mesh_wanted_.empty()) return;
+
+    UINT slots[kMeshChunksPerFrame];
+    size_t taken = 0;
+    while (taken < mesh_wanted_.size() && m.count < kMeshChunksPerFrame) {
+        const ChunkKey k = mesh_wanted_[taken];
+        ++taken;
+        UINT slot = 0;
+        if (!streamer_.slot_of(k, slot)) continue;
+        slots[m.count] = slot;
+        m.keys[m.count] = k;
+        m.slots[m.count] = slot;
+        ++m.count;
+    }
+    mesh_wanted_.erase(mesh_wanted_.begin(), mesh_wanted_.begin() + taken);
+    mesher_.record_mesh_copy(cmd_.Get(), ring, slots, m.count);
+}
+
+void Renderer::consume_meshes() {
+    if (frame_index_ < kReadbackRing - 1) return;
+    const UINT ring = static_cast<UINT>((frame_index_ + 1) % kReadbackRing);
+    MeshRingRecord& m = mesh_ring_[ring];
+    if (m.count == 0) return;
+    if (frame_index_ < m.frame + (kReadbackRing - 1)) return;
+
+    const unsigned char* base = mesher_.mapped_mesh(ring, m.count);
+    if (!base) { m.count = 0; return; }
+
+    for (UINT p = 0; p < m.count; ++p) {
+        UINT slot = 0;
+        if (!streamer_.slot_of(m.keys[p], slot) || slot != m.slots[p]) continue;
+        UINT nv = 0, ni = 0;
+        mesher_.slot_counts(slot, nv, ni);
+        if (nv == 0 || ni < 3) continue;
+
+        const unsigned char* chunk = base + size_t(p) * kMeshChunkBytes;
+        const MeshVertex* mv = reinterpret_cast<const MeshVertex*>(chunk);
+        const unsigned* mi =
+            reinterpret_cast<const unsigned*>(chunk + kMeshVertexBytes);
+
+        MeshPatchEvent e;
+        e.key = m.keys[p];
+        e.verts.resize(size_t(nv) * 3);
+        for (UINT i = 0; i < nv; ++i) {
+            e.verts[size_t(i) * 3 + 0] = mv[i].pos[0];
+            e.verts[size_t(i) * 3 + 1] = mv[i].pos[1];
+            e.verts[size_t(i) * 3 + 2] = mv[i].pos[2];
+        }
+        // Pool indices are absolute so the draw needs no rebasing; a shape
+        // built from this chunk's vertices alone does.
+        const unsigned vbase = slot * kSlotVertices;
+        e.idx.reserve(ni);
+        for (UINT i = 0; i < ni; ++i) {
+            const unsigned v = mi[i] - vbase;
+            e.idx.push_back(v < nv ? v : 0);
+        }
+        mesh_patches_added_.push_back(e);
+        ++stats_.mesh_shapes_delivered;
+    }
+    mesher_.unmap_mesh(ring);
+    m.count = 0;
+}
+
 void Renderer::record_frame(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HANDLE rtv) {
     // Streaming first, in compute, then the draw reads what it produced.
     mesher_.record_to_compute(cmd_.Get());
@@ -672,6 +753,7 @@ void Renderer::record_frame(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     mesher_.record_timestamp(cmd_.Get(), 1);
     mesher_.resolve_timestamps(cmd_.Get());
     stage_heights();
+    stage_meshes();
     mesher_.record_counter_copy(cmd_.Get());
     mesher_.record_vertex_copy(cmd_.Get());
     mesher_.record_to_draw(cmd_.Get());
@@ -689,8 +771,11 @@ void Renderer::render(const ViewConstants& view) {
         const std::vector<ChunkKey>& gone = streamer_.retired_keys();
         patches_removed_.assign(gone.begin(), gone.end());
     }
+    mesh_patches_added_.clear();
     stats_.patches_this_frame = 0;
     consume_heights();
+    consume_meshes();
+    stats_.mesh_backlog = mesh_wanted_.size();
 
     allocators_[frame_]->Reset();
     cmd_->Reset(allocators_[frame_].Get(), nullptr);

@@ -38,6 +38,13 @@ bool  g_walk = false;
 // and the raymarch's capsule agree with what physics actually did, rather than
 // with what was asked for.
 float g_feet[3] = {0.0f, 0.0f, 0.0f};
+// Where the mesh shapes handed to physics actually are, and whether their
+// vertices lie on the isosurface. If a shape is not the terrain, nothing about
+// Jolt's behaviour will explain why the character goes through it.
+double g_mesh_resid_max = 0.0;
+unsigned long long g_mesh_verts_checked = 0;
+double g_mesh_y_lo = 1e9, g_mesh_y_hi = -1e9;
+size_t g_mesh_max_verts = 0, g_mesh_max_idx = 0;
 const float kCapsuleRadius = 0.35f;
 const float kCapsuleHalf = 0.80f;
 const float kEyeAboveFeet = 1.60f;
@@ -50,6 +57,30 @@ void sync_physics_terrain() {
     for (size_t i = 0; i < added.size(); ++i) {
         g_physics.set_chunk(added[i].key, added[i].origin, added[i].voxel,
                             added[i].h.data());
+    }
+    // The real triangles for chunks the cheap shape cannot hold. These land
+    // later than the heights and replace them.
+    const std::vector<engine::Renderer::MeshPatchEvent>& meshes =
+        g_renderer.mesh_patches_added();
+    for (size_t i = 0; i < meshes.size(); ++i) {
+        const engine::Renderer::MeshPatchEvent& e = meshes[i];
+        const size_t nv = e.verts.size() / 3;
+        for (size_t k = 0; k < nv; k += 7) {
+            const float vy = e.verts[k * 3 + 1];
+            if (vy < g_mesh_y_lo) g_mesh_y_lo = vy;
+            if (vy > g_mesh_y_hi) g_mesh_y_hi = vy;
+            const float d = trivial_density(e.verts[k * 3 + 0], vy, e.verts[k * 3 + 2]);
+            const double a = d < 0.0f ? -double(d) : double(d);
+            if (a > g_mesh_resid_max) g_mesh_resid_max = a;
+            ++g_mesh_verts_checked;
+        }
+        if (nv > g_mesh_max_verts) g_mesh_max_verts = nv;
+        if (e.idx.size() > g_mesh_max_idx) g_mesh_max_idx = e.idx.size();
+
+        g_physics.set_chunk_mesh(meshes[i].key, meshes[i].verts.data(),
+                                 unsigned(meshes[i].verts.size() / 3),
+                                 meshes[i].idx.data(),
+                                 unsigned(meshes[i].idx.size()));
     }
     const std::vector<engine::ChunkKey>& gone = g_renderer.patches_removed();
     for (size_t i = 0; i < gone.size(); ++i) g_physics.remove_chunk(gone[i]);
@@ -152,6 +183,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     bool start_overlay = false, start_raymarch = false, debug_layer = false;
     double flight_seconds = 0.0;
     double walk_seconds = 0.0;
+    double overhang_seconds = 0.0;
     bool flight_vsync = false;
     {
         const std::string cl = cmdline ? cmdline : "";
@@ -164,6 +196,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             }
             if (shot_path.empty()) shot_path = "build/shot.bmp";
         }
+        if (cl.find("--overhang") != std::string::npos) overhang_seconds = 14.0;
         const size_t wk = cl.find("--walk");
         if (wk != std::string::npos) {
             walk_seconds = 8.0;
@@ -247,6 +280,168 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     }
 
     ShowWindow(hwnd, show);
+
+    if (overhang_seconds > 0.0) {
+        // Straight north, under the sphere at (14, 26, -10) whose underside
+        // sits at y = 13 over ground near y = -1.6.
+        g_renderer.set_vsync(true);
+        g_walk = true;
+        g_physics.place_character(14.0f, 6.0f, -34.0f);
+        g_physics.character_position(g_feet);
+        g_camera.yaw = 0.0f;
+        g_camera.pitch = -0.05f;
+
+        LARGE_INTEGER ofreq, ostart, oprev;
+        QueryPerformanceFrequency(&ofreq);
+        QueryPerformanceCounter(&ostart);
+        oprev = ostart;
+
+        double y_max = -1e9, y_under_max = -1e9, y_under_min = 1e9;
+        unsigned long long under_frames = 0, climbed_frames = 0;
+        bool shot_taken = false;
+        // Phase two: once under the sphere, go straight up at it.
+        bool launched = false;
+        bool placed_under = false;
+        double launch_peak = -1e9;
+
+        for (;;) {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&m);
+                DispatchMessageA(&m);
+            }
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            const double total = double(now.QuadPart - ostart.QuadPart) / double(ofreq.QuadPart);
+            const double dt = double(now.QuadPart - oprev.QuadPart) / double(ofreq.QuadPart);
+            oprev = now;
+            if (total >= overhang_seconds) break;
+
+            sync_physics_terrain();
+            // Stand still for the first two seconds: the mesh shape takes four
+            // frames to arrive and the world has to stream in at all.
+            float speed = total < 2.0 ? 0.0f : 4.0f;
+
+            // Phase two, on a clock rather than on position. The capsule
+            // slides laterally on slopes, so "near the centre" drifted it to
+            // the rim of the sphere's footprint where the underside is high
+            // or absent -- which is not a test of anything. Put it exactly
+            // under the middle, let it settle, then fire.
+            //
+            // 45 m/s against gravity of 22 is about 46 m of rise, three times
+            // the 14.6 m to the underside, so a short peak means something
+            // stopped it rather than that it ran out of speed.
+            if (total >= 9.0 && !placed_under) {
+                placed_under = true;
+                g_physics.place_character(14.0f, 3.0f, -10.0f);
+            }
+            if (total >= 10.5 && !launched) {
+                launched = true;
+                g_physics.launch_character(45.0f);
+            }
+            if (placed_under) speed = 0.0f;
+
+            g_physics.update(float(dt), 0.0f, speed, false);
+            g_physics.character_position(g_feet);
+            if (launched && g_feet[1] > launch_peak) launch_peak = g_feet[1];
+
+            g_camera.x = g_feet[0];
+            g_camera.y = g_feet[1] + kEyeAboveFeet;
+            g_camera.z = g_feet[2];
+
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
+            if (w < 1.0f || h < 1.0f) continue;
+            engine::ViewConstants v = {};
+            fill_view(g_camera, w, h, float(total), v);
+            g_renderer.render(v);
+
+            if (total > 2.0) {
+                if (g_feet[1] > y_max) y_max = g_feet[1];
+                // Inside the sphere's footprint in plan: if the character is
+                // here and below y = 13, it is underneath the overhang.
+                const float dx = g_feet[0] - 14.0f, dz = g_feet[2] + 10.0f;
+                if (dx * dx + dz * dz < 100.0f) {
+                    ++under_frames;
+                    if (g_feet[1] > y_under_max) y_under_max = g_feet[1];
+                    if (g_feet[1] < y_under_min) y_under_min = g_feet[1];
+                    if (g_feet[1] > 13.0f) ++climbed_frames;
+                    if (!shot_taken && dx * dx + dz * dz < 9.0f) {
+                        shot_taken = true;
+                        engine::Camera c = g_camera;
+                        // Beside and slightly below, looking up past the
+                        // capsule at the sphere it is standing under.
+                        // Far enough back that the capsule and the thing
+                        // 14 m above it both fit one 60-degree frame: closer
+                        // in, the sphere is out of shot above the character.
+                        // Back along the path just walked: open ground, so
+                        // nothing occludes the capsule, and far enough that
+                        // the sphere 14 m above it is still in frame.
+                        c.x = g_feet[0];
+                        c.y = g_feet[1] + 2.5f;
+                        c.z = g_feet[2] - 22.0f;
+                        c.yaw = 0.0f;
+                        c.pitch = 0.25f;
+                        engine::ViewConstants cv = {};
+                        fill_view(c, 1280.0f, 720.0f, 0.0f, cv);
+                        // The capsule is drawn by the RAYMARCH, not the mesh
+                        // pipeline, so a capture left in mesh mode shows the
+                        // terrain and no character at all.
+                        const engine::Mode was = g_renderer.mode();
+                        g_renderer.set_mode(engine::Mode::Raymarch);
+                        std::string e2;
+                        g_renderer.capture(cv, "build/b5_overhang.bmp", e2);
+                        g_renderer.set_mode(was);
+                    }
+                }
+            }
+        }
+
+        const engine::FrameStats st = g_renderer.stats();
+        if (FILE* f = std::fopen("build/overhang.txt", "w")) {
+            std::fprintf(f, "walking under the overhang, %.0f s\n", overhang_seconds);
+            std::fprintf(f, "the sphere: centre (14, 26, -10) radius 13, so its\n");
+            std::fprintf(f, "underside is at y = 13 and its top at y = 39;\n");
+            std::fprintf(f, "the ground beneath it is near y = -1.6\n\n");
+            std::fprintf(f, "frames inside the sphere's footprint: %llu\n", under_frames);
+            std::fprintf(f, "feet while under it: min %.2f m, max %.2f m\n",
+                         under_frames ? y_under_min : 0.0,
+                         under_frames ? y_under_max : 0.0);
+            std::fprintf(f, "frames spent ABOVE the underside (climbed onto it): %llu\n",
+                         climbed_frames);
+            std::fprintf(f, "highest the feet ever reached: %.2f m\n", y_max);
+            std::fprintf(f, "\nlaunched straight up at the underside: %s\n",
+                         launched ? "yes" : "NO - never reached the centre");
+            if (launched) {
+                std::fprintf(f, "  the capsule's feet peaked at %.2f m\n", launch_peak);
+                std::fprintf(f, "  its head therefore reached %.2f m\n",
+                             launch_peak + double(kCapsuleHalf + kCapsuleRadius) * 2.0);
+                std::fprintf(f, "  the underside is at 13.00 m, so %s\n",
+                             launch_peak + double(kCapsuleHalf + kCapsuleRadius) * 2.0 < 14.0
+                                 ? "it was STOPPED by the overhang"
+                                 : "it passed straight THROUGH the overhang");
+            }
+            std::fprintf(f, "chunks classified: %llu, needing a mesh: %llu (%.1f%%)\n",
+                         st.chunks_classified, st.chunks_needing_mesh,
+                         st.chunks_classified ? 100.0 * double(st.chunks_needing_mesh) /
+                                                     double(st.chunks_classified) : 0.0);
+            std::fprintf(f, "mesh shapes delivered: %llu, still waiting: %zu\n",
+                         st.mesh_shapes_delivered, st.mesh_backlog);
+            std::fprintf(f, "physics bodies: %zu total, %zu of them mesh shapes\n",
+                         g_physics.body_count(), g_physics.mesh_body_count());
+            std::fprintf(f, "mesh vertices checked against the field: %llu, worst %.4f m\n",
+                         g_mesh_verts_checked, g_mesh_resid_max);
+            std::fprintf(f, "mesh shape vertices span y %.2f .. %.2f m\n",
+                         g_mesh_y_lo, g_mesh_y_hi);
+            std::fprintf(f, "biggest mesh patch: %zu vertices, %zu indices\n",
+                         g_mesh_max_verts, g_mesh_max_idx);
+            std::fclose(f);
+        }
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return 0;
+    }
 
     if (walk_seconds > 0.0) {
         g_renderer.set_vsync(true);
@@ -384,6 +579,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(f, "worst single-frame vertical step: %.4f m\n", worst_step);
             std::fprintf(f, "static bodies in the physics world: %zu\n",
                          g_physics.body_count());
+            std::fprintf(f, "chunks classified: %llu, needing a mesh shape: %llu (%.1f%%)\n",
+                         st.chunks_classified, st.chunks_needing_mesh,
+                         st.chunks_classified
+                             ? 100.0 * double(st.chunks_needing_mesh) /
+                                   double(st.chunks_classified)
+                             : 0.0);
             for (int L = 0; L < 8; ++L) {
                 if (!lod_frames[L]) continue;
                 std::fprintf(f, "  standing on LOD %d: %llu frames, residual max %.4f mean %.4f\n",

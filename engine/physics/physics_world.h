@@ -56,12 +56,22 @@ public:
     // that chunk, so a remesh at a new LOD swaps cleanly.
     void set_chunk(const ChunkKey& key, const float origin[3], float voxel,
                    const float* heights);
+    // The chunk's real triangles, for one a heightfield cannot represent.
+    // Replaces whatever shape it had, so an overhang chunk starts out filled
+    // in solid and becomes correct four frames later.
+    void set_chunk_mesh(const ChunkKey& key, const float* verts, unsigned nverts,
+                        const unsigned* idx, unsigned nidx);
+
     void remove_chunk(const ChunkKey& key);
     size_t body_count() const { return bodies_.size(); }
+    size_t mesh_body_count() const { return mesh_bodies_; }
 
     // Place the character. Used once at the start and never again -- moving it
     // by hand afterwards would defeat the thing being measured.
     void place_character(float x, float y, float z);
+    // Straight up at inVy. The only way to ask whether the UNDERSIDE of an
+    // overhang is collision at all: walking cannot reach it.
+    void launch_character(float vy);
 
     // vx/vz is the desired horizontal velocity in metres per second.
     void update(float dt, float vx, float vz, bool jump);
@@ -81,6 +91,12 @@ private:
 
     std::unordered_map<ChunkKey, JPH::BodyID, ChunkKeyHash> bodies_;
     std::unordered_map<JPH::uint32, int> body_lod_;
+    std::unordered_map<JPH::uint32, int> body_is_mesh_;
+    size_t mesh_bodies_ = 0;
+    // Applied in update() AFTER the on-ground branch, which zeroes any
+    // upward velocity it finds. Setting the velocity directly from outside
+    // is silently undone on the next step.
+    float  pending_launch_ = 0.0f;
     float radius_ = 0.35f;
     float half_height_ = 0.80f;
 };

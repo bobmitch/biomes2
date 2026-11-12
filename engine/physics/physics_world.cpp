@@ -5,6 +5,7 @@
 #include <Jolt/Core/TempAllocator.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
+#include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyInterface.h>
@@ -177,12 +178,58 @@ void PhysicsWorld::set_chunk(const ChunkKey& key, const float origin[3], float v
     }
 }
 
+void PhysicsWorld::set_chunk_mesh(const ChunkKey& key, const float* verts,
+                                  unsigned nverts, const unsigned* idx,
+                                  unsigned nidx) {
+    if (!impl_ || nverts == 0 || nidx < 3) return;
+
+    JPH::VertexList vl;
+    vl.resize(nverts);
+    for (unsigned i = 0; i < nverts; ++i) {
+        vl[i] = JPH::Float3(verts[size_t(i) * 3 + 0], verts[size_t(i) * 3 + 1],
+                            verts[size_t(i) * 3 + 2]);
+    }
+
+    JPH::IndexedTriangleList tl;
+    tl.reserve(nidx / 3);
+    for (unsigned t = 0; t + 2 < nidx; t += 3) {
+        const unsigned a = idx[t], b = idx[t + 1], c = idx[t + 2];
+        // Surface nets emits degenerate triangles wherever two of a quad's
+        // four cell vertices land on the same point. Jolt would reject or
+        // silently drop them; dropping them here keeps the shape's triangle
+        // count meaningful.
+        if (a == b || b == c || a == c) continue;
+        if (a >= nverts || b >= nverts || c >= nverts) continue;
+        tl.push_back(JPH::IndexedTriangle(a, b, c, 0));
+    }
+    if (tl.empty()) return;
+
+    JPH::MeshShapeSettings ms(vl, tl);
+    ms.mMaxTrianglesPerLeaf = 8;
+    JPH::ShapeSettings::ShapeResult r = ms.Create();
+    if (r.HasError()) return;
+
+    remove_chunk(key);
+    JPH::BodyCreationSettings bcs(r.Get(), JPH::RVec3(0, 0, 0), JPH::Quat::sIdentity(),
+                                  JPH::EMotionType::Static, Layers::NON_MOVING);
+    const JPH::BodyID id = impl_->system.GetBodyInterface().CreateAndAddBody(
+        bcs, JPH::EActivation::DontActivate);
+    if (!id.IsInvalid()) {
+        bodies_[key] = id;
+        body_lod_[id.GetIndexAndSequenceNumber()] = key.lod;
+        body_is_mesh_[id.GetIndexAndSequenceNumber()] = 1;
+        ++mesh_bodies_;
+    }
+}
+
 void PhysicsWorld::remove_chunk(const ChunkKey& key) {
     if (!impl_) return;
     std::unordered_map<ChunkKey, JPH::BodyID, ChunkKeyHash>::iterator it = bodies_.find(key);
     if (it == bodies_.end()) return;
     JPH::BodyInterface& bi = impl_->system.GetBodyInterface();
-    body_lod_.erase(it->second.GetIndexAndSequenceNumber());
+    const JPH::uint32 bid = it->second.GetIndexAndSequenceNumber();
+    if (body_is_mesh_.erase(bid)) --mesh_bodies_;
+    body_lod_.erase(bid);
     bi.RemoveBody(it->second);
     bi.DestroyBody(it->second);
     bodies_.erase(it);
@@ -203,6 +250,10 @@ void PhysicsWorld::place_character(float x, float y, float z) {
     impl_->character->SetLinearVelocity(JPH::Vec3::sZero());
 }
 
+void PhysicsWorld::launch_character(float vy) {
+    pending_launch_ = vy;
+}
+
 void PhysicsWorld::update(float dt, float vx, float vz, bool jump) {
     if (!impl_ || !impl_->character) return;
     if (dt > 0.05f) dt = 0.05f;
@@ -220,6 +271,10 @@ void PhysicsWorld::update(float dt, float vx, float vz, bool jump) {
     }
     v.SetX(vx);
     v.SetZ(vz);
+    if (pending_launch_ != 0.0f) {
+        v.SetY(pending_launch_);
+        pending_launch_ = 0.0f;
+    }
     c->SetLinearVelocity(v);
 
     // ExtendedUpdate is what makes this a character rather than a falling

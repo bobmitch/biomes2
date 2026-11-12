@@ -72,6 +72,14 @@ static const UINT kHeightSamples = kHeightGrid * kHeightGrid;
 static const UINT kReadbackRing = 3;
 static const UINT kReadbackChunksPerFrame = 8;
 
+// Mesh readback for the chunks a heightfield cannot represent. Two a frame,
+// because one chunk's triangles are 163 KB against a height patch's 4.6 KB
+// and only about one chunk in a hundred needs them.
+static const UINT kMeshChunksPerFrame = 2;
+static const UINT kMeshVertexBytes = kSlotVertices * sizeof(MeshVertex);
+static const UINT kMeshIndexBytes = kSlotIndices * 4;
+static const UINT kMeshChunkBytes = kMeshVertexBytes + kMeshIndexBytes;
+
 // One chunk's heights, as handed to physics.
 struct HeightPatch {
     UINT  slot;
@@ -121,6 +129,26 @@ public:
     const float* mapped_heights(UINT ring, UINT count);
     void         unmap_heights(UINT ring);
 
+    // How many columns of each staged chunk hold more than one surface. Zero
+    // means a heightfield represents the chunk exactly; anything else means
+    // it does not.
+    void         record_flag_copy(ID3D12GraphicsCommandList* cmd, UINT ring,
+                                  const UINT* slots, UINT count);
+    const UINT*  mapped_flags(UINT ring, UINT count);
+    void         unmap_flags(UINT ring);
+
+    // A flagged chunk's triangles. Vertices then indices, one chunk after
+    // another, so a single mapped pointer serves both.
+    void         record_mesh_copy(ID3D12GraphicsCommandList* cmd, UINT ring,
+                                  const UINT* slots, UINT count);
+    const unsigned char* mapped_mesh(UINT ring, UINT count);
+    void         unmap_mesh(UINT ring);
+
+    // Vertex and index counts for one slot, from the counter readback. Stale
+    // by the same two frames as everything else on this path, which is
+    // harmless: the slot's contents do not change while it stays resident.
+    void         slot_counts(UINT slot, UINT& vertices, UINT& indices);
+
     ID3D12Resource* vertices()  const { return vertices_.Get(); }
     ID3D12Resource* indices()   const { return indices_.Get(); }
     ID3D12Resource* draw_args() const { return draw_args_.Get(); }
@@ -138,8 +166,10 @@ private:
     ComPtr<ID3D12Resource> density_, cell_vertex_, vertices_, indices_;
     ComPtr<ID3D12Resource> counters_, draw_args_;
     ComPtr<ID3D12Resource> counter_readback_, vertex_readback_, args_readback_;
-    ComPtr<ID3D12Resource> heights_;
+    ComPtr<ID3D12Resource> heights_, chunk_flags_;
     ComPtr<ID3D12Resource> height_readback_[kReadbackRing];
+    ComPtr<ID3D12Resource> flag_readback_[kReadbackRing];
+    ComPtr<ID3D12Resource> mesh_readback_[kReadbackRing];
 
     ComPtr<ID3D12QueryHeap> timestamps_;
     ComPtr<ID3D12Resource>  timestamp_readback_;

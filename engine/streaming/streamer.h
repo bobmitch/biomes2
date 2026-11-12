@@ -230,6 +230,17 @@ public:
     // them, or a character keeps standing on terrain nothing draws any more.
     const std::vector<ChunkKey>& retired_keys() const { return retired_keys_; }
 
+    // Which slot a chunk currently owns, if it is still resident. The mesh
+    // readback needs this: by the time a copy lands the chunk may have been
+    // retired and its slot handed to something else entirely.
+    bool slot_of(const ChunkKey& k, UINT& out) const {
+        std::unordered_map<ChunkKey, UINT, ChunkKeyHash>::const_iterator it =
+            resident_.find(k);
+        if (it == resident_.end()) return false;
+        out = it->second;
+        return true;
+    }
+
     size_t resident_count() const { return resident_.size(); }
     size_t pending_count() const {
         // The queue is rebuilt each update, so what is left after a frame's

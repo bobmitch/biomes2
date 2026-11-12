@@ -58,6 +58,10 @@ struct FrameStats {
     unsigned long long patches_total = 0;
     UINT   patches_this_frame = 0;
     size_t collision_patches = 0;
+    unsigned long long chunks_classified = 0;
+    unsigned long long chunks_needing_mesh = 0;
+    unsigned long long mesh_shapes_delivered = 0;
+    size_t mesh_backlog = 0;
     UINT   readback_latency_frames = 0;
     float  height_residual_max = 0.0f;
     double height_residual_mean = 0.0;
@@ -106,9 +110,24 @@ public:
         ChunkKey key;
         float    origin[3];
         float    voxel;
+        // Columns in this chunk holding more than one surface. Non-zero means
+        // a heightfield cannot represent it and it needs a mesh shape.
+        UINT     multi_surface_columns;
         std::vector<float> h;
     };
+    // A chunk the cheap shape cannot represent, with its actual triangles.
+    // Arrives four frames after the chunk was meshed: two for the
+    // classification to come back, two more for the geometry.
+    struct MeshPatchEvent {
+        ChunkKey key;
+        std::vector<float>    verts;   // xyz triples, world space
+        std::vector<unsigned> idx;     // into verts
+    };
+
     const std::vector<PatchEvent>& patches_added() const { return patches_added_; }
+    const std::vector<MeshPatchEvent>& mesh_patches_added() const {
+        return mesh_patches_added_;
+    }
     const std::vector<ChunkKey>&   patches_removed() const { return patches_removed_; }
 
     // Max and mean |density| at the vertices of slot 0, in metres. A vertex on
@@ -150,6 +169,7 @@ private:
     ChunkMesher mesher_;
     Streamer    streamer_;
     std::vector<PatchEvent> patches_added_;
+    std::vector<MeshPatchEvent> mesh_patches_added_;
     std::vector<ChunkKey>   patches_removed_;
     FrameStats  stats_;
     Mode        mode_ = Mode::Mesh;
@@ -171,9 +191,24 @@ private:
         float    voxel[kReadbackChunksPerFrame];
     };
     RingRecord ring_[kReadbackRing];
+
+    // The same shape again for the mesh path, which is staged a frame later
+    // than the heights because it cannot start until the classification has
+    // come back.
+    struct MeshRingRecord {
+        UINT     count = 0;
+        unsigned long long frame = 0;
+        ChunkKey keys[kMeshChunksPerFrame];
+        UINT     slots[kMeshChunksPerFrame];
+    };
+    MeshRingRecord mesh_ring_[kReadbackRing];
+    std::vector<ChunkKey> mesh_wanted_;
+
     unsigned long long frame_index_ = 0;
     void stage_heights();
     void consume_heights();
+    void stage_meshes();
+    void consume_meshes();
 
     bool ready_ = false;
     bool vsync_ = true;
