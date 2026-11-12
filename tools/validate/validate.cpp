@@ -61,6 +61,8 @@ struct SeedResult {
     bool  spawn_calmest = false;
     float slope_gentle = 1.0f;  // share of land under 30 degrees
     float lod_worst = 0.0f;     // worst |h(LOD) - h(0)| as a multiple of that voxel
+    float cave_fraction = 0.0f;   // subsurface samples that are air
+    float overhang_cols = 0.0f;   // land columns whose surface is crossed twice or more
     int   river_segments = 0;
     int   river_paths_total = 0, river_paths_to_ocean = 0, river_ascending = 0;
     uint64_t hash = 0;
@@ -298,6 +300,48 @@ static SeedResult eval_seed(uint64_t world_seed,
         out.lod_worst = worst;
     }
 
+    // --- layer 6 volumetrics ---
+    // A column with more than one sign change above the ground is an actual
+    // overhang. Without this, overhang_strength could be doing nothing but
+    // roughening the surface and nothing would say so.
+    {
+        const float R = wp.radius;
+        const int   CG = 13;
+        const float cs = 2.0f * R / CG;
+        int cols = 0, overhung = 0, sub = 0, air = 0;
+        for (int gj = 0; gj < CG; ++gj) {
+            const float z = -R + (gj + 0.5f) * cs;
+            for (int gi = 0; gi < CG; ++gi) {
+                const float x = -R + (gi + 0.5f) * cs;
+                const float rr = std::sqrt(x * x + z * z) / R;
+                if (rr > 1.0f) continue;
+                const float surf = terrain_height(w, wp, table, x, z, rr);
+                if (surf <= wp.sea_level) continue;
+                ++cols;
+
+                // Above the surface: count crossings to find overhangs.
+                int crossings = 0;
+                bool prev_solid = terrain_density(w, wp, table, x, surf + 60.0f, z) > 0.0f;
+                for (int k = 1; k <= 40; ++k) {
+                    const float y = surf + 60.0f - 100.0f * k / 40.0f;
+                    const bool solid = terrain_density(w, wp, table, x, y, z) > 0.0f;
+                    if (solid != prev_solid) ++crossings;
+                    prev_solid = solid;
+                }
+                if (crossings > 1) ++overhung;
+
+                // Below the surface: how much of it is cave.
+                for (int k = 1; k <= 60; ++k) {
+                    const float y = surf - 320.0f * k / 60.0f;
+                    ++sub;
+                    if (terrain_density(w, wp, table, x, y, z) <= 0.0f) ++air;
+                }
+            }
+        }
+        out.overhang_cols = cols > 0 ? static_cast<float>(overhung) / cols : 0.0f;
+        out.cave_fraction = sub > 0 ? static_cast<float>(air) / sub : 0.0f;
+    }
+
     // --- determinism hash ---
     // Layers 0 and 1 on a fixed grid, plus the layer-3 assignment. Quantised,
     // because the point is to catch a changed generator, not float noise.
@@ -317,6 +361,16 @@ static SeedResult eval_seed(uint64_t world_seed,
                 h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(hh * 4096.0f)));
                 h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(dd * 4096.0f)));
                 h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(tt * 64.0f)));
+                // Layer 6 at every 64th column, two depths each. The pin has
+                // to cover the whole generator, and density is part of it now;
+                // sampling every column in 3D would cost more than the rest of
+                // the hash put together.
+                if (((gi | gj) & 7) == 0) {
+                    const float d1 = terrain_density(w, wp, table, x, tt - 20.0f, z);
+                    const float d2 = terrain_density(w, wp, table, x, tt - 80.0f, z);
+                    h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(d1 * 64.0f)));
+                    h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(d2 * 64.0f)));
+                }
             }
         }
         for (int i = 0; i < n; ++i) {
@@ -394,6 +448,7 @@ struct Summary {
     int slope_failures = 0;      // under 60% of land walkable
     int lod_failures = 0;        // a LOD disagreeing by more than its voxel
     float max_lod_worst = 0.0f;
+    float mean_cave_fraction = 0.0f, mean_overhang_cols = 0.0f;
     int river_failures = 0;      // no rivers, or one that climbs or never reaches the sea
     float mean_river_segments = 0.0f;
     float min_home_share = 2.0f;     // islandness: measured, not asserted
@@ -450,6 +505,8 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
         if (r.slope_gentle < 0.60f) ++sm.slope_failures;
         if (r.lod_worst > 1.0f) ++sm.lod_failures;
         sm.max_lod_worst = std::max(sm.max_lod_worst, r.lod_worst);
+        sm.mean_cave_fraction += r.cave_fraction;
+        sm.mean_overhang_cols += r.overhang_cols;
         if (r.river_segments == 0 || r.river_ascending > 0 ||
             r.river_paths_to_ocean != r.river_paths_total) ++sm.river_failures;
         sm.mean_river_segments += r.river_segments;
@@ -487,6 +544,7 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
     sm.mean_patch_cells *= inv; sm.mean_patch_km2 *= inv;
     sm.mean_relaxed *= inv; sm.mean_overflow *= inv; sm.mean_candidates *= inv;
     sm.mean_river_segments *= inv;
+    sm.mean_cave_fraction *= inv; sm.mean_overhang_cols *= inv;
     sm.mean_home_share *= inv; sm.mean_landmasses *= inv;
     std::sort(errs.begin(), errs.end());
     sm.p95_quota_err = errs[std::min<size_t>(errs.size() - 1, static_cast<size_t>(errs.size() * 0.95))];
@@ -795,6 +853,9 @@ int main(int argc, char** argv) {
     bool relief = false;
     bool closeup = false;
     bool components = false;
+    bool section = false;
+    uint64_t section_seed = 0;
+    float section_width = 4000.0f;
     bool land_sweep = false;
     float land_target = -1.0f;
     uint64_t closeup_seed = 0;
@@ -826,6 +887,12 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--bless"))                  bless = true;
         else if (!std::strcmp(argv[i], "--relief"))                 relief = true;
         else if (!std::strcmp(argv[i], "--components"))              components = true;
+        else if (!std::strcmp(argv[i], "--section") && i + 1 < argc) {
+            section = true;
+            section_seed = std::strtoull(argv[++i], nullptr, 10);
+        }
+        else if (!std::strcmp(argv[i], "--section-width") && i + 1 < argc)
+            section_width = static_cast<float>(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--closeup") && i + 1 < argc) {
             closeup = true;
             closeup_seed = std::strtoull(argv[++i], nullptr, 10);
@@ -855,6 +922,52 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("archetypes: %d biomes, invariants OK\n", static_cast<int>(table.size()));
+
+    if (section) {
+        const int W = 1400, H = 300;
+        std::printf("cross-section, seed %llu, %.0f m wide, %dx%d\n",
+                    static_cast<unsigned long long>(section_seed), section_width, W, H);
+        const SeedWorld sw = build_world(section_seed, wp, table, ap);
+        std::vector<unsigned char> img(static_cast<size_t>(W) * H * 3, 0);
+        render_section(sw, wp, table, 0.0f, section_width * 0.5f, -420.0f, 380.0f, img, W, H);
+        if (!write_bmp(sheet_path, W, H, img)) {
+            std::printf("FAILED to write %s\n", sheet_path);
+            return 1;
+        }
+        std::printf("wrote %s\n", sheet_path);
+
+        // What the cave field is actually doing, so a blank slice can be told
+        // from a slice of solid rock.
+        {
+            double cmin = 1e30, cmax = -1e30, csum = 0.0;
+            int n = 0, air = 0, below = 0;
+            float smin = 1e30f, smax = -1e30f;
+            for (int ix = 0; ix < 160; ++ix) {
+                const float x = -section_width * 0.5f + section_width * (ix + 0.5f) / 160.0f;
+                const float rr = std::sqrt(x * x) / wp.radius;
+                if (rr > 1.0f) continue;
+                const float surf = terrain_height(sw, wp, table, x, 0.0f, rr);
+                if (surf < smin) smin = surf;
+                if (surf > smax) smax = surf;
+                for (int iy = 0; iy < 120; ++iy) {
+                    const float y = surf - 400.0f * (iy + 0.5f) / 120.0f;   // below surface only
+                    const float c = cave_field(x, y, 0.0f, wp.cave_freq, sw.s_cave, 0.0f);
+                    if (c < cmin) cmin = c;
+                    if (c > cmax) cmax = c;
+                    csum += c;
+                    ++n;
+                    ++below;
+                    if (terrain_density(sw, wp, table, x, y, 0.0f) <= 0.0f) ++air;
+                }
+            }
+            std::printf("surface height %.0f..%.0f m\n", smin, smax);
+            std::printf("cave_field over %d subsurface samples: min %.3f mean %.3f max %.3f\n",
+                        n, cmin, n > 0 ? csum / n : 0.0, cmax);
+            std::printf("subsurface samples that are air: %d of %d (%.2f%%)\n",
+                        air, below, below > 0 ? 100.0 * air / below : 0.0);
+        }
+        return 0;
+    }
 
     if (land_sweep) {
         // The band worth choosing from. 56 is roughly where we ship; the low
@@ -1195,6 +1308,9 @@ int main(int argc, char** argv) {
         std::snprintf(d, sizeof(d), "worst seed has %.1f%% of land under 30 degrees, threshold 60%%",
                       100.0 * s.min_slope_gentle);
         line("slope budget", s.slope_failures == 0, d);
+        std::snprintf(d, sizeof(d), "%.2f%% of subsurface is cave air, %.1f%% of land columns "
+                      "overhang", 100.0 * s.mean_cave_fraction, 100.0 * s.mean_overhang_cols);
+        std::printf("  %-18s %-6s %s\n", "volumetrics", "n/a", d);
         std::snprintf(d, sizeof(d), "worst LOD differs from LOD 0 by %.2f of its voxel "
                       "(limit 1.00)", s.max_lod_worst);
         line("LOD agreement", s.lod_failures == 0, d);

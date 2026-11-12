@@ -30,7 +30,9 @@ enum FeatureId : uint32_t {
     FEATURE_CELLS     = 3u,
     FEATURE_WARP_X    = 4u,
     FEATURE_WARP_Z    = 5u,
-    FEATURE_HEIGHT    = 6u
+    FEATURE_HEIGHT    = 6u,
+    FEATURE_OVERHANG  = 7u,
+    FEATURE_CAVE      = 8u
 };
 
 inline uint64_t hash64(uint64_t x) {
@@ -99,6 +101,12 @@ struct WorldParams {
     // layer 5
     int   river_grid        = 256;        // the doc's figure; ample over the disc
     float river_threshold   = 70.0f;      // upstream cells before it is a river
+
+    // layer 6
+    float overhang_freq     = 1.0f / 50.0f;
+    float overhang_scale    = 30.0f;      // metres at strength 1; the ratio to the feature size is what makes an overhang possible
+    float cave_freq         = 1.0f / 260.0f;
+    float cave_carve        = 10.0f;      // metres of air margin inside a tunnel
 };
 
 // Thin adapters onto the canonical field function in worldgen/shaders/field.h.
@@ -230,6 +238,7 @@ struct SeedWorld {
     std::vector<int>        biome;
     AssignStats             stats;
     uint32_t s_cont = 0, s_dang = 0, s_wx = 0, s_wz = 0, s_height = 0;
+    uint32_t s_overhang = 0, s_cave = 0;
     float    land_fraction = 0.0f;
 
     // --- layer 5 ---
@@ -282,6 +291,11 @@ float terrain_height(const SeedWorld& w, const WorldParams& wp,
                      float voxel = 0.0f);
 
 void build_rivers(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table);
+
+// Layer 6. Positive is rock, negative is air; the sign change is the surface.
+float terrain_density(const SeedWorld& w, const WorldParams& wp,
+                      const ArchetypeTable& table, float x, float y, float z,
+                      float voxel = 0.0f);
 
 // One seed, from scatter through quota assignment to drainage.
 SeedWorld build_world(uint64_t world_seed, const WorldParams& wp,

@@ -20,6 +20,10 @@ static BiomeProfile profile_of(const BiomeArchetype& a) {
     p.gain           = a.gain;
     p.ridge_blend    = a.ridge_blend;
     p.flatness       = a.flatness;
+    p.overhang_strength = a.overhang_strength;
+    p.cave_density      = a.cave_density;
+    p.cave_depth_min    = a.cave_depth_min;
+    p.cave_depth_max    = a.cave_depth_max;
     return p;
 }
 
@@ -178,6 +182,63 @@ float terrain_height(const SeedWorld& w, const WorldParams& wp,
     return river_carve(h, dist, rw, rd);
 }
 
+// Layer 6. The per-biome cave and overhang parameters are blended across the
+// nearest cells, the same weights layer 4 uses for heights.
+//
+// Blending these is safe where blending octave counts would not be: they are
+// strength multipliers on a shared noise field, not parameters that change
+// what the noise looks like. A biome boundary with a step in cave density
+// would read as tunnels stopping dead at an invisible line.
+float terrain_density(const SeedWorld& w, const WorldParams& wp,
+                      const ArchetypeTable& table, float x, float y, float z, float voxel) {
+    const float r = std::sqrt(x * x + z * z) / wp.radius;
+    const float h = terrain_height(w, wp, table, x, z, r, voxel);
+
+    const float wx = x + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wx);
+    const float wz = z + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wz);
+    int   idx[4];
+    float dist[4];
+    const int found = w.lookup.nearest4(w.pts, wx, wz, idx, dist);
+
+    BiomeProfile p;
+    p.base_elevation = 0.0f;
+    p.amplitude = 0.0f;
+    p.octaves = 0;
+    p.lacunarity = 2.0f;
+    p.gain = 0.5f;
+    p.ridge_blend = 0.0f;
+    p.flatness = 1.0f;
+    p.overhang_strength = 0.0f;
+    p.cave_density = 0.0f;
+    p.cave_depth_min = 0.0f;
+    p.cave_depth_max = 0.0f;
+
+    float wsum = 0.0f;
+    for (int k = 0; k < found; ++k) {
+        const int b = w.biome[idx[k]];
+        if (b < 0) continue;
+        const float t = 1.0f - (dist[k] - dist[0]) / wp.blend_width;
+        const float wt = t > 0.0f ? t * t : 0.0f;
+        if (wt <= 0.0f) continue;
+        const BiomeArchetype& a = table[b];
+        p.overhang_strength = p.overhang_strength + wt * a.overhang_strength;
+        p.cave_density      = p.cave_density      + wt * a.cave_density;
+        p.cave_depth_min    = p.cave_depth_min    + wt * a.cave_depth_min;
+        p.cave_depth_max    = p.cave_depth_max    + wt * a.cave_depth_max;
+        wsum = wsum + wt;
+    }
+    if (wsum > 0.0f) {
+        const float inv = 1.0f / wsum;
+        p.overhang_strength = p.overhang_strength * inv;
+        p.cave_density      = p.cave_density * inv;
+        p.cave_depth_min    = p.cave_depth_min * inv;
+        p.cave_depth_max    = p.cave_depth_max * inv;
+    }
+
+    return layer6_density(x, y, z, h, p, wp.overhang_freq, wp.overhang_scale,
+                          wp.cave_freq, wp.cave_carve, w.s_overhang, w.s_cave, voxel);
+}
+
 // --- layer 5: trace the drainage -------------------------------------------
 //
 // Steepest descent on a raw heightfield gets stuck in every local minimum, so
@@ -334,6 +395,8 @@ SeedWorld build_world(uint64_t world_seed,
     w.s_wx   = feature_seed(world_seed, FEATURE_WARP_X);
     w.s_wz   = feature_seed(world_seed, FEATURE_WARP_Z);
     w.s_height = feature_seed(world_seed, FEATURE_HEIGHT);
+    w.s_overhang = feature_seed(world_seed, FEATURE_OVERHANG);
+    w.s_cave = feature_seed(world_seed, FEATURE_CAVE);
     const uint32_t s_cont = w.s_cont, s_dang = w.s_dang, s_wx = w.s_wx, s_wz = w.s_wz;
     const uint32_t s_cell = feature_seed(world_seed, FEATURE_CELLS);
 

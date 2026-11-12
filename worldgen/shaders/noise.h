@@ -164,4 +164,127 @@ WG_FN float fbm(float x, float y, int octaves, float lacunarity, float gain, uin
 }
 
 
+// --- 3D noise (layer 6) -----------------------------------------------------
+// Caves and overhangs are volumetric, so they need noise in three dimensions.
+// The design doc offers a gyroid as one option for the cave field; it is not
+// available to us, because a gyroid is sin and cos and invariant 9 forbids
+// libm anywhere upstream of the golden hash. Simplex in 3D needs nothing but
+// multiply, add, floor and compare.
+
+WG_FN uint hash3i(int x, int y, int z, uint seed) {
+    return pcg(asuint(x) * 0x9E3779B1u ^
+               pcg(asuint(y) * 0x85EBCA77u ^
+                   pcg(asuint(z) * 0xC2B2AE3Du ^ seed)));
+}
+
+// The twelve edge-midpoints of a cube, padded to sixteen so the index is a
+// mask rather than a modulo. Perlin's set: equal length, well spread.
+WG_FN float3 grad3(uint h) {
+    float3 kG[16];
+    kG[0] = float3(1.0f, 1.0f, 0.0f);
+    kG[1] = float3(-1.0f, 1.0f, 0.0f);
+    kG[2] = float3(1.0f, -1.0f, 0.0f);
+    kG[3] = float3(-1.0f, -1.0f, 0.0f);
+    kG[4] = float3(1.0f, 0.0f, 1.0f);
+    kG[5] = float3(-1.0f, 0.0f, 1.0f);
+    kG[6] = float3(1.0f, 0.0f, -1.0f);
+    kG[7] = float3(-1.0f, 0.0f, -1.0f);
+    kG[8] = float3(0.0f, 1.0f, 1.0f);
+    kG[9] = float3(0.0f, -1.0f, 1.0f);
+    kG[10] = float3(0.0f, 1.0f, -1.0f);
+    kG[11] = float3(0.0f, -1.0f, -1.0f);
+    kG[12] = float3(1.0f, 1.0f, 0.0f);
+    kG[13] = float3(-1.0f, 1.0f, 0.0f);
+    kG[14] = float3(0.0f, -1.0f, 1.0f);
+    kG[15] = float3(0.0f, -1.0f, -1.0f);
+    return kG[h & 15u];
+}
+
+WG_FN float simplex3(float x, float y, float z, uint seed) {
+    const float F3 = 0.3333333333f;
+    const float G3 = 0.1666666667f;
+
+    const float s = (x + y + z) * F3;
+    const int i = int(floor(x + s));
+    const int j = int(floor(y + s));
+    const int k = int(floor(z + s));
+    const float t = float(i + j + k) * G3;
+
+    const float x0 = x - (float(i) - t);
+    const float y0 = y - (float(j) - t);
+    const float z0 = z - (float(k) - t);
+
+    // Which of the six tetrahedra the point is in, decided by ordering the
+    // three offsets. Written as comparisons rather than a lookup so it maps
+    // straight across to HLSL.
+    int i1 = 0; int j1 = 0; int k1 = 0;
+    int i2 = 0; int j2 = 0; int k2 = 0;
+    if (x0 >= y0) {
+        if (y0 >= z0)      { i1 = 1; j1 = 0; k1 = 0; i2 = 1; j2 = 1; k2 = 0; }
+        else if (x0 >= z0) { i1 = 1; j1 = 0; k1 = 0; i2 = 1; j2 = 0; k2 = 1; }
+        else               { i1 = 0; j1 = 0; k1 = 1; i2 = 1; j2 = 0; k2 = 1; }
+    } else {
+        if (y0 < z0)       { i1 = 0; j1 = 0; k1 = 1; i2 = 0; j2 = 1; k2 = 1; }
+        else if (x0 < z0)  { i1 = 0; j1 = 1; k1 = 0; i2 = 0; j2 = 1; k2 = 1; }
+        else               { i1 = 0; j1 = 1; k1 = 0; i2 = 1; j2 = 1; k2 = 0; }
+    }
+
+    const float x1 = x0 - float(i1) + G3;
+    const float y1 = y0 - float(j1) + G3;
+    const float z1 = z0 - float(k1) + G3;
+    const float x2 = x0 - float(i2) + 2.0f * G3;
+    const float y2 = y0 - float(j2) + 2.0f * G3;
+    const float z2 = z0 - float(k2) + 2.0f * G3;
+    const float x3 = x0 - 1.0f + 3.0f * G3;
+    const float y3 = y0 - 1.0f + 3.0f * G3;
+    const float z3 = z0 - 1.0f + 3.0f * G3;
+
+    float n = 0.0f;
+    float tt = 0.0f;
+    float3 g = float3(0.0f, 0.0f, 0.0f);
+
+    tt = 0.6f - x0 * x0 - y0 * y0 - z0 * z0;
+    if (tt > 0.0f) {
+        g = grad3(hash3i(i, j, k, seed));
+        tt = tt * tt;
+        n = n + tt * tt * (g.x * x0 + g.y * y0 + g.z * z0);
+    }
+    tt = 0.6f - x1 * x1 - y1 * y1 - z1 * z1;
+    if (tt > 0.0f) {
+        g = grad3(hash3i(i + i1, j + j1, k + k1, seed));
+        tt = tt * tt;
+        n = n + tt * tt * (g.x * x1 + g.y * y1 + g.z * z1);
+    }
+    tt = 0.6f - x2 * x2 - y2 * y2 - z2 * z2;
+    if (tt > 0.0f) {
+        g = grad3(hash3i(i + i2, j + j2, k + k2, seed));
+        tt = tt * tt;
+        n = n + tt * tt * (g.x * x2 + g.y * y2 + g.z * z2);
+    }
+    tt = 0.6f - x3 * x3 - y3 * y3 - z3 * z3;
+    if (tt > 0.0f) {
+        g = grad3(hash3i(i + 1, j + 1, k + 1, seed));
+        tt = tt * tt;
+        n = n + tt * tt * (g.x * x3 + g.y * y3 + g.z * z3);
+    }
+    return 32.0f * n;   // roughly [-1, 1]
+}
+
+// Octave-faded 3D fBm, same Nyquist rule as the 2D one.
+WG_FN float fbm3_lod(float x, float y, float z, int octaves, float lacunarity, float gain, uint seed, float base_period, float voxel) {
+    float amp = 1.0f;
+    float freq = 1.0f;
+    float sum = 0.0f;
+    float norm = 0.0f;
+    for (int o = 0; o < octaves; o = o + 1) {
+        const float w = octave_weight(base_period / freq, voxel);
+        sum = sum + amp * w * simplex3(x * freq, y * freq, z * freq, seed + asuint(o) * 0x9E3779B1u);
+        norm = norm + amp;
+        amp = amp * gain;
+        freq = freq * lacunarity;
+    }
+    if (norm > 0.0f) { return sum / norm; }
+    return 0.0f;
+}
+
 #endif

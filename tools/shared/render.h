@@ -185,6 +185,52 @@ inline void render_danger_tile(const SeedWorld& w, const WorldParams& wp,
     }
 }
 
+
+// A vertical slice through the world. Rock, air, water and cave air are drawn
+// as four different things, because a cave below sea level is not water and
+// drawing it as water would hide the bug where it is.
+//
+// The height is evaluated once per column: it depends only on x and z, so
+// recomputing it for every y would multiply the cost of the slice by its
+// height in pixels. The engine's fill shader will want the same split.
+inline void render_section(const SeedWorld& w, const WorldParams& wp,
+                           const ArchetypeTable& table,
+                           float z0, float half_width, float ymin, float ymax,
+                           std::vector<unsigned char>& img, int W, int H) {
+    const float R = wp.radius;
+    for (int px = 0; px < W; ++px) {
+        const float x = -half_width + (2.0f * half_width) * (static_cast<float>(px) + 0.5f) / W;
+        const float rr = std::sqrt(x * x + z0 * z0) / R;
+        const float surface = rr <= 1.0f ? terrain_height(w, wp, table, x, z0, rr) : -1.0e9f;
+
+        for (int py = 0; py < H; ++py) {
+            // Top of the image is the top of the world.
+            const float y = ymax - (ymax - ymin) * (static_cast<float>(py) + 0.5f) / H;
+            unsigned char c[3];
+
+            if (rr > 1.0f) {
+                c[0] = 10; c[1] = 12; c[2] = 18;              // past the terminator
+            } else {
+                const float d = terrain_density(w, wp, table, x, y, z0);
+                if (d > 0.0f) {
+                    // Rock, shaded by how deep below the surface it sits.
+                    const float depth = wg_saturate((surface - y) / 420.0f);
+                    c[0] = static_cast<unsigned char>(122 - 64 * depth);
+                    c[1] = static_cast<unsigned char>(98 - 52 * depth);
+                    c[2] = static_cast<unsigned char>(76 - 40 * depth);
+                } else if (y > surface) {
+                    if (y <= 0.0f) { c[0] = 46; c[1] = 86; c[2] = 140; }   // sea
+                    else           { c[0] = 150; c[1] = 172; c[2] = 198; } // sky
+                } else {
+                    c[0] = 24; c[1] = 20; c[2] = 28;          // cave air
+                }
+            }
+            const size_t o = (static_cast<size_t>(py) * W + px) * 3;
+            img[o + 0] = c[0]; img[o + 1] = c[1]; img[o + 2] = c[2];
+        }
+    }
+}
+
 // One entry point, so a caller picks a mode rather than a function.
 inline void render_view(const SeedWorld& w, const WorldParams& wp,
                         const ArchetypeTable& table, ViewMode mode,

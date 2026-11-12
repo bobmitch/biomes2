@@ -104,6 +104,11 @@ struct BiomeProfile {
     float gain;
     float ridge_blend;
     float flatness;
+    // layer 6
+    float overhang_strength;
+    float cave_density;
+    float cave_depth_min;
+    float cave_depth_max;
 };
 
 // One biome's profile, in metres.
@@ -163,6 +168,67 @@ WG_FN float river_carve(float h, float d, float width, float depth) {
     const float t = wg_saturate(1.0f - d / width);
     const float profile = t * t * (3.0f - 2.0f * t);
     return h - depth * profile;
+}
+
+
+// --- layer 6: 3D density ----------------------------------------------------
+//
+// density(p) > 0 is rock, < 0 is air, and the sign change is the surface.
+// Everything above this layer produces a heightfield; this is where the world
+// stops being 2.5D.
+
+// Ridged 3D noise. The creases are what make an overhang: a plain fBm
+// displacement just makes the surface wobble.
+WG_FN float ridged3(float x, float y, float z, int octaves, float lacunarity, float gain, uint seed, float base_period, float voxel) {
+    const float n = fbm3_lod(x, y, z, octaves, lacunarity, gain, seed, base_period, voxel);
+    return 1.0f - 2.0f * abs(n);
+}
+
+// Tunnels, as the intersection of two ridged fields. Each field's crest is a
+// sheet through the volume; two sheets meet in a line, and a line is a tunnel.
+// The design doc also offers a gyroid, which is unavailable: a gyroid is sin
+// and cos, and invariant 9 forbids libm upstream of the golden hash.
+WG_FN float cave_field(float x, float y, float z, float freq, uint seed, float voxel) {
+    const float bp = 1.0f / freq;
+    const float a = ridged3(x * freq, y * freq, z * freq, 2, 2.0f, 0.5f, seed, bp, voxel);
+    const float b = ridged3(x * freq, y * freq, z * freq, 2, 2.0f, 0.5f, seed + 0x9E3779B1u, bp, voxel);
+    const float ta = wg_smoothstep(0.62f, 0.97f, a);
+    const float tb = wg_smoothstep(0.62f, 0.97f, b);
+    return ta * tb;
+}
+
+// Caves live in a depth band below the surface. Without the lower edge they
+// open onto cliff faces wherever the ground happens to cut through one, which
+// reads as holes punched in the terrain rather than as a cave mouth.
+WG_FN float cave_depth_mask(float depth, float dmin, float dmax) {
+    const float lo = wg_smoothstep(dmin, dmin + 12.0f, depth);
+    const float hi = 1.0f - wg_smoothstep(dmax - 24.0f, dmax, depth);
+    return lo * hi;
+}
+
+WG_FN float layer6_density(float x, float y, float z, float height, BiomeProfile p, float overhang_freq, float overhang_scale, float cave_freq, float cave_carve, uint seed_overhang, uint seed_cave, float voxel) {
+    float d = height - y;
+    if (p.overhang_strength > 0.0f) {
+        const float bp = 1.0f / overhang_freq;
+        const float rg = ridged3(x * overhang_freq, y * overhang_freq, z * overhang_freq,
+                                 3, 2.0f, 0.5f, seed_overhang, bp, voxel);
+        d = d + p.overhang_strength * overhang_scale * rg;
+    }
+    if (p.cave_density > 0.0f) {
+        const float m = cave_depth_mask(height - y, p.cave_depth_min, p.cave_depth_max);
+        if (m > 0.0f) {
+            const float c = cave_field(x, y, z, cave_freq, seed_cave, voxel);
+            // Blend towards air rather than subtracting from rock. density is
+            // height - y, which grows without bound with depth, so a fixed
+            // subtraction stops winning a few metres down and the cave simply
+            // never opens. Measured that way: 0 of 19200 subsurface samples
+            // were air. cave_density widens the tunnel instead of deepening
+            // the cut.
+            const float open = wg_saturate(c * (0.5f + 2.0f * p.cave_density) * m);
+            d = d * (1.0f - open) - cave_carve * open;
+        }
+    }
+    return d;
 }
 
 #endif
