@@ -17,7 +17,19 @@ cbuffer View : register(b0) {
     float3 cam_fwd;    float aspect;
     float3 cam_right;  float tan_half_fov;
     float3 cam_up;     float pad0;
+    float3 cap_pos;    float cap_r;
+    float  cap_half;   float3 pad1;
 };
+
+// Distance to the character capsule: a segment of length 2*cap_half about
+// cap_pos, thickened by cap_r. Marched alongside the terrain so the two depth
+// orders resolve against each other for free.
+float capsule_sd(float3 p) {
+    if (cap_r <= 0.0f) return 1.0e9f;
+    const float3 d = p - cap_pos;
+    const float  y = clamp(d.y, -cap_half, cap_half);
+    return length(float3(d.x, d.y - y, d.z)) - cap_r;
+}
 
 struct VSOut {
     float4 pos : SV_Position;
@@ -66,11 +78,13 @@ float4 ps_main(VSOut i) : SV_Target {
     // thin rock. Uniform steps are slower and correct; B2 stops caring.
     float t = 0.0f;
     bool  hit = false;
+    bool  hit_capsule = false;
     float3 p = cam_pos;
     const float step = kMaxDist / kMaxSteps;
 
     for (int s = 0; s < kMaxSteps; ++s) {
         p = cam_pos + dir * t;
+        if (capsule_sd(p) < 0.0f) { hit = true; hit_capsule = true; break; }
         if (trivial_density(p.x, p.y, p.z) > 0.0f) { hit = true; break; }
         t += step;
     }
@@ -89,9 +103,24 @@ float4 ps_main(VSOut i) : SV_Target {
     for (int b = 0; b < 6; ++b) {
         const float mid = 0.5f * (lo + hi);
         const float3 q = cam_pos + dir * mid;
-        if (trivial_density(q.x, q.y, q.z) > 0.0f) { hi = mid; } else { lo = mid; }
+        const bool inside = hit_capsule ? (capsule_sd(q) < 0.0f)
+                                        : (trivial_density(q.x, q.y, q.z) > 0.0f);
+        if (inside) { hi = mid; } else { lo = mid; }
     }
     p = cam_pos + dir * hi;
+
+    if (hit_capsule) {
+        // Gradient of the capsule distance, which is already an outward
+        // normal -- no negation here, unlike the density field.
+        const float e = 0.02f;
+        const float3 cn = normalize(float3(
+            capsule_sd(p + float3(e, 0, 0)) - capsule_sd(p - float3(e, 0, 0)),
+            capsule_sd(p + float3(0, e, 0)) - capsule_sd(p - float3(0, e, 0)),
+            capsule_sd(p + float3(0, 0, e)) - capsule_sd(p - float3(0, 0, e))));
+        const float3 sun2 = normalize(float3(0.45f, 0.78f, 0.35f));
+        const float  l = saturate(dot(cn, sun2));
+        return float4(float3(0.92f, 0.36f, 0.20f) * (0.25f + 0.75f * l), 1.0f);
+    }
 
     const float3 n = field_normal(p);
     const float3 sun = normalize(float3(0.45f, 0.78f, 0.35f));

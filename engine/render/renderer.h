@@ -11,6 +11,7 @@
 
 #include "engine/meshing/chunk_mesher.h"
 #include "engine/streaming/streamer.h"
+#include "engine/physics/height_field.h"
 
 #include <windows.h>
 #include <d3d12.h>
@@ -38,6 +39,9 @@ struct ViewConstants {
     float cam_fwd[3];    float aspect;
     float cam_right[3];  float tan_half_fov;
     float cam_up[3];     float pad0;
+    // The character capsule, drawn by the raymarch. cap_r <= 0 means none.
+    float cap_pos[3];    float cap_r;
+    float cap_half;      float pad1[3];
 };
 
 // What the frame draws. Raymarch and Mesh render the same field from the same
@@ -48,6 +52,15 @@ struct ViewConstants {
 enum class Mode { Raymarch, Mesh, Overlay };
 
 struct FrameStats {
+    // Readback: how many height patches came back, how stale they were, and
+    // how far the surface they describe is from the field itself.
+    unsigned long long patches_total = 0;
+    UINT   patches_this_frame = 0;
+    size_t collision_patches = 0;
+    UINT   readback_latency_frames = 0;
+    float  height_residual_max = 0.0f;
+    double height_residual_mean = 0.0;
+    unsigned long long height_samples_checked = 0;
     size_t resident = 0, pending = 0, free_slots = 0;
     UINT   vertices = 0, indices = 0, overflowed = 0;
     UINT   meshed_this_frame = 0;
@@ -84,6 +97,9 @@ public:
     Mode mode() const { return mode_; }
 
     const FrameStats& stats() const { return stats_; }
+
+    // The streamed terrain as a collision surface, for the character.
+    const HeightField& height_field() const { return height_field_; }
 
     // Max and mean |density| at the vertices of slot 0, in metres. A vertex on
     // the isosurface reads zero; surface nets averages edge crossings rather
@@ -123,6 +139,7 @@ private:
 
     ChunkMesher mesher_;
     Streamer    streamer_;
+    HeightField height_field_;
     FrameStats  stats_;
     Mode        mode_ = Mode::Mesh;
 
@@ -133,6 +150,20 @@ private:
 
     UINT rtv_stride_ = 0;
     UINT width_ = 0, height_ = 0;
+    // One record per staging buffer: what was copied into it and when, so the
+    // consumer knows which chunk each patch belongs to.
+    struct RingRecord {
+        UINT     count = 0;
+        unsigned long long frame = 0;
+        ChunkKey keys[kReadbackChunksPerFrame];
+        float    origin[kReadbackChunksPerFrame][3];
+        float    voxel[kReadbackChunksPerFrame];
+    };
+    RingRecord ring_[kReadbackRing];
+    unsigned long long frame_index_ = 0;
+    void stage_heights();
+    void consume_heights();
+
     bool ready_ = false;
     bool vsync_ = true;
     bool tearing_ok_ = false;

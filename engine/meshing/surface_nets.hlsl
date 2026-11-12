@@ -51,6 +51,12 @@ RWStructuredBuffer<Vertex> g_vertices    : register(u2);   // pool
 RWStructuredBuffer<uint>   g_indices     : register(u3);   // pool
 RWStructuredBuffer<uint>   g_counters    : register(u4);   // 2 per slot
 RWStructuredBuffer<uint>   g_draw_args   : register(u5);   // 5 per slot
+RWStructuredBuffer<float>  g_heights     : register(u6);   // kCorners^2 per slot
+
+// A column with no surface in it. Jolt spells its equivalent
+// HeightFieldShapeConstants::cNoCollisionValue; the conversion happens on the
+// CPU so this kernel does not have to know about a physics engine.
+static const float kNoSurface = 1.0e30f;
 
 uint vertex_cap() { return slot_caps & 0xFFFFu; }
 uint index_cap()  { return (slot_caps >> 16) & 0xFFFFu; }
@@ -254,6 +260,42 @@ void cs_quads(uint3 id : SV_DispatchThreadID) {
             g_indices[o + 3] = v00; g_indices[o + 4] = v11; g_indices[o + 5] = v01;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pass 3b -- the surface height of every column, for physics.
+//
+// Reuses the density grid rather than re-evaluating the field: the same
+// samples that produced the mesh produce the shape, so the two cannot
+// disagree about where the ground is. A separate CPU evaluation would be a
+// second source of truth for the one thing the player stands on.
+//
+// Highest surface wins. The trivial field has a floating sphere over the
+// ground, and a heightfield can only represent one surface per column -- B5's
+// MeshShape is where overhangs stop being approximated. Taking the highest
+// means a character walks on top of the sphere rather than through it.
+// ---------------------------------------------------------------------------
+[numthreads(8, 8, 1)]
+void cs_heights(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= kCorners || id.y >= kCorners) return;
+
+    float h = kNoSurface;
+    // Downwards from the top, so the first crossing found is the highest.
+    for (uint j = kCorners - 1u; j >= 1u; --j) {
+        const float above = g_density[corner_index(uint3(id.x, j, id.y))];
+        const float below = g_density[corner_index(uint3(id.x, j - 1u, id.y))];
+        if (above <= 0.0f && below > 0.0f) {
+            // Linear crossing between the two samples, the same interpolation
+            // the mesher uses along an edge.
+            // t is the fraction from the SOLID sample (j-1) up to the air
+            // sample (j), so the height is measured from j-1, not down from j.
+            const float denom = below - above;
+            const float t = abs(denom) > 1e-12f ? saturate(below / denom) : 0.5f;
+            h = chunk_origin.y + (float(j - 1u) + t) * voxel;
+            break;
+        }
+    }
+    g_heights[slot * (kCorners * kCorners) + id.y * kCorners + id.x] = h;
 }
 
 // ---------------------------------------------------------------------------

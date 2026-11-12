@@ -60,6 +60,26 @@ struct MeshVertex {
     float nrm[3];
 };
 
+// One height sample per corner of the chunk, ghost layer included, so
+// neighbouring shapes overlap by a cell instead of leaving a seam a character
+// could fall through.
+static const UINT kHeightGrid = kChunkCorners;          // 34
+static const UINT kHeightSamples = kHeightGrid * kHeightGrid;
+
+// Three staging buffers, the design's figure. Written in frame N, read at the
+// start of frame N+2: with two frames in flight the CPU has already waited on
+// frame N's fence by then, so the map never blocks.
+static const UINT kReadbackRing = 3;
+static const UINT kReadbackChunksPerFrame = 8;
+
+// One chunk's heights, as handed to physics.
+struct HeightPatch {
+    UINT  slot;
+    float origin[3];     // world position of sample (0,0)
+    float voxel;         // metres between samples
+    float h[kHeightSamples];
+};
+
 class ChunkMesher {
 public:
     // timestamp_freq comes from the command queue the work will run on: ticks
@@ -93,6 +113,14 @@ public:
     void record_vertex_copy(ID3D12GraphicsCommandList* cmd);
     bool read_vertices(UINT slot, UINT count, std::vector<MeshVertex>& out);
 
+    // Copy the heights of the chunks meshed this frame into one staging
+    // buffer of the ring. `ring` is the frame's own slot.
+    void record_height_copy(ID3D12GraphicsCommandList* cmd, UINT ring,
+                            const UINT* slots, UINT count);
+    // Read back what was staged `kReadbackRing - 1` frames ago. Never blocks.
+    const float* mapped_heights(UINT ring, UINT count);
+    void         unmap_heights(UINT ring);
+
     ID3D12Resource* vertices()  const { return vertices_.Get(); }
     ID3D12Resource* indices()   const { return indices_.Get(); }
     ID3D12Resource* draw_args() const { return draw_args_.Get(); }
@@ -105,11 +133,13 @@ public:
 private:
     ComPtr<ID3D12RootSignature> root_;
     ComPtr<ID3D12PipelineState> pso_clear_, pso_density_, pso_vertices_,
-                                pso_quads_, pso_args_, pso_retire_;
+                                pso_quads_, pso_args_, pso_retire_, pso_heights_;
 
     ComPtr<ID3D12Resource> density_, cell_vertex_, vertices_, indices_;
     ComPtr<ID3D12Resource> counters_, draw_args_;
     ComPtr<ID3D12Resource> counter_readback_, vertex_readback_, args_readback_;
+    ComPtr<ID3D12Resource> heights_;
+    ComPtr<ID3D12Resource> height_readback_[kReadbackRing];
 
     ComPtr<ID3D12QueryHeap> timestamps_;
     ComPtr<ID3D12Resource>  timestamp_readback_;

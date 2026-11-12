@@ -17,6 +17,8 @@
 // ---------------------------------------------------------------------------
 #include "engine/render/renderer.h"
 #include "engine/camera.h"
+#include "engine/physics/character.h"
+#include "engine/field/trivial_field.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -28,8 +30,10 @@
 
 namespace {
 
-engine::Renderer g_renderer;
-engine::Camera   g_camera;
+engine::Renderer  g_renderer;
+engine::Camera    g_camera;
+engine::Character g_character;
+bool g_walk = false;
 bool g_captured = false;
 bool g_want_shot = false;
 
@@ -67,6 +71,18 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                                                 : engine::Mode::Raymarch);
                 return 0;
             }
+            if (wp == VK_TAB) {
+                g_walk = !g_walk;
+                if (g_walk) {
+                    // Drop in above the camera's ground so the first frames
+                    // are a short fall rather than a long one.
+                    g_character.x = g_camera.x;
+                    g_character.z = g_camera.z;
+                    g_character.y = g_camera.y;
+                    g_character.vy = 0.0f;
+                }
+                return 0;
+            }
             if (wp == VK_F2) { g_want_shot = true; return 0; }
             if (wp == VK_F5) {
                 std::string err;
@@ -98,6 +114,13 @@ void fill_view(const engine::Camera& cam, float w, float h, float t,
     v.aspect = h > 0.0f ? w / h : 1.0f;
     v.tan_half_fov = 0.5773503f;   // 60 degrees vertical
     v.pad0 = 0.0f;
+    // The capsule is only drawn in walk mode; a radius of zero switches it off
+    // rather than needing a second shader.
+    v.cap_pos[0] = g_character.x;
+    v.cap_pos[1] = g_character.y;
+    v.cap_pos[2] = g_character.z;
+    v.cap_r = g_walk ? g_character.radius : 0.0f;
+    v.cap_half = g_character.half_height;
 }
 
 }  // namespace
@@ -109,6 +132,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     std::string shot_path;
     bool start_overlay = false, start_raymarch = false, debug_layer = false;
     double flight_seconds = 0.0;
+    double walk_seconds = 0.0;
     bool flight_vsync = false;
     {
         const std::string cl = cmdline ? cmdline : "";
@@ -120,6 +144,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 shot_path = cl.substr(p, e == std::string::npos ? e : e - p);
             }
             if (shot_path.empty()) shot_path = "build/shot.bmp";
+        }
+        const size_t wk = cl.find("--walk");
+        if (wk != std::string::npos) {
+            walk_seconds = 8.0;
+            size_t p = cl.find_first_not_of(" \t", wk + 6);
+            if (p != std::string::npos && cl[p] != '-') walk_seconds = std::atof(cl.c_str() + p);
+            if (walk_seconds <= 0.0) walk_seconds = 8.0;
         }
         const size_t fl = cl.find("--flight");
         if (fl != std::string::npos) {
@@ -192,6 +223,115 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     }
 
     ShowWindow(hwnd, show);
+
+    if (walk_seconds > 0.0) {
+        g_renderer.set_vsync(true);
+        g_walk = true;
+        g_character.x = 0.0f; g_character.z = 0.0f; g_character.y = 30.0f;
+        g_camera.pitch = -0.12f;
+
+        LARGE_INTEGER wfreq, wstart, wprev;
+        QueryPerformanceFrequency(&wfreq);
+        QueryPerformanceCounter(&wstart);
+        wprev = wstart;
+
+        unsigned long long frames = 0, airborne = 0, waiting = 0, settled_frames = 0;
+        double resid_sum = 0.0, resid_max = 0.0;
+        double worst_step = 0.0, travelled = 0.0;
+        float  last_feet = 0.0f;
+        bool   have_last = false;
+
+        for (;;) {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&m);
+                DispatchMessageA(&m);
+            }
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            const double total = double(now.QuadPart - wstart.QuadPart) / double(wfreq.QuadPart);
+            const double dt = double(now.QuadPart - wprev.QuadPart) / double(wfreq.QuadPart);
+            wprev = now;
+            if (total >= walk_seconds) break;
+
+            g_camera.yaw = float(total) * 0.20f;
+            const float sy = std::sin(g_camera.yaw), cy = std::cos(g_camera.yaw);
+            const float sp = 6.0f;
+            const float px = g_character.x, pz = g_character.z;
+            g_character.update(g_renderer.height_field(), float(dt), sy * sp, cy * sp, false);
+            travelled += std::sqrt((g_character.x - px) * (g_character.x - px) +
+                                   (g_character.z - pz) * (g_character.z - pz));
+
+            g_camera.x = g_character.x;
+            g_camera.y = g_character.y + g_character.eye;
+            g_camera.z = g_character.z;
+
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
+            if (w < 1.0f || h < 1.0f) continue;
+            engine::ViewConstants v = {};
+            fill_view(g_camera, w, h, float(total), v);
+            g_renderer.render(v);
+
+            ++frames;
+            if (g_character.waiting_for_ground) ++waiting;
+            else if (!g_character.grounded) ++airborne;
+
+            // Give the world a second to stream in and the capsule a moment to
+            // land before judging it.
+            if (total > 1.5 && g_character.grounded) {
+                ++settled_frames;
+                const float fy = g_character.feet();
+                const float d = trivial_density(g_character.x, fy, g_character.z);
+                const double a = d < 0.0f ? -double(d) : double(d);
+                resid_sum += a;
+                if (a > resid_max) resid_max = a;
+                if (have_last) {
+                    const double step = std::fabs(double(fy) - double(last_feet));
+                    if (step > worst_step) worst_step = step;
+                }
+                last_feet = fy;
+                have_last = true;
+            }
+        }
+
+        const engine::FrameStats st = g_renderer.stats();
+        if (FILE* f = std::fopen("build/walk.txt", "w")) {
+            std::fprintf(f, "capsule walk over the trivial world, %.1f s\n", walk_seconds);
+            std::fprintf(f, "frames %llu, travelled %.0f m\n", frames, travelled);
+            std::fprintf(f, "frames airborne: %llu, frames with no terrain streamed yet: %llu\n",
+                         airborne, waiting);
+            std::fprintf(f, "settled frames judged: %llu\n", settled_frames);
+            std::fprintf(f, "feet vs the field: max %.4f m, mean %.4f m\n",
+                         resid_max, settled_frames ? resid_sum / double(settled_frames) : 0.0);
+            std::fprintf(f, "worst single-frame vertical step: %.4f m\n", worst_step);
+            std::fprintf(f, "LOD changes under the feet: %d\n", g_character.lod_changes);
+            std::fprintf(f, "collision patches resident at the end: %zu\n",
+                         st.collision_patches);
+            std::fprintf(f, "height readback latency: %u frames\n",
+                         st.readback_latency_frames);
+            std::fclose(f);
+        }
+
+        // A third-person look at where the capsule ended up, drawn against the
+        // analytic field rather than the mesh -- see the note in the shader.
+        {
+            engine::Camera c = g_camera;
+            const float sy = std::sin(g_camera.yaw), cy = std::cos(g_camera.yaw);
+            c.x = g_character.x - sy * 7.0f;
+            c.y = g_character.y + 3.2f;
+            c.z = g_character.z - cy * 7.0f;
+            c.pitch = -0.33f;
+            engine::ViewConstants v = {};
+            fill_view(c, 1280.0f, 720.0f, 0.0f, v);
+            g_renderer.set_mode(engine::Mode::Raymarch);
+            std::string err;
+            g_renderer.capture(v, "build/b4_walk.bmp", err);
+        }
+        g_renderer.shutdown();
+        return 0;
+    }
 
     if (flight_seconds > 0.0) {
         // A long straight run with a slow turn, so chunks enter and leave
@@ -280,6 +420,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(f, "at the end: %zu chunks resident, %u triangles, %zu slots free\n",
                          st.resident, st.indices / 3, st.free_slots);
             std::fprintf(f, "slots overflowed: %u\n", st.overflowed);
+            std::fprintf(f, "height patches read back: %llu, latency %u frames\n",
+                         st.patches_total, st.readback_latency_frames);
+            std::fprintf(f, "height residual over %llu samples: max %.4f m, mean %.4f m\n",
+                         st.height_samples_checked, st.height_residual_max,
+                         st.height_residual_mean);
             std::fprintf(f, "uncapped presentation: %s\n",
                          g_renderer.tearing_available()
                              ? "yes, tearing allowed"
@@ -321,6 +466,28 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const float h = static_cast<float>(cr.bottom - cr.top);
         if (w < 1.0f || h < 1.0f) continue;
 
+        if (g_walk) {
+            // The capsule moves; the camera rides it at eye height. Streaming
+            // follows the camera, so this is also what keeps chunks loading
+            // around the character rather than around a detached viewpoint.
+            float mx = 0.0f, mz = 0.0f;
+            if (g_captured && GetForegroundWindow() == hwnd) {
+                if (GetAsyncKeyState('W') & 0x8000) mz += 1.0f;
+                if (GetAsyncKeyState('S') & 0x8000) mz -= 1.0f;
+                if (GetAsyncKeyState('D') & 0x8000) mx += 1.0f;
+                if (GetAsyncKeyState('A') & 0x8000) mx -= 1.0f;
+            }
+            const float sy = std::sin(g_camera.yaw), cy = std::cos(g_camera.yaw);
+            const float sp = 6.0f;
+            const float vx = (sy * mz + cy * mx) * sp;
+            const float vz = (cy * mz - sy * mx) * sp;
+            const bool jump = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+            g_character.update(g_renderer.height_field(), float(dt), vx, vz, jump);
+            g_camera.x = g_character.x;
+            g_camera.y = g_character.y + g_character.eye;
+            g_camera.z = g_character.z;
+        }
+
         if (g_captured && GetForegroundWindow() == hwnd) {
             // Delta from the client centre, then recentre. Simpler than raw
             // input and good enough for a debug flycam.
@@ -336,7 +503,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 ClientToScreen(hwnd, &back);
                 SetCursorPos(back.x, back.y);
             }
-            g_camera.update(static_cast<float>(dt));
+            if (!g_walk) g_camera.update(static_cast<float>(dt));
         }
 
         engine::ViewConstants view = {};

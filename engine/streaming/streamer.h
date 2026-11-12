@@ -142,10 +142,12 @@ public:
         wanted_.clear();
         for (size_t i = 0; i < desired_.size(); ++i) wanted_[desired_[i]] = 1;
         retire_.clear();
+        retired_keys_.clear();
         for (std::unordered_map<ChunkKey, UINT, ChunkKeyHash>::iterator it = resident_.begin();
              it != resident_.end();) {
             if (wanted_.find(it->first) == wanted_.end()) {
                 retire_.push_back(it->second);
+                retired_keys_.push_back(it->first);
                 free_slots_.push_back(it->second);
                 it = resident_.erase(it);
             } else {
@@ -180,6 +182,7 @@ public:
         for (size_t i = 0; i < retire_.size(); ++i) mesher.record_retire(cmd, retire_[i]);
         retire_.clear();
 
+        last_meshed_.clear();
         UINT done = 0;
         for (size_t i = 0; i < queue_.size() && done < budget; ++i) {
             if (free_slots_.empty()) break;
@@ -190,10 +193,25 @@ public:
             const float origin[3] = {float(k.x) * S, float(k.y) * S, float(k.z) * S};
             mesher.record_mesh(cmd, slot, origin, lod_voxel(k.lod));
             resident_[k] = slot;
+            MeshedChunk mc;
+            mc.key = k;
+            mc.slot = slot;
+            last_meshed_.push_back(mc);
             ++done;
         }
         return done;
     }
+
+    // What was meshed in the last record_work call, for the readback ring.
+    struct MeshedChunk {
+        ChunkKey key;
+        UINT     slot;
+    };
+    const std::vector<MeshedChunk>& last_meshed() const { return last_meshed_; }
+
+    // Chunks dropped by the last update. Their collision patches must go with
+    // them, or a character keeps standing on terrain nothing draws any more.
+    const std::vector<ChunkKey>& retired_keys() const { return retired_keys_; }
 
     size_t resident_count() const { return resident_.size(); }
     size_t pending_count() const {
@@ -220,6 +238,8 @@ private:
     std::vector<Pending> queue_;
     std::vector<UINT>    retire_;
     std::vector<UINT>    free_slots_;
+    std::vector<MeshedChunk> last_meshed_;
+    std::vector<ChunkKey>    retired_keys_;
 };
 
 }  // namespace engine

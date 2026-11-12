@@ -574,6 +574,87 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     }
 }
 
+// Record the copy of this frame's newly meshed chunks into this frame's
+// staging buffer, and remember which chunk each patch belongs to.
+void Renderer::stage_heights() {
+    const UINT ring = static_cast<UINT>(frame_index_ % kReadbackRing);
+    RingRecord& r = ring_[ring];
+    const std::vector<Streamer::MeshedChunk>& meshed = streamer_.last_meshed();
+
+    UINT slots[kReadbackChunksPerFrame];
+    r.count = 0;
+    r.frame = frame_index_;
+    for (size_t i = 0; i < meshed.size() && r.count < kReadbackChunksPerFrame; ++i) {
+        const Streamer::MeshedChunk& m = meshed[i];
+        const float S = lod_chunk_size(m.key.lod);
+        slots[r.count] = m.slot;
+        r.keys[r.count] = m.key;
+        r.origin[r.count][0] = float(m.key.x) * S;
+        r.origin[r.count][1] = float(m.key.y) * S;
+        r.origin[r.count][2] = float(m.key.z) * S;
+        r.voxel[r.count] = lod_voxel(m.key.lod);
+        ++r.count;
+    }
+    mesher_.record_height_copy(cmd_.Get(), ring, slots, r.count);
+}
+
+// Consume what was staged two frames ago. Two, because with two frames in
+// flight the CPU has already waited on that frame's fence, so the map cannot
+// block -- which is the entire point of the ring.
+void Renderer::consume_heights() {
+    if (frame_index_ < kReadbackRing - 1) return;
+    const UINT ring = static_cast<UINT>((frame_index_ + 1) % kReadbackRing);
+    RingRecord& r = ring_[ring];
+    if (r.count == 0) return;
+    if (frame_index_ < r.frame + (kReadbackRing - 1)) return;
+
+    const float* h = mesher_.mapped_heights(ring, r.count);
+    if (!h) { r.count = 0; return; }
+
+    stats_.readback_latency_frames = static_cast<UINT>(frame_index_ - r.frame);
+    stats_.patches_this_frame = r.count;
+    stats_.patches_total += r.count;
+
+    // Every reported height should sit on the isosurface. Checked against the
+    // C++ side of the dialect, the same tolerance comparison B2 used on the
+    // mesh -- and the only thing that would catch a ring read one frame early,
+    // which returns a previous chunk's perfectly plausible terrain.
+    double sum = 0.0;
+    unsigned long long n = 0;
+    for (UINT p = 0; p < r.count; ++p) {
+        const float* g = h + size_t(p) * kHeightSamples;
+        const float v = r.voxel[p];
+        for (UINT k = 0; k < kHeightGrid; k += 4) {
+            for (UINT i = 0; i < kHeightGrid; i += 4) {
+                const float y = g[k * kHeightGrid + i];
+                if (y > 1.0e29f) continue;          // no surface in this column
+                const float x = r.origin[p][0] + float(i) * v;
+                const float z = r.origin[p][2] + float(k) * v;
+                const float d = trivial_density(x, y, z);
+                const float a = d < 0.0f ? -d : d;
+                if (a > stats_.height_residual_max) stats_.height_residual_max = a;
+                sum += a;
+                ++n;
+            }
+        }
+    }
+    // Into the collision surface, keyed by chunk so retirement can remove it.
+    for (UINT p = 0; p < r.count; ++p) {
+        height_field_.insert(r.keys[p], r.origin[p], r.voxel[p],
+                             h + size_t(p) * kHeightSamples);
+    }
+
+    mesher_.unmap_heights(ring);
+    if (n) {
+        const unsigned long long before = stats_.height_samples_checked;
+        stats_.height_samples_checked = before + n;
+        stats_.height_residual_mean =
+            (stats_.height_residual_mean * double(before) + sum) /
+            double(stats_.height_samples_checked);
+    }
+    r.count = 0;
+}
+
 void Renderer::record_frame(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HANDLE rtv) {
     // Streaming first, in compute, then the draw reads what it produced.
     mesher_.record_to_compute(cmd_.Get());
@@ -582,6 +663,7 @@ void Renderer::record_frame(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         streamer_.record_work(cmd_.Get(), mesher_, kMeshBudgetPerFrame);
     mesher_.record_timestamp(cmd_.Get(), 1);
     mesher_.resolve_timestamps(cmd_.Get());
+    stage_heights();
     mesher_.record_counter_copy(cmd_.Get());
     mesher_.record_vertex_copy(cmd_.Get());
     mesher_.record_to_draw(cmd_.Get());
@@ -593,6 +675,13 @@ void Renderer::render(const ViewConstants& view) {
     if (!ready_) return;
 
     streamer_.update(view.cam_pos[0], view.cam_pos[1], view.cam_pos[2]);
+    {
+        const std::vector<ChunkKey>& gone = streamer_.retired_keys();
+        for (size_t i = 0; i < gone.size(); ++i) height_field_.remove(gone[i]);
+    }
+    stats_.patches_this_frame = 0;
+    consume_heights();
+    stats_.collision_patches = height_field_.patch_count();
 
     allocators_[frame_]->Reset();
     cmd_->Reset(allocators_[frame_].Get(), nullptr);
@@ -630,6 +719,7 @@ void Renderer::render(const ViewConstants& view) {
     stats_.resident = streamer_.resident_count();
     stats_.pending = streamer_.pending_count();
     stats_.free_slots = streamer_.free_slot_count();
+    ++frame_index_;
 }
 
 bool Renderer::capture(const ViewConstants& view, const char* path, std::string& error) {
