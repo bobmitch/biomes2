@@ -43,8 +43,8 @@ enum { ID_SEED_PREV = 100, ID_SEED_NEXT, ID_W, ID_FEAT, ID_MODE, ID_REPAIR, ID_L
 // GLOBAL: the slider sets the MEAN land fraction across seeds and leaves each
 // seed free to land above or below. Per-seed solving would flatten exactly the
 // spread the islandness comes from.
-const int LAND_MIN = 400;    // 40.0%
-const int LAND_MAX = 650;    // 65.0%
+const int LAND_MIN = 250;    // 25.0%
+const int LAND_MAX = 550;    // 55.0%
 
 const int PANEL = 232;
 const int PREVIEW_PX = 220;    // while dragging
@@ -328,7 +328,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     // once at startup, against about a second for every slider step if the
     // offset were bisected on demand. Coarse on purpose -- it only has to be
     // accurate enough to place a slider, and the harness is what measures.
-    g.calib.build(g.wp, 16, 192);
+    g.calib.build(g.wp, 16, 192, -0.25f, 0.30f, 22);
 
     WNDCLASSA wc;
     ZeroMemory(&wc, sizeof(wc));

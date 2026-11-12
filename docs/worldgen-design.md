@@ -188,7 +188,9 @@ The fix is equal-area rings: `r_k = R · √(k / N)`.
 
 The same applies to the danger field: `D` should be defined on normalised area, not normalised radius, or every quota the assignment layer computes will be fighting the geometry. In practice that means `D ∝ r²` before the noise is added.
 
-**Ocean is a separate budget line.** Quotas are fractions of *land* area, not world area, with ocean taking a flat 40–50% of the disc off the top. Mixing them means a seed with more coastline silently shrinks every biome.
+**Ocean is a separate budget line.** Quotas are fractions of *land* area, not world area. Mixing them means a seed with more coastline silently shrinks every biome.
+
+That separation is what makes the land fraction a free parameter. It now sits at a **35% mean**, so ocean takes about 65% of the disc rather than the 40–50% first guessed here — and every biome still receives its stated share of whatever land exists, because the quota is a fraction of land. Measured over 200 seeds at 35%: presence passes on every seed and boat connectivity reaches every biome. What degrades at low land fraction is the *accuracy* of the share, not the share itself: fewer land cells means coarser granularity, which is paid for with smaller cells.
 
 ### Scale and cell count
 
@@ -643,7 +645,7 @@ Starting points, not measurements. Every budget row is a number to instrument an
 | Parameter | Value | Note |
 | --- | --- | --- |
 | Field budget | ≤ 20 ns/sample | 0.7 ms per chunk serial-equivalent; the hard constraint of the no-storage design |
-| Region cells, R = 10 km | \~245 | `15 × biome_count / land_fraction` |
+| Region cells, R = 10 km | \~2,430 | 0.12 km² each. The rule of thumb below undersizes badly, and less land needs more cells, not fewer |
 | Region cells, R = 20 km | \~960 | Same cell size, more of them |
 | Cell lookup grid | 64 × 64 buckets | A handful of candidates per sample |
 | Boundary warp amplitude | \~1.3 km | Roughly one cell radius; the parameter that makes cells read as coastlines |
@@ -651,7 +653,7 @@ Starting points, not measurements. Every budget row is a number to instrument an
 | Danger feature size | 2 km | Smaller than the original 3–6 km. Fragments the assignment on its own; the layer-3 repair pass is what makes it read as zones rather than noise |
 | Patch repair passes | 4 | Converges by 4. Without it, `w` and patch size are the same knob |
 | Continent fBm | 4–6 octaves, 2–8 km base | Simplex family, never classic Perlin |
-| Land fraction target | 55% | ±5% tolerance in the harness |
+| Land fraction | 35% mean | A distribution, not a target: seeds run 31–41%. The harness asserts the mean within ±2 and each seed inside 26–45%. The spread is the point — the archipelagos are its low tail |
 | Quota tolerance | ±10% relative | Granularity-limited; tighten by adding cells |
 
 ### Runtime

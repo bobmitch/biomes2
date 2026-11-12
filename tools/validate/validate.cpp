@@ -404,7 +404,7 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
         if (r.missing_biomes > 0) ++sm.presence_failures;
         if (r.max_quota_err > 0.10f) ++sm.quota_failures;
         if (r.spearman < 0.8f) ++sm.radial_failures;
-        if (std::fabs(r.land_fraction - 0.55f) > 0.05f) ++sm.land_failures;
+        if (r.land_fraction < 0.26f || r.land_fraction > 0.45f) ++sm.land_failures;
         if (r.adj_violations > 0) ++sm.adjacency_failures;
         if (!r.taper_ok) ++sm.taper_failures;
         // A DEGENERACY guard, not a connectivity requirement: the spawn
@@ -1121,8 +1121,15 @@ int main(int argc, char** argv) {
         line("quota", s.quota_failures == 0, d);
         std::snprintf(d, sizeof(d), "Spearman min %.2f, threshold 0.80", s.min_spearman);
         line("radial order", s.radial_failures == 0, d);
-        std::snprintf(d, sizeof(d), "mean %.1f%%, target 55%% +/- 5", 100.0 * s.mean_land_frac);
-        line("land fraction", s.land_failures == 0, d);
+        // A mean target plus a per-seed band, not a tight per-seed target.
+        // The spread IS the islandness, so squeezing every seed onto the
+        // mean would remove the archipelagos along with it.
+        const bool land_mean_ok = std::fabs(s.mean_land_frac - 0.35f) <= 0.02f;
+        std::snprintf(d, sizeof(d), "mean %.1f%% (target 35 +/- 2), seeds %.1f-%.1f%% "
+                      "(band 26-45), %d outside",
+                      100.0 * s.mean_land_frac, 100.0 * s.min_land_frac,
+                      100.0 * s.max_land_frac, s.land_failures);
+        line("land fraction", s.land_failures == 0 && land_mean_ok, d);
         std::snprintf(d, sizeof(d), "%d seeds break an authored adjacency rule", s.adjacency_failures);
         line("adjacency", s.adjacency_failures == 0, d);
         std::snprintf(d, sizeof(d), "%d seeds with land past r=0.95 or a rim above the void",
@@ -1180,6 +1187,7 @@ int main(int argc, char** argv) {
                          s.adjacency_failures == 0 && s.taper_failures == 0 &&
                          s.home_failures == 0 && s.boat_failures == 0 &&
                          s.spawn_failures == 0 && s.slope_failures == 0 &&
+                         land_mean_ok &&
                          s.river_failures == 0 &&
                          ns <= 400.0 && golden_ok && sheet_ok;
         std::printf("\n%s\n", all ? "ALL CHECKS PASSED" : "FAILED");

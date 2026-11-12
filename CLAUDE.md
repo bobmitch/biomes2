@@ -109,10 +109,13 @@ from spawn, which made a single continent a pass condition and forbade the
 island clusters layer 3 is specified to produce; the design doc had left the
 threshold as a literal `X%`. Whether a world should read as one continent or
 an archipelago is a feel call made on the contact sheet, not an assertion.
-`tools/validate/README.md` §8 has the measurement. **`land_offset` is the
-lever** (`--land-offset`, and a slider in `view.exe`): land fraction currently
-sits just above the percolation threshold, which is why every seed is a
-Pangaea.
+`tools/validate/README.md` §8 has the measurement. **Land fraction is the
+lever** (`--land-target`, `--land-sweep`, and a slider in `view.exe` reading in
+percent). It is now a **35% mean** — below the percolation threshold, so a
+typical seed is an archipelago of about 7 landmasses with the spawn mass
+holding roughly three quarters of the land, and the worst seeds far less.
+The offset behind it is solved GLOBALLY for the mean and baked as a literal:
+solving per seed would flatten the spread the islandness comes from.
 
 It also emits a shaded-relief sheet with `--relief`, and a single seed rendered
 large with `--closeup <seed>`. Use the close-up for anything narrower than a

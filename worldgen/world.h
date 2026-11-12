@@ -66,7 +66,7 @@ struct WorldParams {
     // table implies: the rule of thumb assumes a centred quota error, and it
     // is not centred, so R = 10 km needs about 4x the cells. R = 20 km passes
     // at either figure.
-    float cell_area_target  = 0.27e6f;
+    float cell_area_target  = 0.12e6f;
     int   grid              = 1024;       // sample grid per side
 
     // layer 0 stand-in
@@ -77,7 +77,10 @@ struct WorldParams {
     float sea_level         = 0.0f;
     // Stand-in only: shifts the continent mask to hit the 55% land target.
     // In the real generator this is sea level, which is a world constant.
-    float land_offset       = 0.17f;   // calibrated to the 55% land target
+    // Solved globally for a 35% MEAN land fraction, then baked. Seeds run
+    // about 31-41% around it, and that spread is where the islandness is:
+    // the archipelagos are its low tail, not a separate mode.
+    float land_offset       = -0.0248f;
 
     // layer 1
     float danger_w          = 0.60f;      // the feel parameter; see tools/validate/README.md
