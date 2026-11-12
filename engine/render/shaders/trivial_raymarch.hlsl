@@ -77,16 +77,24 @@ float4 ps_main(VSOut i) : SV_Target {
     // difference, not a distance -- so sphere tracing would overshoot through
     // thin rock. Uniform steps are slower and correct; B2 stops caring.
     float t = 0.0f;
+    float step = 0.0f;
     bool  hit = false;
     bool  hit_capsule = false;
     float3 p = cam_pos;
-    const float step = kMaxDist / kMaxSteps;
 
     for (int s = 0; s < kMaxSteps; ++s) {
         p = cam_pos + dir * t;
         if (capsule_sd(p) < 0.0f) { hit = true; hit_capsule = true; break; }
         if (trivial_density(p.x, p.y, p.z) > 0.0f) { hit = true; break; }
+        // The step GROWS with distance. A uniform kMaxDist / kMaxSteps is
+        // 1.3 m, which marches straight through a 0.7 m capsule a few metres
+        // away and leaves pieces of it missing -- the character appeared as
+        // two disconnected blobs. Near the camera the step has to be smaller
+        // than the smallest thing worth seeing; far away the terrain is the
+        // only thing left and a coarse step is fine.
+        step = 0.12f + t * 0.012f;
         t += step;
+        if (t > kMaxDist) break;
     }
 
     if (!hit) {

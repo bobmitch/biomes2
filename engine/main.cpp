@@ -17,7 +17,7 @@
 // ---------------------------------------------------------------------------
 #include "engine/render/renderer.h"
 #include "engine/camera.h"
-#include "engine/physics/character.h"
+#include "engine/physics/physics_world.h"
 #include "engine/field/trivial_field.h"
 
 #include <windows.h>
@@ -32,8 +32,28 @@ namespace {
 
 engine::Renderer  g_renderer;
 engine::Camera    g_camera;
-engine::Character g_character;
-bool g_walk = false;
+engine::PhysicsWorld g_physics;
+bool  g_walk = false;
+// The capsule's feet, read back from Jolt each frame. Kept here so the camera
+// and the raymarch's capsule agree with what physics actually did, rather than
+// with what was asked for.
+float g_feet[3] = {0.0f, 0.0f, 0.0f};
+const float kCapsuleRadius = 0.35f;
+const float kCapsuleHalf = 0.80f;
+const float kEyeAboveFeet = 1.60f;
+
+// Hand this frame's streamed height patches to physics, and drop the ones
+// whose chunk is gone. Called before the character moves, so it never steps on
+// terrain that was retired a frame ago.
+void sync_physics_terrain() {
+    const std::vector<engine::Renderer::PatchEvent>& added = g_renderer.patches_added();
+    for (size_t i = 0; i < added.size(); ++i) {
+        g_physics.set_chunk(added[i].key, added[i].origin, added[i].voxel,
+                            added[i].h.data());
+    }
+    const std::vector<engine::ChunkKey>& gone = g_renderer.patches_removed();
+    for (size_t i = 0; i < gone.size(); ++i) g_physics.remove_chunk(gone[i]);
+}
 bool g_captured = false;
 bool g_want_shot = false;
 
@@ -74,12 +94,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == VK_TAB) {
                 g_walk = !g_walk;
                 if (g_walk) {
-                    // Drop in above the camera's ground so the first frames
-                    // are a short fall rather than a long one.
-                    g_character.x = g_camera.x;
-                    g_character.z = g_camera.z;
-                    g_character.y = g_camera.y;
-                    g_character.vy = 0.0f;
+                    // Drop in where the camera is, so the first frames are a
+                    // short fall rather than a long one.
+                    g_physics.place_character(g_camera.x, g_camera.y, g_camera.z);
                 }
                 return 0;
             }
@@ -116,11 +133,13 @@ void fill_view(const engine::Camera& cam, float w, float h, float t,
     v.pad0 = 0.0f;
     // The capsule is only drawn in walk mode; a radius of zero switches it off
     // rather than needing a second shader.
-    v.cap_pos[0] = g_character.x;
-    v.cap_pos[1] = g_character.y;
-    v.cap_pos[2] = g_character.z;
-    v.cap_r = g_walk ? g_character.radius : 0.0f;
-    v.cap_half = g_character.half_height;
+    // The raymarch draws the capsule about its centre, so the feet are lifted
+    // by the half extent.
+    v.cap_pos[0] = g_feet[0];
+    v.cap_pos[1] = g_feet[1] + kCapsuleHalf + kCapsuleRadius;
+    v.cap_pos[2] = g_feet[2];
+    v.cap_r = g_walk ? kCapsuleRadius : 0.0f;
+    v.cap_half = kCapsuleHalf;
 }
 
 }  // namespace
@@ -181,6 +200,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     if (!hwnd) return 1;
 
     std::string error;
+    if (!g_physics.init(error)) {
+        MessageBoxA(hwnd, error.c_str(), "Physics init failed", MB_OK | MB_ICONERROR);
+        return 1;
+    }
     if (!g_renderer.init(hwnd, error, debug_layer)) {
         MessageBoxA(hwnd, error.c_str(), "Renderer init failed", MB_OK | MB_ICONERROR);
         return 1;
@@ -204,6 +227,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_renderer.dump_draw_args("build/draw_args.txt");
         }
         g_renderer.shutdown();
+        g_physics.shutdown();
 
         const std::string sp = shot_path + ".txt";
         if (FILE* f = std::fopen(sp.c_str(), "w")) {
@@ -227,7 +251,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     if (walk_seconds > 0.0) {
         g_renderer.set_vsync(true);
         g_walk = true;
-        g_character.x = 0.0f; g_character.z = 0.0f; g_character.y = 30.0f;
+        g_physics.place_character(0.0f, 30.0f, 0.0f);
+        g_physics.character_position(g_feet);
         g_camera.pitch = -0.12f;
 
         LARGE_INTEGER wfreq, wstart, wprev;
@@ -237,6 +262,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
 
         unsigned long long frames = 0, airborne = 0, waiting = 0, settled_frames = 0;
         double resid_sum = 0.0, resid_max = 0.0;
+        double sink_max = 0.0, hover_max = 0.0, excess_sum = 0.0, excess_max = 0.0;
+        unsigned long long steep_frames = 0;
+        unsigned long long lod_frames[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        double lod_resid[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        double lod_max[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         double worst_step = 0.0, travelled = 0.0;
         float  last_feet = 0.0f;
         bool   have_last = false;
@@ -257,14 +287,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_camera.yaw = float(total) * 0.20f;
             const float sy = std::sin(g_camera.yaw), cy = std::cos(g_camera.yaw);
             const float sp = 6.0f;
-            const float px = g_character.x, pz = g_character.z;
-            g_character.update(g_renderer.height_field(), float(dt), sy * sp, cy * sp, false);
-            travelled += std::sqrt((g_character.x - px) * (g_character.x - px) +
-                                   (g_character.z - pz) * (g_character.z - pz));
+            sync_physics_terrain();
+            const float px = g_feet[0], pz = g_feet[2];
+            g_physics.update(float(dt), sy * sp, cy * sp, false);
+            g_physics.character_position(g_feet);
+            travelled += std::sqrt((g_feet[0] - px) * (g_feet[0] - px) +
+                                   (g_feet[2] - pz) * (g_feet[2] - pz));
 
-            g_camera.x = g_character.x;
-            g_camera.y = g_character.y + g_character.eye;
-            g_camera.z = g_character.z;
+            g_camera.x = g_feet[0];
+            g_camera.y = g_feet[1] + kEyeAboveFeet;
+            g_camera.z = g_feet[2];
 
             RECT cr;
             GetClientRect(hwnd, &cr);
@@ -275,18 +307,53 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_renderer.render(v);
 
             ++frames;
-            if (g_character.waiting_for_ground) ++waiting;
-            else if (!g_character.grounded) ++airborne;
+            // Jolt distinguishes standing from merely touching something, and
+            // the difference is what a slope too steep to stand on looks like.
+            // Jolt separates three states, and they mean different things:
+            // nothing under us at all, standing, and touching a slope too
+            // steep to stand on. The terrain reaches about 52 degrees and the
+            // character's limit is 50, so the third is expected, not a fault.
+            if (!g_physics.character_supported()) ++airborne;
+            else if (!g_physics.character_grounded()) ++steep_frames;
 
             // Give the world a second to stream in and the capsule a moment to
             // land before judging it.
-            if (total > 1.5 && g_character.grounded) {
+            if (total > 1.5 && g_physics.character_grounded()) {
                 ++settled_frames;
-                const float fy = g_character.feet();
-                const float d = trivial_density(g_character.x, fy, g_character.z);
+                const float fy = g_feet[1];
+                const float d = trivial_density(g_feet[0], fy, g_feet[2]);
+                // density > 0 is rock, so a positive reading means the feet
+                // are INSIDE the ground. That is the direction that would be
+                // a bug; the other is the capsule sitting on its own radius.
+                if (d > 0.0f && double(d) > sink_max) sink_max = double(d);
+                const double hover = d < 0.0f ? -double(d) : 0.0;
+                if (hover > hover_max) hover_max = hover;
+
+                // What the capsule's radius alone accounts for on this slope.
+                const float e = 0.25f;
+                const float gx = (trivial_height(g_feet[0] + e, g_feet[2]) -
+                                  trivial_height(g_feet[0] - e, g_feet[2])) / (2.0f * e);
+                const float gz = (trivial_height(g_feet[0], g_feet[2] + e) -
+                                  trivial_height(g_feet[0], g_feet[2] - e)) / (2.0f * e);
+                const double grad = std::sqrt(double(gx) * gx + double(gz) * gz);
+                const double expected = kCapsuleRadius * (std::sqrt(1.0 + grad * grad) - 1.0);
+                const double excess = hover - expected;
+                const double aex = excess < 0.0 ? -excess : excess;
+                excess_sum += aex;
+                if (aex > excess_max) excess_max = aex;
+
                 const double a = d < 0.0f ? -double(d) : double(d);
                 resid_sum += a;
                 if (a > resid_max) resid_max = a;
+                // Which chunk is actually holding it up. Once several LOD
+                // levels have bodies overlapping, the position alone cannot
+                // say, and the residual is meaningless without it.
+                const int gl = g_physics.character_ground_lod();
+                if (gl >= 0 && gl < 8) {
+                    ++lod_frames[gl];
+                    lod_resid[gl] += a;
+                    if (a > lod_max[gl]) lod_max[gl] = a;
+                }
                 if (have_last) {
                     const double step = std::fabs(double(fy) - double(last_feet));
                     if (step > worst_step) worst_step = step;
@@ -300,15 +367,29 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (FILE* f = std::fopen("build/walk.txt", "w")) {
             std::fprintf(f, "capsule walk over the trivial world, %.1f s\n", walk_seconds);
             std::fprintf(f, "frames %llu, travelled %.0f m\n", frames, travelled);
-            std::fprintf(f, "frames airborne: %llu, frames with no terrain streamed yet: %llu\n",
-                         airborne, waiting);
+            // Jolt cannot tell "in the air" from "that chunk has not arrived":
+            // in both cases nothing is underneath. One number, not two labels
+            // for the same count.
+            std::fprintf(f, "frames with nothing underneath: %llu\n", airborne);
+            (void)waiting;
             std::fprintf(f, "settled frames judged: %llu\n", settled_frames);
             std::fprintf(f, "feet vs the field: max %.4f m, mean %.4f m\n",
                          resid_max, settled_frames ? resid_sum / double(settled_frames) : 0.0);
+            std::fprintf(f, "  of which sinking INTO the ground: max %.4f m\n", sink_max);
+            std::fprintf(f, "  hovering above it: max %.4f m\n", hover_max);
+            std::fprintf(f, "  beyond what the capsule radius explains on that slope:"
+                            " max %.4f m, mean %.4f m\n",
+                         excess_max, settled_frames ? excess_sum / double(settled_frames) : 0.0);
+            std::fprintf(f, "frames on a slope too steep to stand on: %llu\n", steep_frames);
             std::fprintf(f, "worst single-frame vertical step: %.4f m\n", worst_step);
-            std::fprintf(f, "LOD changes under the feet: %d\n", g_character.lod_changes);
-            std::fprintf(f, "collision patches resident at the end: %zu\n",
-                         st.collision_patches);
+            std::fprintf(f, "static bodies in the physics world: %zu\n",
+                         g_physics.body_count());
+            for (int L = 0; L < 8; ++L) {
+                if (!lod_frames[L]) continue;
+                std::fprintf(f, "  standing on LOD %d: %llu frames, residual max %.4f mean %.4f\n",
+                             L, lod_frames[L], lod_max[L],
+                             lod_resid[L] / double(lod_frames[L]));
+            }
             std::fprintf(f, "height readback latency: %u frames\n",
                          st.readback_latency_frames);
             std::fclose(f);
@@ -319,9 +400,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         {
             engine::Camera c = g_camera;
             const float sy = std::sin(g_camera.yaw), cy = std::cos(g_camera.yaw);
-            c.x = g_character.x - sy * 7.0f;
-            c.y = g_character.y + 3.2f;
-            c.z = g_character.z - cy * 7.0f;
+            c.x = g_feet[0] - sy * 7.0f;
+            c.z = g_feet[2] - cy * 7.0f;
+            // Lifted clear of whatever is at the camera's own position: seven
+            // metres behind the character is often inside a hillside, and the
+            // first attempt at this shot was a screen of solid rock.
+            const float behind = trivial_height(c.x, c.z);
+            c.y = g_feet[1] + 3.2f;
+            if (c.y < behind + 2.5f) c.y = behind + 2.5f;
             c.pitch = -0.33f;
             engine::ViewConstants v = {};
             fill_view(c, 1280.0f, 720.0f, 0.0f, v);
@@ -330,6 +416,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_renderer.capture(v, "build/b4_walk.bmp", err);
         }
         g_renderer.shutdown();
+        g_physics.shutdown();
         return 0;
     }
 
@@ -432,6 +519,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fclose(f);
         }
         g_renderer.shutdown();
+        g_physics.shutdown();
         return 0;
     }
 
@@ -482,10 +570,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             const float vx = (sy * mz + cy * mx) * sp;
             const float vz = (cy * mz - sy * mx) * sp;
             const bool jump = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
-            g_character.update(g_renderer.height_field(), float(dt), vx, vz, jump);
-            g_camera.x = g_character.x;
-            g_camera.y = g_character.y + g_character.eye;
-            g_camera.z = g_character.z;
+            sync_physics_terrain();
+            g_physics.update(float(dt), vx, vz, jump);
+            g_physics.character_position(g_feet);
+            g_camera.x = g_feet[0];
+            g_camera.y = g_feet[1] + kEyeAboveFeet;
+            g_camera.z = g_feet[2];
         }
 
         if (g_captured && GetForegroundWindow() == hwnd) {
@@ -543,5 +633,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     }
 
     g_renderer.shutdown();
+        g_physics.shutdown();
     return 0;
 }

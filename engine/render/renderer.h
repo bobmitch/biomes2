@@ -11,7 +11,8 @@
 
 #include "engine/meshing/chunk_mesher.h"
 #include "engine/streaming/streamer.h"
-#include "engine/physics/height_field.h"
+
+#include <vector>
 
 #include <windows.h>
 #include <d3d12.h>
@@ -98,8 +99,17 @@ public:
 
     const FrameStats& stats() const { return stats_; }
 
-    // The streamed terrain as a collision surface, for the character.
-    const HeightField& height_field() const { return height_field_; }
+    // Height patches that arrived through the readback ring this frame, and
+    // the chunks whose patches are no longer valid. Drained by the caller and
+    // handed to physics; the renderer keeps no collision state of its own.
+    struct PatchEvent {
+        ChunkKey key;
+        float    origin[3];
+        float    voxel;
+        std::vector<float> h;
+    };
+    const std::vector<PatchEvent>& patches_added() const { return patches_added_; }
+    const std::vector<ChunkKey>&   patches_removed() const { return patches_removed_; }
 
     // Max and mean |density| at the vertices of slot 0, in metres. A vertex on
     // the isosurface reads zero; surface nets averages edge crossings rather
@@ -139,7 +149,8 @@ private:
 
     ChunkMesher mesher_;
     Streamer    streamer_;
-    HeightField height_field_;
+    std::vector<PatchEvent> patches_added_;
+    std::vector<ChunkKey>   patches_removed_;
     FrameStats  stats_;
     Mode        mode_ = Mode::Mesh;
 

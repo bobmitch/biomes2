@@ -88,7 +88,7 @@ public:
         trivial_band(band_lo, band_hi);
 
         // Each level's world box, so the next level out can test containment.
-        float fine_x0 = 0, fine_x1 = 0, fine_y0 = 0, fine_y1 = 0, fine_z0 = 0, fine_z1 = 0;
+        float fine_x0 = 0, fine_x1 = 0, fine_z0 = 0, fine_z1 = 0;
         bool have_fine = false;
 
         for (int lod = 0; lod < kLodCount; ++lod) {
@@ -102,8 +102,8 @@ public:
             const float bx1 = float(ci + kRingHalf + 1) * S;
             const float bz0 = float(ck - kRingHalf) * S;
             const float bz1 = float(ck + kRingHalf + 1) * S;
-            const float by0 = float(j0) * S;
-            const float by1 = float(j1 + 1) * S;
+
+
 
             for (int k = ck - kRingHalf; k <= ck + kRingHalf; ++k) {
                 for (int i = ci - kRingHalf; i <= ci + kRingHalf; ++i) {
@@ -118,9 +118,26 @@ public:
                         // Entirely covered by the finer level: it is drawn
                         // there, at higher detail, and drawing it here too
                         // would double the ground.
+                        // Containment is tested in XZ ONLY, and that is not a
+                        // simplification -- testing y as well is wrong.
+                        //
+                        // Every level spans the same surface band, so a level
+                        // that covers a column in XZ covers all of it. But the
+                        // levels' y boxes are quantised to their own chunk
+                        // size, so a 256 m chunk reaches from -256 to 0 where
+                        // the 128 m level only reaches -128. Including y in
+                        // the test therefore never excludes the coarse chunks
+                        // that hang below the band, and they stay resident
+                        // directly underneath the fine ones.
+                        //
+                        // Rendering hides that: the depth test draws whichever
+                        // surface is nearer. Physics does not -- a character
+                        // stands on whichever is HIGHER, so it spent 44% of a
+                        // measured walk on LOD 3 and 4 heightfields while
+                        // standing in the middle of the LOD 0 ring, with the
+                        // feet up to 1.16 m off the real surface.
                         if (have_fine &&
                             x0 >= fine_x0 && x1 <= fine_x1 &&
-                            y0 >= fine_y0 && y1 <= fine_y1 &&
                             z0 >= fine_z0 && z1 <= fine_z1) {
                             continue;
                         }
@@ -133,7 +150,7 @@ public:
             }
 
             fine_x0 = bx0; fine_x1 = bx1;
-            fine_y0 = by0; fine_y1 = by1;
+
             fine_z0 = bz0; fine_z1 = bz1;
             have_fine = true;
         }

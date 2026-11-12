@@ -638,10 +638,18 @@ void Renderer::consume_heights() {
             }
         }
     }
-    // Into the collision surface, keyed by chunk so retirement can remove it.
+    // Copied out, because the staging buffer is unmapped on the next line and
+    // will be overwritten two frames from now.
     for (UINT p = 0; p < r.count; ++p) {
-        height_field_.insert(r.keys[p], r.origin[p], r.voxel[p],
-                             h + size_t(p) * kHeightSamples);
+        PatchEvent e;
+        e.key = r.keys[p];
+        e.origin[0] = r.origin[p][0];
+        e.origin[1] = r.origin[p][1];
+        e.origin[2] = r.origin[p][2];
+        e.voxel = r.voxel[p];
+        const float* src = h + size_t(p) * kHeightSamples;
+        e.h.assign(src, src + kHeightSamples);
+        patches_added_.push_back(e);
     }
 
     mesher_.unmap_heights(ring);
@@ -674,14 +682,15 @@ void Renderer::record_frame(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
 void Renderer::render(const ViewConstants& view) {
     if (!ready_) return;
 
+    patches_added_.clear();
+    patches_removed_.clear();
     streamer_.update(view.cam_pos[0], view.cam_pos[1], view.cam_pos[2]);
     {
         const std::vector<ChunkKey>& gone = streamer_.retired_keys();
-        for (size_t i = 0; i < gone.size(); ++i) height_field_.remove(gone[i]);
+        patches_removed_.assign(gone.begin(), gone.end());
     }
     stats_.patches_this_frame = 0;
     consume_heights();
-    stats_.collision_patches = height_field_.patch_count();
 
     allocators_[frame_]->Reset();
     cmd_->Reset(allocators_[frame_].Get(), nullptr);

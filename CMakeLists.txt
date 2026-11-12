@@ -63,12 +63,47 @@ endif()
 # hashes, nothing in engine/ feeds them, and pinning the renderer's maths
 # would imply a determinism guarantee this binary does not make.
 if(WIN32 AND EXISTS ${PROJECT_SOURCE_DIR}/engine/main.cpp)
+  if(NOT EXISTS ${PROJECT_SOURCE_DIR}/third_party/JoltPhysics/Build/CMakeLists.txt)
+    message(FATAL_ERROR
+      "engine/ needs Jolt: run  git submodule update --init --recursive
+"
+      "(validate.exe, the CI gate, does not -- it never links the engine.)")
+  endif()
+
+  # OVERRIDE_CXX_FLAGS is OFF deliberately. Jolt defaults it ON, which rewrites
+  # CMAKE_CXX_FLAGS_DEBUG and CMAKE_CXX_FLAGS_RELEASE. Those are the flags
+  # invariant 8 rests on, and a dependency quietly editing the global C++ flags
+  # is exactly how a project loses its determinism guarantee without noticing.
+  # The golden hashes are what proves it did not: validate.exe must still pass.
+  set(OVERRIDE_CXX_FLAGS OFF)
+  set(DOUBLE_PRECISION OFF)
+  # Jolt's own cross-platform determinism is not needed: physics never reaches
+  # the golden hash, and it costs performance.
+  set(CROSS_PLATFORM_DETERMINISTIC OFF)
+  set(INTERPROCEDURAL_OPTIMIZATION OFF)
+  set(ENABLE_ALL_WARNINGS OFF)
+  set(TARGET_UNIT_TESTS OFF)
+  set(TARGET_HELLO_WORLD OFF)
+  set(TARGET_PERFORMANCE_TEST OFF)
+  set(TARGET_SAMPLES OFF)
+  set(TARGET_VIEWER OFF)
+  add_subdirectory(third_party/JoltPhysics/Build EXCLUDE_FROM_ALL)
+
+  # Jolt builds against the STATIC MSVC runtime by default; everything else
+  # here uses the dynamic one, and mixing them is a link error. Jolt moves,
+  # not the rest: worldgen and validate are the determinism authority, and
+  # changing how they are built to suit a physics dependency is the wrong way
+  # round. Needs CMP0091, which cmake_minimum_required(3.20) already sets NEW.
+  set_property(TARGET Jolt PROPERTY MSVC_RUNTIME_LIBRARY
+               "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+
   add_executable(engine WIN32
     engine/main.cpp
     engine/render/renderer.cpp
-    engine/meshing/chunk_mesher.cpp)
+    engine/meshing/chunk_mesher.cpp
+    engine/physics/physics_world.cpp)
   target_include_directories(engine PRIVATE ${PROJECT_SOURCE_DIR})
-  target_link_libraries(engine PRIVATE d3d12 dxgi d3dcompiler)
+  target_link_libraries(engine PRIVATE d3d12 dxgi d3dcompiler Jolt)
   if(MSVC)
     target_compile_options(engine PRIVATE /W3 /D_CRT_SECURE_NO_WARNINGS)
   endif()
