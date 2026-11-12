@@ -20,6 +20,8 @@ namespace {
 
 engine::Renderer g_renderer;
 bool g_paused = false;
+bool g_start_mesh = false;
+bool g_start_overlay = false;
 
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -31,6 +33,15 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_KEYDOWN:
             if (wp == VK_ESCAPE) { PostQuitMessage(0); return 0; }
             if (wp == VK_SPACE)  { g_paused = !g_paused; return 0; }
+            if (wp == 'M') {
+                // The comparison this milestone turns on: same camera, same
+                // field, marched or meshed or both at once.
+                const engine::Mode m = g_renderer.mode();
+                g_renderer.set_mode(m == engine::Mode::Raymarch ? engine::Mode::Mesh
+                                  : m == engine::Mode::Mesh     ? engine::Mode::Overlay
+                                                                : engine::Mode::Raymarch);
+                return 0;
+            }
             if (wp == VK_F5) {
                 // Shader hot-reload. Cheap here and the thing B2 will lean on
                 // hardest -- a kernel is mostly shader edits.
@@ -82,6 +93,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             }
             if (shot_path.empty()) shot_path = "build/b1.bmp";
         }
+        if (cl.find("--mesh") != std::string::npos) g_start_mesh = true;
+        if (cl.find("--overlay") != std::string::npos) g_start_overlay = true;
     }
 
     WNDCLASSA wc = {};
@@ -107,8 +120,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     if (!shot_path.empty()) {
         // A fixed camera, so two runs produce the same image and a diff means
         // something changed rather than that time moved on.
-        const Vec3 target{0.0f, 6.0f, 0.0f};
-        const Vec3 pos{62.0f, 34.0f, 46.0f};
+        const Vec3 target{0.0f, 0.0f, 0.0f};
+        const Vec3 pos{10.0f, 22.0f, 8.0f};
         const Vec3 fwd = norm(sub(target, pos));
         const Vec3 right = norm(cross(fwd, Vec3{0.0f, 1.0f, 0.0f}));
         const Vec3 up = cross(right, fwd);
@@ -122,7 +135,27 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         v.tan_half_fov = 0.5773503f;
 
         std::string err;
+        if (g_start_mesh) g_renderer.set_mode(engine::Mode::Mesh);
+        if (g_start_overlay) g_renderer.set_mode(engine::Mode::Overlay);
         const bool ok = g_renderer.capture(v, shot_path.c_str(), err);
+
+        // Stats beside the image. A windowed build puts these in the title
+        // bar, which a headless capture never sees.
+        {
+            const std::string sp = shot_path + ".txt";
+            FILE* f = std::fopen(sp.c_str(), "w");
+            if (f) {
+                float mx = 0.0f, mn = 0.0f;
+                unsigned checked = 0;
+                g_renderer.check_against_field(mx, mn, checked);
+                std::fprintf(f, "vertices %u\nindices %u\ntriangles %u\nmesh_ms %.4f\n",
+                             g_renderer.mesh_vertices(), g_renderer.mesh_indices(),
+                             g_renderer.mesh_indices() / 3, g_renderer.mesh_ms());
+                std::fprintf(f, "field residual at %u vertices: max %.4f m, mean %.4f m"
+                                " (voxel 0.500 m)\n", checked, mx, mn);
+                std::fclose(f);
+            }
+        }
         g_renderer.shutdown();
         if (!ok) {
             MessageBoxA(nullptr, err.c_str(), "Capture failed", MB_OK | MB_ICONERROR);
@@ -131,6 +164,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (g_start_mesh) g_renderer.set_mode(engine::Mode::Mesh);
+    if (g_start_overlay) g_renderer.set_mode(engine::Mode::Overlay);
     ShowWindow(hwnd, show);
 
     const LARGE_INTEGER zero = {};
@@ -170,10 +205,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // holding frame rate while moving through a streamed world -- there is
         // nothing to stream yet, so a fixed path is the honest version.
         const float a = t * 0.18f;
-        const Vec3 target{0.0f, 6.0f, 0.0f};
-        const Vec3 pos{target.x + std::cos(a) * 78.0f,
-                       34.0f,
-                       target.z + std::sin(a) * 78.0f};
+        const Vec3 target{0.0f, 0.0f, 0.0f};
+        const Vec3 pos{target.x + std::cos(a) * 13.0f,
+                       22.0f,
+                       target.z + std::sin(a) * 13.0f};
         const Vec3 fwd = norm(sub(target, pos));
         const Vec3 right = norm(cross(fwd, Vec3{0.0f, 1.0f, 0.0f}));
         const Vec3 up = cross(right, fwd);
@@ -194,9 +229,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (fps_accum >= 0.5) {
             char title[160];
             std::snprintf(title, sizeof(title),
-                          "biomes2 engine - B1 trivial field - %.0f fps - %.0fx%.0f"
-                          " - space pauses, F5 reloads shader",
-                          fps_frames / fps_accum, w, h);
+                          "biomes2 engine - B2 - %s - %.0f fps - %u verts, %u tris,"
+                          " meshed in %.3f ms - M switches, F5 reloads",
+                          g_renderer.mode() == engine::Mode::Mesh    ? "mesh"
+                          : g_renderer.mode() == engine::Mode::Overlay ? "overlay"
+                                                                      : "raymarch",
+                          fps_frames / fps_accum,
+                          g_renderer.mesh_vertices(), g_renderer.mesh_indices() / 3,
+                          g_renderer.mesh_ms());
             SetWindowTextA(hwnd, title);
             fps_accum = 0.0;
             fps_frames = 0;
