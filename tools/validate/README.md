@@ -326,7 +326,7 @@ breaks the radial banding, and the repair pass is what stops the first two
 reading as noise. Changing any of them moves every seed, which is free only
 until A3 pins the golden hashes.
 
-### 8. The world is a Pangaea on every seed, and an assertion was holding it there
+## 8. The world is a Pangaea on every seed, and an assertion was holding it there
 
 The contact sheet reads as one continent on every seed. That is not a tuning
 accident — it is the land-fraction target sitting on the wrong side of a
@@ -449,6 +449,65 @@ cells in both passes, and `allow_island` is parsed from `archetypes.json` and
 never read. Lowering `land_offset` today gives you more coastline and more
 islands, but those islands get their biomes from the ordinary land assignment
 — there is no island-specific placement, and no biome can land island-only.
+
+## 9. The caves had no way in, and the golden hash could not see the layer that fixed it
+
+`--cave-access` walks random land columns, finds the first solid going down
+and then the first air below it, and reports that thickness: the rind of rock
+sealing the cave system off from the surface. Over 12 seeds and 400 land
+columns, 43% had subsurface air beneath them, 83% of those under 25 m or more
+of rock, and the shallowest rind anywhere was 1 m. Never zero.
+
+That is not bad luck. `cave_depth_mask` forbids carving within
+`cave_depth_min` of the heightfield, which is what stops the terrain reading
+as swiss cheese and equally what stops any cave reaching daylight. The few
+1–5 m rinds were not cave mouths either, only places where the layer-6
+overhang term happened to drop real rock below the heightfield the mask is
+measured against — an accident of a term that exists for another reason.
+
+Layer 7 answers it with shafts traced from the surface down into existing
+cave air, kept only if the walk reached it. `--entrances` walks every stored
+shaft: over 200 seeds, 20 to 24 trunks per seed (mean 23.8), zero of 220k
+subsurface segments still solid at their midpoint, zero of 4769 mouths sealed
+a metre under the lip, mean reach 86 m.
+
+**The hash was blind to the whole layer.** Adding layer 7 left all eight
+golden hashes byte for byte unchanged. The hash samples a 1024² grid — one
+density sample per 156 m — and a world has ~24 shafts a few metres across, so
+a sample lands in one about never. Every entrance would have been free to
+drift through CI. The shaft buffer is hashed directly now, and the general
+rule is that **a layer whose features are smaller than the hash grid must be
+pinned by its buffer.** Layer 5 escapes only because 428 river segments per
+seed carve a wide enough area to land in the samples.
+
+Both halves were mutation-tested, and they catch different things:
+
+| Mutant | `cave entrances` | `golden seeds` |
+| --- | --- | --- |
+| `entrance_carve` disabled — shafts stored but never opened | FAIL | **PASS** |
+| walk never terminates in air — no shafts at all | FAIL | FAIL |
+
+So the hash pins *where* the shafts are and the check pins *that they are
+open*. Neither covers the layer alone.
+
+What the gate does not catch: it samples every 16th segment, because
+exhaustive costs about a minute over 200 seeds. It will catch a systemic
+pinch, not one shaft in a thousand closing up halfway down. `--entrances` is
+the exhaustive version.
+
+`--entrance-section <seed>` draws one shaft, and is an *unrolled* section —
+the horizontal axis is distance along the shaft's own ground track, not a
+fixed plane. A shaft tilts up to 1.8 lateral metres per metre of drop and
+wanders, so it leaves any plane within a few metres; a plane section through
+the mouth shows the bowl and nothing else, which was the first thing tried.
+Both axes are drawn at the same metres per pixel, or every shaft looks like
+the same gentle ramp whatever its real gradient.
+
+Note that `--cave-access` still reports a sealed system, and correctly so: 24
+shafts in a 314 km² disc will never be hit by 400 random columns. It measures
+the part of the world that remains sealed, which is nearly all of it, and that
+is the intended shape — the caves are sealed except where an entrance says
+otherwise.
 
 ## What this implies for A2
 

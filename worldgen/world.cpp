@@ -235,8 +235,45 @@ float terrain_density(const SeedWorld& w, const WorldParams& wp,
         p.cave_depth_max    = p.cave_depth_max * inv;
     }
 
-    return layer6_density(x, y, z, h, p, wp.overhang_freq, wp.overhang_scale,
-                          wp.cave_freq, wp.cave_carve, w.s_overhang, w.s_cave, voxel);
+    float d = layer6_density(x, y, z, h, p, wp.overhang_freq, wp.overhang_scale,
+                             wp.cave_freq, wp.cave_carve, w.s_overhang, w.s_cave, voxel);
+
+    // Layer 7 last, and outside cave_depth_mask entirely. Every other carve in
+    // this function is forbidden to reach the surface; this one exists to.
+    if (!w.entrances.empty()) {
+        const float sd = nearest_entrance(w, wp, x, y, z);
+        if (sd < 0.0f) {
+            d = entrance_carve(d, sd, wp.entrance_falloff, wp.cave_carve);
+        }
+    }
+    return d;
+}
+
+// Signed distance to the nearest shaft wall, through the XZ bin grid. Shafts
+// are near-vertical, so binning them in the plane the way the rivers are
+// leaves very few candidates per sample.
+float nearest_entrance(const SeedWorld& w, const WorldParams& wp,
+                       float x, float y, float z) {
+    if (w.entrances.empty()) return 3.4e38f;
+    const float R = wp.radius;
+    const int gx = std::min(w.egrid_n - 1, std::max(0, static_cast<int>((x + R) / w.egrid_cell)));
+    const int gz = std::min(w.egrid_n - 1, std::max(0, static_cast<int>((z + R) / w.egrid_cell)));
+    float best = 3.4e38f;
+    for (int j = gz - 1; j <= gz + 1; ++j) {
+        if (j < 0 || j >= w.egrid_n) continue;
+        for (int i = gx - 1; i <= gx + 1; ++i) {
+            if (i < 0 || i >= w.egrid_n) continue;
+            const std::vector<int>& bin = w.egrid[static_cast<size_t>(j) * w.egrid_n + i];
+            for (size_t m = 0; m < bin.size(); ++m) {
+                const SeedWorld::EntranceSeg& e = w.entrances[bin[m]];
+                const float sd = entrance_tube_sd(x, y, z,
+                                                  e.ax, e.ay, e.az, e.ra,
+                                                  e.bx, e.by, e.bz, e.rb);
+                if (sd < best) best = sd;
+            }
+        }
+    }
+    return best;
 }
 
 // --- layer 5: trace the drainage -------------------------------------------
@@ -384,6 +421,185 @@ void build_rivers(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& tab
     }
 }
 
+// --- layer 7: trace the way in ---------------------------------------------
+//
+// A candidate mouth is a point on land. The walk descends from it, asking the
+// finished layer-6 density at every step whether it has broken into air yet.
+// If it has, the polyline is kept; if it runs out of steps, the candidate is
+// thrown away. Nothing is stored that did not reach a cave, which is where the
+// connectivity guarantee comes from -- the same shape of argument as priority
+// flood making rivers reach the sea, rather than tracing something plausible
+// and asserting afterwards that it worked.
+
+// A heading in the XZ plane, uniform in angle, without trig. Rejection
+// sampling normalised with sqrt: cos/sin here would move the stored vertices
+// by an ULP, and invariant 9 exists because exactly that moved a river.
+static bool unit_heading(Rng& rng, float& hx, float& hz) {
+    for (int t = 0; t < 24; ++t) {
+        const float ax = rng.uniform() * 2.0f - 1.0f;
+        const float az = rng.uniform() * 2.0f - 1.0f;
+        const float d2 = ax * ax + az * az;
+        if (d2 > 1.0e-8f && d2 <= 1.0f) {
+            const float inv = 1.0f / std::sqrt(d2);
+            hx = ax * inv;
+            hz = az * inv;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Descend from a point, wandering, until the rock opens. tilt is lateral
+// metres per metre of drop, so 0 is a plumb shaft and 1 is a 45-degree ramp.
+static bool walk_shaft(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
+                       Rng& rng, float sx, float sy, float sz, float surf,
+                       int max_steps, float tilt,
+                       std::vector<float>& px, std::vector<float>& py, std::vector<float>& pz) {
+    float hx = 0.0f, hz = 0.0f;
+    if (!unit_heading(rng, hx, hz)) return false;
+
+    float cx = sx, cy = sy, cz = sz;
+    px.clear(); py.clear(); pz.clear();
+    px.push_back(cx); py.push_back(cy); pz.push_back(cz);
+
+    for (int st = 0; st < max_steps; ++st) {
+        // Wander the heading and renormalise. A straight shaft reads as a
+        // mineshaft; nudging the vector and dividing by its length keeps the
+        // wander trig-free.
+        hx += (rng.uniform() * 2.0f - 1.0f) * 0.45f;
+        hz += (rng.uniform() * 2.0f - 1.0f) * 0.45f;
+        const float hd = hx * hx + hz * hz;
+        if (hd > 1.0e-8f) {
+            const float hinv = 1.0f / std::sqrt(hd);
+            hx *= hinv;
+            hz *= hinv;
+        }
+        const float ex = hx * tilt, ey = -1.0f, ez = hz * tilt;
+        const float el = std::sqrt(ex * ex + ey * ey + ez * ez);
+        const float k = wp.entrance_step / el;
+        cx += ex * k;
+        cy += ey * k;
+        cz += ez * k;
+        px.push_back(cx); py.push_back(cy); pz.push_back(cz);
+
+        // Air within entrance_min_depth of the surface is an overhang, not a
+        // cave. Without this the walk terminates one step in, under the lip it
+        // started on, and the shaft connects the surface to itself.
+        if (surf - cy < wp.entrance_min_depth) continue;
+        if (terrain_density(w, wp, table, cx, cy, cz) <= 0.0f) return true;
+    }
+    return false;
+}
+
+// Turn a polyline into segments carrying the radius profile.
+static void emit_shaft(std::vector<SeedWorld::EntranceSeg>& out, const WorldParams& wp,
+                       const std::vector<float>& px, const std::vector<float>& py,
+                       const std::vector<float>& pz, float mouth) {
+    const int n = static_cast<int>(px.size());
+    if (n < 2) return;
+    const float inv = 1.0f / static_cast<float>(n - 1);
+    for (int i = 0; i + 1 < n; ++i) {
+        SeedWorld::EntranceSeg e;
+        e.ax = px[i];     e.ay = py[i];     e.az = pz[i];
+        e.bx = px[i + 1]; e.by = py[i + 1]; e.bz = pz[i + 1];
+        e.ra = entrance_radius(static_cast<float>(i) * inv, mouth,
+                               wp.entrance_throat, wp.entrance_bowl, wp.entrance_bowls);
+        e.rb = entrance_radius(static_cast<float>(i + 1) * inv, mouth,
+                               wp.entrance_throat, wp.entrance_bowl, wp.entrance_bowls);
+        out.push_back(e);
+    }
+}
+
+void build_entrances(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table) {
+    const float R = wp.radius;
+    Rng rng(w.s_entrance);
+
+    // Accumulated locally and installed at the end. Appending to w.entrances as
+    // we go would let one shaft's walk terminate in a previous shaft's air,
+    // which is the same feedback trap terrain_base exists to avoid in layer 5.
+    std::vector<SeedWorld::EntranceSeg> segs;
+    std::vector<SeedWorld::EntranceMouth> mouths;
+    std::vector<float> px, py, pz;
+    int found = 0, tries = 0;
+
+    while (found < wp.entrance_target && tries < wp.entrance_tries) {
+        ++tries;
+
+        // A mouth somewhere on land. Rejection inside the unit disc is already
+        // uniform in AREA, which is the distribution wanted here; sampling a
+        // radius uniformly would crowd every entrance into the middle.
+        float ux = 0.0f, uz = 0.0f, ud = 0.0f;
+        bool ok = false;
+        for (int t = 0; t < 24 && !ok; ++t) {
+            ux = rng.uniform() * 2.0f - 1.0f;
+            uz = rng.uniform() * 2.0f - 1.0f;
+            ud = ux * ux + uz * uz;
+            ok = (ud > 1.0e-8f) && (ud <= 0.92f * 0.92f);   // clear of the edge taper
+        }
+        if (!ok) continue;
+
+        const float mx = ux * R, mz = uz * R;
+        const float rr = std::sqrt(ud);
+        const float surf = terrain_height(w, wp, table, mx, mz, rr);
+        if (surf <= wp.sea_level + 6.0f) continue;
+
+        // Lateral metres per metre of drop. The range is wide on purpose:
+        // at 0.3 the shaft is a pit you fall into, at 1.8 it is a ramp you can
+        // walk down. A narrow range gives every entrance in the world the same
+        // gradient, which reads as a template.
+        const float tilt = 0.30f + 1.50f * rng.uniform();
+        // Start above ground so the bowl actually breaks the surface.
+        if (!walk_shaft(w, wp, table, rng, mx, surf + 1.5f, mz, surf,
+                        wp.entrance_max_steps, tilt, px, py, pz)) {
+            continue;
+        }
+        ++found;
+        SeedWorld::EntranceMouth em;
+        em.x = mx; em.y = surf; em.z = mz;
+        em.reach = surf - py.back();
+        em.seg_begin = static_cast<int>(segs.size());
+        emit_shaft(segs, wp, px, py, pz, wp.entrance_mouth);
+        em.seg_count = static_cast<int>(segs.size()) - em.seg_begin;
+        mouths.push_back(em);
+
+        // One dead-end side passage, sometimes. It is not required to reach
+        // anything: a passage that goes nowhere is a feature, and the
+        // connectivity guarantee is carried by the trunk.
+        if (rng.uniform() < wp.entrance_branch_p && px.size() >= 6) {
+            const size_t third = px.size() / 3;
+            const size_t at = third + static_cast<size_t>(rng.next()) % third;
+            std::vector<float> bx, by, bz;
+            walk_shaft(w, wp, table, rng, px[at], py[at], pz[at], surf,
+                       wp.entrance_max_steps / 3, 1.1f + rng.uniform(), bx, by, bz);
+            if (bx.size() >= 2) emit_shaft(segs, wp, bx, by, bz, wp.entrance_throat);
+        }
+    }
+
+    w.entrances.swap(segs);
+    w.entrance_mouths.swap(mouths);
+    w.entrance_count = found;
+    w.entrance_tries_used = tries;
+
+    // Bin in XZ, padded by the widest radius the segment reaches so the 3x3
+    // lookup cannot miss a chamber that bulges across a cell line.
+    w.egrid_n = 128;
+    w.egrid_cell = 2.0f * R / w.egrid_n;
+    w.egrid.assign(static_cast<size_t>(w.egrid_n) * w.egrid_n, std::vector<int>());
+    for (size_t sg = 0; sg < w.entrances.size(); ++sg) {
+        const SeedWorld::EntranceSeg& e = w.entrances[sg];
+        const float pad = std::max(e.ra, e.rb) + wp.entrance_falloff;
+        const int i0 = std::max(0, static_cast<int>((std::min(e.ax, e.bx) - pad + R) / w.egrid_cell));
+        const int i1 = std::min(w.egrid_n - 1, static_cast<int>((std::max(e.ax, e.bx) + pad + R) / w.egrid_cell));
+        const int j0 = std::max(0, static_cast<int>((std::min(e.az, e.bz) - pad + R) / w.egrid_cell));
+        const int j1 = std::min(w.egrid_n - 1, static_cast<int>((std::max(e.az, e.bz) + pad + R) / w.egrid_cell));
+        for (int j = j0; j <= j1; ++j) {
+            for (int i = i0; i <= i1; ++i) {
+                w.egrid[static_cast<size_t>(j) * w.egrid_n + i].push_back(static_cast<int>(sg));
+            }
+        }
+    }
+}
+
 SeedWorld build_world(uint64_t world_seed,
                              const WorldParams& wp,
                              const ArchetypeTable& table,
@@ -397,6 +613,7 @@ SeedWorld build_world(uint64_t world_seed,
     w.s_height = feature_seed(world_seed, FEATURE_HEIGHT);
     w.s_overhang = feature_seed(world_seed, FEATURE_OVERHANG);
     w.s_cave = feature_seed(world_seed, FEATURE_CAVE);
+    w.s_entrance = feature_seed(world_seed, FEATURE_ENTRANCE);
     const uint32_t s_cont = w.s_cont, s_dang = w.s_dang, s_wx = w.s_wx, s_wz = w.s_wz;
     const uint32_t s_cell = feature_seed(world_seed, FEATURE_CELLS);
 
@@ -494,6 +711,10 @@ SeedWorld build_world(uint64_t world_seed,
     // Layer 5 runs last: it needs the finished heightfield, which needs the
     // biome assignment.
     build_rivers(w, wp, table);
+
+    // Layer 7 after that again: the descent walks against the finished
+    // density, which needs the carved heightfield under it.
+    build_entrances(w, wp, table);
     return w;
 }
 

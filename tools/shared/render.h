@@ -193,13 +193,85 @@ inline void render_danger_tile(const SeedWorld& w, const WorldParams& wp,
 // The height is evaluated once per column: it depends only on x and z, so
 // recomputing it for every y would multiply the cost of the slice by its
 // height in pixels. The engine's fill shader will want the same split.
+// Follow one shaft: horizontal axis is distance along its ground track,
+// vertical axis is world height. A plane section cannot show a tube that
+// wanders in three dimensions, and this layer is entirely about what the
+// tube does on the way down.
+inline void render_shaft_profile(const SeedWorld& w, const WorldParams& wp,
+                                 const ArchetypeTable& table, int mouth_index,
+                                 float ymin, float ymax, float xspan,
+                                 std::vector<unsigned char>& img, int W, int H) {
+    const SeedWorld::EntranceMouth& em = w.entrance_mouths[mouth_index];
+
+    // The trunk's vertices, and the cumulative distance along its ground track.
+    std::vector<float> vx, vz, acc;
+    for (int i = 0; i < em.seg_count; ++i) {
+        const SeedWorld::EntranceSeg& e = w.entrances[em.seg_begin + i];
+        vx.push_back(e.ax);
+        vz.push_back(e.az);
+    }
+    if (em.seg_count > 0) {
+        const SeedWorld::EntranceSeg& last = w.entrances[em.seg_begin + em.seg_count - 1];
+        vx.push_back(last.bx);
+        vz.push_back(last.bz);
+    }
+    float total = 0.0f;
+    acc.push_back(0.0f);
+    for (size_t i = 1; i < vx.size(); ++i) {
+        const float dx = vx[i] - vx[i - 1], dz = vz[i] - vz[i - 1];
+        total += std::sqrt(dx * dx + dz * dz);
+        acc.push_back(total);
+    }
+    if (total <= 0.0f) return;
+
+    // xspan is passed rather than derived from the track length so the
+    // caller can keep metres per pixel equal on both axes. A profile drawn to
+    // whatever width the track happens to be makes every shaft look like the
+    // same gentle ramp, whatever its real gradient.
+    const float mid = total * 0.5f;
+    for (int px = 0; px < W; ++px) {
+        const float s = mid - xspan * 0.5f + xspan * (static_cast<float>(px) + 0.5f) / W;
+        // Point at arc length s, extrapolating along the end segments outside
+        // the track so the rock either side of the mouth is drawn too.
+        size_t k = 1;
+        while (k + 1 < acc.size() && acc[k] < s) ++k;
+        const float seg = acc[k] - acc[k - 1];
+        const float t = seg > 0.0f ? (s - acc[k - 1]) / seg : 0.0f;
+        const float x = vx[k - 1] + (vx[k] - vx[k - 1]) * t;
+        const float z = vz[k - 1] + (vz[k] - vz[k - 1]) * t;
+        const float rr = std::sqrt(x * x + z * z) / wp.radius;
+        const float surface = rr <= 1.0f ? terrain_height(w, wp, table, x, z, rr) : -1.0e9f;
+
+        for (int py = 0; py < H; ++py) {
+            const float y = ymax - (ymax - ymin) * (static_cast<float>(py) + 0.5f) / H;
+            unsigned char c[3];
+            const float d = terrain_density(w, wp, table, x, y, z);
+            if (d > 0.0f) {
+                // Rock, shaded by depth below the local surface.
+                const float depth = surface - y;
+                const float f = depth < 0.0f ? 0.0f : (depth > 320.0f ? 1.0f : depth / 320.0f);
+                c[0] = static_cast<unsigned char>(150 - 76 * f);
+                c[1] = static_cast<unsigned char>(118 - 56 * f);
+                c[2] = static_cast<unsigned char>(92 - 44 * f);
+            } else if (y > surface) {
+                c[0] = 150; c[1] = 170; c[2] = 196;           // sky
+            } else {
+                c[0] = 16; c[1] = 16; c[2] = 22;              // void underground
+            }
+            const size_t o = (static_cast<size_t>(py) * W + px) * 3;
+            img[o] = c[0]; img[o + 1] = c[1]; img[o + 2] = c[2];
+        }
+    }
+}
+
 inline void render_section(const SeedWorld& w, const WorldParams& wp,
                            const ArchetypeTable& table,
                            float z0, float half_width, float ymin, float ymax,
-                           std::vector<unsigned char>& img, int W, int H) {
+                           std::vector<unsigned char>& img, int W, int H,
+                           float x0 = 0.0f) {
     const float R = wp.radius;
     for (int px = 0; px < W; ++px) {
-        const float x = -half_width + (2.0f * half_width) * (static_cast<float>(px) + 0.5f) / W;
+        const float x = x0 - half_width + (2.0f * half_width) * (static_cast<float>(px) + 0.5f) / W;
         const float rr = std::sqrt(x * x + z0 * z0) / R;
         const float surface = rr <= 1.0f ? terrain_height(w, wp, table, x, z0, rr) : -1.0e9f;
 

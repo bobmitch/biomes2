@@ -231,4 +231,87 @@ WG_FN float layer6_density(float x, float y, float z, float height, BiomeProfile
     return d;
 }
 
+// --- layer 7: cave entrances ------------------------------------------------
+//
+// Layer 6 produces a cave system that is sealed. cave_depth_mask forbids
+// carving within cave_depth_min of the surface, which is what stops the
+// terrain reading as swiss cheese -- and also what stops any cave reaching
+// daylight. Measured over 12 seeds: 43% of land columns had air beneath them,
+// 83% of those under 25 m or more of rock, and the shallowest rind anywhere
+// was 1 m. Never zero. The few near-breaches were not cave mouths either,
+// just places where the layer-6 overhang term happened to drop real rock
+// below the heightfield the mask is measured against.
+//
+// Loosening the mask is the wrong lever: it would open holes everywhere the
+// noise crests near grade. So access is its own layer. Shafts are traced on
+// the CPU at world init -- downwards from a point on the surface until the
+// walk breaks into cave air layer 6 already put there -- and stored as 3D
+// polylines with a per-vertex radius. A shaft exists only if its walk
+// terminated in air, so surface-to-cave connectivity holds by construction,
+// the way priority flood makes rivers reach the sea.
+//
+// Same split as layer 5: WHICH segments are near a sample is a spatial index
+// question and belongs to the caller; the geometry is here. The carve
+// deliberately ignores cave_depth_mask -- breaching the surface is the whole
+// point of this layer.
+
+// Distance from a point to a shaft segment, less the shaft radius there:
+// negative inside the tube, zero on its wall. The layer-5 distance is planar
+// because a river is; a shaft is not, so this one carries y.
+//
+// The radius is interpolated at the same t the distance uses, which is why
+// this is one function rather than a distance plus a separate lookup.
+WG_FN float entrance_tube_sd(float px, float py, float pz, float ax, float ay, float az, float ra, float bx, float by, float bz, float rb) {
+    const float vx = bx - ax;
+    const float vy = by - ay;
+    const float vz = bz - az;
+    const float wx = px - ax;
+    const float wy = py - ay;
+    const float wz = pz - az;
+    const float len2 = vx * vx + vy * vy + vz * vz;
+    float t = 0.0f;
+    if (len2 > 0.0f) {
+        t = wg_saturate((wx * vx + wy * vy + wz * vz) / len2);
+    }
+    const float dx = wx - vx * t;
+    const float dy = wy - vy * t;
+    const float dz = wz - vz * t;
+    return sqrt(dx * dx + dy * dy + dz * dz) - (ra + (rb - ra) * t);
+}
+
+// Open the shaft out of the rock. Blends towards air rather than subtracting
+// from it, for the reason layer 6's cave carve does: density is height - y,
+// which grows without bound with depth, so a fixed subtraction stops winning a
+// few metres down and the shaft closes under its own overburden. falloff
+// metres of feathering outside the wall keep the mouth from reading as a
+// drilled hole.
+WG_FN float entrance_carve(float d, float sd, float falloff, float carve) {
+    const float open = 1.0f - wg_smoothstep(-falloff, 0.0f, sd);
+    if (open <= 0.0f) { return d; }
+    return d * (1.0f - open) - carve * open;
+}
+
+// Shaft radius at u along the trunk, 0 at the mouth and 1 at the cave it
+// breaks into: a wide bowl at the surface, a narrow throat below it, chambers
+// at intervals, and a taper into the cave so the join does not read as a pipe
+// ending in a wall.
+//
+// The chambers are a triangle wave off floor() rather than a cosine. This
+// value is baked into the stored radii and so reaches the golden hash, which
+// puts it under invariant 9: + - * / sqrt floor and comparisons only.
+WG_FN float entrance_radius(float u, float mouth, float throat, float bowl, float bowls) {
+    float flare = 0.0f;
+    if (u < 0.22f) { flare = 1.0f - u / 0.22f; }
+    float r = throat + (mouth - throat) * flare * flare;
+    const float f = u * bowls;
+    const float frac = f - floor(f);
+    float tri = 2.0f * frac - 1.0f;
+    if (tri < 0.0f) { tri = -tri; }
+    tri = 1.0f - tri;
+    r = r + bowl * tri * tri;
+    float tail = 0.0f;
+    if (u > 0.88f) { tail = (u - 0.88f) / 0.12f; }
+    return r * (1.0f - 0.35f * tail);
+}
+
 #endif

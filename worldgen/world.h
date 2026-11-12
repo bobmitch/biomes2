@@ -32,7 +32,8 @@ enum FeatureId : uint32_t {
     FEATURE_WARP_Z    = 5u,
     FEATURE_HEIGHT    = 6u,
     FEATURE_OVERHANG  = 7u,
-    FEATURE_CAVE      = 8u
+    FEATURE_CAVE      = 8u,
+    FEATURE_ENTRANCE  = 9u
 };
 
 inline uint64_t hash64(uint64_t x) {
@@ -107,6 +108,22 @@ struct WorldParams {
     float overhang_scale    = 30.0f;      // metres at strength 1; the ratio to the feature size is what makes an overhang possible
     float cave_freq         = 1.0f / 260.0f;
     float cave_carve        = 10.0f;      // metres of air margin inside a tunnel
+
+    // layer 7 -- the way in. See the header comment in shaders/field.h for why
+    // the caves need one at all.
+    int   entrance_target    = 24;        // shafts per world, when candidates allow
+    int   entrance_tries     = 240;       // candidate mouths before giving up on the target
+    float entrance_step      = 4.0f;      // metres per step of the descent walk
+    int   entrance_max_steps = 90;        // 360 m of path before the candidate is discarded
+    // Air shallower than this is an overhang, not a cave. Without it a shaft
+    // terminates one step in, under the lip it started on.
+    float entrance_min_depth = 10.0f;
+    float entrance_mouth     = 8.0f;      // bowl radius where it breaks the surface
+    float entrance_throat    = 2.4f;
+    float entrance_bowl      = 1.8f;      // extra radius at a chamber
+    float entrance_bowls     = 3.5f;      // chambers along the shaft
+    float entrance_falloff   = 1.5f;      // metres of feathering at the tube wall
+    float entrance_branch_p  = 0.6f;      // chance of a dead-end side passage
 };
 
 // Thin adapters onto the canonical field function in worldgen/shaders/field.h.
@@ -238,7 +255,7 @@ struct SeedWorld {
     std::vector<int>        biome;
     AssignStats             stats;
     uint32_t s_cont = 0, s_dang = 0, s_wx = 0, s_wz = 0, s_height = 0;
-    uint32_t s_overhang = 0, s_cave = 0;
+    uint32_t s_overhang = 0, s_cave = 0, s_entrance = 0;
     float    land_fraction = 0.0f;
 
     // --- layer 5 ---
@@ -256,6 +273,32 @@ struct SeedWorld {
     int   river_paths_to_ocean = 0;
     int   river_paths_total = 0;
     int   river_ascending = 0;   // segments that climb on the filled surface
+    // --- layer 7 ---
+    // Shafts from the surface into the cave system, as 3D polylines with a
+    // radius at each vertex, binned in XZ the way the rivers are. A trunk is
+    // only stored if its walk ended in cave air, so entrance_count is a count
+    // of connections, not of attempts.
+    struct EntranceSeg {
+        float ax, ay, az, ra;
+        float bx, by, bz, rb;
+    };
+    std::vector<EntranceSeg> entrances;
+    // Where each trunk breaks the surface, and how deep it had to go to find
+    // air. The segment list cannot answer this after the fact: a shaft that
+    // drifts sideways under lower ground has mid-shaft vertices above the
+    // local surface too, and they look exactly like mouths.
+    struct EntranceMouth {
+        float x, y, z;
+        float reach;               // metres below the surface where it broke through
+        int   seg_begin, seg_count;  // this trunk's run in entrances[]; branches follow it
+    };
+    std::vector<EntranceMouth> entrance_mouths;
+    int   entrance_count = 0;      // trunks; each reaches cave air by construction
+    int   entrance_tries_used = 0;
+    int   egrid_n = 0;
+    float egrid_cell = 0.0f;
+    std::vector<std::vector<int> > egrid;
+
     // Highest layer-0 sample beyond r = 0.95. The edge taper assertion: land
     // must have fallen away before the rim, on every seed.
     float    max_h_outer = -1.0e9f;
@@ -291,6 +334,16 @@ float terrain_height(const SeedWorld& w, const WorldParams& wp,
                      float voxel = 0.0f);
 
 void build_rivers(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table);
+
+// Signed distance to the nearest entrance shaft: negative inside one. Large
+// positive when the world has none near the sample.
+float nearest_entrance(const SeedWorld& w, const WorldParams& wp,
+                       float x, float y, float z);
+
+// Layer 7. Runs after the drainage, because the walk descends against the
+// finished heightfield, and writes into w.entrances only once every walk is
+// done -- a half-built buffer would let one shaft terminate in another.
+void build_entrances(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table);
 
 // Layer 6. Positive is rock, negative is air; the sign change is the surface.
 float terrain_density(const SeedWorld& w, const WorldParams& wp,
