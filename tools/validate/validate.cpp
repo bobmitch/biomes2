@@ -593,10 +593,10 @@ static bool single_relief(const WorldParams& wp, const ArchetypeTable& table,
 // actually do around it. The spread is the product, not an error bar: the
 // worlds that break into archipelagos are this distribution's low tail.
 static void land_report_header() {
-    std::printf("\n%-8s %-9s %-26s %-11s %-21s %-10s\n",
+    std::printf("\n%-8s %-9s %-25s %-13s %-15s %-8s %s\n",
                 "target", "offset", "land% mean/min/max/sd", "landmasses",
-                "spawn mass mean/worst", "quota max");
-    std::printf("%s\n", std::string(94, '-').c_str());
+                "spawn mean/worst", "quotamx", "fails: quota pres boat");
+    std::printf("%s\n", std::string(104, '-').c_str());
 }
 
 static void land_report_row(float target, int nseeds, const WorldParams& base,
@@ -608,14 +608,16 @@ static void land_report_row(float target, int nseeds, const WorldParams& base,
     wp.land_offset = off;
 
     const Summary s = run(nseeds, wp, table, ap);
-    std::printf("%6.1f%%  %+8.4f  %5.1f %5.1f %5.1f %5.2f     %4.1f (max %d)  %5.1f%% / %5.1f%%        %5.1f%%%s\n",
+    std::printf("%6.1f%%  %+8.4f  %5.1f %5.1f %5.1f %5.2f  %4.1f(max%2d)  %5.1f%%/%5.1f%%  %5.1f%%   %3d %3d %3d%s\n",
                 100.0 * target, off,
                 100.0 * s.mean_land_frac, 100.0 * s.min_land_frac,
                 100.0 * s.max_land_frac, 100.0 * s.sd_land_frac,
                 s.mean_landmasses, s.max_landmasses,
                 100.0 * s.mean_home_share, 100.0 * s.min_home_share,
                 100.0 * s.max_quota_err,
-                s.quota_failures > 0 ? "  QUOTA OVER" : "");
+                s.quota_failures, s.presence_failures, s.boat_failures,
+                (s.quota_failures || s.presence_failures || s.boat_failures)
+                    ? "  <-- fails" : "");
 }
 
 // --- adjacency test --------------------------------------------------------
@@ -823,11 +825,11 @@ int main(int argc, char** argv) {
     if (land_sweep) {
         // The band worth choosing from. 56 is roughly where we ship; the low
         // end is where quota granularity starts to bite.
-        const float targets[] = {0.56f, 0.54f, 0.52f, 0.50f, 0.48f, 0.46f};
+        const float targets[] = {0.50f, 0.45f, 0.40f, 0.35f, 0.30f};
         std::printf("land fraction sweep, %d seeds per row, offset solved GLOBALLY for the mean\n",
                     nseeds);
         land_report_header();
-        for (int i = 0; i < 6; ++i) land_report_row(targets[i], nseeds, wp, table, ap);
+        for (int i = 0; i < 5; ++i) land_report_row(targets[i], nseeds, wp, table, ap);
         std::printf("\nThe mean is the lever; the min column is where the islandness lives.\n");
         return 0;
     }
