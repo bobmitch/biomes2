@@ -439,59 +439,66 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     g_renderer.set_water_debug(water_debug);
     if (no_water) g_renderer.set_water(false);
 
-    if (!shot_path.empty()) {
-        g_camera.x = 10.0f; g_camera.y = 46.0f; g_camera.z = -70.0f;
-        g_camera.yaw = 0.15f; g_camera.pitch = -0.42f;
-        if (shot_altitude > 0.0) {
-            g_camera.y = float(shot_altitude);
-            g_camera.pitch = -0.30f;
+    if (sea_shot) {
+        // Waves are metres tall and the world is twenty kilometres wide,
+        // so no camera that can judge the ARCHIPELAGO can also judge the
+        // SURFACE. This finds the nearest coast to the origin, stands just
+        // off it at eye height, and looks out to sea -- which is the only
+        // vantage from which a 7 m storm swell is a swell rather than a
+        // texture.
+        const engine::WorldGpu& wg = g_renderer.world();
+        const float sea = wg.params().sea_level;
+        float best_x = 0.0f, best_z = 0.0f, best_d = 1e9f;
+        bool found = false;
+        for (int ring = 1; ring <= 400 && !found; ++ring) {
+            const float rad = float(ring) * 20.0f;
+            const int spokes = ring * 6;
+            for (int sp = 0; sp < spokes; ++sp) {
+                const float a = 6.2831853f * float(sp) / float(spokes);
+                const float x = rad * std::cos(a), z = rad * std::sin(a);
+                const float h = wg.height(x, z);
+                // Four to twelve metres of water: deep enough to read as
+                // sea, shallow enough that the shore is in the frame.
+                const float depth = sea - h;
+                if (depth < 4.0f || depth > 12.0f) continue;
+                const float d = rad;
+                if (d < best_d) { best_d = d; best_x = x; best_z = z; found = true; }
+            }
+            if (found) break;
         }
-        if (sea_shot) {
-            // Waves are metres tall and the world is twenty kilometres wide,
-            // so no camera that can judge the ARCHIPELAGO can also judge the
-            // SURFACE. This finds the nearest coast to the origin, stands just
-            // off it at eye height, and looks out to sea -- which is the only
-            // vantage from which a 7 m storm swell is a swell rather than a
-            // texture.
-            const engine::WorldGpu& wg = g_renderer.world();
-            const float sea = wg.params().sea_level;
-            float best_x = 0.0f, best_z = 0.0f, best_d = 1e9f;
-            bool found = false;
-            for (int ring = 1; ring <= 400 && !found; ++ring) {
-                const float rad = float(ring) * 20.0f;
-                const int spokes = ring * 6;
-                for (int sp = 0; sp < spokes; ++sp) {
-                    const float a = 6.2831853f * float(sp) / float(spokes);
-                    const float x = rad * std::cos(a), z = rad * std::sin(a);
-                    const float h = wg.height(x, z);
-                    // Four to twelve metres of water: deep enough to read as
-                    // sea, shallow enough that the shore is in the frame.
-                    const float depth = sea - h;
-                    if (depth < 4.0f || depth > 12.0f) continue;
-                    const float d = rad;
-                    if (d < best_d) { best_d = d; best_x = x; best_z = z; found = true; }
-                }
-                if (found) break;
+        if (!found) {
+            const std::string where = shot_path.empty() ? std::string("build/sea_shot.txt")
+                                                        : shot_path + ".txt";
+            if (FILE* e = std::fopen(where.c_str(), "w")) {
+                std::fprintf(e, "no water 4-12 m deep within 8 km of the origin,\n"
+                                "so there was nothing to stand beside.\n");
+                std::fclose(e);
             }
-            if (!found) {
-                if (FILE* e = std::fopen((shot_path + ".txt").c_str(), "w")) {
-                    std::fprintf(e, "no water 4-12 m deep within 8 km of the origin,\n"
-                                    "so there was nothing to stand beside.\n");
-                    std::fclose(e);
-                }
-                g_renderer.shutdown();
-                g_physics.shutdown();
-                return 0;
+            g_renderer.shutdown();
+            g_physics.shutdown();
+            return 0;
+        }
+        // Face away from the land: out along the radius, which at a coast
+        // found by walking outwards is seaward by construction.
+        g_camera.x = best_x;
+        g_camera.z = best_z;
+        // Above the biggest sea this dial produces (7.5 m crest to
+        // trough), or a storm shot is taken from underwater.
+        g_camera.y = sea + 5.0f;
+        g_camera.yaw = std::atan2(best_x, best_z);
+        g_camera.pitch = -0.06f;
+    }
+
+    if (!shot_path.empty()) {
+        // --sea-shot has already placed the camera on a coast; do not stamp
+        // the fixed vantage over it.
+        if (!sea_shot) {
+            g_camera.x = 10.0f; g_camera.y = 46.0f; g_camera.z = -70.0f;
+            g_camera.yaw = 0.15f; g_camera.pitch = -0.42f;
+            if (shot_altitude > 0.0) {
+                g_camera.y = float(shot_altitude);
+                g_camera.pitch = -0.30f;
             }
-            // Face away from the land: out along the radius, which at a coast
-            // found by walking outwards is seaward by construction.
-            g_camera.x = best_x;
-            g_camera.z = best_z;
-            // Above the biggest sea this dial produces (7.5 m crest to
-            // trough), or a storm shot is taken from underwater.
-            g_camera.y = sea + 5.0f;
-            g_camera.yaw = std::atan2(best_x, best_z);
-            g_camera.pitch = -0.06f;
         }
         engine::ViewConstants v = {};
         fill_view(g_camera, 1280.0f, 720.0f, 0.0f, v);
@@ -558,7 +565,18 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
-    ShowWindow(hwnd, show);
+    // Never honour SW_HIDE: every mode that genuinely wants no window has
+    // already returned above this line, so there is no caller for whom hidden
+    // is the right answer.
+    //
+    // This is NOT why a window takes a while to appear. Startup compiles the
+    // field shaders and builds the whole seed before the first frame, which
+    // is about fifteen to twenty seconds -- during which the process burns a
+    // core with no window up, and looks exactly like a hang. It is not one.
+    // I diagnosed it as one and was wrong; the guard below is defensive, not
+    // a fix. No SetForegroundWindow: grabbing focus twenty seconds after
+    // launch would interrupt whatever the user moved on to.
+    ShowWindow(hwnd, show == SW_HIDE ? SW_SHOWNORMAL : show);
 
     // The three holes both runs use. Fixed so the two processes agree
     // without passing anything but the measurement.
