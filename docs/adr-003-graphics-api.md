@@ -70,3 +70,13 @@ command list recycling are what B2 through B7 are built on.
   rehearsal: M1 swaps the trivial field for the real one, and the include
   mechanism it depends on is exercised from B1 rather than first tried at the
   merge point.
+
+  **M1 has happened, and the rehearsal paid.** The field function itself
+  needed no change at all: `worldgen/shaders/field.h` compiles as HLSL
+  unmodified, which `engine.exe --check-dialect` proves on its own. What M1
+  cost was entirely on the CALLER's side of ADR-001's line — the spatial
+  indices — plus the include handler learning to resolve a sibling `#include`
+  relative to the including file. The trivial field and the raymarch that was
+  its last caller are gone; what replaced the raymarch as the check that the
+  mesh matches its field is `--probe-field`, a tolerance comparison against
+  the C++ authority rather than two pictures.

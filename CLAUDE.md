@@ -15,7 +15,7 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32). Debug tool, Windows only. |
 | `tools/shared/` | Presentation, shared by the harness and the viewer. |
-| `engine/` | Track B runtime (D3D12, `docs/adr-003-*`). Built against the TRIVIAL field in `engine/field/`, never `worldgen/`, until M1. |
+| `engine/` | Track B runtime (D3D12, `docs/adr-003-*`). Since M1 it evaluates the REAL field: `engine/field/real_field.hlsl` is the caller's side of ADR-001's line (which cells, rivers and shafts are near a point), and `world_gpu.{h,cpp}` uploads them. |
 
 **`worldgen/` is everything upstream of the golden hash; `tools/` is
 everything downstream.** That line is what makes invariant 9 checkable — the
@@ -46,6 +46,12 @@ cmake -S . -B build/cmake -G Ninja && cmake --build build/cmake
 `validate.exe`, `view.exe` and `engine.exe` all read data by paths relative to
 the repository root, so run them from there. `engine.exe --shot <path>` renders
 one frame at a fixed camera and writes a BMP without opening a window.
+
+The engine's headless modes all write a text file under `build/` and exit:
+`--shot`, `--flight <s>`, `--walk <s>`, `--overhang`, `--dig`, `--dig-save`,
+`--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field` and
+`--band-report`. It is a GUI subsystem binary, so a shell does not wait on it:
+run it with `Start-Process -Wait` or the file you read will be the last run's.
 
 ## Invariants — breaking one of these is a bug, not a tradeoff
 
@@ -105,6 +111,22 @@ one frame at a fixed camera and writes a BMP without opening a window.
 - Changing any generator parameter changes the world. If golden hashes move,
   either revert or bump `generator_version` — saves store edits anchored to the
   base terrain, and a silent change corrupts them.
+- A D3D12 buffer bound through a ROOT UAV must be created with
+  `ALLOW_UNORDERED_ACCESS`. Root descriptors are not bounds checked and the
+  debug layer is not installed on this machine, so the whole of M1's world
+  upload missing that one flag showed up as `DXGI_ERROR_DEVICE_HUNG` —
+  indistinguishable from an infinite loop in the field function, which is
+  where two hours went. A flat-constant shader hanging too is what separates
+  the two: that rules out the field and leaves the binding.
+- Residency over the real field needs a PER-COLUMN band, and the band must
+  sample the FULL height, not layer 0 padded by the biggest biome amplitude.
+  That padding made the band 610 m tall over a column whose surface moves
+  1.6 m, so the slot pool filled with air and the ground was never reached.
+  `engine.exe --band-report` prints the band, the relief, the resulting chunk
+  count and whether the sampling misses the surface, at every LOD.
+- Most of the clipmap meshes to nothing — nine chunks per LOD 0 column and the
+  surface crosses one. A chunk that meshes to zero vertices gives its slot back
+  and keeps its key: dropping the key would requeue it every frame.
 
 ## Testing
 
@@ -170,6 +192,31 @@ Never re-bless to make a red build green without deciding the world should
 move.
 
 Run it before any commit touching `worldgen/`.
+
+### The engine's own checks
+
+The GPU cannot be hashed (invariant 8), so CPU-to-GPU agreement is a tolerance
+comparison: `engine.exe --probe-field` meshes one chunk and compares its
+density grid against `worldgen::terrain_density` corner by corner. At M1 that
+was **6 µm over densities spanning 18 m**. It is also the first thing to run
+when the engine renders nothing — it says whether the two disagree, or whether
+they agree and the chunk really is empty.
+
+Three engine numbers look alarming and are not, as long as the voxel is
+printed beside them: the height residual (worst 10.0 m), the mesh-vertex
+residual (worst tens of metres) and the dig test's fall distances. A surface
+vertex is placed by linear interpolation along ONE edge, so its density is
+only as near zero as the field is linear over one voxel — at an 8 m voxel
+beside a cave, where `cave_carve` pins the air at -10, the worst case IS 10.
+Every one of these now reports the voxel size it came from, because without it
+the number cannot be read at all.
+
+`--overhang` no longer has a landmark to aim at: it searches for a real
+ceiling and reports what it found. Near spawn the layer-6 overhangs are
+spikes — 4.75 m thick and under 0.5 m wide — so a launched capsule rises
+beside them, and the report says so rather than claiming the collision failed.
+11.6% of land columns overhang, so the world has them; it does not yet have
+one wide enough to be a test.
 
 ## Style
 
