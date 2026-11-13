@@ -131,6 +131,28 @@ run it with `Start-Process -Wait` or the file you read will be the last run's.
   missing submodule now SKIPS the engine instead. Check `gh run list` after
   anything that touches the build, because a half-red matrix looks like a
   working one from here.
+- **A dual-compile header's OUT parameters must be spelled per language.**
+  `T out[1]` decays to a pointer in C++ and works; in HLSL an array parameter
+  is passed BY VALUE and the write never reaches the caller. The wave normal
+  was uninitialised for the whole first version of the sea, and it did not
+  look broken — Fresnel saturated and the water came out exactly the colour of
+  the sky at every depth, which reads as a shading choice. Sampling three
+  pixels at three different depths and getting one identical value is what
+  caught it. Use `WW_OUT_F3` (`T&` / `out T`).
+- A D3D12 root signature holds **64 DWORDs**. Root constants cost one each, a
+  descriptor costs two. 44 floats of camera state plus a CBV plus ten root
+  UAVs is 66, `CreateRootSignature` returns `E_INVALIDARG`, and renderer init
+  fails. Put anything bigger than a handful of values in a CBV.
+- **Never put a modal dialog on a headless path.** That root-signature failure
+  raised a message box behind every other window, and a `--shot` that should
+  have failed in two seconds hung for ten minutes with the real error already
+  written to `build/engine_error.txt`. Init failures now only box when a
+  window is going to be shown.
+- A threshold must be normalised against what the LOD actually delivers, not
+  against the ideal. The whitecap test compared crest height to the sea's full
+  amplitude while the grid was carrying two thirds of it, so foam covered 2.9%
+  of a storm and did not move when the threshold changed — twice. Measure the
+  numerator before tuning the constant.
 - Most of the clipmap meshes to nothing — nine chunks per LOD 0 column and the
   surface crosses one. A chunk that meshes to zero vertices gives its slot back
   and keeps its key: dropping the key would requeue it every frame. Any code
@@ -281,6 +303,28 @@ rather than a mesher fault — per terrain pixel there are **280× more** of the
 in a 1400 m vista than in a ground shot, where inverted normals would appear
 equally at every level. Consistent with sub-metre overhang spans aliasing at a
 64 m voxel, though that last step is inference, not measurement.
+
+**The sea** is `engine/render/shaders/water.hlsl` over
+`engine/render/water_wave.h`. That header compiles as C++ AND as HLSL, the same
+trick `worldgen/shaders` uses, so `--sea-report` measures the function the
+shader draws. It is **not** the ADR-001 dialect and invariant 9 does not reach
+it: the sea feeds no hash, no save and no generator decision, so `sin` and
+`cos` are allowed here where they are forbidden four directories away.
+
+Wave height is a runtime value, because storms are a planned mechanic. The
+dial is `sea_state`, 0 to 1, and `--sea-report` says what it buys: **0.20 m
+crest-to-trough calm, 7.51 m at full storm**, with the surface mean staying at
+sea level to 2.4 mm — the one thing worth asserting, because a sea that rose
+with the weather would flood coastlines and no screenshot of a rough sea would
+look wrong.
+
+Controls: `--sea-state <0..1>`, `--sea-shot` (stands the camera off the nearest
+coast, which is the only vantage a 7 m swell reads as a swell from),
+`--water-debug 1..5` (depth, foam, normal, displacement, surviving amplitude),
+`--no-water`, and `[` `]` `K` in the window.
+
+The water asks the SHARED FIELD FUNCTION how deep it is, so the shoreline is
+the real one at every LOD. That is M1 paying off somewhere other than terrain.
 
 `--overhang` no longer has a landmark to aim at: it searches for a real
 ceiling and reports what it found. Near spawn the layer-6 overhangs are

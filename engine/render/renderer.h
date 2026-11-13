@@ -123,6 +123,16 @@ public:
 
     const WorldGpu& world() const { return world_; }
 
+    // Sea state: 0 calm, 1 storm. Storms are a planned mechanic, so this is a
+    // runtime value and nothing about the surface shape is baked.
+    void  set_sea_state(float s) { sea_state_ = s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s); }
+    float sea_state() const { return sea_state_; }
+    void  set_water(bool on) { water_ = on; }
+    // 0 real shading, 1 depth, 2 foam, 3 normal, 4 displacement.
+    void  set_water_debug(float m) { water_debug_ = m; }
+    float water_debug() const { return water_debug_; }
+    bool  water() const { return water_; }
+
     // Mesh one chunk and compare its density grid against the CPU generator.
     // Returns false only if the GPU work failed; disagreement is reported in
     // the numbers, not as an error.
@@ -205,6 +215,14 @@ private:
     ComPtr<ID3D12Resource>         depth_;
     ComPtr<ID3D12RootSignature>    mesh_root_;
     ComPtr<ID3D12PipelineState>    mesh_pso_, mesh_wire_pso_;
+    ComPtr<ID3D12RootSignature> water_root_;
+    ComPtr<ID3D12PipelineState> water_pso_;
+    ComPtr<ID3D12Resource>      water_indices_;
+    ComPtr<ID3D12Resource>      water_cb_[kFrameCount];
+    void*                       water_cb_cpu_[kFrameCount] = {};
+    D3D12_INDEX_BUFFER_VIEW     water_ibv_ = {};
+    UINT                        water_index_count_ = 0;
+    bool create_water_pipeline(std::string& error);
     ComPtr<ID3D12CommandSignature> cmd_sig_;
 
     WorldGpu    world_;
@@ -219,6 +237,9 @@ private:
     std::vector<ChunkKey>   patches_removed_;
     FrameStats  stats_;
     Mode        mode_ = Mode::Mesh;
+    float       sea_state_ = 0.25f;
+    bool        water_ = true;
+    float       water_debug_ = 0.0f;
 
     ComPtr<ID3D12Fence> fence_;
     HANDLE              fence_event_ = nullptr;

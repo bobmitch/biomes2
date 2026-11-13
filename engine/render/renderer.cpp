@@ -14,12 +14,40 @@ namespace engine {
 namespace {
 
 const char* kMeshShaderPath = "engine/render/shaders/mesh.hlsl";
+const char* kWaterShaderPath = "engine/render/shaders/water.hlsl";
 
 // The far plane has to clear the clipmap's own corner or the outermost ring
 // is streamed and then clipped away: 8 levels of 7 x 7 give a +/-7.2 km box,
 // whose diagonal is 10.2 km.
 const float kNearPlane = 0.2f;
 const float kFarPlane  = 16000.0f;
+
+// The sea surface grid. 192 cells a side is 37,249 vertices and 221,184
+// indices -- small enough that the whole thing is one static index buffer
+// uploaded once, and dense enough that the cells nearest the camera are about
+// 0.4 m across. The spacing is quadratic, so the same grid reaches the far
+// plane; see grid_offset in water.hlsl.
+const UINT kWaterCells = 256;
+
+struct WaterConstants {
+    float view_proj[16];
+    float cam_pos[3];
+    float time;
+    float sun_dir[3];
+    float far_plane;
+    float cam_fwd[3];
+    float aspect;
+    float cam_right[3];
+    float tan_half_fov;
+    float cam_up[3];
+    float pad1;
+    float sea_level;
+    float sea_state;
+    float grid_cells;
+    float extent;
+    float debug_mode;
+    float pad0[3];
+};
 
 struct MeshConstants {
     float view_proj[16];
@@ -259,6 +287,169 @@ bool Renderer::create_depth(std::string& error) {
     return true;
 }
 
+// The sea's own pipeline. It needs the WORLD buffers, not just a camera: the
+// vertex shader asks the shared field function how deep the water is, so the
+// shoreline is the real one. Those are the same bindings the mesher's compute
+// root signature uses -- b1 plus u11..u20 -- because it is literally the same
+// header being included.
+bool Renderer::create_water_pipeline(std::string& error) {
+    if (!water_root_) {
+        // A root CBV, not root constants. WaterConstants grew to 44 DWORDs
+        // when the camera basis went in for the projected grid, and 44 plus a
+        // CBV plus ten root UAVs is 66 against a 64 DWORD root signature --
+        // CreateRootSignature returned E_INVALIDARG, the renderer failed to
+        // initialise, and because that path ends in a modal message box the
+        // headless run simply hung. A descriptor costs 2 DWORDs however big
+        // the struct behind it is.
+        D3D12_ROOT_PARAMETER params[12] = {};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[0].Descriptor.ShaderRegister = 0;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].Descriptor.ShaderRegister = 1;
+        for (UINT i = 0; i < 10; ++i) {
+            params[2 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            params[2 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            params[2 + i].Descriptor.ShaderRegister = 11 + i;
+        }
+
+        D3D12_ROOT_SIGNATURE_DESC rsd = {};
+        rsd.NumParameters = 12;
+        rsd.pParameters = params;
+        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+        ComPtr<ID3DBlob> sig, sig_err;
+        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1,
+                                                 &sig, &sig_err);
+        if (FAILED(hr)) {
+            error = "water root signature: ";
+            error += sig_err ? static_cast<const char*>(sig_err->GetBufferPointer())
+                             : hr_text("D3D12SerializeRootSignature", hr).c_str();
+            return false;
+        }
+        hr = device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                                          IID_PPV_ARGS(&water_root_));
+        if (FAILED(hr)) { error = hr_text("CreateRootSignature (water)", hr); return false; }
+    }
+
+    ComPtr<ID3DBlob> vs, ps;
+    if (!compile_shader(kWaterShaderPath, "vs_main", "vs_5_1", vs, error)) return false;
+    if (!compile_shader(kWaterShaderPath, "ps_main", "ps_5_1", ps, error)) return false;
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = water_root_.Get();
+    pd.VS.pShaderBytecode = vs->GetBufferPointer();
+    pd.VS.BytecodeLength  = vs->GetBufferSize();
+    pd.PS.pShaderBytecode = ps->GetBufferPointer();
+    pd.PS.BytecodeLength  = ps->GetBufferSize();
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    // Both faces. A camera under the surface -- in a flooded cave mouth, or
+    // simply swimming -- has to see the underside, and culling it would show
+    // the sky through the sea.
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+
+    // Straight alpha over the terrain already drawn. Depth WRITE is off: the
+    // sea is transparent in the shallows, and a transparent surface that
+    // writes depth hides whatever is drawn after it.
+    D3D12_RENDER_TARGET_BLEND_DESC& rt = pd.BlendState.RenderTarget[0];
+    rt.BlendEnable = TRUE;
+    rt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    rt.BlendOp = D3D12_BLEND_OP_ADD;
+    rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+    rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    pd.SampleMask = UINT_MAX;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    pd.SampleDesc.Count = 1;
+
+    ComPtr<ID3D12PipelineState> pso;
+    const HRESULT hr = device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
+    if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (water)", hr); return false; }
+    water_pso_ = pso;
+
+    // One constant buffer per frame in flight. A single buffer would be
+    // rewritten by the CPU while the GPU was still reading the previous
+    // frame's copy of it.
+    if (!water_cb_[0]) {
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = 256;                 // CBVs are 256-byte aligned
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        for (UINT i = 0; i < kFrameCount; ++i) {
+            const HRESULT ch = device_->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr, IID_PPV_ARGS(&water_cb_[i]));
+            if (FAILED(ch)) { error = hr_text("CreateCommittedResource (water cb)", ch); return false; }
+            D3D12_RANGE none = {0, 0};
+            water_cb_[i]->Map(0, &none, &water_cb_cpu_[i]);
+        }
+    }
+
+    // The grid's indices. The POSITIONS come from SV_VertexID -- a vertex of a
+    // regular grid knows where it is from its own id and needs no buffer --
+    // but the triangles do not follow from an id, so they are uploaded once.
+    if (!water_indices_) {
+        const UINT n = kWaterCells + 1;
+        std::vector<UINT> idx;
+        idx.reserve(size_t(kWaterCells) * kWaterCells * 6);
+        for (UINT z = 0; z < kWaterCells; ++z) {
+            for (UINT x = 0; x < kWaterCells; ++x) {
+                const UINT a = z * n + x, b = a + 1, c = a + n, d = c + 1;
+                idx.push_back(a); idx.push_back(c); idx.push_back(b);
+                idx.push_back(b); idx.push_back(c); idx.push_back(d);
+            }
+        }
+        water_index_count_ = static_cast<UINT>(idx.size());
+        const UINT64 bytes = UINT64(idx.size()) * 4;
+
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = bytes;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        // An upload heap read straight by the input assembler. It is written
+        // once and never again, so the extra copy into a default heap would
+        // buy nothing.
+        const HRESULT ih = device_->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr, IID_PPV_ARGS(&water_indices_));
+        if (FAILED(ih)) { error = hr_text("CreateCommittedResource (water indices)", ih); return false; }
+
+        void* mapped = nullptr;
+        D3D12_RANGE none = {0, 0};
+        water_indices_->Map(0, &none, &mapped);
+        std::memcpy(mapped, idx.data(), size_t(bytes));
+        water_indices_->Unmap(0, nullptr);
+
+        water_ibv_.BufferLocation = water_indices_->GetGPUVirtualAddress();
+        water_ibv_.SizeInBytes = static_cast<UINT>(bytes);
+        water_ibv_.Format = DXGI_FORMAT_R32_UINT;
+    }
+    return true;
+}
+
 bool Renderer::create_mesh_pipeline(std::string& error) {
     if (!mesh_root_) {
         D3D12_ROOT_PARAMETER params[2] = {};
@@ -357,6 +548,7 @@ bool Renderer::reload_shaders(std::string& error) {
     if (ready_) wait_for_gpu();
     if (!mesher_.reload_shaders(device_.Get(), error)) return false;
     if (!create_mesh_pipeline(error)) return false;
+    if (!create_water_pipeline(error)) return false;
     // Everything resident was built by the old kernel, so start again.
     streamer_.init();
     return true;
@@ -391,6 +583,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     queue_->GetTimestampFrequency(&tsfreq);
     if (!mesher_.init(device_.Get(), tsfreq, error)) return false;
     if (!create_mesh_pipeline(error)) return false;
+    if (!create_water_pipeline(error)) return false;
     streamer_.init();
     pager_.init(kMaxBricks);
 
@@ -519,6 +712,56 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         // arguments and the command processor skips it, which is cheaper than
         // compacting the array every time a chunk moves.
         cmd_->ExecuteIndirect(cmd_sig_.Get(), kSlots, mesher_.draw_args(), 0, nullptr, 0);
+    }
+
+    // The sea goes last: it is transparent, so it has to blend over whatever
+    // is behind it, and the depth buffer the terrain just wrote is what tells
+    // it where the land is in front.
+    if (water_ && water_pso_ && mode_ != Mode::Wireframe) {
+        WaterConstants wc = {};
+        std::memcpy(wc.view_proj, mc.view_proj, sizeof wc.view_proj);
+        wc.cam_pos[0] = view.cam_pos[0];
+        wc.cam_pos[1] = view.cam_pos[1];
+        wc.cam_pos[2] = view.cam_pos[2];
+        // The caller's clock, the same one the raymarch used. A renderer
+        // keeping its own would drift from the simulation the moment a frame
+        // was dropped or a headless mode skipped the loop.
+        wc.time = view.time;
+        // The same sun the terrain is lit by, or the two surfaces disagree
+        // about where the light is and the sea looks pasted on.
+        wc.sun_dir[0] = 0.45f; wc.sun_dir[1] = 0.78f; wc.sun_dir[2] = 0.35f;
+        wc.far_plane = kFarPlane;
+        // The camera basis, because the grid is built on the SCREEN and needs
+        // to know which way each pixel looks.
+        for (int k = 0; k < 3; ++k) {
+            wc.cam_fwd[k] = view.cam_fwd[k];
+            wc.cam_right[k] = view.cam_right[k];
+            wc.cam_up[k] = view.cam_up[k];
+        }
+        wc.aspect = view.aspect;
+        wc.tan_half_fov = view.tan_half_fov;
+        wc.sea_level = world_.params().sea_level;
+        wc.sea_state = sea_state_;
+        wc.grid_cells = static_cast<float>(kWaterCells);
+        wc.extent = kFarPlane;
+        wc.debug_mode = water_debug_;
+
+        cmd_->SetPipelineState(water_pso_.Get());
+        cmd_->SetGraphicsRootSignature(water_root_.Get());
+        std::memcpy(water_cb_cpu_[frame_], &wc, sizeof wc);
+        cmd_->SetGraphicsRootConstantBufferView(
+            0, water_cb_[frame_]->GetGPUVirtualAddress());
+        cmd_->SetGraphicsRootConstantBufferView(1, world_.world_cb()->GetGPUVirtualAddress());
+        ID3D12Resource* wb[10] = {
+            world_.cells(), world_.cell_offsets(), world_.cell_items(),
+            world_.archetypes(), world_.rivers(), world_.river_offsets(),
+            world_.river_items(), world_.entrances(), world_.entrance_offsets(),
+            world_.entrance_items()};
+        for (UINT i = 0; i < 10; ++i) {
+            cmd_->SetGraphicsRootUnorderedAccessView(2 + i, wb[i]->GetGPUVirtualAddress());
+        }
+        cmd_->IASetIndexBuffer(&water_ibv_);
+        cmd_->DrawIndexedInstanced(water_index_count_, 1, 0, 0, 0);
     }
 }
 

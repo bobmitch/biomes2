@@ -16,6 +16,7 @@
 //   F2          write a capture to build/shot.bmp
 // ---------------------------------------------------------------------------
 #include "engine/render/renderer.h"
+#include "engine/render/water_wave.h"
 #include "engine/render/shader_compile.h"
 #include "engine/camera.h"
 #include "engine/physics/physics_world.h"
@@ -131,6 +132,21 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 else PostQuitMessage(0);
                 return 0;
             }
+            if (wp == VK_OEM_4 || wp == VK_OEM_6) {
+                // [ and ]: calm to storm without leaving the water. Seeing the
+                // surface change under one camera is the only way to judge
+                // whether the sea state actually reads as weather.
+                const float d = (wp == VK_OEM_6) ? 0.1f : -0.1f;
+                g_renderer.set_sea_state(g_renderer.sea_state() + d);
+                return 0;
+            }
+            if (wp == 'K') {
+                // Cycle the water debug views.
+                float m = g_renderer.water_debug() + 1.0f;
+                if (m > 4.5f) m = 0.0f;
+                g_renderer.set_water_debug(m);
+                return 0;
+            }
             if (wp == 'M') {
                 // Wireframe over the same camera: where the chunk boundaries
                 // are, and which LOD a piece of ground came from.
@@ -192,12 +208,84 @@ void fill_view(const engine::Camera& cam, float w, float h, float t,
 
 }  // namespace
 
+// --sea-report: what the sea state actually produces, measured on the C++ side
+// of the SAME function the shader draws. Storms are a planned mechanic, so the
+// thing that matters is not that waves exist but that the dial maps onto a
+// usable range of weather -- and the formula in water_wave.h is not evidence
+// of that, only the numbers it produces are.
+//
+// The assertion worth making is the one you would never catch by looking: the
+// MEAN surface height must stay at sea level whatever the sea state. A Gerstner
+// sum has zero mean by construction, so a non-zero mean here means an amplitude
+// or a steepness term has acquired a bias -- the sea would silently rise or
+// fall with the weather, flooding or draining coastlines, and no screenshot of
+// a rough sea would look wrong.
+static int run_sea_report(const char* path) {
+    FILE* f = std::fopen(path, "w");
+    if (!f) return 1;
+
+    std::fprintf(f, "The sea surface, measured from engine/render/water_wave.h\n");
+    std::fprintf(f, "-- the same text the shader compiles.\n\n");
+    std::fprintf(f, "%-6s %10s %10s %10s %10s %9s\n",
+                 "state", "crest-m", "trough-m", "height-m", "max-slope", "mean-m");
+
+    const int N = 160;          // sample grid a side
+    const float span = 420.0f;  // metres, several of the longest wavelength
+    double worst_mean = 0.0;
+    bool ok = true;
+
+    for (int s = 0; s <= 10; s += 2) {
+        const float state = float(s) / 10.0f;
+        double lo = 1e30, hi = -1e30, sum = 0.0, slope = 0.0;
+        int n = 0;
+        // Two times, because a single snapshot of a travelling wave can miss
+        // the crest entirely and report a calm sea.
+        for (int ti = 0; ti < 2; ++ti) {
+            const float t = ti == 0 ? 0.0f : 7.3f;
+            for (int j = 0; j < N; ++j) {
+                for (int i = 0; i < N; ++i) {
+                    const float x = -span * 0.5f + span * float(i) / float(N - 1);
+                    const float z = -span * 0.5f + span * float(j) / float(N - 1);
+                    ww_float3 nrm;
+                    const ww_float3 p = ww_surface(x, z, t, state, 1.0f, 0.0f, nrm);
+                    if (p.y < lo) lo = p.y;
+                    if (p.y > hi) hi = p.y;
+                    sum += p.y;
+                    ++n;
+                    // ny is cos of the angle from vertical; smaller means steeper.
+                    const double sl = nrm.y > 1e-6f ? (1.0 / nrm.y) : 1e6;
+                    if (sl > slope) slope = sl;
+                }
+            }
+        }
+        const double mean = n ? sum / n : 0.0;
+        const double amean = mean < 0.0 ? -mean : mean;
+        if (amean > worst_mean) worst_mean = amean;
+        if (amean > 0.05) ok = false;
+
+        std::fprintf(f, "%-6.1f %10.2f %10.2f %10.2f %10.2f %9.4f\n",
+                     state, hi, lo, hi - lo, slope, mean);
+    }
+
+    std::fprintf(f, "\nmean surface height must stay at sea level: worst |mean| %.4f m -> %s\n",
+                 worst_mean, ok ? "PASS" : "FAIL (the sea rises with the weather)");
+    std::fprintf(f, "\nmax-slope is 1/n.y, so 1.00 is flat and the Gerstner limit is\n");
+    std::fprintf(f, "where crests come to a point. Steepness rises with the sea\n");
+    std::fprintf(f, "state on purpose -- sharpening crests is most of what makes a\n");
+    std::fprintf(f, "storm read as one rather than as calm water scaled up.\n");
+    std::fclose(f);
+    return ok ? 0 : 1;
+}
+
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     // --shot <path> renders one frame at a fixed camera and writes it out
     // without showing the window, with residency filled first so the image is
     // the finished world rather than eight chunks of it.
     std::string shot_path;
     bool start_overlay = false, debug_layer = false;
+    float sea_state = 0.25f;
+    float water_debug = 0.0f;
+    bool  no_water = false;
     double flight_seconds = 0.0;
     double walk_seconds = 0.0;
     double overhang_seconds = 0.0;
@@ -205,6 +293,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     bool mode_dig_save = false, mode_dig_verify = false, mode_dig_stress = false;
     bool flight_vsync = false;
     double shot_altitude = 0.0;
+    bool   sea_shot = false;
     {
         const std::string cl = cmdline ? cmdline : "";
         const size_t at = cl.find("--shot");
@@ -236,12 +325,29 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (flight_seconds <= 0.0) flight_seconds = 8.0;
         }
         flight_vsync = cl.find("--vsync") != std::string::npos;
+
+        // Sea state, 0 calm to 1 storm. Storms are a planned mechanic, so this
+        // has to be drivable from outside the shader -- here, and on [ and ]
+        // while the window is up.
+        const size_t ss = cl.find("--sea-state");
+        if (ss != std::string::npos) {
+            size_t p = cl.find_first_not_of(" \t", ss + 11);
+            if (p != std::string::npos) sea_state = float(std::atof(cl.c_str() + p));
+        }
+        no_water = cl.find("--no-water") != std::string::npos;
+        const size_t wd = cl.find("--water-debug");
+        if (wd != std::string::npos) {
+            size_t p = cl.find_first_not_of(" \t", wd + 13);
+            if (p != std::string::npos && cl[p] != '-') water_debug = float(std::atof(cl.c_str() + p));
+            else water_debug = 1.0f;
+        }
         // The shot camera stands on the ground, which is the right place to
         // judge the terrain underfoot and the wrong one to judge a 20 km
         // disc. --altitude lifts it so the clipmap's outer rings are in
         // frame: without something like this the only way to see whether the
         // world reads as an archipelago is the top-down contact sheet, which
         // is not what a player will ever look at.
+        sea_shot = cl.find("--sea-shot") != std::string::npos;
         const size_t al = cl.find("--altitude");
         if (al != std::string::npos) {
             size_t p = cl.find_first_not_of(" 	", al + 10);
@@ -255,6 +361,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     // --check-dialect answers ADR-001's central question and nothing else:
     // does the real field function compile as HLSL? It needs no device, no
     // window and no world, so it runs before any of them exist.
+    if (std::string(cmdline ? cmdline : "").find("--sea-report") != std::string::npos) {
+        return run_sea_report("build/sea_report.txt");
+    }
+
     if (std::string(cmdline ? cmdline : "").find("--check-dialect") != std::string::npos) {
         engine::ComPtr<ID3DBlob> blob;
         std::string err;
@@ -301,10 +411,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(ef, "renderer init failed:\n%s\n", error.c_str());
             std::fclose(ef);
         }
-        MessageBoxA(hwnd, error.c_str(), "Renderer init failed", MB_OK | MB_ICONERROR);
+        // Never a modal box in a headless run. A water root signature that
+        // was two DWORDs over the limit put this dialog up behind everything
+        // and a `--shot` that should have failed in seconds sat there for ten
+        // minutes instead, with the real error already written to the file
+        // above. A box nobody can see is not an error report.
+        if (shot_path.empty()) {
+            MessageBoxA(hwnd, error.c_str(), "Renderer init failed", MB_OK | MB_ICONERROR);
+        }
         return 1;
     }
     if (start_overlay) g_renderer.set_mode(engine::Mode::Wireframe);
+    g_renderer.set_sea_state(sea_state);
+    g_renderer.set_water_debug(water_debug);
+    if (no_water) g_renderer.set_water(false);
 
     if (!shot_path.empty()) {
         g_camera.x = 10.0f; g_camera.y = 46.0f; g_camera.z = -70.0f;
@@ -312,6 +432,53 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (shot_altitude > 0.0) {
             g_camera.y = float(shot_altitude);
             g_camera.pitch = -0.30f;
+        }
+        if (sea_shot) {
+            // Waves are metres tall and the world is twenty kilometres wide,
+            // so no camera that can judge the ARCHIPELAGO can also judge the
+            // SURFACE. This finds the nearest coast to the origin, stands just
+            // off it at eye height, and looks out to sea -- which is the only
+            // vantage from which a 7 m storm swell is a swell rather than a
+            // texture.
+            const engine::WorldGpu& wg = g_renderer.world();
+            const float sea = wg.params().sea_level;
+            float best_x = 0.0f, best_z = 0.0f, best_d = 1e9f;
+            bool found = false;
+            for (int ring = 1; ring <= 400 && !found; ++ring) {
+                const float rad = float(ring) * 20.0f;
+                const int spokes = ring * 6;
+                for (int sp = 0; sp < spokes; ++sp) {
+                    const float a = 6.2831853f * float(sp) / float(spokes);
+                    const float x = rad * std::cos(a), z = rad * std::sin(a);
+                    const float h = wg.height(x, z);
+                    // Four to twelve metres of water: deep enough to read as
+                    // sea, shallow enough that the shore is in the frame.
+                    const float depth = sea - h;
+                    if (depth < 4.0f || depth > 12.0f) continue;
+                    const float d = rad;
+                    if (d < best_d) { best_d = d; best_x = x; best_z = z; found = true; }
+                }
+                if (found) break;
+            }
+            if (!found) {
+                if (FILE* e = std::fopen((shot_path + ".txt").c_str(), "w")) {
+                    std::fprintf(e, "no water 4-12 m deep within 8 km of the origin,\n"
+                                    "so there was nothing to stand beside.\n");
+                    std::fclose(e);
+                }
+                g_renderer.shutdown();
+                g_physics.shutdown();
+                return 0;
+            }
+            // Face away from the land: out along the radius, which at a coast
+            // found by walking outwards is seaward by construction.
+            g_camera.x = best_x;
+            g_camera.z = best_z;
+            // Above the biggest sea this dial produces (7.5 m crest to
+            // trough), or a storm shot is taken from underwater.
+            g_camera.y = sea + 5.0f;
+            g_camera.yaw = std::atan2(best_x, best_z);
+            g_camera.pitch = -0.06f;
         }
         engine::ViewConstants v = {};
         fill_view(g_camera, 1280.0f, 720.0f, 0.0f, v);
