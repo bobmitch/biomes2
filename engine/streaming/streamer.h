@@ -14,7 +14,16 @@
 //
 // What it does NOT solve is the seam. Adjacent chunks at different levels have
 // vertices on different grids, so the surfaces do not meet exactly and a thin
-// crack of sky shows through. Skirts cover it -- see the skirt pass.
+// crack of sky shows through.
+//
+// This comment used to end "Skirts cover it -- see the skirt pass". There was
+// no skirt pass. It was written at B3 and went unchallenged for the obvious
+// reason: with five levels the seams were close to the camera and the cracks
+// were sub-pixel, so nothing contradicted it. Eight levels put seven seams in
+// frame and a ground shot went from 71 cracks to 569. The lip in
+// cs_vertices is the skirt now, and it is a lip rather than a real skirt
+// pass -- cheap, measured at zero sky pixels below the horizon, and worth
+// revisiting if a thin chunk edge ever shows from below.
 // ---------------------------------------------------------------------------
 #ifndef ENGINE_STREAMER_H
 #define ENGINE_STREAMER_H
@@ -45,12 +54,17 @@ namespace engine {
 // by LOOKING. From the ground at +/-900 m there is no coastline in sight but
 // your own.
 //
-// The three new levels were already paid for. The harness asserts LOD
-// agreement from 0.5 m to 64 m -- lod_voxel(7) is exactly 64 m -- so levels
-// 5, 6 and 7 have been validated all along and simply were not used. They are
-// also the cheapest chunks in the clipmap: --band-report measures about one
-// chunk per column at the coarse levels, against the slots that empty-chunk
-// reclamation freed.
+// The FIELD at these voxel sizes was already validated: the harness asserts
+// LOD agreement from 0.5 m to 64 m, and lod_voxel(7) is exactly 64 m, so
+// evaluating the field that coarsely was never the risk. Be precise about
+// what that does and does not cover -- it is a statement about the octave
+// fade across voxel sizes, and says nothing about residency, seams or skirts
+// at those levels. Both of the things that actually broke here were on the
+// side it says nothing about: the index cap, and the missing skirt.
+//
+// They are also the cheapest chunks in the clipmap: --band-report measures
+// about one chunk per column at the coarse levels, against the slots that
+// empty-chunk reclamation freed.
 static const int kLodCount = 8;
 
 // Half-extent in chunks at every level: 7 x 7 columns per level.
@@ -71,6 +85,22 @@ inline float lod_chunk_size(int lod) { return lod_voxel(lod) * float(kChunkOwned
 // with the near ground never reached because the air above and below it got
 // there first.
 static const UINT kNoSlot = 0xFFFFFFFFu;
+
+// The skirt lip sits on the outermost ring of cells, deliberately two voxels
+// below the isosurface. Every check that measures a vertex against the field
+// has to skip those, or it reports the lip depth instead of the error it was
+// built to find -- measured: slot 0's worst residual went from 0.60 m to
+// 1.33 m the moment the lip went in, which would have masked any real
+// disagreement up to a metre.
+//
+// A chunk meshes kChunkCells cells from its origin, and the lip is the first
+// and last of them in X and Z.
+inline bool is_lip_vertex(const float pos[3], const float origin[3], float voxel) {
+    const float span = voxel * float(kChunkCells);
+    const float lx = pos[0] - origin[0];
+    const float lz = pos[2] - origin[2];
+    return lx < voxel || lx > span - voxel || lz < voxel || lz > span - voxel;
+}
 
 struct ChunkKey {
     int x, y, z, lod;
@@ -285,6 +315,15 @@ public:
         ++empty_resident_;
     }
     size_t empty_resident() const { return empty_resident_; }
+
+    // Which chunk is in a slot. A linear scan, for debug checks only.
+    bool key_of_slot(UINT slot, ChunkKey& out) const {
+        for (std::unordered_map<ChunkKey, UINT, ChunkKeyHash>::const_iterator it =
+                 resident_.begin(); it != resident_.end(); ++it) {
+            if (it->second == slot) { out = it->first; return true; }
+        }
+        return false;
+    }
 
     // What the edit overlay needs to answer "which bricks does this chunk
     // read, and where are they in the pool".

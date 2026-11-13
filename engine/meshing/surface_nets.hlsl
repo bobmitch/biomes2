@@ -228,7 +228,29 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
     if (n == 0) return;
 
     const float3 local = sum / float(n);
-    const float3 world = chunk_origin + (float3(id) + local) * voxel;
+    float3 world = chunk_origin + (float3(id) + local) * voxel;
+
+    // The skirt, such as it is. Adjacent chunks at DIFFERENT levels put their
+    // vertices on different grids, so the two surfaces do not meet exactly and
+    // a sliver of sky shows between them. streamer.h has claimed since B3 that
+    // "skirts cover it -- see the skirt pass"; there was no skirt pass, and
+    // the claim went unchallenged because at five levels the seams were close
+    // to the camera and sub-pixel. Eight levels put seven seams in frame and
+    // took a ground shot from 71 cracks to 569.
+    //
+    // Dropping the outermost ring of cells turns each chunk's edge into a
+    // downward lip, and two neighbouring lips overlap across their depth
+    // whichever way the surfaces disagree. Only X and Z: vertically stacked
+    // chunks are always the same level, share a ghost layer and agree exactly,
+    // so there is nothing to cover there.
+    //
+    // Two voxels deep because the coarser neighbour is exactly twice this
+    // chunk's voxel and the harness bounds LOD disagreement at one voxel of
+    // the coarser level. The lip sits on the ghost ring, which is the cell the
+    // neighbour starts at, so the neighbour's own surface covers it.
+    if (id.x == 0u || id.x == kCells - 1u || id.z == 0u || id.z == kCells - 1u) {
+        world.y -= voxel * 2.0f;
+    }
 
     uint local_slot;
     InterlockedAdd(g_counters[slot * 2u + 0u], 1u, local_slot);

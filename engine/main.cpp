@@ -72,10 +72,17 @@ void sync_physics_terrain() {
     for (size_t i = 0; i < meshes.size(); ++i) {
         const engine::Renderer::MeshPatchEvent& e = meshes[i];
         const size_t nv = e.verts.size() / 3;
+        const float mS = engine::lod_chunk_size(e.key.lod);
+        const float morigin[3] = {float(e.key.x) * mS, float(e.key.y) * mS,
+                                  float(e.key.z) * mS};
+        const float mvoxel = engine::lod_voxel(e.key.lod);
         for (size_t k = 0; k < nv; k += 7) {
             const float vy = e.verts[k * 3 + 1];
             if (vy < g_mesh_y_lo) g_mesh_y_lo = vy;
             if (vy > g_mesh_y_hi) g_mesh_y_hi = vy;
+            // Same exclusion as the capture check: the lip is not an error.
+            const float vpos[3] = {e.verts[k * 3 + 0], vy, e.verts[k * 3 + 2]};
+            if (engine::is_lip_vertex(vpos, morigin, mvoxel)) continue;
             const float d = g_renderer.world().density(e.verts[k * 3 + 0], vy,
                                                       e.verts[k * 3 + 2]);
             const double a = d < 0.0f ? -double(d) : double(d);
@@ -961,6 +968,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const engine::FrameStats st = g_renderer.stats();
         if (FILE* f = std::fopen("build/overhang.txt", "w")) {
             std::fprintf(f, "walking under the overhang, %.0f s\n", overhang_seconds);
+            // A run where the window never got a size renders nothing and
+            // classifies nothing, but the time-driven flags below still fire
+            // -- so the report cheerfully concluded "it was STOPPED by the
+            // overhang" off zero frames of simulation. A check that draws a
+            // conclusion from no data is worse than no check, so say it here,
+            // first, where it cannot be missed.
+            if (st.chunks_classified == 0) {
+                std::fprintf(f, "\n*** THIS RUN SIMULATED NOTHING. No chunk was ever\n");
+                std::fprintf(f, "*** classified, so no geometry and no physics existed.\n");
+                std::fprintf(f, "*** Every number below is void. Run it again.\n\n");
+            }
             std::fprintf(f, "the ceiling found: over (%.1f, %.1f), underside at\n",
                          ov_x, ov_z);
             std::fprintf(f, "y = %.2f with a floor at y = %.2f, so %.2f m of headroom\n",

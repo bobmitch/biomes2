@@ -1004,15 +1004,30 @@ bool Renderer::check_against_field(float& max_err, float& mean_err, UINT& checke
     const UINT n = mesher_.slot_vertex_count(0);
     std::vector<MeshVertex> verts;
     if (!mesher_.read_vertices(0, n, verts)) return false;
+    ChunkKey key;
+    const bool have_key = streamer_.key_of_slot(0, key);
+    float origin[3] = {0.0f, 0.0f, 0.0f};
+    float voxel = 0.0f;
+    if (have_key) {
+        const float S = lod_chunk_size(key.lod);
+        origin[0] = float(key.x) * S;
+        origin[1] = float(key.y) * S;
+        origin[2] = float(key.z) * S;
+        voxel = lod_voxel(key.lod);
+    }
+
     double sum = 0.0;
     for (size_t i = 0; i < verts.size(); ++i) {
+        // The lip is off the isosurface on purpose; measuring it here would
+        // report the skirt depth and hide everything smaller.
+        if (have_key && is_lip_vertex(verts[i].pos, origin, voxel)) continue;
         const float d = world_.density(verts[i].pos[0], verts[i].pos[1],
                                        verts[i].pos[2]);
         const float a = d < 0.0f ? -d : d;
         if (a > max_err) max_err = a;
         sum += a;
+        ++checked;
     }
-    checked = static_cast<UINT>(verts.size());
     if (checked) mean_err = static_cast<float>(sum / checked);
     return true;
 }
@@ -1129,6 +1144,78 @@ void Renderer::band_report(const char* path) const {
         total_chunks += chunk_sum;
         if (worst_miss > worst_miss_any) worst_miss_any = worst_miss;
     }
+
+    // The table above samples columns around the ORIGIN, and the origin is a
+    // gentle plain -- relief 1.8 m over a 16 m column. That is the FRIENDLY
+    // case for a margin rule that scales with the relief the samples happen to
+    // see, so passing there says very little. This second pass walks out
+    // across the disc, where the continent mask, the mountains and the river
+    // gorges are, and reports the worst case rather than the local one.
+    std::fprintf(f, "\nThe same question away from the origin, which is a plain.\n");
+    std::fprintf(f, "%-5s %12s %12s %s\n", "LOD", "worst miss", "at radius", "verdict");
+
+    double worst_any = -1.0e9;
+    int    worst_lod = -1;
+    float  worst_x = 0.0f, worst_z = 0.0f;
+
+    for (int lod = 0; lod < kLodCount; ++lod) {
+        const float S = lod_chunk_size(lod);
+        double worst = -1.0e9;
+        float at_r = 0.0f, at_x = 0.0f, at_z = 0.0f;
+
+        // Rings out to the rim. 16 directions, so the sampling is not aligned
+        // to the chunk grid and does not keep landing on the same phase.
+        static const float kRadii[] = {0.0f, 500.0f, 1500.0f, 3000.0f, 5000.0f,
+                                       7000.0f, 8500.0f, 9500.0f};
+        for (int ri = 0; ri < 8; ++ri) {
+            const int spokes = ri == 0 ? 1 : 16;
+            for (int sp = 0; sp < spokes; ++sp) {
+                const float a = 6.2831853f * float(sp) / float(spokes) + 0.37f;
+                const float px = kRadii[ri] * std::cos(a);
+                const float pz = kRadii[ri] * std::sin(a);
+
+                const float x0 = std::floor(px / S) * S;
+                const float z0 = std::floor(pz / S) * S;
+                const float x1 = x0 + S, z1 = z0 + S;
+
+                float lo = 0.0f, hi = 0.0f;
+                world_.column_band(x0, z0, x1, z1, lo, hi);
+
+                float tmn = 1.0e9f, tmx = -1.0e9f;
+                for (int j = 0; j <= 16; ++j) {
+                    for (int i = 0; i <= 16; ++i) {
+                        const float x = x0 + (x1 - x0) * float(i) / 16.0f;
+                        const float z = z0 + (z1 - z0) * float(j) / 16.0f;
+                        const float h = world_.height(x, z);
+                        if (h < tmn) tmn = h;
+                        if (h > tmx) tmx = h;
+                    }
+                }
+                const double over = double(lo) - double(tmn) > double(tmx) - double(hi)
+                                        ? double(lo) - double(tmn)
+                                        : double(tmx) - double(hi);
+                if (over > worst) {
+                    worst = over;
+                    at_r = kRadii[ri];
+                    at_x = x0; at_z = z0;
+                }
+            }
+        }
+
+        std::fprintf(f, "%-5d %10.2f m %10.0f m %s\n", lod, worst, at_r,
+                     worst > 0.0 ? "GROUND HIDDEN" : "contained");
+        if (worst > worst_any) {
+            worst_any = worst;
+            worst_lod = lod;
+            worst_x = at_x; worst_z = at_z;
+        }
+    }
+
+    std::fprintf(f, "\nworst over the whole disc: %.2f m at LOD %d, column (%.0f, %.0f)\n",
+                 worst_any, worst_lod, worst_x, worst_z);
+    std::fprintf(f, "  %s\n", worst_any > 0.0
+                     ? "POSITIVE: the band hides ground somewhere. The margin rule is wrong."
+                     : "still negative everywhere, so the margin rule holds off the plain too.");
 
     std::fprintf(f, "\nchunks the whole clipmap wants: %.0f, against a pool of %u.\n"
                     "Most of them hold no surface and give their slot straight\n"

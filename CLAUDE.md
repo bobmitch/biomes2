@@ -137,6 +137,16 @@ run it with `Start-Process -Wait` or the file you read will be the last run's.
   path that meshes outside the frame loop has to reclaim too: `capture()` did
   not, and from 1400 m up it spent the whole pool on the air around the camera
   and returned an empty sky over 483,590 triangles it never reached.
+- There was no skirt pass for five years' worth of commits, while a comment in
+  `streamer.h` said there was. Nothing contradicted it because at five LOD
+  levels the seams were near the camera and sub-pixel. Eight levels took a
+  ground shot from 71 cracks to 569. The fix is a lip in `cs_vertices`: the
+  outermost ring of cells drops two voxels, so neighbouring chunks overlap
+  vertically. Measured 0 sky pixels below the horizon afterwards.
+  **Any check that measures a vertex against the field must skip the lip** —
+  `is_lip_vertex` in `streamer.h`. It is off the isosurface by construction,
+  and counting it took slot 0's worst residual from 0.60 m to 1.33 m, which
+  would have masked any real disagreement up to a metre.
 - A chunk's index cap must track its vertex cap at about **6 per vertex** — a
   closed quad surface has roughly as many quads as vertices. A flat 16384
   against 4096 vertices overflowed on chunks the vertex cap was happy with,
@@ -244,6 +254,13 @@ only as near zero as the field is linear over one voxel — at an 8 m voxel
 beside a cave, where `cave_carve` pins the air at -10, the worst case IS 10.
 Every one of these now reports the voxel size it came from, because without it
 the number cannot be read at all.
+
+**An engine mode whose window never gets a size renders nothing, classifies
+nothing — and its time-driven flags still fire.** One `--overhang` run in
+roughly eight came back with 0 frames, 0 chunks and 0 physics bodies, and
+concluded "it was STOPPED by the overhang" from that. The report now says so
+at the top when `chunks_classified == 0`. Treat an all-zero engine report as a
+void run, not a pass, and check the counts before believing a conclusion.
 
 `--overhang` no longer has a landmark to aim at: it searches for a real
 ceiling and reports what it found. Near spawn the layer-6 overhangs are
