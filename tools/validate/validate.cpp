@@ -25,6 +25,8 @@
 #include <thread>
 #include <vector>
 
+#include "worldgen/generator_version.h"
+
 using namespace worldgen;
 using namespace view;
 
@@ -867,6 +869,62 @@ struct Golden {
 
 static const char* kGoldenPath = "worldgen/golden/golden.json";
 
+// The eight seeds, hashed at a canonical resolution. The cell areas and the
+// land mask are derived from the raster, so hashing at whatever --grid a run
+// happened to use would pin a HARNESS setting rather than the generator, and
+// the gate would fire on nothing.
+static WorldParams golden_params(const WorldParams& wp) {
+    WorldParams gw = wp;
+    gw.grid = 1024;
+    return gw;
+}
+
+static const int kGoldenSeeds = 8;
+
+// One thread per seed. The gate sits on every build that touches worldgen/,
+// and a check people are tempted to switch off is not a gate -- 4.2 s serial
+// against 1.1 s here. Threading cannot move a hash: each seed is an
+// independent build_world with its own per-feature seeds (invariant 4), and
+// if that were ever untrue this is the one check that would say so.
+static void golden_hashes(const WorldParams& wp, const ArchetypeTable& table,
+                          const AssignParams& ap,
+                          std::vector<std::pair<uint64_t, uint64_t> >& out) {
+    const WorldParams gw = golden_params(wp);
+    std::vector<uint64_t> hashes(kGoldenSeeds, 0);
+
+    unsigned nthreads = std::thread::hardware_concurrency();
+    if (nthreads == 0) nthreads = 4;
+    nthreads = std::min<unsigned>(nthreads, static_cast<unsigned>(kGoldenSeeds));
+
+    std::vector<std::thread> pool;
+    for (unsigned th = 0; th < nthreads; ++th) {
+        pool.push_back(std::thread([&, th]() {
+            for (int i = static_cast<int>(th); i < kGoldenSeeds;
+                 i += static_cast<int>(nthreads)) {
+                hashes[i] = eval_seed(static_cast<uint64_t>(i), gw, table, ap).hash;
+            }
+        }));
+    }
+    for (size_t i = 0; i < pool.size(); ++i) pool[i].join();
+
+    out.clear();
+    for (int i = 0; i < kGoldenSeeds; ++i) {
+        out.push_back(std::make_pair(static_cast<uint64_t>(i), hashes[i]));
+    }
+}
+
+// How many of the pinned hashes `now` disagrees with. A different COUNT of
+// seeds is a move too: it means the pinned set is not the set being checked.
+static int golden_moved_count(const Golden& g,
+                              const std::vector<std::pair<uint64_t, uint64_t> >& now) {
+    if (g.seeds.size() != now.size()) return static_cast<int>(now.size());
+    int moved = 0;
+    for (size_t i = 0; i < g.seeds.size(); ++i) {
+        if (g.seeds[i].first != now[i].first || g.seeds[i].second != now[i].second) ++moved;
+    }
+    return moved;
+}
+
 static bool load_golden(Golden& g) {
     try {
         const jsonlite::Value root = jsonlite::parse_file(kGoldenPath);
@@ -903,6 +961,103 @@ static bool write_golden(const Golden& g) {
     return true;
 }
 
+
+// --- the gate --------------------------------------------------------------
+//
+// M2: this is what the BUILD runs, not what someone remembers to run. Three
+// states, and only the first is a pass:
+//
+//   version matches the pin, hashes match  -> the world is what it claims
+//   version matches the pin, hashes moved  -> a silent world change
+//   version differs from the pin           -> the pin is stale, bless it
+//
+// The second is the one the milestone is about. It cannot be cleared by
+// re-pinning, because --bless refuses while kGeneratorVersion is unchanged:
+// the only way out is to revert the change or say, in worldgen's own header,
+// that the world is allowed to be different.
+static int run_golden_gate(const WorldParams& wp, const ArchetypeTable& table,
+                           const AssignParams& ap) {
+    Golden g;
+    const bool had = load_golden(g);
+    std::vector<std::pair<uint64_t, uint64_t> > now;
+    golden_hashes(wp, table, ap, now);
+
+    if (!had) {
+        std::printf("golden gate: no %s.\n", kGoldenPath);
+        std::printf("  This world has never been pinned. Run:  validate --bless\n");
+        return 1;
+    }
+
+    const int moved = golden_moved_count(g, now);
+
+    if (g.generator_version != kGeneratorVersion) {
+        std::printf("golden gate: worldgen/generator_version.h says %d, but %s\n",
+                    kGeneratorVersion, kGoldenPath);
+        std::printf("  holds hashes pinned at %d.\n", g.generator_version);
+        std::printf("  %d of %d seeds %s.\n", moved, static_cast<int>(now.size()),
+                    moved ? "differ" : "still agree");
+        std::printf("  Re-pin the new version:  validate --bless\n");
+        return 1;
+    }
+
+    if (moved > 0) {
+        std::printf("golden gate: THE WORLD MOVED at generator_version %d.\n",
+                    kGeneratorVersion);
+        std::printf("  %d of %d golden seeds hash differently than %s pins.\n",
+                    moved, static_cast<int>(now.size()), kGoldenPath);
+        for (size_t i = 0; i < now.size() && i < g.seeds.size(); ++i) {
+            if (g.seeds[i].second == now[i].second) continue;
+            std::printf("    seed %llu: pinned 0x%016llx, now 0x%016llx\n",
+                        static_cast<unsigned long long>(now[i].first),
+                        static_cast<unsigned long long>(g.seeds[i].second),
+                        static_cast<unsigned long long>(now[i].second));
+        }
+        std::printf("\n  Saves store edits as absolute density against the base\n");
+        std::printf("  terrain, so a world that changes under them corrupts them.\n");
+        std::printf("  Either revert the change, or bump kGeneratorVersion in\n");
+        std::printf("  worldgen/generator_version.h and then run:  validate --bless\n");
+        return 1;
+    }
+
+    std::printf("golden gate: %d seeds pinned at generator_version %d, all matching\n",
+                static_cast<int>(now.size()), kGeneratorVersion);
+    return 0;
+}
+
+// Pin the current world. Refuses the one case that would make the gate
+// meaningless: writing moved hashes back at a version that has not changed,
+// which is "make the red build green" with extra steps.
+static int run_bless(const WorldParams& wp, const ArchetypeTable& table,
+                     const AssignParams& ap) {
+    Golden g;
+    const bool had = load_golden(g);
+    std::vector<std::pair<uint64_t, uint64_t> > now;
+    golden_hashes(wp, table, ap, now);
+
+    if (had && g.generator_version == kGeneratorVersion &&
+        golden_moved_count(g, now) > 0) {
+        std::printf("refusing to bless: generator_version is still %d.\n",
+                    kGeneratorVersion);
+        std::printf("  These hashes are a different world from the ones already\n");
+        std::printf("  pinned at that version, and pinning both under one number\n");
+        std::printf("  is what the number exists to prevent.\n");
+        std::printf("  Bump kGeneratorVersion in worldgen/generator_version.h\n");
+        std::printf("  first -- or revert, if the change was not meant to move\n");
+        std::printf("  the world.\n");
+        return 1;
+    }
+
+    g.generator_version = kGeneratorVersion;
+    g.seeds = now;
+    if (!write_golden(g)) {
+        std::printf("FAILED to write %s\n", kGoldenPath);
+        return 1;
+    }
+    std::printf("blessed %d golden seeds at generator_version %d -> %s\n",
+                static_cast<int>(g.seeds.size()), g.generator_version, kGoldenPath);
+    return 0;
+}
+
 static void line(const char* name, bool ok, const char* detail) {
     std::printf("  %-18s %-6s %s\n", name, ok ? "PASS" : "FAIL", detail);
 }
@@ -919,6 +1074,10 @@ int main(int argc, char** argv) {
     bool sheet = false;
     bool adjacency = false;
     bool bless = false;
+    // M2: the gate on its own, which is what the build runs. Eight seeds,
+    // no 200-seed sweep, no contact sheet -- it has to be cheap enough to
+    // sit on every build that touches worldgen/.
+    bool golden_only = false;
     bool relief = false;
     bool closeup = false;
     bool components = false;
@@ -957,6 +1116,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--tile") && i + 1 < argc)   tile = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--test-adjacency"))         adjacency = true;
         else if (!std::strcmp(argv[i], "--bless"))                  bless = true;
+        else if (!std::strcmp(argv[i], "--golden"))                 golden_only = true;
         else if (!std::strcmp(argv[i], "--relief"))                 relief = true;
         else if (!std::strcmp(argv[i], "--components"))              components = true;
         else if (!std::strcmp(argv[i], "--cave-access"))             cave_access = true;
@@ -1000,6 +1160,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("archetypes: %d biomes, invariants OK\n", static_cast<int>(table.size()));
+
+    // M2: the gate and the pin, both on their own. These return straight out
+    // -- the 200-seed sweep below asks a different question (is this world any
+    // good) from the one the build asks (is this the world that is pinned).
+    if (golden_only) return run_golden_gate(wp, table, ap);
+    if (bless)       return run_bless(wp, table, ap);
 
     if (entrance_section) {
         // Slice vertically through the first mouth of this seed. Narrow by
@@ -1459,32 +1625,15 @@ int main(int argc, char** argv) {
         // Golden seeds.
         Golden g;
         const bool had_golden = load_golden(g);
-        bool golden_ok = false;
-        int  golden_moved = 0;
-        // Pinned at a canonical sampling resolution. The cell areas and land
-        // mask are derived from the raster, so hashing at whatever --grid the
-        // run happened to use would pin a harness setting rather than the
-        // generator, and the gate would fire on nothing.
-        WorldParams gw = wp;
-        gw.grid = 1024;
-        if (bless) {
-            g.generator_version = had_golden ? g.generator_version : 1;
-            g.seeds.clear();
-            for (uint64_t ws = 0; ws < 8; ++ws) {
-                g.seeds.push_back(std::make_pair(ws, eval_seed(ws, gw, table, ap).hash));
-            }
-            if (!write_golden(g)) { std::printf("FAILED to write %s\n", kGoldenPath); return 1; }
-            std::printf("\nblessed %d golden seeds at generator_version %d -> %s\n",
-                        static_cast<int>(g.seeds.size()), g.generator_version, kGoldenPath);
-            golden_ok = true;
-        } else if (had_golden) {
-            for (size_t i = 0; i < g.seeds.size(); ++i) {
-                if (eval_seed(g.seeds[i].first, gw, table, ap).hash != g.seeds[i].second) {
-                    ++golden_moved;
-                }
-            }
-            golden_ok = (golden_moved == 0);
-        }
+        // --bless and --golden returned long before this point, so all that is
+        // left here is reporting. The comparison itself is the gate's, not a
+        // second copy: two implementations would eventually disagree, and the
+        // one that disagreed quietly would be this one.
+        std::vector<std::pair<uint64_t, uint64_t> > golden_now;
+        golden_hashes(wp, table, ap, golden_now);
+        const int  golden_moved = had_golden ? golden_moved_count(g, golden_now) : 0;
+        const bool golden_ok = had_golden && golden_moved == 0 &&
+                               g.generator_version == kGeneratorVersion;
 
         std::printf("\nchecks over %d seeds\n", nseeds);
         char d[128];
@@ -1551,11 +1700,16 @@ int main(int argc, char** argv) {
         std::snprintf(d, sizeof(d), "%.0f ns/sample, scalar CPU reference; design budget is "
                       "20 ns serial-equivalent for the full field on the shipping path", ns);
         line("throughput", ns <= 400.0, d);
-        if (!had_golden && !bless) {
-            std::snprintf(d, sizeof(d), "no %s -- run with --bless to pin this world", kGoldenPath);
+        if (!had_golden) {
+            std::snprintf(d, sizeof(d), "no %s -- run with --bless to pin this world",
+                          kGoldenPath);
         } else if (golden_moved > 0) {
-            std::snprintf(d, sizeof(d), "%d of %d moved: revert, or bump generator_version",
+            std::snprintf(d, sizeof(d), "%d of %d moved: revert, or bump kGeneratorVersion",
                           golden_moved, static_cast<int>(g.seeds.size()));
+        } else if (g.generator_version != kGeneratorVersion) {
+            std::snprintf(d, sizeof(d),
+                          "hashes agree but are pinned at %d, not %d -- run --bless",
+                          g.generator_version, kGeneratorVersion);
         } else {
             std::snprintf(d, sizeof(d), "%d seeds pinned at generator_version %d",
                           static_cast<int>(g.seeds.size()), g.generator_version);

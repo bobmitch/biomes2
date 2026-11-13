@@ -1,6 +1,6 @@
 #include "engine/field/world_gpu.h"
 
-#include "worldgen/assign/json_lite.h"
+#include "worldgen/generator_version.h"
 
 #include <cmath>
 #include <cstring>
@@ -95,20 +95,14 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
                 "(is the working directory the repository root?)";
         return false;
     }
-    // The generator version lives in golden.json, where the re-blessing
-    // discipline already keeps it honest. Reading it here rather than keeping
-    // a second copy in the engine means the two cannot drift.
-    int gen_version = 0;
-    try {
-        const jsonlite::Value g = jsonlite::parse_file("worldgen/golden/golden.json");
-        gen_version = static_cast<int>(g.number("generator_version"));
-    } catch (const std::exception&) {
-        error = "could not read worldgen/golden/golden.json for the generator version";
-        return false;
-    }
+    // M2 made the version a compile-time constant in worldgen's own header,
+    // so there is nothing to read and nothing that can fail. Before that this
+    // parsed golden.json at startup, which put a JSON parse and a file open on
+    // the path between the engine and its own world.
     {
         uint64_t h = 1469598103934665603ull;
-        const uint64_t parts[2] = {static_cast<uint64_t>(gen_version), seed};
+        const uint64_t parts[2] = {
+            static_cast<uint64_t>(worldgen::kGeneratorVersion), seed};
         for (int i = 0; i < 2; ++i) {
             h ^= parts[i];
             h *= 1099511628211ull;

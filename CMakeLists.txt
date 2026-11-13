@@ -45,6 +45,32 @@ add_executable(validate tools/validate/validate.cpp)
 target_link_libraries(validate PRIVATE worldgen)
 worldgen_strict_fp(validate)
 
+# M2: the golden gate runs as part of the BUILD, not as something to remember.
+#
+# The discipline it enforces -- "the hashes moved, so revert or bump the
+# version" -- only survives a year of tuning if forgetting is impossible, and
+# a check you have to run by hand is a check you will skip on the commit that
+# needed it. So: eight seeds, no sweep, no contact sheet, and a non-zero exit
+# fails `cmake --build`.
+#
+# It depends on validate rather than on a list of sources, and that is the
+# point: ANY change to a worldgen header or source relinks validate, so the
+# gate re-runs. A list would be a second place to remember, which is the thing
+# being designed out. The two data files are named explicitly because nothing
+# compiles them.
+set(GOLDEN_STAMP ${CMAKE_CURRENT_BINARY_DIR}/golden.stamp)
+add_custom_command(
+  OUTPUT ${GOLDEN_STAMP}
+  COMMAND $<TARGET_FILE:validate> --golden
+  COMMAND ${CMAKE_COMMAND} -E touch ${GOLDEN_STAMP}
+  DEPENDS validate
+          ${PROJECT_SOURCE_DIR}/worldgen/data/archetypes.json
+          ${PROJECT_SOURCE_DIR}/worldgen/golden/golden.json
+  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+  COMMENT "golden seeds: is this the world that is pinned?"
+  VERBATIM)
+add_custom_target(golden_gate ALL DEPENDS ${GOLDEN_STAMP})
+
 # The native viewer (ADR-002). Windows-only by design: it is a debug tool, it
 # links the shipping generator directly, and CI is headless so determinism
 # coverage does not depend on it.
@@ -55,20 +81,39 @@ if(WIN32 AND EXISTS ${PROJECT_SOURCE_DIR}/tools/view/view.cpp)
 endif()
 
 # Track B: the engine (ADR-003 -- Direct3D 12). Windows-only, like the viewer.
-# It does NOT link worldgen: Track B is built against the trivial analytic
-# field in engine/field/ precisely so that pipeline bugs are never confused
-# with worldgen bugs. M1 is where that changes.
+# Until M1 it did not link worldgen at all: Track B was built against the
+# trivial analytic field in engine/field/ precisely so that pipeline bugs
+# could never be confused with worldgen bugs. M1 ended that separation, which
+# is what the milestone was.
 #
 # No strict-fp here on purpose. These flags exist to protect the golden
 # hashes, nothing in engine/ feeds them, and pinning the renderer's maths
 # would imply a determinism guarantee this binary does not make.
+#
+# A missing Jolt submodule SKIPS the engine. It used to be a FATAL_ERROR, and
+# that error cost nine commits of Windows CI: actions/checkout does not fetch
+# submodules by default, so every configure on windows-latest died here from
+# the commit that added Jolt onwards. The Linux job stayed green and the run
+# stayed red, which is the worst shape a failure can take -- the two-OS matrix
+# is the ONLY thing that catches the libm divergence invariant 9 is about, and
+# half of it was gone.
+#
+# The comment that error carried was already right: validate.exe never links
+# the engine. So a checkout without the submodule is a perfectly good
+# determinism gate, and refusing to configure one was the bug.
+set(BIOMES2_ENGINE OFF)
 if(WIN32 AND EXISTS ${PROJECT_SOURCE_DIR}/engine/main.cpp)
-  if(NOT EXISTS ${PROJECT_SOURCE_DIR}/third_party/JoltPhysics/Build/CMakeLists.txt)
-    message(FATAL_ERROR
-      "engine/ needs Jolt: run  git submodule update --init --recursive
-"
-      "(validate.exe, the CI gate, does not -- it never links the engine.)")
+  if(EXISTS ${PROJECT_SOURCE_DIR}/third_party/JoltPhysics/Build/CMakeLists.txt)
+    set(BIOMES2_ENGINE ON)
+  else()
+    message(STATUS
+      "engine/: SKIPPED -- the Jolt submodule is not checked out. "
+      "Run  git submodule update --init --recursive  to build it. "
+      "worldgen and validate, which are the determinism gate, do not need it.")
   endif()
+endif()
+
+if(BIOMES2_ENGINE)
 
   # OVERRIDE_CXX_FLAGS is OFF deliberately. Jolt defaults it ON, which rewrites
   # CMAKE_CXX_FLAGS_DEBUG and CMAKE_CXX_FLAGS_RELEASE. Those are the flags
