@@ -169,6 +169,22 @@ run it with `Start-Process -Wait` or the file you read will be the last run's.
   `is_lip_vertex` in `streamer.h`. It is off the isosurface by construction,
   and counting it took slot 0's worst residual from 0.60 m to 1.33 m, which
   would have masked any real disagreement up to a metre.
+- **A gradient arm must not scale with the voxel.** `field_normal` took a
+  central difference at half a voxel, which is 0.25 m at LOD 0 and 32 m at
+  LOD 7 — a difference between two unrelated pieces of terrain, not a
+  gradient. 14.8° of mean error at a 64 m voxel and 6% of normals pointing
+  more than 90° from the surface's own. The density function already fades
+  octaves by `voxel`, so the field is smooth at coarse levels and a SHORT arm
+  is the correct gradient there. `engine.exe --normal-check` measures it, with
+  the CPU at the shader's own arm as a control: a large error with a zero
+  control means the formula is wrong rather than the GPU.
+- A short gradient arm inside a fully carved cave finds **no gradient at
+  all** — layer 6 pins density at exactly `-cave_carve` — and `normalize(0)`
+  is NaN, which shades to pure black. Guard it.
+- **The dual-compile field function is expensive to inline, and the budgets
+  bite without warning.** `field_normal` holds six whole field evaluations;
+  twelve is `error X4505: Sum of temp registers ... exceeds limit of 4096`.
+  FXC inlines everything, so a second call to the field is not a small change.
 - A chunk's index cap must track its vertex cap at about **6 per vertex** — a
   closed quad surface has roughly as many quads as vertices. A flat 16384
   against 4096 vertices overflowed on chunks the vertex cap was happy with,
@@ -301,8 +317,21 @@ It is the third: zero pure-black pixels, zero sky-coloured pixels below the
 horizon, nothing below the arithmetic floor. And they are a coarse-LOD effect
 rather than a mesher fault — per terrain pixel there are **280× more** of them
 in a 1400 m vista than in a ground shot, where inverted normals would appear
-equally at every level. Consistent with sub-metre overhang spans aliasing at a
-64 m voxel, though that last step is inference, not measurement.
+equally at every level.
+
+**Not settled, and twice now a confident explanation has been wrong.** The
+first was "aliased overhangs"; chasing it found that `field_normal` was using a
+32 m arm (below), which really was a bug and really did produce faces lit as
+though they pointed away from the sun — and fixing it did not remove the
+patches. What is ruled out, by measurement: holes, NaN normals, inverted
+normals, and the normal formula. What is left is that they are geometry —
+zoomed in they have a lit sunward rim and a dark shadow face, so they read as
+coherent raised shapes. Identifying WHICH geometry needs a world position for
+one of them, which nothing currently reports.
+
+**Both pixel detectors above stop working once water is in frame.** The sea
+sits near the clear colour, so a crack count on a seascape returns thousands of
+"cracks" that are just water. Mask the water before trusting either number.
 
 **The sea** is `engine/render/shaders/water.hlsl` over
 `engine/render/water_wave.h`. That header compiles as C++ AND as HLSL, the same
