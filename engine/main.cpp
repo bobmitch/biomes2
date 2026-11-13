@@ -19,7 +19,6 @@
 #include "engine/render/shader_compile.h"
 #include "engine/camera.h"
 #include "engine/physics/physics_world.h"
-#include "engine/field/trivial_field.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -43,6 +42,13 @@ float g_feet[3] = {0.0f, 0.0f, 0.0f};
 // vertices lie on the isosurface. If a shape is not the terrain, nothing about
 // Jolt's behaviour will explain why the character goes through it.
 double g_mesh_resid_max = 0.0;
+// Which LOD the worst one came from. A surface-nets vertex is placed by
+// linear interpolation along an edge, so the density there is only as close
+// to zero as the field is linear over one voxel -- at an 8 m voxel beside an
+// overhang, where layer 6 moves the surface tens of metres, "far from zero"
+// is the expected answer and not a fault. Without the voxel beside it the
+// number cannot be read at all.
+double g_mesh_resid_voxel = 0.0;
 unsigned long long g_mesh_verts_checked = 0;
 double g_mesh_y_lo = 1e9, g_mesh_y_hi = -1e9;
 size_t g_mesh_max_verts = 0, g_mesh_max_idx = 0;
@@ -70,9 +76,13 @@ void sync_physics_terrain() {
             const float vy = e.verts[k * 3 + 1];
             if (vy < g_mesh_y_lo) g_mesh_y_lo = vy;
             if (vy > g_mesh_y_hi) g_mesh_y_hi = vy;
-            const float d = trivial_density(e.verts[k * 3 + 0], vy, e.verts[k * 3 + 2]);
+            const float d = g_renderer.world().density(e.verts[k * 3 + 0], vy,
+                                                      e.verts[k * 3 + 2]);
             const double a = d < 0.0f ? -double(d) : double(d);
-            if (a > g_mesh_resid_max) g_mesh_resid_max = a;
+            if (a > g_mesh_resid_max) {
+                g_mesh_resid_max = a;
+                g_mesh_resid_voxel = engine::lod_voxel(e.key.lod);
+            }
             ++g_mesh_verts_checked;
         }
         if (nv > g_mesh_max_verts) g_mesh_max_verts = nv;
@@ -115,12 +125,11 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (wp == 'M') {
-                // The comparison B2 turned on and B3 still needs: same camera,
-                // same field, marched or meshed or both at once.
+                // Wireframe over the same camera: where the chunk boundaries
+                // are, and which LOD a piece of ground came from.
                 const engine::Mode m = g_renderer.mode();
-                g_renderer.set_mode(m == engine::Mode::Raymarch ? engine::Mode::Mesh
-                                  : m == engine::Mode::Mesh     ? engine::Mode::Overlay
-                                                                : engine::Mode::Raymarch);
+                g_renderer.set_mode(m == engine::Mode::Mesh ? engine::Mode::Wireframe
+                                                            : engine::Mode::Mesh);
                 return 0;
             }
             if (wp == VK_TAB) {
@@ -181,7 +190,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     // without showing the window, with residency filled first so the image is
     // the finished world rather than eight chunks of it.
     std::string shot_path;
-    bool start_overlay = false, start_raymarch = false, debug_layer = false;
+    bool start_overlay = false, debug_layer = false;
     double flight_seconds = 0.0;
     double walk_seconds = 0.0;
     double overhang_seconds = 0.0;
@@ -219,8 +228,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (flight_seconds <= 0.0) flight_seconds = 8.0;
         }
         flight_vsync = cl.find("--vsync") != std::string::npos;
-        start_overlay = cl.find("--overlay") != std::string::npos;
-        start_raymarch = cl.find("--raymarch") != std::string::npos;
+        start_overlay = cl.find("--wire") != std::string::npos;
         debug_layer = cl.find("--debuglayer") != std::string::npos;
     }
 
@@ -267,11 +275,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 1;
     }
     if (!g_renderer.init(hwnd, error, debug_layer)) {
+        // To a file as well as a box: a headless run exits with a code and no
+        // other trace of why, which is a long way to debug blind.
+        if (FILE* ef = std::fopen("build/engine_error.txt", "w")) {
+            std::fprintf(ef, "renderer init failed:\n%s\n", error.c_str());
+            std::fclose(ef);
+        }
         MessageBoxA(hwnd, error.c_str(), "Renderer init failed", MB_OK | MB_ICONERROR);
         return 1;
     }
-    if (start_overlay) g_renderer.set_mode(engine::Mode::Overlay);
-    if (start_raymarch) g_renderer.set_mode(engine::Mode::Raymarch);
+    if (start_overlay) g_renderer.set_mode(engine::Mode::Wireframe);
 
     if (!shot_path.empty()) {
         g_camera.x = 10.0f; g_camera.y = 46.0f; g_camera.z = -70.0f;
@@ -308,6 +321,32 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (std::string(cmdline ? cmdline : "").find("--band-report") != std::string::npos) {
+        g_renderer.band_report("build/band_report.txt");
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return 0;
+    }
+
+    if (std::string(cmdline ? cmdline : "").find("--probe-field") != std::string::npos) {
+        // A chunk straddling the surface near the origin, where the centre
+        // floor guarantees land.
+        const float surface = 0.20f * 140.0f;
+        const float origin[3] = {-8.0f, surface - 8.0f, -8.0f};
+        std::string e;
+        g_renderer.probe_field(origin, 0.5f, "build/field_probe.txt", e);
+        if (debug_layer) g_renderer.drain_debug_messages("build/d3d12_validation.txt");
+        if (!e.empty()) {
+            if (FILE* f = std::fopen("build/field_probe.txt", "a")) {
+                std::fprintf(f, "error: %s\n", e.c_str());
+                std::fclose(f);
+            }
+        }
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return 0;
+    }
+
     ShowWindow(hwnd, show);
 
     // The three holes both runs use. Fixed so the two processes agree
@@ -315,10 +354,21 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     const float kHoleX[3] = {0.0f, 11.0f, 0.0f};
     const float kHoleZ[3] = {0.0f, 0.0f, 11.0f};
 
+    // Drop the character just above the real ground rather than at a literal
+    // height. The literal was the trivial field's: against the generated world
+    // it put the capsule 180 m in the air over one spot and inside a hill over
+    // another, and every measurement downstream was then of a long fall.
+    struct Spawn {
+        static float above(float x, float z) {
+            return g_renderer.world().height(x, z) + 2.0f;
+        }
+    };
+
     if (mode_dig_save || mode_dig_verify) {
         g_renderer.set_vsync(true);
         g_walk = true;
-        g_physics.place_character(kHoleX[0], 20.0f, kHoleZ[0]);
+        g_physics.place_character(kHoleX[0], Spawn::above(kHoleX[0], kHoleZ[0]),
+                                  kHoleZ[0]);
         g_physics.character_position(g_feet);
 
         bool  mismatch = false;
@@ -498,7 +548,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     if (dig_seconds > 0.0) {
         g_renderer.set_vsync(true);
         g_walk = true;
-        g_physics.place_character(0.0f, 20.0f, 0.0f);
+        g_physics.place_character(0.0f, Spawn::above(0.0f, 0.0f), 0.0f);
         g_physics.character_position(g_feet);
         g_camera.yaw = 0.6f;
         g_camera.pitch = -0.35f;
@@ -559,7 +609,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 sent_away = true;
                 ground_after = g_feet[1];
                 // Far enough that every chunk around the hole retires.
-                g_physics.place_character(400.0f, 60.0f, 400.0f);
+                g_physics.place_character(400.0f, Spawn::above(400.0f, 400.0f),
+                                          400.0f);
             }
             if (sent_away && !brought_back && total >= 14.0) {
                 brought_back = true;
@@ -646,11 +697,139 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     }
 
     if (overhang_seconds > 0.0) {
-        // Straight north, under the sphere at (14, 26, -10) whose underside
-        // sits at y = 13 over ground near y = -1.6.
+        // B5 ran this against the trivial field's floating sphere, whose
+        // underside sat at a literal y = 13. The generated world has no such
+        // landmark, so the test now goes looking for a real one: a column with
+        // rock over air over rock, deep enough to stand in and solid enough
+        // overhead to stop a jump. Without this the check would still pass and
+        // mean nothing, because there would be nothing above the character at
+        // all.
+        float ov_x = 0.0f, ov_z = 0.0f;       // under the ceiling
+        float ov_ground = 0.0f;               // the floor of the void
+        float ov_under = 0.0f;                // the ceiling's underside
+        float ov_gap = 0.0f;                  // how much headroom it leaves
+        float ov_span = 0.0f;                 // how far it reaches in plan
+        float ov_thick = 0.0f;                // how thick the slab is
+        bool  ov_found = false;
+        bool  ov_fallback = false;
+        {
+            const engine::WorldGpu& wg = g_renderer.world();
+            const float step = 0.25f;
+            for (int ring = 1; ring <= 300 && !ov_found; ++ring) {
+                const float rad = float(ring) * 6.0f;
+                const int spokes = ring * 8;
+                for (int sp = 0; sp < spokes && !ov_found; ++sp) {
+                    // Rejection-free and good enough for a search: this is a
+                    // test fixture, not the generator, so an angle is fine
+                    // here where invariant 9 would forbid it upstream.
+                    const float a = 6.2831853f * float(sp) / float(spokes);
+                    const float x = rad * std::cos(a), z = rad * std::sin(a);
+                    const float grade = wg.height(x, z);
+                    // From well above the heightfield, because the layer-6
+                    // overhang term puts rock up to its own scale ABOVE it,
+                    // and that rock is the thing being looked for.
+                    const float top = grade + 40.0f;
+
+                    // Downward: the first rock, then the air under it, then
+                    // the floor. The first rock must have real thickness, or a
+                    // single noisy sample reads as a ceiling.
+                    float roof_bottom = 0.0f, roof_top = 0.0f;
+                    bool in_roof = false, have_roof = false;
+                    for (float y = top; y > grade - 20.0f; y -= step) {
+                        const bool rock = wg.density(x, y, z) > 0.0f;
+                        if (rock && !in_roof) { in_roof = true; roof_top = y; }
+                        if (!rock && in_roof) {
+                            roof_bottom = y;
+                            if (roof_top - roof_bottom >= 1.5f) have_roof = true;
+                            break;
+                        }
+                    }
+                    if (!have_roof) continue;
+
+                    // The void below it, and the floor it stands on.
+                    float floor_y = 0.0f;
+                    bool have_floor = false;
+                    for (float y = roof_bottom; y > roof_bottom - 60.0f; y -= step) {
+                        if (wg.density(x, y, z) > 0.0f) {
+                            floor_y = y;
+                            have_floor = true;
+                            break;
+                        }
+                    }
+                    if (!have_floor) continue;
+                    const float gap = roof_bottom - floor_y;
+                    if (gap < 3.0f) continue;        // no room for the capsule
+                    // Near grade, or it is a cave roof rather than an
+                    // overhang. The first version of this search did not say
+                    // so and found a ceiling 45 m underground, which the
+                    // character could only reach by being placed inside it.
+                    if (floor_y < grade - 10.0f) continue;
+                    if (roof_top < grade) continue;  // the slab is above the surface
+
+                    // How far the roof reaches in plan, at the height it
+                    // would have to stop something. A slab that is thick but
+                    // only as wide as the capsule does not stop a launch --
+                    // the capsule rises beside it -- so the width is measured
+                    // and printed rather than assumed, and the first version
+                    // of this test reported "passed straight THROUGH" for a
+                    // roof 1.5 m thick without saying how wide it was.
+                    const float probe = roof_bottom + 0.5f;
+                    float span = 0.0f;
+                    for (float rr = 0.5f; rr <= 12.0f; rr += 0.5f) {
+                        bool all_solid = true;
+                        for (int d = 0; d < 4 && all_solid; ++d) {
+                            const float ox = (d == 0 ? rr : d == 1 ? -rr : 0.0f);
+                            const float oz = (d == 2 ? rr : d == 3 ? -rr : 0.0f);
+                            if (wg.density(x + ox, probe, z + oz) <= 0.0f) all_solid = false;
+                        }
+                        if (!all_solid) break;
+                        span = rr;
+                    }
+                    // A roof the capsule can rise beside is not a test of
+                    // anything, so a wide one is preferred -- but a narrow one
+                    // is kept as a fallback rather than reporting that the
+                    // world has no overhangs at all, which would be the wrong
+                    // conclusion from the wrong threshold.
+                    if (span < 1.0f) {
+                        if (!ov_fallback) {
+                            ov_fallback = true;
+                            ov_x = x; ov_z = z;
+                            ov_ground = floor_y; ov_under = roof_bottom;
+                            ov_gap = gap; ov_span = span;
+                            ov_thick = roof_top - roof_bottom;
+                        }
+                        continue;
+                    }
+                    ov_span = span;
+                    ov_thick = roof_top - roof_bottom;
+
+                    ov_x = x; ov_z = z;
+                    ov_ground = floor_y;
+                    ov_under = roof_bottom;
+                    ov_gap = gap;
+                    ov_found = true;
+                }
+            }
+        }
+        if (!ov_found && ov_fallback) ov_found = true;
+        if (!ov_found) {
+            if (FILE* f = std::fopen("build/overhang.txt", "w")) {
+                std::fprintf(f, "no overhang within 1800 m of the origin, so there\n"
+                                "was nothing to test. That is a finding about the\n"
+                                "world, not a pass.\n");
+                std::fclose(f);
+            }
+            g_renderer.shutdown();
+            g_physics.shutdown();
+            return 0;
+        }
+
         g_renderer.set_vsync(true);
         g_walk = true;
-        g_physics.place_character(14.0f, 6.0f, -34.0f);
+        // Approach from 24 m away along -z, on the surface, so the walk in is
+        // over open ground.
+        g_physics.place_character(ov_x, g_renderer.world().height(ov_x, ov_z - 24.0f) + 2.0f,
+                                  ov_z - 24.0f);
         g_physics.character_position(g_feet);
         g_camera.yaw = 0.0f;
         g_camera.pitch = -0.05f;
@@ -697,7 +876,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             // stopped it rather than that it ran out of speed.
             if (total >= 9.0 && !placed_under) {
                 placed_under = true;
-                g_physics.place_character(14.0f, 3.0f, -10.0f);
+                g_physics.place_character(ov_x, ov_ground + 1.0f, ov_z);
             }
             if (total >= 10.5 && !launched) {
                 launched = true;
@@ -723,14 +902,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
 
             if (total > 2.0) {
                 if (g_feet[1] > y_max) y_max = g_feet[1];
-                // Inside the sphere's footprint in plan: if the character is
-                // here and below y = 13, it is underneath the overhang.
-                const float dx = g_feet[0] - 14.0f, dz = g_feet[2] + 10.0f;
+                // Inside the ceiling's footprint in plan: if the character
+                // is here and below its underside, it is beneath the overhang.
+                const float dx = g_feet[0] - ov_x, dz = g_feet[2] - ov_z;
                 if (dx * dx + dz * dz < 100.0f) {
-                    ++under_frames;
-                    if (g_feet[1] > y_under_max) y_under_max = g_feet[1];
-                    if (g_feet[1] < y_under_min) y_under_min = g_feet[1];
-                    if (g_feet[1] > 13.0f) ++climbed_frames;
+                    if (g_feet[1] > ov_under) {
+                        ++climbed_frames;
+                    } else {
+                        ++under_frames;
+                        if (g_feet[1] > y_under_max) y_under_max = g_feet[1];
+                        if (g_feet[1] < y_under_min) y_under_min = g_feet[1];
+                    }
                     if (!shot_taken && dx * dx + dz * dz < 9.0f) {
                         shot_taken = true;
                         engine::Camera c = g_camera;
@@ -749,11 +931,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                         c.pitch = 0.25f;
                         engine::ViewConstants cv = {};
                         fill_view(c, 1280.0f, 720.0f, 0.0f, cv);
-                        // The capsule is drawn by the RAYMARCH, not the mesh
-                        // pipeline, so a capture left in mesh mode shows the
-                        // terrain and no character at all.
                         const engine::Mode was = g_renderer.mode();
-                        g_renderer.set_mode(engine::Mode::Raymarch);
+                        g_renderer.set_mode(engine::Mode::Mesh);
                         std::string e2;
                         g_renderer.capture(cv, "build/b5_overhang.bmp", e2);
                         g_renderer.set_mode(was);
@@ -765,10 +944,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const engine::FrameStats st = g_renderer.stats();
         if (FILE* f = std::fopen("build/overhang.txt", "w")) {
             std::fprintf(f, "walking under the overhang, %.0f s\n", overhang_seconds);
-            std::fprintf(f, "the sphere: centre (14, 26, -10) radius 13, so its\n");
-            std::fprintf(f, "underside is at y = 13 and its top at y = 39;\n");
-            std::fprintf(f, "the ground beneath it is near y = -1.6\n\n");
-            std::fprintf(f, "frames inside the sphere's footprint: %llu\n", under_frames);
+            std::fprintf(f, "the ceiling found: over (%.1f, %.1f), underside at\n",
+                         ov_x, ov_z);
+            std::fprintf(f, "y = %.2f with a floor at y = %.2f, so %.2f m of headroom\n",
+                         ov_under, ov_ground, ov_gap);
+            std::fprintf(f, "the slab is %.2f m thick and stays solid %.1f m out in\n"
+                            "every direction, against a capsule %.2f m across\n\n",
+                         ov_thick, ov_span, kCapsuleRadius * 2.0f);
+            std::fprintf(f, "frames inside the ceiling's footprint: %llu\n", under_frames);
             std::fprintf(f, "feet while under it: min %.2f m, max %.2f m\n",
                          under_frames ? y_under_min : 0.0,
                          under_frames ? y_under_max : 0.0);
@@ -781,8 +964,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 std::fprintf(f, "  the capsule's feet peaked at %.2f m\n", launch_peak);
                 std::fprintf(f, "  its head therefore reached %.2f m\n",
                              launch_peak + double(kCapsuleHalf + kCapsuleRadius) * 2.0);
-                std::fprintf(f, "  the underside is at 13.00 m, so %s\n",
-                             launch_peak + double(kCapsuleHalf + kCapsuleRadius) * 2.0 < 14.0
+                if (ov_span < 1.0f) {
+                    std::fprintf(f, "  the roof is only %.1f m wide, which a capsule"
+                                    " %.2f m across can\n  rise beside, so what"
+                                    " follows is not evidence about the ceiling\n",
+                                 ov_span, kCapsuleRadius * 2.0f);
+                }
+                std::fprintf(f, "  the underside is at %.2f m, so %s\n", ov_under,
+                             launch_peak + double(kCapsuleHalf + kCapsuleRadius) * 2.0 <
+                                     double(ov_under) + 1.0
                                  ? "it was STOPPED by the overhang"
                                  : "it passed straight THROUGH the overhang");
             }
@@ -794,8 +984,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                          st.mesh_shapes_delivered, st.mesh_backlog);
             std::fprintf(f, "physics bodies: %zu total, %zu of them mesh shapes\n",
                          g_physics.body_count(), g_physics.mesh_body_count());
-            std::fprintf(f, "mesh vertices checked against the field: %llu, worst %.4f m\n",
-                         g_mesh_verts_checked, g_mesh_resid_max);
+            std::fprintf(f, "mesh vertices checked against the field: %llu, worst %.4f m at a %.1f m voxel\n",
+                         g_mesh_verts_checked, g_mesh_resid_max, g_mesh_resid_voxel);
             std::fprintf(f, "mesh shape vertices span y %.2f .. %.2f m\n",
                          g_mesh_y_lo, g_mesh_y_hi);
             std::fprintf(f, "biggest mesh patch: %zu vertices, %zu indices\n",
@@ -810,7 +1000,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     if (walk_seconds > 0.0) {
         g_renderer.set_vsync(true);
         g_walk = true;
-        g_physics.place_character(0.0f, 30.0f, 0.0f);
+        g_physics.place_character(0.0f, Spawn::above(0.0f, 0.0f), 0.0f);
         g_physics.character_position(g_feet);
         g_camera.pitch = -0.12f;
 
@@ -880,7 +1070,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (total > 1.5 && g_physics.character_grounded()) {
                 ++settled_frames;
                 const float fy = g_feet[1];
-                const float d = trivial_density(g_feet[0], fy, g_feet[2]);
+                const float d = g_renderer.world().density(g_feet[0], fy, g_feet[2]);
                 // density > 0 is rock, so a positive reading means the feet
                 // are INSIDE the ground. That is the direction that would be
                 // a bug; the other is the capsule sitting on its own radius.
@@ -890,10 +1080,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
 
                 // What the capsule's radius alone accounts for on this slope.
                 const float e = 0.25f;
-                const float gx = (trivial_height(g_feet[0] + e, g_feet[2]) -
-                                  trivial_height(g_feet[0] - e, g_feet[2])) / (2.0f * e);
-                const float gz = (trivial_height(g_feet[0], g_feet[2] + e) -
-                                  trivial_height(g_feet[0], g_feet[2] - e)) / (2.0f * e);
+                const engine::WorldGpu& wg = g_renderer.world();
+                const float gx = (wg.height(g_feet[0] + e, g_feet[2]) -
+                                  wg.height(g_feet[0] - e, g_feet[2])) / (2.0f * e);
+                const float gz = (wg.height(g_feet[0], g_feet[2] + e) -
+                                  wg.height(g_feet[0], g_feet[2] - e)) / (2.0f * e);
                 const double grad = std::sqrt(double(gx) * gx + double(gz) * gz);
                 const double expected = kCapsuleRadius * (std::sqrt(1.0 + grad * grad) - 1.0);
                 const double excess = hover - expected;
@@ -924,7 +1115,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
 
         const engine::FrameStats st = g_renderer.stats();
         if (FILE* f = std::fopen("build/walk.txt", "w")) {
-            std::fprintf(f, "capsule walk over the trivial world, %.1f s\n", walk_seconds);
+            std::fprintf(f, "capsule walk over the generated world, %.1f s\n", walk_seconds);
             std::fprintf(f, "frames %llu, travelled %.0f m\n", frames, travelled);
             // Jolt cannot tell "in the air" from "that chunk has not arrived":
             // in both cases nothing is underneath. One number, not two labels
@@ -960,8 +1151,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fclose(f);
         }
 
-        // A third-person look at where the capsule ended up, drawn against the
-        // analytic field rather than the mesh -- see the note in the shader.
+        // Where the walk ended up. The capsule itself is no longer in the
+        // picture: it was drawn by the raymarch's capsule SDF, and M1 retired
+        // the raymarch along with the trivial field it was the last caller of.
+        // What the shot still shows is the ground the walk finished on.
         {
             engine::Camera c = g_camera;
             const float sy = std::sin(g_camera.yaw), cy = std::cos(g_camera.yaw);
@@ -970,13 +1163,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             // Lifted clear of whatever is at the camera's own position: seven
             // metres behind the character is often inside a hillside, and the
             // first attempt at this shot was a screen of solid rock.
-            const float behind = trivial_height(c.x, c.z);
+            const float behind = g_renderer.world().height(c.x, c.z);
             c.y = g_feet[1] + 3.2f;
             if (c.y < behind + 2.5f) c.y = behind + 2.5f;
             c.pitch = -0.33f;
             engine::ViewConstants v = {};
             fill_view(c, 1280.0f, 720.0f, 0.0f, v);
-            g_renderer.set_mode(engine::Mode::Raymarch);
+            g_renderer.set_mode(engine::Mode::Mesh);
             std::string err;
             g_renderer.capture(v, "build/b4_walk.bmp", err);
         }
@@ -1059,7 +1252,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             const double p50 = frame_ms[frame_ms.size() / 2];
             const double p99 = frame_ms[(frame_ms.size() * 99) / 100];
             const double worst = frame_ms.back();
-            std::fprintf(f, "flight over the trivial world, %.1f s, vsync %s\n",
+            std::fprintf(f, "flight over the generated world, %.1f s, vsync %s\n",
                          flight_seconds, flight_vsync ? "ON (60 Hz cap)" : "off");
             std::fprintf(f, "frames %zu\n", frame_ms.size());
             std::fprintf(f, "mean %.2f ms (%.0f fps)\n", mean, 1000.0 / mean);
@@ -1069,14 +1262,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(f, "mean meshing time per frame: %.3f ms\n",
                          mesh_ms_n ? mesh_ms_sum / mesh_ms_n : 0.0);
             std::fprintf(f, "worst backlog: %zu chunks waiting\n", max_pending);
+            std::fprintf(f, "of those resident, holding no slot because they"
+                            " meshed to nothing: %zu\n", st.empty_resident);
             std::fprintf(f, "at the end: %zu chunks resident, %u triangles, %zu slots free\n",
                          st.resident, st.indices / 3, st.free_slots);
             std::fprintf(f, "slots overflowed: %u\n", st.overflowed);
             std::fprintf(f, "height patches read back: %llu, latency %u frames\n",
                          st.patches_total, st.readback_latency_frames);
-            std::fprintf(f, "height residual over %llu samples: max %.4f m, mean %.4f m\n",
+            std::fprintf(f, "height residual over %llu samples: max %.4f m at a %.1f m voxel, mean %.4f m\n",
                          st.height_samples_checked, st.height_residual_max,
-                         st.height_residual_mean);
+                         st.height_residual_voxel, st.height_residual_mean);
             std::fprintf(f, "uncapped presentation: %s\n",
                          g_renderer.tearing_available()
                              ? "yes, tearing allowed"
@@ -1182,9 +1377,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                           "biomes2 engine - %s - %.0f fps (worst %.1f ms) - "
                           "%zu chunks, %u tris - %u meshed/frame in %.3f ms - "
                           "%zu pending, %zu slots free%s",
-                          g_renderer.mode() == engine::Mode::Mesh    ? "mesh"
-                          : g_renderer.mode() == engine::Mode::Overlay ? "overlay"
-                                                                      : "raymarch",
+                          g_renderer.mode() == engine::Mode::Mesh ? "mesh" : "wireframe",
                           fps_frames / fps_accum, worst_frame_ms,
                           st.resident, st.indices / 3,
                           st.meshed_this_frame, st.mesh_ms,

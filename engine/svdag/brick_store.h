@@ -74,6 +74,9 @@ struct BrickLease {
 // generator change moves that terrain out from under them.
 static const uint32_t kSaveMagic = 0x44453242u;   // "B2ED"
 static const uint32_t kSaveFormat = 1;
+// M1 replaced this with WorldGpu::field_id(), which is the generator
+// version and the seed together. Kept only so an old save is recognised
+// as a MISMATCH rather than silently read as the current world.
 static const uint32_t kTrivialFieldId = 0;
 
 class BrickStore {
