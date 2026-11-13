@@ -22,8 +22,21 @@
 // were sub-pixel, so nothing contradicted it. Eight levels put seven seams in
 // frame and a ground shot went from 71 cracks to 569. The lip in
 // cs_vertices is the skirt now, and it is a lip rather than a real skirt
-// pass -- cheap, measured at zero sky pixels below the horizon, and worth
-// revisiting if a thin chunk edge ever shows from below.
+// pass -- cheap, and measured at zero sky pixels below the horizon.
+//
+// The reason to revisit it is not cosmetic. The lip is BAKED into surface
+// vertices, which makes g_vertices mean two things at once: the surface, and
+// the surface plus a rendering fudge. That is precisely how it reached Jolt
+// and put a character two voxels into the ground, and it is why
+// is_lip_vertex() has to reconstruct a cell index from a position -- which it
+// cannot do exactly, so the predicate has a deliberate failure direction.
+//
+// A real skirt pass removes all of that rather than patching it: separate
+// quads hanging from the chunk border, appended AFTER the surface geometry.
+// Every stored surface vertex stays true, no predicate is needed anywhere,
+// and the physics copy excludes the skirt by index range instead of by
+// guessing from coordinates. If the lip causes trouble a second time, that is
+// the fix, not a better predicate.
 // ---------------------------------------------------------------------------
 #ifndef ENGINE_STREAMER_H
 #define ENGINE_STREAMER_H
