@@ -262,6 +262,26 @@ concluded "it was STOPPED by the overhang" from that. The report now says so
 at the top when `chunks_classified == 0`. Treat an all-zero engine report as a
 void run, not a pass, and check the counts before believing a conclusion.
 
+**The near-black patches on distant terrain are geometry, not a fault**, and
+the way to tell is worth keeping because the eye gets it wrong. They read as
+black beside lit ground; measured, the darkest pixel in frame is (22, 29, 21)
+and `mesh.hlsl` cannot go below `rock * 0.22` ≈ (19, 26, 16), which is a
+normal pointing straight down. Three causes are distinguishable without
+guessing:
+
+| what you see | cause |
+| --- | --- |
+| the clear colour (102, 128, 168) below the horizon | a hole — missing geometry |
+| pure black | a NaN normal, which `saturate` collapses to zero |
+| the shader's floor, ~(19–32, 26–42, 16–40) | a down-facing face, correctly shaded |
+
+It is the third: zero pure-black pixels, zero sky-coloured pixels below the
+horizon, nothing below the arithmetic floor. And they are a coarse-LOD effect
+rather than a mesher fault — per terrain pixel there are **280× more** of them
+in a 1400 m vista than in a ground shot, where inverted normals would appear
+equally at every level. Consistent with sub-metre overhang spans aliasing at a
+64 m voxel, though that last step is inference, not measurement.
+
 `--overhang` no longer has a landmark to aim at: it searches for a real
 ceiling and reports what it found. Near spawn the layer-6 overhangs are
 spikes — 4.75 m thick and under 0.5 m wide — so a launched capsule rises
