@@ -197,6 +197,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     double dig_seconds = 0.0;
     bool mode_dig_save = false, mode_dig_verify = false, mode_dig_stress = false;
     bool flight_vsync = false;
+    double shot_altitude = 0.0;
     {
         const std::string cl = cmdline ? cmdline : "";
         const size_t at = cl.find("--shot");
@@ -228,6 +229,18 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (flight_seconds <= 0.0) flight_seconds = 8.0;
         }
         flight_vsync = cl.find("--vsync") != std::string::npos;
+        // The shot camera stands on the ground, which is the right place to
+        // judge the terrain underfoot and the wrong one to judge a 20 km
+        // disc. --altitude lifts it so the clipmap's outer rings are in
+        // frame: without something like this the only way to see whether the
+        // world reads as an archipelago is the top-down contact sheet, which
+        // is not what a player will ever look at.
+        const size_t al = cl.find("--altitude");
+        if (al != std::string::npos) {
+            size_t p = cl.find_first_not_of(" 	", al + 10);
+            if (p != std::string::npos && cl[p] != '-') shot_altitude = std::atof(cl.c_str() + p);
+            if (shot_altitude <= 0.0) shot_altitude = 1200.0;
+        }
         start_overlay = cl.find("--wire") != std::string::npos;
         debug_layer = cl.find("--debuglayer") != std::string::npos;
     }
@@ -289,6 +302,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     if (!shot_path.empty()) {
         g_camera.x = 10.0f; g_camera.y = 46.0f; g_camera.z = -70.0f;
         g_camera.yaw = 0.15f; g_camera.pitch = -0.42f;
+        if (shot_altitude > 0.0) {
+            g_camera.y = float(shot_altitude);
+            g_camera.pitch = -0.30f;
+        }
         engine::ViewConstants v = {};
         fill_view(g_camera, 1280.0f, 720.0f, 0.0f, v);
 
@@ -1267,6 +1284,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(f, "at the end: %zu chunks resident, %u triangles, %zu slots free\n",
                          st.resident, st.indices / 3, st.free_slots);
             std::fprintf(f, "slots overflowed: %u\n", st.overflowed);
+            // An overflow is dropped geometry -- a hole. The peaks say how
+            // much a chunk actually wanted, so the slot can be sized from a
+            // measurement instead of doubled on a guess.
+            std::fprintf(f, "worst chunk wanted %u vertices (cap %u) and %u indices (cap %u)\n",
+                         st.peak_slot_vertices, engine::kSlotVertices,
+                         st.peak_slot_indices, engine::kSlotIndices);
             std::fprintf(f, "height patches read back: %llu, latency %u frames\n",
                          st.patches_total, st.readback_latency_frames);
             std::fprintf(f, "height residual over %llu samples: max %.4f m at a %.1f m voxel, mean %.4f m\n",

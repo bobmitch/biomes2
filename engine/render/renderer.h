@@ -79,6 +79,8 @@ struct FrameStats {
     UINT   readback_latency_frames = 0;
     size_t empty_resident = 0;
     float  height_residual_voxel = 0.0f;
+    UINT   peak_slot_vertices = 0;
+    UINT   peak_slot_indices = 0;
     float  height_residual_max = 0.0f;
     double height_residual_mean = 0.0;
     unsigned long long height_samples_checked = 0;

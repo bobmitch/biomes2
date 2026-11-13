@@ -454,8 +454,10 @@ void ChunkMesher::read_draw_args(UINT first, UINT count, std::vector<UINT>& out)
     args_readback_->Unmap(0, &none);
 }
 
-void ChunkMesher::read_counts(UINT& verts, UINT& inds, UINT& overflowed) {
+void ChunkMesher::read_counts(UINT& verts, UINT& inds, UINT& overflowed,
+                              UINT& peak_v, UINT& peak_i) {
     verts = 0; inds = 0; overflowed = 0;
+    peak_v = 0; peak_i = 0;
     void* p = nullptr;
     D3D12_RANGE r = {0, SIZE_T(kSlots) * 2 * 4};
     if (FAILED(counter_readback_->Map(0, &r, &p))) return;
@@ -465,6 +467,8 @@ void ChunkMesher::read_counts(UINT& verts, UINT& inds, UINT& overflowed) {
         // The kernel keeps incrementing past the cap and drops the write, so a
         // counter above the cap is exactly the overflow signal.
         if (v > kSlotVertices || i > kSlotIndices) ++overflowed;
+        if (v > peak_v) peak_v = v;
+        if (i > peak_i) peak_i = i;
         verts += v < kSlotVertices ? v : kSlotVertices;
         inds += i < kSlotIndices ? i : kSlotIndices;
     }

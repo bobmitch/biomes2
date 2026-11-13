@@ -15,8 +15,11 @@ namespace {
 
 const char* kMeshShaderPath = "engine/render/shaders/mesh.hlsl";
 
+// The far plane has to clear the clipmap's own corner or the outermost ring
+// is streamed and then clipped away: 8 levels of 7 x 7 give a +/-7.2 km box,
+// whose diagonal is 10.2 km.
 const float kNearPlane = 0.2f;
-const float kFarPlane  = 2400.0f;
+const float kFarPlane  = 16000.0f;
 
 struct MeshConstants {
     float view_proj[16];
@@ -820,7 +823,8 @@ void Renderer::render(const ViewConstants& view) {
     // Read a frame or two stale, deliberately: waiting on these would be a
     // stall in the thing being measured.
     mesher_.read_timestamps();
-    mesher_.read_counts(stats_.vertices, stats_.indices, stats_.overflowed);
+    mesher_.read_counts(stats_.vertices, stats_.indices, stats_.overflowed,
+                        stats_.peak_slot_vertices, stats_.peak_slot_indices);
     stats_.mesh_ms = mesher_.last_mesh_ms();
     stats_.resident = streamer_.resident_count();
     stats_.pending = streamer_.pending_count();
@@ -871,8 +875,29 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
         ID3D12CommandList* ls[] = {cmd_.Get()};
         queue_->ExecuteCommandLists(1, ls);
         wait_for_gpu();
+
+        // Give back the slots of chunks that meshed to nothing. The frame
+        // loop does this off the readback ring two frames later; this loop
+        // has its own pacing and never touched the ring, so it never
+        // reclaimed anything -- the pool filled with air and the fill stalled
+        // with hundreds of chunks still queued.
+        //
+        // It did not show from the ground, where the nearest chunks are
+        // ground. From 1400 m up, nearest-first spends the entire pool on the
+        // air around the camera and the capture came back as an empty sky
+        // over 483,590 triangles that were never reached.
+        //
+        // No latency to wait out here: wait_for_gpu() above means the
+        // counters just copied are this pass's own.
+        const std::vector<Streamer::MeshedChunk>& done = streamer_.last_meshed();
+        for (size_t i = 0; i < done.size(); ++i) {
+            UINT v = 0, ix = 0;
+            mesher_.slot_counts(done[i].slot, v, ix);
+            if (v == 0 && ix == 0) streamer_.release_empty(done[i].key);
+        }
     }
-    mesher_.read_counts(stats_.vertices, stats_.indices, stats_.overflowed);
+    mesher_.read_counts(stats_.vertices, stats_.indices, stats_.overflowed,
+                        stats_.peak_slot_vertices, stats_.peak_slot_indices);
     stats_.resident = streamer_.resident_count();
     stats_.pending = streamer_.pending_count();
     stats_.free_slots = streamer_.free_slot_count();

@@ -133,7 +133,15 @@ run it with `Start-Process -Wait` or the file you read will be the last run's.
   working one from here.
 - Most of the clipmap meshes to nothing — nine chunks per LOD 0 column and the
   surface crosses one. A chunk that meshes to zero vertices gives its slot back
-  and keeps its key: dropping the key would requeue it every frame.
+  and keeps its key: dropping the key would requeue it every frame. Any code
+  path that meshes outside the frame loop has to reclaim too: `capture()` did
+  not, and from 1400 m up it spent the whole pool on the air around the camera
+  and returned an empty sky over 483,590 triangles it never reached.
+- A chunk's index cap must track its vertex cap at about **6 per vertex** — a
+  closed quad surface has roughly as many quads as vertices. A flat 16384
+  against 4096 vertices overflowed on chunks the vertex cap was happy with,
+  and an overflow is dropped geometry, which is a hole.
+  `--flight` prints what the worst chunk actually wanted.
 
 ## Testing
 

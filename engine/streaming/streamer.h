@@ -32,11 +32,26 @@
 
 namespace engine {
 
-// Five levels of 16, 32, 64, 128 and 256 m chunks. The design specifies eight,
-// reaching 16 km; five reaches 1.8 km, which is as far as the trivial field is
-// worth looking and keeps the resident set inside one slot pool. Adding levels
-// is changing a constant, not the scheme.
-static const int kLodCount = 5;
+// Eight levels: 16, 32, 64, 128, 256, 512, 1024 and 2048 m chunks, which the
+// 7 x 7 ring below turns into a +/-7.2 km box.
+//
+// It was five until the view distance stopped being the trivial field's
+// problem. Five reaches +/-900 m, and on a 20 km disc that is 0.8% of the
+// world's area -- enough while Track B was looking at a sine heightfield, and
+// not enough the moment M1 put the real generator underneath it. Layers 2 and
+// 3 exist to produce islandness (7.2 landmasses a seed, the spawn mass holding
+// about three quarters of the land) and the design says explicitly that
+// whether a world reads as a continent or an archipelago is a feel call made
+// by LOOKING. From the ground at +/-900 m there is no coastline in sight but
+// your own.
+//
+// The three new levels were already paid for. The harness asserts LOD
+// agreement from 0.5 m to 64 m -- lod_voxel(7) is exactly 64 m -- so levels
+// 5, 6 and 7 have been validated all along and simply were not used. They are
+// also the cheapest chunks in the clipmap: --band-report measures about one
+// chunk per column at the coarse levels, against the slots that empty-chunk
+// reclamation freed.
+static const int kLodCount = 8;
 
 // Half-extent in chunks at every level: 7 x 7 columns per level.
 static const int kRingHalf = 3;

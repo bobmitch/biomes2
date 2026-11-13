@@ -55,7 +55,14 @@ static const UINT kChunkCorners    = 34;
 // away.
 static const UINT kSlots        = 768;
 static const UINT kSlotVertices = 4096;
-static const UINT kSlotIndices  = 16384;
+// Six per vertex, not a round number. A closed quad surface has about as many
+// quads as vertices -- each quad owns four, each vertex is shared by four --
+// so the index count tracks the vertex count at 6 per vertex, and a cap that
+// does not keep that ratio overflows on geometry the vertex cap was happy
+// with. Measured at 5.7 on the worst chunk of a flight, which wanted 19578
+// indices against the old 16384 and silently lost the rest. Four chunks of a
+// 15 s flight came out with holes in them.
+static const UINT kSlotIndices  = kSlotVertices * 6;   // 24576
 
 struct MeshVertex {
     float pos[3];
@@ -146,7 +153,12 @@ public:
     // two stale on purpose rather than waited on: a stall here would be a
     // stall in the very thing B3 is measuring.
     void record_counter_copy(ID3D12GraphicsCommandList* cmd);
-    void read_counts(UINT& vertices, UINT& indices, UINT& slots_overflowed);
+    // `peak_*` are the RAW counters, which the kernel keeps incrementing
+    // after it stops writing -- so they say what a chunk actually needed,
+    // not what it got. That is the number to size the slot from; without
+    // it an overflow only says "some geometry was dropped".
+    void read_counts(UINT& vertices, UINT& indices, UINT& slots_overflowed,
+                     UINT& peak_vertices, UINT& peak_indices);
     UINT slot_vertex_count(UINT slot);
     // The indirect arguments as the kernel actually wrote them. Debug only.
     void read_draw_args(UINT first, UINT count, std::vector<UINT>& out);
