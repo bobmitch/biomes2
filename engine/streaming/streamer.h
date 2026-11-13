@@ -20,9 +20,9 @@
 #define ENGINE_STREAMER_H
 
 #include "engine/meshing/chunk_mesher.h"
-#include "engine/field/trivial_field.h"
 #include "engine/svdag/brick_store.h"
 #include "engine/svdag/brick_pager.h"
+#include "engine/field/world_gpu.h"
 
 #include <algorithm>
 #include <cmath>
@@ -49,6 +49,14 @@ inline float lod_voxel(int lod) { return kVoxel0 * float(1 << lod); }
 // one voxel too far apart and the cracks would come back wider.
 inline float lod_chunk_size(int lod) { return lod_voxel(lod) * float(kChunkOwnedCells); }
 
+// A chunk that is resident but holds no slot. Most of the clipmap is like
+// this: measured over the real world, a LOD 0 column wants nine chunks and the
+// surface crosses one of them. The other eight mesh to nothing, and before
+// this they each held a slot of the pool -- 981 chunks wanted against 768,
+// with the near ground never reached because the air above and below it got
+// there first.
+static const UINT kNoSlot = 0xFFFFFFFFu;
+
 struct ChunkKey {
     int x, y, z, lod;
     bool operator==(const ChunkKey& o) const {
@@ -70,6 +78,13 @@ struct ChunkKeyHash {
 
 class Streamer {
 public:
+    // The band of heights any surface can occupy. The trivial field answered
+    // this with two literals; the real generator derives it from the continent
+    // scale and the biome amplitudes, so it is set from outside now.
+    void set_band(float lo, float hi) { band_lo_ = lo; band_hi_ = hi; }
+    // Per-column bounds, when there is a world to ask.
+    void set_bounds(const WorldGpu* w) { bounds_ = w; }
+
     void init() {
         free_slots_.clear();
         free_slots_.reserve(kSlots);
@@ -79,6 +94,7 @@ public:
         resident_.clear();
         queue_.clear();
         retire_.clear();
+        empty_resident_ = 0;
     }
 
     // Recompute what should be resident. Fills the queue with what is missing
@@ -86,8 +102,7 @@ public:
     void update(float cx, float cy, float cz) {
         desired_.clear();
 
-        float band_lo = 0.0f, band_hi = 0.0f;
-        trivial_band(band_lo, band_hi);
+        const float band_lo = band_lo_, band_hi = band_hi_;
 
         // Each level's world box, so the next level out can test containment.
         float fine_x0 = 0, fine_x1 = 0, fine_z0 = 0, fine_z1 = 0;
@@ -97,8 +112,6 @@ public:
             const float S = lod_chunk_size(lod);
             const int ci = int(std::floor(cx / S));
             const int ck = int(std::floor(cz / S));
-            const int j0 = int(std::floor(band_lo / S));
-            const int j1 = int(std::floor(band_hi / S));
 
             const float bx0 = float(ci - kRingHalf) * S;
             const float bx1 = float(ci + kRingHalf + 1) * S;
@@ -109,13 +122,27 @@ public:
 
             for (int k = ck - kRingHalf; k <= ck + kRingHalf; ++k) {
                 for (int i = ci - kRingHalf; i <= ci + kRingHalf; ++i) {
-                    for (int j = j0; j <= j1; ++j) {
+                    // The vertical range is per COLUMN, not global. Over the
+                    // real world a global band spans about 700 m, which is 44
+                    // chunks of air per column at LOD 0; the pool fills with
+                    // them and the ground is never reached. Asking layer 0
+                    // where the surface is here costs one fBm and usually
+                    // leaves two or three.
+                    float col_lo = band_lo, col_hi = band_hi;
+                    if (bounds_) {
+                        bounds_->column_band(float(i) * S, float(k) * S,
+                                             float(i + 1) * S, float(k + 1) * S,
+                                             col_lo, col_hi);
+                    }
+                    const int cj0 = int(std::floor(col_lo / S));
+                    const int cj1 = int(std::floor(col_hi / S));
+                    for (int j = cj0; j <= cj1; ++j) {
                         const float x0 = float(i) * S, x1 = x0 + S;
                         const float y0 = float(j) * S, y1 = y0 + S;
                         const float z0 = float(k) * S, z1 = z0 + S;
 
                         // No surface can pass through this chunk at all.
-                        if (y1 < band_lo || y0 > band_hi) continue;
+                        if (y1 < col_lo || y0 > col_hi) continue;
 
                         // Entirely covered by the finer level: it is drawn
                         // there, at higher detail, and drawing it here too
@@ -165,9 +192,11 @@ public:
         for (std::unordered_map<ChunkKey, UINT, ChunkKeyHash>::iterator it = resident_.begin();
              it != resident_.end();) {
             if (wanted_.find(it->first) == wanted_.end()) {
-                retire_.push_back(it->second);
                 retired_keys_.push_back(it->first);
-                free_slots_.push_back(it->second);
+                if (it->second != kNoSlot) {
+                    retire_.push_back(it->second);
+                    free_slots_.push_back(it->second);
+                }
                 it = resident_.erase(it);
             } else {
                 ++it;
@@ -219,13 +248,28 @@ public:
             const bool hit = !(hi[0] < x0 || lo[0] > x1 || hi[1] < y0 || lo[1] > y1 ||
                                hi[2] < z0 || lo[2] > z1);
             if (!hit) { ++it; continue; }
-            retire_.push_back(it->second);
             retired_keys_.push_back(it->first);
-            free_slots_.push_back(it->second);
+            if (it->second != kNoSlot) {
+                retire_.push_back(it->second);
+                free_slots_.push_back(it->second);
+            }
             it = resident_.erase(it);
             ++last_invalidated_;
         }
     }
+
+    // The chunk meshed to nothing, which the counter readback says two
+    // frames after the fact. Give the slot back but KEEP the key resident:
+    // dropping the key would have update() queue the chunk again next frame,
+    // and the pool would spend every frame re-meshing the same air.
+    void release_empty(const ChunkKey& k) {
+        std::unordered_map<ChunkKey, UINT, ChunkKeyHash>::iterator it = resident_.find(k);
+        if (it == resident_.end() || it->second == kNoSlot) return;
+        free_slots_.push_back(it->second);
+        it->second = kNoSlot;
+        ++empty_resident_;
+    }
+    size_t empty_resident() const { return empty_resident_; }
 
     // What the edit overlay needs to answer "which bricks does this chunk
     // read, and where are they in the pool".
@@ -354,7 +398,10 @@ private:
     std::vector<UINT>    free_slots_;
     std::vector<MeshedChunk> last_meshed_;
     std::vector<ChunkKey>    retired_keys_;
+    float band_lo_ = -13.0f, band_hi_ = 40.0f;
+    const WorldGpu* bounds_ = nullptr;
     size_t last_invalidated_ = 0;
+    size_t empty_resident_ = 0;
     struct Planned {
         ChunkKey key;
         UINT     slot;

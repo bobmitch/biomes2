@@ -13,6 +13,7 @@
 #include "engine/streaming/streamer.h"
 #include "engine/svdag/brick_store.h"
 #include "engine/svdag/brick_pager.h"
+#include "engine/field/world_gpu.h"
 
 #include <vector>
 
@@ -52,7 +53,9 @@ struct ViewConstants {
 // draws triangles built from it. Any other difference is a meshing bug, which
 // is why the raymarch survives rather than being deleted once there is a mesh.
 // The raymarch is not streamed -- it is the whole field, always.
-enum class Mode { Raymarch, Mesh, Overlay };
+// B1 had a third mode that raymarched the field directly. M1 retired it
+// with the trivial field it was the only remaining caller of.
+enum class Mode { Mesh, Wireframe };
 
 struct FrameStats {
     // Readback: how many height patches came back, how stale they were, and
@@ -74,6 +77,8 @@ struct FrameStats {
     unsigned long long brick_misses = 0;
     unsigned long long brick_upload_deferrals = 0;
     UINT   readback_latency_frames = 0;
+    size_t empty_resident = 0;
+    float  height_residual_voxel = 0.0f;
     float  height_residual_max = 0.0f;
     double height_residual_mean = 0.0;
     unsigned long long height_samples_checked = 0;
@@ -113,6 +118,19 @@ public:
     Mode mode() const { return mode_; }
 
     const FrameStats& stats() const { return stats_; }
+
+    const WorldGpu& world() const { return world_; }
+
+    // Mesh one chunk and compare its density grid against the CPU generator.
+    // Returns false only if the GPU work failed; disagreement is reported in
+    // the numbers, not as an error.
+    bool probe_field(const float origin[3], float voxel, const char* path,
+                     std::string& error);
+
+    // What residency costs: how tall the band is over each column, how much
+    // of that is terrain and how much is margin, and how many chunks that
+    // works out to. Reading only; it changes nothing.
+    void band_report(const char* path) const;
 
     // The edit overlay. Digging goes through here, and the renderer takes care
     // of uploading what changed and re-meshing what it touched.
@@ -165,7 +183,6 @@ private:
     bool create_swapchain(HWND hwnd, std::string& error);
     bool create_rtvs(std::string& error);
     bool create_depth(std::string& error);
-    bool create_pipeline(std::string& error);
     bool create_mesh_pipeline(std::string& error);
     void record_frame(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HANDLE rtv);
     void record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HANDLE rtv);
@@ -181,8 +198,6 @@ private:
     ComPtr<ID3D12Resource>            targets_[kFrameCount];
     ComPtr<ID3D12CommandAllocator>    allocators_[kFrameCount];
     ComPtr<ID3D12GraphicsCommandList> cmd_;
-    ComPtr<ID3D12RootSignature>       root_;
-    ComPtr<ID3D12PipelineState>       pso_;
 
     ComPtr<ID3D12DescriptorHeap>   dsv_heap_;
     ComPtr<ID3D12Resource>         depth_;
@@ -190,6 +205,7 @@ private:
     ComPtr<ID3D12PipelineState>    mesh_pso_, mesh_wire_pso_;
     ComPtr<ID3D12CommandSignature> cmd_sig_;
 
+    WorldGpu    world_;
     ChunkMesher mesher_;
     Streamer    streamer_;
     BrickStore  edits_;
@@ -215,6 +231,7 @@ private:
         UINT     count = 0;
         unsigned long long frame = 0;
         ChunkKey keys[kReadbackChunksPerFrame];
+        UINT     slot[kReadbackChunksPerFrame];
         float    origin[kReadbackChunksPerFrame][3];
         float    voxel[kReadbackChunksPerFrame];
     };

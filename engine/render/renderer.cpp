@@ -1,6 +1,5 @@
 #include "engine/render/renderer.h"
 #include "engine/render/shader_compile.h"
-#include "engine/field/trivial_field.h"
 
 #include <d3dcompiler.h>
 #include <cstdio>
@@ -14,7 +13,6 @@
 namespace engine {
 namespace {
 
-const char* kShaderPath = "engine/render/shaders/trivial_raymarch.hlsl";
 const char* kMeshShaderPath = "engine/render/shaders/mesh.hlsl";
 
 const float kNearPlane = 0.2f;
@@ -258,64 +256,6 @@ bool Renderer::create_depth(std::string& error) {
     return true;
 }
 
-bool Renderer::create_pipeline(std::string& error) {
-    if (!root_) {
-        D3D12_ROOT_PARAMETER param = {};
-        param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        param.Constants.ShaderRegister = 0;
-        param.Constants.Num32BitValues = sizeof(ViewConstants) / 4;
-
-        D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 1;
-        rsd.pParameters = &param;
-        rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-
-        ComPtr<ID3DBlob> sig, sig_err;
-        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1,
-                                                 &sig, &sig_err);
-        if (FAILED(hr)) {
-            error = "root signature: ";
-            error += sig_err ? static_cast<const char*>(sig_err->GetBufferPointer())
-                             : hr_text("D3D12SerializeRootSignature", hr).c_str();
-            return false;
-        }
-        hr = device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
-                                          IID_PPV_ARGS(&root_));
-        if (FAILED(hr)) { error = hr_text("CreateRootSignature", hr); return false; }
-    }
-
-    ComPtr<ID3DBlob> vs, ps;
-    if (!compile_shader(kShaderPath, "vs_main", "vs_5_1", vs, error)) return false;
-    if (!compile_shader(kShaderPath, "ps_main", "ps_5_1", ps, error)) return false;
-
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
-    pd.pRootSignature = root_.Get();
-    pd.VS.pShaderBytecode = vs->GetBufferPointer();
-    pd.VS.BytecodeLength  = vs->GetBufferSize();
-    pd.PS.pShaderBytecode = ps->GetBufferPointer();
-    pd.PS.BytecodeLength  = ps->GetBufferSize();
-    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pd.RasterizerState.DepthClipEnable = TRUE;
-    for (UINT i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
-        pd.BlendState.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    }
-    pd.DepthStencilState.DepthEnable = FALSE;
-    pd.SampleMask = UINT_MAX;
-    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-    pd.SampleDesc.Count = 1;
-
-    ComPtr<ID3D12PipelineState> pso;
-    const HRESULT hr = device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
-    if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState", hr); return false; }
-    pso_ = pso;
-    return true;
-}
-
 bool Renderer::create_mesh_pipeline(std::string& error) {
     if (!mesh_root_) {
         D3D12_ROOT_PARAMETER params[2] = {};
@@ -412,7 +352,6 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
 
 bool Renderer::reload_shaders(std::string& error) {
     if (ready_) wait_for_gpu();
-    if (!create_pipeline(error)) return false;
     if (!mesher_.reload_shaders(device_.Get(), error)) return false;
     if (!create_mesh_pipeline(error)) return false;
     // Everything resident was built by the old kernel, so start again.
@@ -443,7 +382,6 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     fence_event_ = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     if (!fence_event_) { error = "CreateEvent failed"; return false; }
 
-    if (!create_pipeline(error)) return false;
     if (!create_depth(error)) return false;
 
     UINT64 tsfreq = 0;
@@ -453,10 +391,21 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     streamer_.init();
     pager_.init(kMaxBricks);
 
-    // Every slot starts retired, so a slot that has never been meshed draws
-    // nothing instead of whatever the allocation happened to contain.
+    // M1: build the seed and upload it before anything is meshed. The world
+    // is static for the run, so this is the only place it happens.
     allocators_[frame_]->Reset();
     cmd_->Reset(allocators_[frame_].Get(), nullptr);
+    if (!world_.build(device_.Get(), cmd_.Get(), 0, error)) return false;
+    mesher_.set_world(&world_);
+    {
+        float lo = 0.0f, hi = 0.0f;
+        world_.band(lo, hi);
+        streamer_.set_band(lo, hi);
+        streamer_.set_bounds(&world_);
+    }
+
+    // Every slot starts retired, so a slot that has never been meshed draws
+    // nothing instead of whatever the allocation happened to contain.
     for (UINT s = 0; s < kSlots; ++s) mesher_.record_retire(cmd_.Get(), s);
     // Leave the pool in the states a frame BEGINS in. Every frame transitions
     // draw -> compute -> draw, so if init left the buffers in UNORDERED_ACCESS
@@ -469,6 +418,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     ID3D12CommandList* lists[] = {cmd_.Get()};
     queue_->ExecuteCommandLists(1, lists);
     wait_for_gpu();
+    world_.release_staging();
 
     ready_ = true;
     return true;
@@ -546,21 +496,15 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     ibv.SizeInBytes = kSlots * kSlotIndices * 4;
     ibv.Format = DXGI_FORMAT_R32_UINT;
 
-    if (mode_ == Mode::Raymarch || mode_ == Mode::Overlay) {
-        cmd_->SetPipelineState(pso_.Get());
-        cmd_->SetGraphicsRootSignature(root_.Get());
-        cmd_->SetGraphicsRoot32BitConstants(0, sizeof(ViewConstants) / 4, &view, 0);
-        cmd_->DrawInstanced(3, 1, 0, 0);
-    } else {
+    {
         // The mesh does not cover the screen, so the sky is cleared rather
-        // than drawn. Same colour the raymarch's horizon fades to, so the two
-        // images differ only where the geometry does.
+        // than drawn.
         const float sky[4] = {0.40f, 0.50f, 0.66f, 1.0f};
         cmd_->ClearRenderTargetView(rtv, sky, 0, nullptr);
     }
 
-    if (mode_ == Mode::Mesh || mode_ == Mode::Overlay) {
-        const bool wire = (mode_ == Mode::Overlay);
+    {
+        const bool wire = (mode_ == Mode::Wireframe);
         mc.wire = wire ? 1.0f : 0.0f;
         cmd_->SetPipelineState(wire ? mesh_wire_pso_.Get() : mesh_pso_.Get());
         cmd_->SetGraphicsRootSignature(mesh_root_.Get());
@@ -589,6 +533,7 @@ void Renderer::stage_heights() {
         const Streamer::MeshedChunk& m = meshed[i];
         const float S = lod_chunk_size(m.key.lod);
         slots[r.count] = m.slot;
+        r.slot[r.count] = m.slot;
         r.keys[r.count] = m.key;
         r.origin[r.count][0] = float(m.key.x) * S;
         r.origin[r.count][1] = float(m.key.y) * S;
@@ -618,6 +563,18 @@ void Renderer::consume_heights() {
     stats_.patches_this_frame = r.count;
     stats_.patches_total += r.count;
 
+    // A chunk that meshed to nothing gives its slot back. The counter the
+    // decision rests on was copied before this frame's work, so it is the
+    // count for THIS chunk and not a successor's: the slot cannot have been
+    // reused yet, because it is still recorded as this chunk's.
+    for (UINT p = 0; p < r.count; ++p) {
+        UINT v = 0, ix = 0;
+        mesher_.slot_counts(r.slot[p], v, ix);
+        // No retire needed: a slot with no vertices already has all-zero
+        // indirect arguments, and the command processor skips those.
+        if (v == 0 && ix == 0) streamer_.release_empty(r.keys[p]);
+    }
+
     // Every reported height should sit on the isosurface. Checked against the
     // C++ side of the dialect, the same tolerance comparison B2 used on the
     // mesh -- and the only thing that would catch a ring read one frame early,
@@ -633,9 +590,12 @@ void Renderer::consume_heights() {
                 if (y > 1.0e29f) continue;          // no surface in this column
                 const float x = r.origin[p][0] + float(i) * v;
                 const float z = r.origin[p][2] + float(k) * v;
-                const float d = trivial_density(x, y, z);
+                const float d = world_.density(x, y, z, v);
                 const float a = d < 0.0f ? -d : d;
-                if (a > stats_.height_residual_max) stats_.height_residual_max = a;
+                if (a > stats_.height_residual_max) {
+                    stats_.height_residual_max = a;
+                    stats_.height_residual_voxel = v;
+                }
                 sum += a;
                 ++n;
             }
@@ -865,6 +825,7 @@ void Renderer::render(const ViewConstants& view) {
     stats_.resident = streamer_.resident_count();
     stats_.pending = streamer_.pending_count();
     stats_.free_slots = streamer_.free_slot_count();
+    stats_.empty_resident = streamer_.empty_resident();
     ++frame_index_;
 }
 
@@ -915,6 +876,7 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
     stats_.resident = streamer_.resident_count();
     stats_.pending = streamer_.pending_count();
     stats_.free_slots = streamer_.free_slot_count();
+    stats_.empty_resident = streamer_.empty_resident();
 
     const D3D12_RESOURCE_DESC rd = targets_[frame_]->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
@@ -1019,7 +981,8 @@ bool Renderer::check_against_field(float& max_err, float& mean_err, UINT& checke
     if (!mesher_.read_vertices(0, n, verts)) return false;
     double sum = 0.0;
     for (size_t i = 0; i < verts.size(); ++i) {
-        const float d = trivial_density(verts[i].pos[0], verts[i].pos[1], verts[i].pos[2]);
+        const float d = world_.density(verts[i].pos[0], verts[i].pos[1],
+                                       verts[i].pos[2]);
         const float a = d < 0.0f ? -d : d;
         if (a > max_err) max_err = a;
         sum += a;
@@ -1078,12 +1041,203 @@ void Renderer::dump_draw_args(const char* path) {
     std::fclose(f);
 }
 
+void Renderer::band_report(const char* path) const {
+    FILE* f = std::fopen(path, "w");
+    if (!f) return;
+
+    std::fprintf(f, "Residency cost per column, and whether the band actually\n"
+                    "contains the surface. The band samples 5x5; this checks it\n"
+                    "against 17x17, at every level.\n\n");
+    std::fprintf(f, "%-5s %-9s %9s %9s %9s %9s\n",
+                 "LOD", "column", "band", "relief", "chunks", "worst miss");
+
+    double total_chunks = 0.0;
+    double worst_miss_any = -1.0e9;
+
+    for (int lod = 0; lod < kLodCount; ++lod) {
+        const float S = lod_chunk_size(lod);
+        double band_sum = 0.0, relief_sum = 0.0, chunk_sum = 0.0;
+        double worst_miss = -1.0e9;
+        int columns = 0;
+
+        // Seven columns a side is the ring this level actually keeps.
+        for (int cz = -kRingHalf; cz <= kRingHalf; ++cz) {
+            for (int cx = -kRingHalf; cx <= kRingHalf; ++cx) {
+                const float x0 = float(cx) * S, z0 = float(cz) * S;
+                const float x1 = x0 + S, z1 = z0 + S;
+
+                float lo = 0.0f, hi = 0.0f;
+                world_.column_band(x0, z0, x1, z1, lo, hi);
+
+                float tmn = 1.0e9f, tmx = -1.0e9f;
+                for (int j = 0; j <= 16; ++j) {
+                    for (int i = 0; i <= 16; ++i) {
+                        const float x = x0 + (x1 - x0) * float(i) / 16.0f;
+                        const float z = z0 + (z1 - z0) * float(j) / 16.0f;
+                        const float h = world_.height(x, z);
+                        if (h < tmn) tmn = h;
+                        if (h > tmx) tmx = h;
+                    }
+                }
+
+                // Positive means the true surface escaped the band -- the one
+                // failure that hides ground. Negative is spare room.
+                const double miss = double(tmn) - double(lo) < double(hi) - double(tmx)
+                                        ? double(lo) - double(tmn)
+                                        : double(tmx) - double(hi);
+                const double over = double(lo) - double(tmn) > double(tmx) - double(hi)
+                                        ? double(lo) - double(tmn)
+                                        : double(tmx) - double(hi);
+                (void)miss;
+                if (over > worst_miss) worst_miss = over;
+
+                band_sum += double(hi - lo);
+                relief_sum += double(tmx - tmn);
+                chunk_sum += double(int((hi - lo) / S) + 1);
+                ++columns;
+            }
+        }
+
+        std::fprintf(f, "%-5d %7.1f m %7.1f m %7.1f m %9.1f %8.2f m\n",
+                     lod, S, band_sum / columns, relief_sum / columns,
+                     chunk_sum / columns, worst_miss);
+        total_chunks += chunk_sum;
+        if (worst_miss > worst_miss_any) worst_miss_any = worst_miss;
+    }
+
+    std::fprintf(f, "\nchunks the whole clipmap wants: %.0f, against a pool of %u.\n"
+                    "Most of them hold no surface and give their slot straight\n"
+                    "back, so the pool is not what this number compares against\n"
+                    "-- a flight measures the slots actually held.\n",
+                 total_chunks, kSlots);
+    std::fprintf(f, "worst the surface escapes the band, over every level: %.2f m\n",
+                 worst_miss_any);
+    std::fprintf(f, "  (negative is spare room; positive is ground the band hides)\n");
+    std::fclose(f);
+}
+
+bool Renderer::probe_field(const float origin[3], float voxel, const char* path,
+                           std::string& error) {
+    if (!ready_) { error = "renderer not initialised"; return false; }
+
+    // Written BEFORE any GPU work: a hung device takes the process with it,
+    // and the numbers that caused the hang are the ones worth having.
+    {
+        const WorldConstants& c = world_.constants();
+        const worldgen::SeedWorld& sw = world_.world();
+        if (FILE* f = std::fopen(path, "w")) {
+            std::fprintf(f, "cells %d over %d x %d buckets of %.1f m\n",
+                         c.cell_count, c.cell_buckets, c.cell_buckets,
+                         c.cell_bucket_size);
+            std::fprintf(f, "biomes %d, radius %.1f, continent octaves %d\n",
+                         c.biome_count, c.radius, c.continent_octaves);
+            std::fprintf(f, "rivers: %d x %d bins of %.1f m\n",
+                         c.river_grid, c.river_grid, c.river_bin_size);
+            std::fprintf(f, "entrances: %d x %d bins of %.1f m\n",
+                         c.entrance_grid, c.entrance_grid, c.entrance_bin_size);
+            size_t worst = 0;
+            for (size_t i = 0; i < sw.lookup.buckets.size(); ++i)
+                if (sw.lookup.buckets[i].size() > worst)
+                    worst = sw.lookup.buckets[i].size();
+            std::fprintf(f, "fullest bucket holds %zu cells\n", worst);
+            int maxoct = 0;
+            for (size_t i = 0; i < world_.table().size(); ++i)
+                if (world_.table()[i].octaves > maxoct)
+                    maxoct = world_.table()[i].octaves;
+            std::fprintf(f, "largest biome octave count %d\n\n", maxoct);
+            std::fclose(f);
+        }
+    }
+
+    allocators_[frame_]->Reset();
+    cmd_->Reset(allocators_[frame_].Get(), nullptr);
+    mesher_.record_to_compute(cmd_.Get());
+    mesher_.begin_frame_bricks();
+    mesher_.record_mesh(cmd_.Get(), 0, origin, voxel, 0, 0);
+    mesher_.record_density_copy(cmd_.Get());
+    mesher_.record_counter_copy(cmd_.Get());
+    mesher_.record_to_draw(cmd_.Get());
+    cmd_->Close();
+    ID3D12CommandList* lists[] = {cmd_.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+    wait_for_gpu();
+
+    const float* gpu = mesher_.mapped_density();
+    if (!gpu) {
+        char buf[160];
+        std::snprintf(buf, sizeof buf,
+                      "could not map the density readback: Map 0x%08lx, "
+                      "device removed 0x%08lx",
+                      (unsigned long)mesher_.last_map_hr(),
+                      (unsigned long)device_->GetDeviceRemovedReason());
+        error = buf;
+        return false;
+    }
+
+    const worldgen::SeedWorld& w = world_.world();
+    const worldgen::WorldParams& wp = world_.params();
+    const worldgen::ArchetypeTable& tbl = world_.table();
+
+    double worst = 0.0, sum = 0.0;
+    int n = 0, gpu_rock = 0, gpu_air = 0, cpu_rock = 0, cpu_air = 0;
+    float gmin = 1e30f, gmax = -1e30f, cmin = 1e30f, cmax = -1e30f;
+    float worst_at[3] = {0.0f, 0.0f, 0.0f};
+    float worst_pair[2] = {0.0f, 0.0f};
+
+    for (UINT k = 0; k < kChunkCorners; k += 4) {
+        for (UINT j = 0; j < kChunkCorners; j += 4) {
+            for (UINT i = 0; i < kChunkCorners; i += 4) {
+                const float x = origin[0] + float(i) * voxel;
+                const float y = origin[1] + float(j) * voxel;
+                const float z = origin[2] + float(k) * voxel;
+                const float g = gpu[(k * kChunkCorners + j) * kChunkCorners + i];
+                const float c = worldgen::terrain_density(w, wp, tbl, x, y, z, voxel);
+                if (g > 0.0f) ++gpu_rock; else ++gpu_air;
+                if (c > 0.0f) ++cpu_rock; else ++cpu_air;
+                if (g < gmin) gmin = g;
+                if (g > gmax) gmax = g;
+                if (c < cmin) cmin = c;
+                if (c > cmax) cmax = c;
+                const double d = double(g) - double(c);
+                const double a = d < 0.0 ? -d : d;
+                if (a > worst) {
+                    worst = a;
+                    worst_at[0] = x; worst_at[1] = y; worst_at[2] = z;
+                    worst_pair[0] = g; worst_pair[1] = c;
+                }
+                sum += a;
+                ++n;
+            }
+        }
+    }
+    mesher_.unmap_density();
+
+    UINT verts = 0, inds = 0;
+    mesher_.slot_counts(0, verts, inds);
+
+    if (FILE* f = std::fopen(path, "a")) {
+        std::fprintf(f, "one chunk at (%.1f, %.1f, %.1f), voxel %.2f m\n\n",
+                     origin[0], origin[1], origin[2], voxel);
+        std::fprintf(f, "GPU density over %d sampled corners: %.3f .. %.3f"
+                        " (%d rock, %d air)\n", n, gmin, gmax, gpu_rock, gpu_air);
+        std::fprintf(f, "CPU density over the same corners:   %.3f .. %.3f"
+                        " (%d rock, %d air)\n", cmin, cmax, cpu_rock, cpu_air);
+        std::fprintf(f, "\nworst disagreement: %.6f at (%.1f, %.1f, %.1f)\n",
+                     worst, worst_at[0], worst_at[1], worst_at[2]);
+        std::fprintf(f, "  GPU said %.4f, CPU said %.4f\n", worst_pair[0], worst_pair[1]);
+        std::fprintf(f, "mean disagreement: %.6f\n", n ? sum / n : 0.0);
+        std::fprintf(f, "\nthe chunk meshed to %u vertices and %u indices\n", verts, inds);
+        std::fclose(f);
+    }
+    return true;
+}
+
 bool Renderer::save_edits(const char* path, std::string& error) const {
-    return edits_.save(path, kTrivialFieldId, error);
+    return edits_.save(path, world_.field_id(), error);
 }
 
 bool Renderer::load_edits(const char* path, std::string& error, bool& field_mismatch) {
-    if (!edits_.load(path, kTrivialFieldId, error, field_mismatch)) return false;
+    if (!edits_.load(path, world_.field_id(), error, field_mismatch)) return false;
     // Everything resident was meshed from terrain that has just changed, and
     // every lease points at pool contents that are now wrong.
     pager_.init(kMaxBricks);
