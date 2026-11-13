@@ -183,11 +183,41 @@ uint3 unit_axis(uint a) {
 // than from the sampled grid so the mesh's shading matches the raymarch it is
 // checked against.
 float3 field_normal(float3 p) {
-    const float e = 0.5f * voxel;
-    const float dx = real_terrain_density(p.x + e, p.y, p.z, voxel) - real_terrain_density(p.x - e, p.y, p.z, voxel);
-    const float dy = real_terrain_density(p.x, p.y + e, p.z, voxel) - real_terrain_density(p.x, p.y - e, p.z, voxel);
-    const float dz = real_terrain_density(p.x, p.y, p.z + e, voxel) - real_terrain_density(p.x, p.y, p.z - e, voxel);
-    return normalize(-float3(dx, dy, dz));
+    // The arm does NOT scale with the voxel. It used to, at half a voxel,
+    // which is 0.25 m at LOD 0 and 32 m at LOD 7 -- and a central difference
+    // with a 32 m arm is not a gradient, it is a difference between two
+    // unrelated pieces of terrain. Measured by --normal-check against the CPU
+    // gradient: 14.8 degrees of mean error at a 64 m voxel, worst 170, and
+    // 6.0% of normals pointing more than 90 degrees away from the surface's
+    // own. A face lit as though it pointed away from the sun is a black
+    // polygon in daylight, and that is exactly what the dark patches on
+    // distant terrain were -- not aliased overhangs, which is what they were
+    // confidently explained as first.
+    //
+    // The density function already fades octaves by `voxel`, so the field
+    // being sampled here is smooth at coarse levels. A short arm on a smooth
+    // field is the correct gradient; a long arm on it is still wrong.
+    const float e = min(0.5f * voxel, 0.25f);
+    float3 g = float3(
+        real_terrain_density(p.x + e, p.y, p.z, voxel) - real_terrain_density(p.x - e, p.y, p.z, voxel),
+        real_terrain_density(p.x, p.y + e, p.z, voxel) - real_terrain_density(p.x, p.y - e, p.z, voxel),
+        real_terrain_density(p.x, p.y, p.z + e, voxel) - real_terrain_density(p.x, p.y, p.z - e, voxel));
+
+    // Inside a fully carved cave, layer 6 pins the density at exactly
+    // -cave_carve, so over a short arm the field is CONSTANT and the gradient
+    // is exactly zero. normalize(0) is NaN, and a NaN normal shades to pure
+    // black -- the very thing the old long arm was being blamed for. The long
+    // arm never hit this because it reached out of the cave.
+    //
+    // Widening the arm where the short one finds nothing was the obvious
+    // answer and does not fit: field_normal already inlines six whole field
+    // evaluations, FXC inlines the lot, and twelve is
+    // "error X4505: Sum of temp registers ... exceeds limit of 4096".
+    // So: a fixed direction. It is arbitrary, but the surface normal in a
+    // saturated void is genuinely undefined, and "up" is deterministic, never
+    // NaN, and shades as lit ground rather than as a black hole.
+    if (dot(g, g) < 1e-12f) return float3(0.0f, 1.0f, 0.0f);
+    return normalize(-g);
 }
 
 // ---------------------------------------------------------------------------

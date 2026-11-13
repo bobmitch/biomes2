@@ -144,6 +144,12 @@ public:
     // works out to. Reading only; it changes nothing.
     void band_report(const char* path) const;
 
+    // Is the shading normal the surface's normal? field_normal takes a
+    // central difference with a half-voxel arm, which is 0.25 m at LOD 0 and
+    // 32 m at LOD 7. This meshes one chunk at each voxel size and compares
+    // every stored normal against the CPU gradient taken at a SMALL arm.
+    void normal_check(const char* path);
+
     // The edit overlay. Digging goes through here, and the renderer takes care
     // of uploading what changed and re-meshing what it touched.
     BrickStore& edits() { return edits_; }

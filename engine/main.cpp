@@ -512,6 +512,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (std::string(cmdline ? cmdline : "").find("--normal-check") != std::string::npos) {
+        g_renderer.normal_check("build/normal_check.txt");
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return 0;
+    }
+
     if (std::string(cmdline ? cmdline : "").find("--band-report") != std::string::npos) {
         g_renderer.band_report("build/band_report.txt");
         g_renderer.shutdown();

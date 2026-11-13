@@ -2,6 +2,7 @@
 #include "engine/render/shader_compile.h"
 
 #include <d3dcompiler.h>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -1468,6 +1469,117 @@ void Renderer::band_report(const char* path) const {
     std::fprintf(f, "worst the surface escapes the band, over every level: %.2f m\n",
                  worst_miss_any);
     std::fprintf(f, "  (negative is spare room; positive is ground the band hides)\n");
+    std::fclose(f);
+}
+
+namespace {
+
+// -grad, normalised. The sign is the one invariant 2's note is about: density
+// grows into the rock, so the outward normal is MINUS the gradient.
+void cpu_normal(const WorldGpu& w, float x, float y, float z, float voxel,
+                float arm, float out[3]) {
+    const float dx = w.density(x + arm, y, z, voxel) - w.density(x - arm, y, z, voxel);
+    const float dy = w.density(x, y + arm, z, voxel) - w.density(x, y - arm, z, voxel);
+    const float dz = w.density(x, y, z + arm, voxel) - w.density(x, y, z - arm, voxel);
+    const double len = std::sqrt(double(dx) * dx + double(dy) * dy + double(dz) * dz);
+    if (len < 1e-20) { out[0] = 0.0f; out[1] = 1.0f; out[2] = 0.0f; return; }
+    out[0] = float(-dx / len);
+    out[1] = float(-dy / len);
+    out[2] = float(-dz / len);
+}
+
+double angle_between(const float a[3], const float b[3]) {
+    double d = double(a[0]) * b[0] + double(a[1]) * b[1] + double(a[2]) * b[2];
+    if (d > 1.0) d = 1.0;
+    if (d < -1.0) d = -1.0;
+    // acos is fine here: this is a metric, downstream of the golden hash on
+    // the tools side of invariant 9's line.
+    return std::acos(d) * 57.29577951308232;
+}
+
+}  // namespace
+
+void Renderer::normal_check(const char* path) {
+    if (!ready_) return;
+    FILE* f = std::fopen(path, "w");
+    if (!f) return;
+
+    std::fprintf(f, "field_normal takes a central difference with a half-voxel\n");
+    std::fprintf(f, "arm. This compares every stored normal against the CPU\n");
+    std::fprintf(f, "gradient at a 0.25 m arm -- the surface's actual normal --\n");
+    std::fprintf(f, "and, as a control, against the CPU at the SAME arm the\n");
+    std::fprintf(f, "shader used. A large first column with a small second one\n");
+    std::fprintf(f, "means the formula is wrong, not the GPU.\n\n");
+    std::fprintf(f, "%-8s %7s %9s %9s %9s %9s\n", "voxel", "verts",
+                 "mean err", "worst", "facing away", "vs control");
+
+    static const float kVoxels[] = {0.5f, 2.0f, 8.0f, 32.0f, 64.0f};
+    const float surface = world_.height(0.0f, 0.0f);
+
+    for (int vi = 0; vi < 5; ++vi) {
+        const float voxel = kVoxels[vi];
+        const float span = voxel * float(kChunkCells);
+        const float origin[3] = {-span * 0.5f, surface - span * 0.5f, -span * 0.5f};
+
+        allocators_[frame_]->Reset();
+        cmd_->Reset(allocators_[frame_].Get(), nullptr);
+        mesher_.record_to_compute(cmd_.Get());
+        mesher_.begin_frame_bricks();
+        mesher_.record_mesh(cmd_.Get(), 0, origin, voxel, 0, 0);
+        mesher_.record_counter_copy(cmd_.Get());
+        mesher_.record_vertex_copy(cmd_.Get());
+        mesher_.record_to_draw(cmd_.Get());
+        cmd_->Close();
+        ID3D12CommandList* ls[] = {cmd_.Get()};
+        queue_->ExecuteCommandLists(1, ls);
+        wait_for_gpu();
+
+        UINT nv = 0, ni = 0;
+        mesher_.slot_counts(0, nv, ni);
+        std::vector<MeshVertex> verts;
+        if (!mesher_.read_vertices(0, nv, verts) || verts.empty()) {
+            std::fprintf(f, "%-8.1f %7s  (no surface in this chunk)\n", voxel, "-");
+            continue;
+        }
+
+        double sum = 0.0, worst = 0.0, ctl_worst = 0.0;
+        int away = 0, counted = 0;
+        float worst_at[3] = {0.0f, 0.0f, 0.0f};
+        for (size_t i = 0; i < verts.size(); i += 3) {
+            const MeshVertex& v = verts[i];
+            // The lip is pushed off the isosurface on purpose and its normal
+            // is whatever the field says where it landed.
+            if (is_lip_vertex(v.pos, origin, voxel)) continue;
+
+            float truth[3], control[3];
+            cpu_normal(world_, v.pos[0], v.pos[1], v.pos[2], voxel, 0.25f, truth);
+            cpu_normal(world_, v.pos[0], v.pos[1], v.pos[2], voxel, 0.5f * voxel, control);
+
+            const double err = angle_between(v.nrm, truth);
+            const double ctl = angle_between(v.nrm, control);
+            if (err > 90.0) ++away;
+            if (err > worst) {
+                worst = err;
+                worst_at[0] = v.pos[0]; worst_at[1] = v.pos[1]; worst_at[2] = v.pos[2];
+            }
+            if (ctl > ctl_worst) ctl_worst = ctl;
+            sum += err;
+            ++counted;
+        }
+        if (counted == 0) { std::fprintf(f, "%-8.1f (all lip)\n", voxel); continue; }
+
+        std::fprintf(f, "%-8.1f %7d %7.1f deg %6.1f deg %7.1f%% %6.1f deg\n",
+                     voxel, counted, sum / counted, worst,
+                     100.0 * double(away) / double(counted), ctl_worst);
+        if (vi == 4) {
+            std::fprintf(f, "\n  worst at (%.0f, %.0f, %.0f)\n",
+                         worst_at[0], worst_at[1], worst_at[2]);
+        }
+    }
+
+    std::fprintf(f, "\n'facing away' is the share of normals more than 90 deg\n");
+    std::fprintf(f, "from the surface's own -- lit as though the surface faced\n");
+    std::fprintf(f, "the other way, which is what a black polygon in daylight is.\n");
     std::fclose(f);
 }
 
