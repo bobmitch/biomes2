@@ -45,6 +45,13 @@ using Microsoft::WRL::ComPtr;
 // cells with nothing spare, so the apron the doc mentions was never actually
 // paid for.
 static const UINT kChunkOwnedCells = 32;
+
+// How far the skirt lip drops the outermost ring of cells, in voxels. It is
+// plumbed to the kernel through ChunkConstants rather than written twice,
+// because the C++ side has to be able to UNDO it exactly: the same vertices
+// go to the renderer, which wants the lip, and to Jolt, which must not have
+// it. Two literals that have to agree is how that goes wrong quietly.
+static const float kSkirtVoxels = 2.0f;
 static const UINT kChunkCells      = 33;
 static const UINT kChunkCorners    = 34;
 

@@ -43,7 +43,7 @@ cbuffer ChunkConstants : register(b0) {
     uint   slot_caps;      // vertex cap in the low 16 bits, index cap in the high
     uint   brick_first;    // this chunk's run in the brick header array
     uint   brick_count;
-    uint   pad0;
+    float  skirt;          // how many voxels the lip drops, from the C++ side
     uint   pad1;
 };
 
@@ -279,7 +279,7 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
     // the coarser level. The lip sits on the ghost ring, which is the cell the
     // neighbour starts at, so the neighbour's own surface covers it.
     if (id.x == 0u || id.x == kCells - 1u || id.z == 0u || id.z == kCells - 1u) {
-        world.y -= voxel * 2.0f;
+        world.y -= voxel * skirt;
     }
 
     uint local_slot;

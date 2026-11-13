@@ -165,10 +165,24 @@ run it with `Start-Process -Wait` or the file you read will be the last run's.
   ground shot from 71 cracks to 569. The fix is a lip in `cs_vertices`: the
   outermost ring of cells drops two voxels, so neighbouring chunks overlap
   vertically. Measured 0 sky pixels below the horizon afterwards.
-  **Any check that measures a vertex against the field must skip the lip** —
-  `is_lip_vertex` in `streamer.h`. It is off the isosurface by construction,
-  and counting it took slot 0's worst residual from 0.60 m to 1.33 m, which
-  would have masked any real disagreement up to a metre.
+  **The lip is wrong for everything except drawing, and `g_vertices` is read
+  by more than the draw.** `is_lip_vertex` in `streamer.h` finds it and
+  `kSkirtVoxels` is the depth, plumbed to the kernel through `ChunkConstants`
+  so the CPU can undo it exactly rather than keep a second literal.
+  Two consumers, and the first version of this only handled one:
+  - checks that measure a vertex against the field must SKIP it — counting it
+    took slot 0's worst residual from 0.60 m to 1.33 m, masking any real
+    disagreement up to a metre;
+  - the collision mesh handed to Jolt must UNDO it — a character standing
+    where a chunk edge fell stood two voxels low, which read as 0.53 m of
+    non-determinism in `--dig-verify` and was diagnosed as the edits failing
+    to persist. They were persisting the whole time.
+
+  `cs_heights` reads the density grid rather than these vertices, so the
+  HeightFieldShape path was never affected — which is why it looked
+  intermittent, appearing only on the 16–27% of chunks that need a MeshShape.
+  "It is below the surface, so it cannot matter" was the reasoning that let it
+  through, and it was never measured.
 - **A gradient arm must not scale with the voxel.** `field_normal` took a
   central difference at half a voxel, which is 0.25 m at LOD 0 and 32 m at
   LOD 7 — a difference between two unrelated pieces of terrain, not a

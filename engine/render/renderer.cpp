@@ -931,11 +931,39 @@ void Renderer::consume_meshes() {
 
         MeshPatchEvent e;
         e.key = m.keys[p];
+
+        // Undo the skirt lip on the way to Jolt. These vertices are two
+        // voxels below the isosurface ON PURPOSE, to cover the crack between
+        // LOD levels -- and the buffer the renderer draws from is the same
+        // buffer the collision mesh is built from, so a character standing
+        // where a chunk edge happens to fall stood two voxels low.
+        //
+        // That cost 0.53 m of apparent non-determinism in --dig-verify,
+        // because WHICH edges are underfoot differs between a chunk that was
+        // meshed and then invalidated by an edit and one meshed fresh. It was
+        // read as the edits failing to persist. They were persisting the
+        // whole time.
+        //
+        // Undone rather than dropped: the offset is exact and known, so
+        // adding it back restores the surface the mesher actually found,
+        // where discarding the ring would leave the collision mesh with a
+        // gap at every chunk edge.
+        //
+        // cs_heights reads the density grid rather than these vertices, so
+        // the HeightFieldShape path was never affected -- which is why this
+        // only ever showed on the 16-27% of chunks that need a MeshShape.
+        const float mS = lod_chunk_size(e.key.lod);
+        const float morigin[3] = {float(e.key.x) * mS, float(e.key.y) * mS,
+                                  float(e.key.z) * mS};
+        const float mvoxel = lod_voxel(e.key.lod);
         e.verts.resize(size_t(nv) * 3);
         for (UINT i = 0; i < nv; ++i) {
             e.verts[size_t(i) * 3 + 0] = mv[i].pos[0];
             e.verts[size_t(i) * 3 + 1] = mv[i].pos[1];
             e.verts[size_t(i) * 3 + 2] = mv[i].pos[2];
+            if (is_lip_vertex(mv[i].pos, morigin, mvoxel)) {
+                e.verts[size_t(i) * 3 + 1] += mvoxel * kSkirtVoxels;
+            }
         }
         // Pool indices are absolute so the draw needs no rebasing; a shape
         // built from this chunk's vertices alone does.

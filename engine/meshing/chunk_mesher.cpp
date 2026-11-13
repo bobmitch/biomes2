@@ -82,7 +82,7 @@ struct ChunkConstants {
     UINT  slot_caps;
     UINT  brick_first;
     UINT  brick_count;
-    UINT  pad0;
+    float skirt;          // kSkirtVoxels, so the kernel and the CPU agree
     UINT  pad1;
 };
 
@@ -354,6 +354,7 @@ void ChunkMesher::record_mesh(ID3D12GraphicsCommandList* cmd, UINT slot,
     c.slot_caps = (kSlotVertices & 0xFFFFu) | ((kSlotIndices & 0xFFFFu) << 16);
     c.brick_first = brick_first;
     c.brick_count = brick_count;
+    c.skirt = kSkirtVoxels;
 
     bind_pool(cmd, root_.Get(), c, density_.Get(), cell_vertex_.Get(),
               vertices_.Get(), indices_.Get(), counters_.Get(), draw_args_.Get(),
