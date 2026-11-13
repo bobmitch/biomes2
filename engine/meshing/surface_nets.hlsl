@@ -16,7 +16,10 @@
 // preserve, so the solve would cost without buying anything.
 // ---------------------------------------------------------------------------
 
-#include "engine/field/trivial_field.h"
+// M1: the real generator. The field function arrives through the ADR-001
+// dialect unmodified; real_field.hlsl is the caller's side of the line --
+// the spatial indices, which are written per backend.
+#include "engine/field/real_field.hlsl"
 
 // A chunk OWNS 32 cells; neighbouring chunk origins are 32 voxels apart. It
 // MESHES 33, one ghost layer on the high side, because the quad joining its
@@ -155,7 +158,7 @@ void cs_density(uint3 id : SV_DispatchThreadID) {
     // answers and nothing was stored at all.
     float e = 0.0f;
     g_density[corner_index(id)] =
-        edited_density(p, e) ? e : trivial_density(p.x, p.y, p.z);
+        edited_density(p, e) ? e : real_terrain_density(p.x, p.y, p.z, voxel);
 }
 
 // The 12 edges of a cell, as pairs of corner indices. Corner bit 0 is x,
@@ -181,9 +184,9 @@ uint3 unit_axis(uint a) {
 // checked against.
 float3 field_normal(float3 p) {
     const float e = 0.5f * voxel;
-    const float dx = trivial_density(p.x + e, p.y, p.z) - trivial_density(p.x - e, p.y, p.z);
-    const float dy = trivial_density(p.x, p.y + e, p.z) - trivial_density(p.x, p.y - e, p.z);
-    const float dz = trivial_density(p.x, p.y, p.z + e) - trivial_density(p.x, p.y, p.z - e);
+    const float dx = real_terrain_density(p.x + e, p.y, p.z, voxel) - real_terrain_density(p.x - e, p.y, p.z, voxel);
+    const float dy = real_terrain_density(p.x, p.y + e, p.z, voxel) - real_terrain_density(p.x, p.y - e, p.z, voxel);
+    const float dz = real_terrain_density(p.x, p.y, p.z + e, voxel) - real_terrain_density(p.x, p.y, p.z - e, voxel);
     return normalize(-float3(dx, dy, dz));
 }
 

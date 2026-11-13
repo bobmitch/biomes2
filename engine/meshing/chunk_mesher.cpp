@@ -117,7 +117,7 @@ bool ChunkMesher::init(ID3D12Device* device, UINT64 timestamp_freq, std::string&
 
     // One root parameter for the chunk constants and six root UAVs. No
     // descriptor heap: root descriptors are enough for plain buffers.
-    D3D12_ROOT_PARAMETER params[12] = {};
+    D3D12_ROOT_PARAMETER params[23] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
     params[0].Constants.Num32BitValues = sizeof(ChunkConstants) / 4;
@@ -125,9 +125,17 @@ bool ChunkMesher::init(ID3D12Device* device, UINT64 timestamp_freq, std::string&
         params[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
         params[1 + i].Descriptor.ShaderRegister = i;
     }
+    // The seed's world: one constant buffer of scalars and ten buffers of
+    // cells, archetypes, rivers and entrance shafts with their indices.
+    params[12].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[12].Descriptor.ShaderRegister = 1;
+    for (UINT i = 0; i < 10; ++i) {
+        params[13 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[13 + i].Descriptor.ShaderRegister = 11 + i;
+    }
 
     D3D12_ROOT_SIGNATURE_DESC rsd = {};
-    rsd.NumParameters = 12;
+    rsd.NumParameters = 23;
     rsd.pParameters = params;
 
     ComPtr<ID3DBlob> sig, sig_err;
@@ -166,6 +174,8 @@ bool ChunkMesher::init(ID3D12Device* device, UINT64 timestamp_freq, std::string&
                        vertex_readback_, error, "vertex readback")) return false;
     if (!make_readback(device, UINT64(kSlots) * 5 * 4, args_readback_, error,
                        "args readback")) return false;
+    if (!make_readback(device, UINT64(kChunkCorners) * kChunkCorners * kChunkCorners * 4,
+                       density_readback_, error, "density readback")) return false;
 
     if (!make_buffer(device, UINT64(kSlots) * kHeightSamples * 4, ua, heights_, error,
                      "height pool")) return false;
@@ -267,6 +277,21 @@ void bind_pool(ID3D12GraphicsCommandList* cmd, ID3D12RootSignature* root,
     cmd->SetComputeRootUnorderedAccessView(10, bden->GetGPUVirtualAddress());
     cmd->SetComputeRootUnorderedAccessView(11, bmask->GetGPUVirtualAddress());
 }
+
+void bind_world(ID3D12GraphicsCommandList* cmd, const WorldGpu* w) {
+    if (!w) return;
+    cmd->SetComputeRootConstantBufferView(12, w->world_cb()->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(13, w->cells()->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(14, w->cell_offsets()->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(15, w->cell_items()->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(16, w->archetypes()->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(17, w->rivers()->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(18, w->river_offsets()->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(19, w->river_items()->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(20, w->entrances()->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(21, w->entrance_offsets()->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(22, w->entrance_items()->GetGPUVirtualAddress());
+}
 }  // namespace
 
 void ChunkMesher::begin_frame_bricks() {
@@ -334,6 +359,7 @@ void ChunkMesher::record_mesh(ID3D12GraphicsCommandList* cmd, UINT slot,
               vertices_.Get(), indices_.Get(), counters_.Get(), draw_args_.Get(),
               heights_.Get(), chunk_flags_.Get(), brick_hdr_.Get(),
               brick_den_.Get(), brick_mask_.Get());
+    bind_world(cmd, world_);
 
     cmd->SetPipelineState(pso_clear_.Get());
     cmd->Dispatch(1, 1, 1);
@@ -376,6 +402,7 @@ void ChunkMesher::record_retire(ID3D12GraphicsCommandList* cmd, UINT slot) {
               vertices_.Get(), indices_.Get(), counters_.Get(), draw_args_.Get(),
               heights_.Get(), chunk_flags_.Get(), brick_hdr_.Get(),
               brick_den_.Get(), brick_mask_.Get());
+    bind_world(cmd, world_);
     cmd->SetPipelineState(pso_retire_.Get());
     cmd->Dispatch(1, 1, 1);
     uav_barrier(cmd, draw_args_.Get(), nullptr);
@@ -584,6 +611,29 @@ void ChunkMesher::unmap_heights(UINT ring) {
     if (ring >= kReadbackRing) return;
     D3D12_RANGE none = {0, 0};
     height_readback_[ring]->Unmap(0, &none);
+}
+
+void ChunkMesher::record_density_copy(ID3D12GraphicsCommandList* cmd) {
+    const UINT64 bytes = UINT64(kChunkCorners) * kChunkCorners * kChunkCorners * 4;
+    transition(cmd, density_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmd->CopyBufferRegion(density_readback_.Get(), 0, density_.Get(), 0, bytes);
+    transition(cmd, density_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+const float* ChunkMesher::mapped_density() {
+    void* p = nullptr;
+    D3D12_RANGE r = {0, SIZE_T(kChunkCorners) * kChunkCorners * kChunkCorners * 4};
+    const HRESULT hr = density_readback_ ? density_readback_->Map(0, &r, &p)
+                                         : E_POINTER;
+    if (FAILED(hr)) { last_map_hr_ = hr; return nullptr; }
+    return static_cast<const float*>(p);
+}
+
+void ChunkMesher::unmap_density() {
+    D3D12_RANGE none = {0, 0};
+    density_readback_->Unmap(0, &none);
 }
 
 void ChunkMesher::record_timestamp(ID3D12GraphicsCommandList* cmd, UINT which) {

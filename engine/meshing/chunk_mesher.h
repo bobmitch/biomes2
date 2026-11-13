@@ -22,6 +22,8 @@
 #ifndef ENGINE_CHUNK_MESHER_H
 #define ENGINE_CHUNK_MESHER_H
 
+#include "engine/field/world_gpu.h"
+
 #include <windows.h>
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -107,6 +109,10 @@ public:
     // timestamp_freq comes from the command queue the work will run on: ticks
     // are per-queue, so there is no device-wide answer to ask for.
     bool init(ID3D12Device* device, UINT64 timestamp_freq, std::string& error);
+
+    // The seed whose world the kernel evaluates. Static for the run: a
+    // different seed is a different world, not a different frame.
+    void set_world(const WorldGpu* w) { world_ = w; }
     bool reload_shaders(ID3D12Device* device, std::string& error);
 
     // Mesh one chunk into one slot. The scratch buffers are shared, so these
@@ -182,12 +188,22 @@ public:
     ID3D12Resource* indices()   const { return indices_.Get(); }
     ID3D12Resource* draw_args() const { return draw_args_.Get(); }
 
+    // The scratch density grid of the chunk meshed last. Only for the
+    // CPU-to-GPU tolerance check -- ADR-001 says agreement between the two is
+    // compared within a tolerance and never by hash, and this is where that
+    // comparison gets its numbers.
+    void record_density_copy(ID3D12GraphicsCommandList* cmd);
+    const float* mapped_density();
+    long         last_map_hr() const { return last_map_hr_; }
+    void         unmap_density();
+
     void   record_timestamp(ID3D12GraphicsCommandList* cmd, UINT which);
     void   resolve_timestamps(ID3D12GraphicsCommandList* cmd);
     void   read_timestamps();
     double last_mesh_ms() const { return last_mesh_ms_; }
 
 private:
+    long   last_map_hr_ = 0;
     ComPtr<ID3D12RootSignature> root_;
     ComPtr<ID3D12PipelineState> pso_clear_, pso_density_, pso_vertices_,
                                 pso_quads_, pso_args_, pso_retire_, pso_heights_;
@@ -195,6 +211,7 @@ private:
     ComPtr<ID3D12Resource> density_, cell_vertex_, vertices_, indices_;
     ComPtr<ID3D12Resource> counters_, draw_args_;
     ComPtr<ID3D12Resource> counter_readback_, vertex_readback_, args_readback_;
+    ComPtr<ID3D12Resource> density_readback_;
     ComPtr<ID3D12Resource> heights_, chunk_flags_;
     ComPtr<ID3D12Resource> height_readback_[kReadbackRing];
     ComPtr<ID3D12Resource> flag_readback_[kReadbackRing];
@@ -205,6 +222,7 @@ private:
     UINT  brick_hdr_cursor_ = 0;
     UINT  brick_uploads_ = 0;
 
+    const WorldGpu* world_ = nullptr;
     ComPtr<ID3D12QueryHeap> timestamps_;
     ComPtr<ID3D12Resource>  timestamp_readback_;
     UINT64                  timestamp_freq_ = 0;

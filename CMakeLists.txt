@@ -103,9 +103,13 @@ if(WIN32 AND EXISTS ${PROJECT_SOURCE_DIR}/engine/main.cpp)
     engine/meshing/chunk_mesher.cpp
     engine/physics/physics_world.cpp
     engine/svdag/brick_store.cpp
-    engine/svdag/brick_pager.cpp)
+    engine/svdag/brick_pager.cpp
+    engine/field/world_gpu.cpp)
   target_include_directories(engine PRIVATE ${PROJECT_SOURCE_DIR})
-  target_link_libraries(engine PRIVATE d3d12 dxgi d3dcompiler Jolt)
+  # M1: the engine links the generator now. Track B was built against the
+  # trivial field precisely so a pipeline bug could never be confused with a
+  # worldgen bug; that separation ends here, which is what the milestone is.
+  target_link_libraries(engine PRIVATE d3d12 dxgi d3dcompiler Jolt worldgen)
   if(MSVC)
     target_compile_options(engine PRIVATE /W3 /D_CRT_SECURE_NO_WARNINGS)
   endif()
