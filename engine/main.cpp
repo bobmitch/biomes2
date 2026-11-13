@@ -399,9 +399,25 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                               nullptr, nullptr, inst, nullptr);
     if (!hwnd) return 1;
 
+    // Every batch mode, not just --shot. The narrow version of this check
+    // covered --shot only and --dig-save hung on a message box the very next
+    // time a shader failed to compile -- ten minutes of nothing, with the real
+    // error already written to build/engine_error.txt. A mode that was asked
+    // to run without a human is headless whatever it is called.
+    const bool headless = !shot_path.empty() || flight_seconds > 0.0 ||
+                          walk_seconds > 0.0 || overhang_seconds > 0.0 ||
+                          dig_seconds > 0.0 || mode_dig_save || mode_dig_verify ||
+                          mode_dig_stress || sea_shot;
+
     std::string error;
     if (!g_physics.init(error)) {
-        MessageBoxA(hwnd, error.c_str(), "Physics init failed", MB_OK | MB_ICONERROR);
+        if (FILE* ef = std::fopen("build/engine_error.txt", "w")) {
+            std::fprintf(ef, "physics init failed:\n%s\n", error.c_str());
+            std::fclose(ef);
+        }
+        if (!headless) {
+            MessageBoxA(hwnd, error.c_str(), "Physics init failed", MB_OK | MB_ICONERROR);
+        }
         return 1;
     }
     if (!g_renderer.init(hwnd, error, debug_layer)) {
@@ -411,12 +427,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(ef, "renderer init failed:\n%s\n", error.c_str());
             std::fclose(ef);
         }
-        // Never a modal box in a headless run. A water root signature that
-        // was two DWORDs over the limit put this dialog up behind everything
-        // and a `--shot` that should have failed in seconds sat there for ten
-        // minutes instead, with the real error already written to the file
-        // above. A box nobody can see is not an error report.
-        if (shot_path.empty()) {
+        // Never a modal box in a headless run. A box nobody can see is not an
+        // error report, it is a hang.
+        if (!headless) {
             MessageBoxA(hwnd, error.c_str(), "Renderer init failed", MB_OK | MB_ICONERROR);
         }
         return 1;
