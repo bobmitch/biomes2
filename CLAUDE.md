@@ -326,6 +326,14 @@ coast, which is the only vantage a 7 m swell reads as a swell from),
 The water asks the SHARED FIELD FUNCTION how deep it is, so the shoreline is
 the real one at every LOD. That is M1 paying off somewhere other than terrain.
 
+**The sea is DRAW-TIME ONLY.** `physics_world` and `streamer.h` contain no
+reference to it — checked, not assumed. A character walks into the sea and
+keeps walking along the seabed; there is no buoyancy, no swimming and no
+waterline. Residency is deliberately untouched by it, which is also what keeps
+`--band-report`'s "worst miss" honest: that check compares the band against
+`worldgen::terrain_height`, and a water surface influencing residency would
+silently make it a check on something else.
+
 `--overhang` no longer has a landmark to aim at: it searches for a real
 ceiling and reports what it found. Near spawn the layer-6 overhangs are
 spikes — 4.75 m thick and under 0.5 m wide — so a launched capsule rises
