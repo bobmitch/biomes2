@@ -3,9 +3,19 @@ name: validate
 # Path-filtered, as the design doc asks: a change to the generator runs the
 # 200-seed gate, and a change to tools/mapview does not.
 #
-# engine/** belongs in this filter too once it exists, with its own job for the
-# C++ build and tests. It is listed here already so the first engine commit
-# does not silently land untested.
+# Two jobs, because they answer different questions and must be able to fail
+# independently. `gate` is the determinism authority and never checks out the
+# Jolt submodule -- it does not link the engine, and keeping it that way is
+# what makes it cheap and what makes a submodule outage unable to touch it.
+# `engine` compiles Track B, which needs the submodule and only exists on
+# Windows.
+#
+# That separation is not theoretical. The commit that added Jolt made
+# CMakeLists fail to CONFIGURE without the submodule, and since
+# actions/checkout does not fetch submodules by default, the windows-latest
+# half of `gate` died for nine commits while the Linux half stayed green. The
+# two-OS matrix is the only thing that catches the libm divergence invariant 9
+# exists for, so half of it being gone was not a cosmetic failure.
 
 on:
   push:
@@ -48,7 +58,11 @@ jobs:
       - name: Configure
         run: cmake -S . -B build/cmake -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build
+      # M2: the golden gate is part of this step, not a separate one. Eight
+      # seeds, under a second, and a non-zero exit fails the build -- so a
+      # commit that moves the world without bumping kGeneratorVersion cannot
+      # reach the 200-seed run below, let alone main.
+      - name: Build (runs the golden gate)
         run: cmake --build build/cmake --config Release
 
       - name: Validate 200 seeds
@@ -71,3 +85,20 @@ jobs:
             build/contact_sheet.bmp
             build/relief.bmp
           if-no-files-found: warn
+
+  # Track B. Compile only: the runners have no GPU, so nothing here can run
+  # the engine -- but nothing was checking that engine/ even builds anywhere
+  # except one developer's machine, which is the same hole the gate above was
+  # just dug out of.
+  engine:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -S . -B build/cmake -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build/cmake --config Release

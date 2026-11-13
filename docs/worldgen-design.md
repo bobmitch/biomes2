@@ -502,6 +502,8 @@ Pin a handful of seeds and store the hash of their sample grid as a checked-in g
 
 This doubles as the generator-version mechanism from earlier: the gate is "golden hashes changed, so either revert or bump `generator_version`". It makes the version bump impossible to forget, which is the only way that discipline survives contact with a year of tuning.
 
+**Built at M2, and the shape it had to take is worth recording.** "Impossible to forget" needs two things that the first version of this had neither of. First, the check has to be part of `cmake --build`, because a check you run by hand is one you skip on exactly the commit that needed it. Second — and this is the part the design did not anticipate — the version and the hashes have to live in *different* files. With both in `golden.json` there is no way to distinguish "the author bumped the version deliberately" from "the author re-pinned a world that drifted", because re-pinning rewrites both at once. So `kGeneratorVersion` moved into `worldgen/generator_version.h`, `golden.json` records the version its hashes were measured at, and `--bless` refuses to write moved hashes back under an unchanged version. Without that refusal the gate is a speed bump: the whole mechanism rests on there being no one-command way to make it green.
+
 ### The contact sheet
 
 Automated checks cannot tell you whether a world is *interesting*. Have CI emit a single PNG contact sheet of 64 seeds rendered as biome maps, attached as a build artifact.
@@ -542,7 +544,7 @@ No dates here; velocity is unknown. The ordering and the exit criteria are the c
 | # | Milestone | Exit criterion |
 | --- | --- | --- |
 | M1 | Compile the dialect field function as HLSL; swap out the trivial field | Walking the real generated world in the engine — **done**: 120 m walked, feet 3.4 mm from the field on average, CPU and GPU density agreeing to 6 µm |
-| M2 | Golden seeds and version pinning wired into the C++ build | Changing a generator parameter fails the build until the version is bumped |
+| M2 | Golden seeds and version pinning wired into the C++ build | Changing a generator parameter fails the build until the version is bumped — **done**: `blend_width` 500 → 505 turns `cmake --build` red, `--bless` refuses while the version is unchanged, and only a bump in `worldgen/generator_version.h` clears it |
 
 ### Keeping the merge small
 

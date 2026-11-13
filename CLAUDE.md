@@ -124,6 +124,13 @@ run it with `Start-Process -Wait` or the file you read will be the last run's.
   1.6 m, so the slot pool filled with air and the ground was never reached.
   `engine.exe --band-report` prints the band, the relief, the resulting chunk
   count and whether the sampling misses the surface, at every LOD.
+- CI's `actions/checkout` does NOT fetch submodules. A `FATAL_ERROR` in
+  CMakeLists for a missing Jolt submodule killed the windows-latest job for
+  nine commits while the Linux job stayed green — and the two-OS matrix is the
+  only thing that catches the libm divergence invariant 9 exists for. A
+  missing submodule now SKIPS the engine instead. Check `gh run list` after
+  anything that touches the build, because a half-red matrix looks like a
+  working one from here.
 - Most of the clipmap meshes to nothing — nine chunks per LOD 0 column and the
   surface crosses one. A chunk that meshes to zero vertices gives its slot back
   and keeps its key: dropping the key would requeue it every frame.
@@ -185,13 +192,32 @@ The hash still does not see whether the shafts are *open*: disabling
 unchanged. That is what the `cave entrances` check is for. Neither covers the
 layer alone — both mutants were tested.
 
-**Golden hashes are pinned.** Any change to `worldgen/` moves them and the run
-fails. That is the gate working: either revert, or bump `generator_version` in
-`worldgen/golden/golden.json` and re-pin with `build\validate.exe --bless`.
-Never re-bless to make a red build green without deciding the world should
-move.
+**Golden hashes are pinned, and since M2 the BUILD checks them.** Any change
+to `worldgen/` moves them, and `cmake --build` then fails — you do not have to
+remember to run anything. Eight seeds, under a second, re-run only when
+something upstream of the hash changed.
 
-Run it before any commit touching `worldgen/`.
+The version lives in `worldgen/generator_version.h` as `kGeneratorVersion`;
+`golden.json` records the hashes *and the version they were pinned at*. Two
+places, because one cannot tell a deliberate bump from an accidental drift.
+Three states, and only the first is a pass:
+
+| version vs the pin | hashes | what it means |
+| --- | --- | --- |
+| same | match | the world is what it claims to be |
+| same | moved | **a silent world change** — revert, or bump the version |
+| differs | either | the pin is stale: `validate --bless` |
+
+**`--bless` refuses the second row.** It will not write moved hashes back
+under an unchanged version, which is what makes the gate a gate rather than a
+speed bump — "make the red build green" has to go through editing
+`generator_version.h`, where the history comment makes you say what changed.
+The sequence is forced, and it was tested by moving `blend_width` 500 → 505:
+build red, bless refused, version bumped, bless accepted, build green, all
+reverted.
+
+Run the full harness before any commit touching `worldgen/` anyway — the gate
+only asks whether the world is the pinned one, not whether it is any good.
 
 ### The engine's own checks
 
