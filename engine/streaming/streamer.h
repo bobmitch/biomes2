@@ -95,6 +95,22 @@ static const UINT kNoSlot = 0xFFFFFFFFu;
 //
 // A chunk meshes kChunkCells cells from its origin, and the lip is the first
 // and last of them in X and Z.
+//
+// The STRICT inequalities are deliberate; do not relax them to <= and >=.
+//
+// The kernel lips by cell index, and a cell-0 vertex occupies lx in [0, voxel]
+// INCLUSIVE, so a vertex landing exactly on lx == voxel is lipped there and
+// missed here. That looks like an off-by-one, and <= appears to fix it. It
+// does not: a cell-ONE vertex also sits at lx == voxel when its crossings
+// average to the cell's near face, and the kernel does NOT lip that one, so
+// <= would raise legitimate ground by two voxels.
+//
+// The position cannot tell the two apart -- that information was lost when
+// the cell index stopped travelling with the vertex -- so neither form is
+// correct and the choice is which way to be wrong. Strict leaves a one-vertex
+// PIT in the collision mesh; relaxed leaves a one-vertex SPIKE, and a spike is
+// what stops a character or launches one. Both need a crossing to land exactly
+// on a cell face, which needs a density of exactly zero at a corner.
 inline bool is_lip_vertex(const float pos[3], const float origin[3], float voxel) {
     const float span = voxel * float(kChunkCells);
     const float lx = pos[0] - origin[0];
