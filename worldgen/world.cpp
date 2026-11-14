@@ -518,7 +518,17 @@ static void emit_shaft(std::vector<SeedWorld::EntranceSeg>& out, const WorldPara
     }
 }
 
+bool caves_enabled(const ArchetypeTable& table) {
+    for (size_t i = 0; i < table.size(); ++i) {
+        if (table[i].cave_density > 0.0f) return true;
+    }
+    return false;
+}
+
 void build_entrances(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table) {
+    // No caves, no shafts. The bin grid stays empty (egrid_n 0), which both
+    // nearest_entrance and the engine's real_nearest_entrance read as "none".
+    if (!caves_enabled(table)) return;
     const float R = wp.radius;
     Rng rng(w.s_entrance);
 

@@ -114,6 +114,7 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
 
     worldgen::AssignParams ap;
     world_ = worldgen::build_world(seed, params_, table_, ap);
+    caves_ = worldgen::caves_enabled(table_);
     if (diag_no_overhang) {
         for (size_t i = 0; i < table_.size(); ++i) table_.biomes[i].overhang_strength = 0.0f;
     }
@@ -345,12 +346,14 @@ void WorldGpu::column_band(float x0, float z0, float x1, float z1,
     // rule against a dense grid at every level and prints what it misses.
     const float margin = 4.0f + 0.75f * (mx - mn);
 
-    // Below: enough for the overhang displacement and the shallow caves an
-    // entrance reaches. The full cave band runs to cave_depth_max, several
-    // hundred metres, and covering it needs a real acceleration structure
-    // rather than a wider guess -- noted here because it is the next thing
-    // this will cost.
-    lo = mn - margin - params_.overhang_scale - 64.0f;
+    // Below: enough for the overhang displacement and, when the world has
+    // caves, the shallow ones an entrance reaches. The full cave band runs to
+    // cave_depth_max, several hundred metres, and covering it needs a real
+    // acceleration structure rather than a wider guess -- noted here because
+    // it is what caves will cost when they come back. With caves off
+    // (generator_version 11) the 64 m was solid rock: chunks meshed to
+    // nothing, every column, at every LOD.
+    lo = mn - margin - params_.overhang_scale - (caves_ ? 64.0f : 0.0f);
     hi = mx + margin + params_.overhang_scale;
     if (core_lo) *core_lo = mn - margin;
     if (core_hi) *core_hi = mx + margin;

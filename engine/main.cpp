@@ -2775,10 +2775,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 if (GetAsyncKeyState('D') & 0x8000) mx += 1.0f;
                 if (GetAsyncKeyState('A') & 0x8000) mx -= 1.0f;
             }
+            // Strafe along Camera::basis's right vector, (-cos yaw, 0, sin yaw),
+            // which is what the view matrix puts on screen right. This used
+            // (+cos, -sin) -- screen LEFT -- so A and D were swapped in walk
+            // mode while fly mode, which uses basis(), had them right.
             const float sy = std::sin(g_camera.yaw), cy = std::cos(g_camera.yaw);
             const float sp = 6.0f;
-            const float vx = (sy * mz + cy * mx) * sp;
-            const float vz = (cy * mz - sy * mx) * sp;
+            const float vx = (sy * mz - cy * mx) * sp;
+            const float vz = (cy * mz + sy * mx) * sp;
             const bool jump = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
             // Ctrl dives. Space is both jump and swim-up, so the way out of
             // the water is the key you would already be pressing.
@@ -2801,7 +2805,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             const float dx = static_cast<float>(p.x - c.x);
             const float dy = static_cast<float>(p.y - c.y);
             if (dx != 0.0f || dy != 0.0f) {
-                g_camera.look(dx * 0.0030f, -dy * 0.0030f);
+                // Minus dx: increasing yaw turns forward toward +x, and the
+                // view's right vector at yaw 0 is -x (Camera::basis), so +yaw
+                // turns LEFT on screen. Mouse right must decrease it.
+                g_camera.look(-dx * 0.0030f, -dy * 0.0030f);
                 POINT back = c;
                 ClientToScreen(hwnd, &back);
                 SetCursorPos(back.x, back.y);

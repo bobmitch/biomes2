@@ -43,7 +43,11 @@ namespace worldgen {
 //      and layer 6's overhang term. The knife-edge 1 - 2|n| rendered as
 //      zigzag teeth along every ridge line; rounding cut them from 2.7% to
 //      1.8% of a rough hillside. Caves keep the exact abs.
-static const int kGeneratorVersion = 10;
+//  11  caves off: every cave_density 0 in archetypes.json, so layer 6 carves
+//      no tunnels and layer 7 builds no shafts (a shaft must end in cave
+//      air). They were unreachable -- residency stopped 64 m down -- and cost
+//      geometry. To be brought back with better seeded placement.
+static const int kGeneratorVersion = 11;
 
 }  // namespace worldgen
 

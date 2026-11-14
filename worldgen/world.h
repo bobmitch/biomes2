@@ -345,9 +345,17 @@ void build_rivers(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& tab
 float nearest_entrance(const SeedWorld& w, const WorldParams& wp,
                        float x, float y, float z);
 
+// Whether any biome carves caves. Off (every cave_density 0) means layer 6
+// carves nothing and layer 7 builds no shafts: a shaft is only kept if its
+// walk ends in cave air, so with no caves all 240 candidate walks would run
+// their 360 m and find nothing. Read by validate and the engine too, so the
+// whole pipeline agrees on what "caves off" means.
+bool caves_enabled(const ArchetypeTable& table);
+
 // Layer 7. Runs after the drainage, because the walk descends against the
 // finished heightfield, and writes into w.entrances only once every walk is
 // done -- a half-built buffer would let one shaft terminate in another.
+// Builds nothing when !caves_enabled(table).
 void build_entrances(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table);
 
 // Layer 6. Positive is rock, negative is air; the sign change is the surface.

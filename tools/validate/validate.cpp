@@ -69,6 +69,7 @@ struct SeedResult {
     float cave_fraction = 0.0f;   // subsurface samples that are air
     float overhang_cols = 0.0f;   // land columns whose surface is crossed twice or more
     int   entrance_trunks = 0;      // shafts that reached cave air
+    int   entrance_segs = 0;        // every segment, branches included
     int   entrance_mouth_sealed = 0;
     int   entrance_pinched = 0;     // sampled shaft segments still solid inside
     float entrance_reach = 0.0f;    // mean metres down to the cave it found
@@ -250,6 +251,7 @@ static SeedResult eval_seed(uint64_t world_seed,
     // --- layer 7: entrances ---
     {
         out.entrance_trunks = w.entrance_count;
+        out.entrance_segs = static_cast<int>(w.entrances.size());
         double reach = 0.0;
         for (size_t m = 0; m < w.entrance_mouths.size(); ++m) {
             const SeedWorld::EntranceMouth& em = w.entrance_mouths[m];
@@ -663,8 +665,14 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
         // 8 is a degeneracy guard, not a target: the measured spread over
         // 200 seeds is 12 to 24, and the low end is seeds with little land
         // rather than a broken layer.
-        if (r.entrance_trunks < 8 || r.entrance_mouth_sealed > 0 ||
-            r.entrance_pinched > 0) ++sm.entrance_failures;
+        // With caves off (every cave_density 0) the check inverts: a single
+        // shaft would be a hole in the ground that leads nowhere.
+        if (caves_enabled(table)) {
+            if (r.entrance_trunks < 8 || r.entrance_mouth_sealed > 0 ||
+                r.entrance_pinched > 0) ++sm.entrance_failures;
+        } else if (r.entrance_trunks != 0 || r.entrance_segs != 0) {
+            ++sm.entrance_failures;
+        }
         sm.entrance_mouths_sealed += r.entrance_mouth_sealed;
         sm.entrance_segs_pinched += r.entrance_pinched;
         sm.min_entrance_trunks = std::min(sm.min_entrance_trunks, r.entrance_trunks);
@@ -1789,10 +1797,15 @@ int main(int argc, char** argv) {
         std::snprintf(d, sizeof(d), "%.0f segments/seed, all descending and reaching the sea",
                       s.mean_river_segments);
         line("river sanity", s.river_failures == 0, d);
-        std::snprintf(d, sizeof(d), "%.1f shafts/seed (min %d, floor 8), reaching cave air "
-                      "%.0f m down; %d mouths sealed, %d sampled segments still solid",
-                      s.mean_entrance_trunks, s.min_entrance_trunks, s.mean_entrance_reach,
-                      s.entrance_mouths_sealed, s.entrance_segs_pinched);
+        if (caves_enabled(table)) {
+            std::snprintf(d, sizeof(d), "%.1f shafts/seed (min %d, floor 8), reaching cave air "
+                          "%.0f m down; %d mouths sealed, %d sampled segments still solid",
+                          s.mean_entrance_trunks, s.min_entrance_trunks, s.mean_entrance_reach,
+                          s.entrance_mouths_sealed, s.entrance_segs_pinched);
+        } else {
+            std::snprintf(d, sizeof(d), "caves OFF (every cave_density 0): %d seeds built a "
+                          "shaft, must be 0", s.entrance_failures);
+        }
         line("cave entrances", s.entrance_failures == 0, d);
         std::snprintf(d, sizeof(d), "%.0f ns/sample, scalar CPU reference; design budget is "
                       "20 ns serial-equivalent for the full field on the shipping path", ns);

@@ -151,6 +151,9 @@ public:
 private:
     struct ColumnSpan { float mn, mx; };   // sampled surface min/max
     mutable std::unordered_map<unsigned long long, ColumnSpan> column_cache_;
+    // worldgen::caves_enabled at load. Off, the band drops the 64 m it kept
+    // under the surface for the shallow caves an entrance reaches.
+    bool caves_ = true;
 
     worldgen::SeedWorld      world_;
     worldgen::WorldParams    params_;

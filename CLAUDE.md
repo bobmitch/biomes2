@@ -138,6 +138,12 @@ last run's.
   missing submodule now SKIPS the engine instead. Check `gh run list` after
   anything that touches the build, because a half-red matrix looks like a
   working one from here.
+- **The view is right-handed: +yaw turns LEFT on screen.** `Camera::basis`
+  gives right = (-cos yaw, 0, sin yaw), and the view matrix puts that on
+  screen right, so at yaw 0 screen right is -x. Mouse look added dx to yaw
+  and walk mode strafed along (+cos, -sin), so both were mirrored, while fly
+  mode's A/D, which use `basis()`, were right. Take sideways directions from
+  `basis()`, never from a hand-written sin/cos pair.
 - **A dual-compile header's OUT parameters must be spelled per language.**
   `T out[1]` decays to a pointer in C++ and works; in HLSL an array parameter
   is passed BY VALUE and the write never reaches the caller. The wave normal
@@ -433,6 +439,13 @@ early takes it to 4.09 and fails, so it bites on over-aggressive dropping.
 It did NOT notice normalising by the faded amplitude, because that error is
 smaller than the worst case already present — it is a guard against the loud
 version of the bug, not the quiet one.
+
+**Caves are OFF since v11.** Every `cave_density` in `archetypes.json` is 0,
+so layer 6 carves nothing, layer 7 builds no shafts (`worldgen::caves_enabled`
+gates it: a shaft must end in cave air) and `column_band` drops its 64 m cave
+padding (1129 → 736 chunks wanted). The `cave entrances` check asserts ZERO
+shafts while caves are off. What follows about layer 7 describes the code,
+which is intact, and applies again when the densities come back.
 
 **The golden hash cannot see everything, and layer 7 proved it.** The hash
 samples a 1024² grid — one density sample per 156 m — and a world has ~24

@@ -6,8 +6,8 @@ the traps live there and are **not** repeated here. This file is the state of
 play; that file is the law.
 
 Written 2026-11-13, at `generator_version` 8. The numbers were updated at
-version 9 (the continuous cell blend) and version 10 (rounded ridged
-crests), with older values kept where they moved.
+version 9 (the continuous cell blend), version 10 (rounded ridged
+crests) and version 11 (caves off), with older values kept where they moved.
 
 ## Where it stands
 
@@ -38,10 +38,10 @@ of having them.
 
 | Check | Command | Value |
 | --- | --- | --- |
-| Generator gate | `build\validate.exe` | ALL CHECKS PASSED, 8 seeds at version 10 |
+| Generator gate | `build\validate.exe` | ALL CHECKS PASSED, 8 seeds at version 11 |
 | Blend seams | same | 0 seeds over 5 cm; worst 0.014 m base, 0.036 m 3D, over 398,211 crossings (v8: steps up to 178 m) |
 | Land / islandness | same | 35.2% mean, 7.2 landmasses/seed, spawn mass 73.9% |
-| Volumetrics | same | 1.72% of subsurface is cave air, 10.6% of land columns overhang (11.6% before v10 rounded the crests) |
+| Volumetrics | same | caves off: 0.00% cave air, 2.3% of land columns overhang (v10 with caves: 1.72% and 10.6% -- most of what the overhang metric counted was cave air near the surface) |
 | CPU vs GPU field | `engine --probe-field` | worst 0.000006 over densities spanning 18 m |
 | Frame cost | `engine --flight 10` | 0.37 ms a frame, 2,684 fps, 1.1 M triangles, 0 overflows. Every earlier figure (74–77 fps) was CPU-bound on recomputing `column_band`; see CLAUDE.md |
 | LOD holes | `engine --flight 15 --vsync --settle --holes [--flight-speed 15]` | 0 frames with a hole at 15 and 60 m/s (`--no-lod-hold`, the old behaviour: 8.5% and 85.3%) |
@@ -53,7 +53,7 @@ of having them.
 | Sea | `engine --sea-report` | 0.20 m calm to 7.51 m storm, mean holds sea level to 2.4 mm; waterline inversion misses by 0.05 mm |
 | Swimming | `engine --swim 40` | 0 of ~611 deep-water frames on the seabed, feet 1.34 m under (balance 1.35), eye never under, back on land |
 | Swimming, storm | `engine --swim 40 --sea-state 1` | 0 of ~513 on the seabed, feet 1.29 m under, eye under 10.9% of frames (worst 0.18 m) |
-| Residency | `engine --band-report` | 1129 chunks wanted, band clears the surface by 34 m everywhere |
+| Residency | `engine --band-report` | 736 chunks wanted (1129 with the caves' 64 m of padding), band clears the surface by 34 m everywhere |
 | Normals | `engine --normal-check` | 0.0° at every voxel, control carries 161° at 64 m |
 
 `engine.exe` is a GUI binary: a shell does not wait on it. Use
@@ -147,17 +147,28 @@ biome". Nothing is blocked on it — the contact sheet and relief sheet already
 let you judge a retune — so it is third despite being the only one on the
 roadmap. What is missing is hot-reload and sliders, in `tools/view`.
 
-### 4. Caves are unreachable in the engine
+### 4. ~~Caves are unreachable in the engine~~ — caves are OFF since v11
 
-Layers 6 and 7 are built and asserted: 23.8 shafts a seed, all reaching cave
-air, 0 mouths sealed. But residency stops 64 m below the surface and the
-shafts break into cave air at 86 m, so the chunks are not there — walk into an
-entrance and you fall out of the world. Two whole layers of generator work
-have never been looked at by a human.
+Every `cave_density` is 0 in `archetypes.json` (the v10 values are in its
+`_note_caves`). Layer 6 carves no tunnels, layer 7 builds no shafts
+(`worldgen::caves_enabled`), and the engine's band drops the 64 m it padded
+below the surface for them: 1129 chunks wanted became 736. `validate`'s
+`cave entrances` check inverts and asserts zero shafts. The code is all still
+there; restoring the densities and bumping the version brings it back.
 
-This is the expensive one. The 64 m is a literal in `WorldGpu::column_band`
-and widening it is not the answer; a vertical residency scheme is. Noted in
-the source at the place that will pay for it.
+When they return they need better seeded placement AND a fix for what made
+them unreachable: residency stopped 64 m down while the shafts met cave air at
+86 m. Widening the literal in `WorldGpu::column_band` is not the answer; a
+vertical residency scheme is.
+
+### 4a. `--overhang` phase A falls out of the world at the v11 roof
+
+v11's world moved phase A's fallback roof to (-1288, 1069), and walking in
+towards it the capsule falls to about -719 m before the test re-places it.
+NOT caused by the shallower band: restoring the 64 m pad gives -715 m. Phase
+B (the dug dome, the decisive test) still STOPS. Phase A's report does not
+flag a fall: it prints "feet while under it: min -719 m" and carries on. Find
+where the walk-in leaves the ground, and make the report call a fall a fall.
 
 ### 5. The dark patches on distant terrain — narrowed, not explained
 
