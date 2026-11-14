@@ -10,6 +10,9 @@
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyInterface.h>
+#include <Jolt/Physics/Collision/RayCast.h>
+#include <Jolt/Physics/Collision/CastResult.h>
+#include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
 
 #include <cstdarg>
 #include <cstdio>
@@ -234,6 +237,36 @@ void PhysicsWorld::remove_chunk(const ChunkKey& key) {
     bi.RemoveBody(it->second);
     bi.DestroyBody(it->second);
     bodies_.erase(it);
+}
+
+PhysicsWorld::UpProbe PhysicsWorld::probe_up(float x, float y, float z, float len) const {
+    UpProbe p;
+    if (!impl_) return p;
+    const JPH::RRayCast ray(JPH::RVec3(x, y, z), JPH::Vec3(0.0f, len, 0.0f));
+    for (int pass = 0; pass < 2; ++pass) {
+        JPH::RayCastSettings rs;
+        rs.SetBackFaceMode(pass == 0 ? JPH::EBackFaceMode::IgnoreBackFaces
+                                     : JPH::EBackFaceMode::CollideWithBackFaces);
+        JPH::ClosestHitCollisionCollector<JPH::CastRayCollector> col;
+        impl_->system.GetNarrowPhaseQuery().CastRay(ray, rs, col);
+        if (!col.HadHit()) continue;
+        const float d = col.mHit.mFraction * len;
+        if (pass == 0) { p.hit_front = true; p.dist_front = d; }
+        else {
+            p.hit_any = true; p.dist_any = d;
+            const JPH::uint32 bid = col.mHit.mBodyID.GetIndexAndSequenceNumber();
+            std::unordered_map<JPH::uint32, int>::const_iterator l = body_lod_.find(bid);
+            p.lod = l == body_lod_.end() ? -1 : l->second;
+            p.is_mesh = body_is_mesh_.count(bid) ? 1 : 0;
+        }
+    }
+    return p;
+}
+
+int PhysicsWorld::chunk_shape(const ChunkKey& k) const {
+    std::unordered_map<ChunkKey, JPH::BodyID, ChunkKeyHash>::const_iterator it = bodies_.find(k);
+    if (it == bodies_.end()) return 0;
+    return body_is_mesh_.count(it->second.GetIndexAndSequenceNumber()) ? 2 : 1;
 }
 
 int PhysicsWorld::character_ground_lod() const {

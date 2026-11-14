@@ -106,6 +106,20 @@ public:
         column_height_ = fn;
     }
 
+    // Diagnostics: what physics actually has. A ray straight up, once
+    // ignoring back faces and once not, and what kind of body it met; and
+    // what kind of body stands for a chunk. "The capsule went through it"
+    // has several causes and these tell them apart.
+    struct UpProbe {
+        bool  hit_front = false, hit_any = false;
+        float dist_front = 0.0f, dist_any = 0.0f;
+        int   lod = -1;        // of the body the any-face ray hit
+        int   is_mesh = -1;    // 1 mesh shape, 0 heightfield
+    };
+    UpProbe probe_up(float x, float y, float z, float len) const;
+    // 0: no body, 1: heightfield, 2: mesh shape.
+    int chunk_shape(const ChunkKey& k) const;
+
     Medium medium() const { return medium_; }
     // World y of the displaced surface above the character, last step. Only
     // meaningful when sea_present().

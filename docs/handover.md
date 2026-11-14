@@ -89,15 +89,14 @@ What remains, in order:
   `validate` already computes and the engine does not.
 - No breath or drowning, no boat, and the sea moves no one sideways.
 
-### 1a. Overhang collision — the first valid test FAILS
+### 1a. ~~Overhang collision fails~~ — it never did; the test was wrong
 
-New and ahead of everything below. v9's terrain gave `--overhang` a real
-ceiling, a slab 3.75 m thick and solid 1 m out in every direction, and the
-launched capsule passes straight through it. Through v8 the test only ever
-found spikes too thin to mean anything, so this was never measurable before.
-The LOD 2 physics cap does not cause it (A/B'd at all LODs). Start with
-Jolt's back-face handling for `MeshShape` against `CharacterVirtual`, and
-whether the slab's chunk got a mesh shape at all rather than a heightfield.
+The capsule slid along an inclined 1 m ledge and off its edge, and the test
+judged by height alone. Fixed in the test: verdict by where the head crossed
+the underside, plus a dug cavity (phase B) that a working collision must
+stop. It stops, and a no-mesh-shape mutant fails. The collision mesh is now
+read back for LOD 0–2 only, so an overhang chunk is a solid heightfield for
+less time (backlog peak 271 → 45). CLAUDE.md has the detail.
 
 ### 1b. LOD seams show as toothed ledges
 

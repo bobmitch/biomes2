@@ -274,12 +274,29 @@ last run's.
   (`kPhysicsMaxLod`): the character is always inside the LOD 0 ring, and
   bodies at coarse LODs cost about 1 ms a frame in flight for ground nobody
   can reach. 524 bodies became 133.
-- **The first valid overhang collision test fails.** v9's terrain gave
-  `--overhang` a real ceiling at last: a slab 3.75 m thick, solid 1 m out in
-  every direction. Through v8 it only ever found spikes too thin to test
-  (0.0 m wide). The capsule launched upward passes straight THROUGH it, with
-  every mesh shape delivered and with physics at all LODs. This predates the
-  LOD 2 cap (A/B'd) and is not yet investigated.
+- **Overhang collision was never broken: the test misjudged a slide.**
+  v9's terrain gave `--overhang` its first real ceiling, a 3.75 m slab, and
+  the test said the capsule "passed straight THROUGH". A ray cast up at the
+  launch hit a LOD 0 mesh shape 1.62 m over the head. Logging the feet showed
+  why it still got past: the capsule hit the inclined underside and SLID
+  sideways along it (0.2 → 2.5 m in ten frames, as collide-and-slide should),
+  cleared the edge of a roof only 1 m wide, and rose past it. The verdict had
+  been judged by height alone. It now takes WHERE the head crossed the
+  underside: inside the roof's footprint is a failure, outside is a slide.
+  The search prefers a roof at least 3 m wide and level underneath, and says
+  when it had to fall back (no such roof within 1.8 km of spawn on v9).
+  **Phase B digs its own ceiling** so the verdict cannot depend on the
+  world: a 3.5 m sphere 7 m under flat ground, the capsule launched from its
+  floor. A dome funnels any slide back to its apex, so a working collision
+  MUST stop it. It does: the head peaked 0.43 m under the apex. With mesh
+  shapes withheld (the mutant), phase B says THROUGH.
+  The real weakness was latency. Until its mesh shape lands, an overhang
+  chunk is a heightfield, which is SOLID up to its top surface, and the 2-a-
+  frame mesh readback was spent on coarse chunks physics then discarded. Now
+  only LOD 0–2 are read back (`kCollisionMaxLod`): the backlog peak went
+  from 271 chunks to 45.
+  `PhysicsWorld::probe_up` (rays up, with and without back faces, plus the
+  kind of body hit) and `chunk_shape` are the instruments.
 - **A gradient arm must not scale with the voxel.** `field_normal` took a
   central difference at half a voxel, which is 0.25 m at LOD 0 and 32 m at
   LOD 7 — a difference between two unrelated pieces of terrain, not a
@@ -512,12 +529,10 @@ Three things that cost time here and will again:
   **A submerged camera has no underwater rendering:** the seabed is lit like
   dry land, with the surface overhead.
 
-`--overhang` no longer has a landmark to aim at: it searches for a real
-ceiling and reports what it found. Near spawn the layer-6 overhangs are
-spikes — 4.75 m thick and under 0.5 m wide — so a launched capsule rises
-beside them, and the report says so rather than claiming the collision failed.
-11.6% of land columns overhang, so the world has them; it does not yet have
-one wide enough to be a test.
+`--overhang` has no landmark to aim at: it searches for a real ceiling
+(phase A), reports what it found and how the capsule left it, then digs a
+cavity of its own (phase B), which is the decisive test. See the gotcha on
+overhang collision above.
 
 ## Style
 

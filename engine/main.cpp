@@ -64,13 +64,10 @@ const float kEyeAboveFeet = 1.60f;
 // Hand this frame's streamed height patches to physics, and drop the ones
 // whose chunk is gone. Called before the character moves, so it never steps on
 // terrain that was retired a frame ago.
-// The finest LODs only. The character is always inside the LOD 0 ring --
-// streaming follows the camera, and the camera rides the feet -- so a body
-// at a 64 m voxel 7 km away is never stood on, and building one cost about
-// 1.4 ms a frame once the sync ran during flight as well (--tab-test, fly
-// phase, uncapped). LOD 2 is a 2 m voxel and a +/-224 m ring: room for a fall
-// from altitude to stream in under the feet before they arrive.
-const int kPhysicsMaxLod = 2;
+// The finest LODs only (engine::kCollisionMaxLod, in streamer.h). Building
+// bodies at every LOD cost about 1.4 ms a frame once the sync ran during
+// flight as well (--tab-test, fly phase, uncapped).
+const int kPhysicsMaxLod = engine::kCollisionMaxLod;
 
 void sync_physics_terrain() {
     const std::vector<engine::Renderer::PatchEvent>& added = g_renderer.patches_added();
@@ -382,7 +379,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             }
             if (shot_path.empty()) shot_path = "build/shot.bmp";
         }
-        if (cl.find("--overhang") != std::string::npos) overhang_seconds = 14.0;
+        // 14 s against the natural roof, then 8 s against a cavity dug for
+        // the purpose (phase B in the --overhang block).
+        if (cl.find("--overhang") != std::string::npos) overhang_seconds = 22.0;
         if (cl.find("--dig-save") != std::string::npos) mode_dig_save = true;
         else if (cl.find("--dig-verify") != std::string::npos) mode_dig_verify = true;
         else if (cl.find("--dig-stress") != std::string::npos) mode_dig_stress = true;
@@ -1363,8 +1362,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         float ov_gap = 0.0f;                  // how much headroom it leaves
         float ov_span = 0.0f;                 // how far it reaches in plan
         float ov_thick = 0.0f;                // how thick the slab is
+        float ov_slope = 0.0f;                // underside rise per metre, worst way
         bool  ov_found = false;
         bool  ov_fallback = false;
+        float best_fallback_span = -1.0f;
+        float fb[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         {
             const engine::WorldGpu& wg = g_renderer.world();
             const float step = 0.25f;
@@ -1443,18 +1445,47 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                     // is kept as a fallback rather than reporting that the
                     // world has no overhangs at all, which would be the wrong
                     // conclusion from the wrong threshold.
-                    if (span < 1.0f) {
-                        if (!ov_fallback) {
+                    //
+                    // And how level the underside is. A capsule launched at an
+                    // inclined roof slides along it -- collide-and-slide keeps
+                    // the tangential part of the velocity -- and off the edge of
+                    // a narrow one. The v9 world's first real ceiling was solid
+                    // 1 m out and inclined; the capsule hit it, slid 2.5 m
+                    // sideways in ten frames, cleared the edge and rose past,
+                    // and the first version of this test called that "passed
+                    // straight THROUGH". Physics was right; the fixture was not.
+                    float slope = 0.0f;
+                    {
+                        const float off[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+                        for (int d = 0; d < 4; ++d) {
+                            const float qx = x + off[d][0], qz = z + off[d][1];
+                            float under = roof_bottom;
+                            bool got = false;
+                            for (float y = roof_bottom + 3.0f; y > roof_bottom - 3.0f; y -= 0.05f) {
+                                if (wg.density(qx, y, qz) > 0.0f && wg.density(qx, y - 0.05f, qz) <= 0.0f) {
+                                    under = y; got = true; break;
+                                }
+                            }
+                            const float dy = got ? std::fabs(under - roof_bottom) : 3.0f;
+                            if (dy > slope) slope = dy;   // metres per metre
+                        }
+                    }
+                    const bool good = span >= 3.0f && slope <= 0.4f;
+                    if (!good) {
+                        // Kept as a fallback: the widest roof seen, so a world
+                        // without a good one still gets the best test it has,
+                        // and the report says which it was.
+                        if (span > best_fallback_span) {
+                            best_fallback_span = span;
                             ov_fallback = true;
-                            ov_x = x; ov_z = z;
-                            ov_ground = floor_y; ov_under = roof_bottom;
-                            ov_gap = gap; ov_span = span;
-                            ov_thick = roof_top - roof_bottom;
+                            fb[0] = x; fb[1] = z; fb[2] = floor_y; fb[3] = roof_bottom;
+                            fb[4] = gap; fb[5] = span; fb[6] = roof_top - roof_bottom; fb[7] = slope;
                         }
                         continue;
                     }
                     ov_span = span;
                     ov_thick = roof_top - roof_bottom;
+                    ov_slope = slope;
 
                     ov_x = x; ov_z = z;
                     ov_ground = floor_y;
@@ -1464,7 +1495,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 }
             }
         }
-        if (!ov_found && ov_fallback) ov_found = true;
+        bool ov_is_fallback = false;
+        if (!ov_found && ov_fallback) {
+            ov_found = true;
+            ov_is_fallback = true;
+            ov_x = fb[0]; ov_z = fb[1]; ov_ground = fb[2]; ov_under = fb[3];
+            ov_gap = fb[4]; ov_span = fb[5]; ov_thick = fb[6]; ov_slope = fb[7];
+        }
         if (!ov_found) {
             if (FILE* f = std::fopen("build/overhang.txt", "w")) {
                 std::fprintf(f, "no overhang within 1800 m of the origin, so there\n"
@@ -1499,6 +1536,33 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         bool launched = false;
         bool placed_under = false;
         double launch_peak = -1e9;
+        // What physics holds above the capsule at the moment of launch, and
+        // how the capsule's feet moved over the first frames after it.
+        engine::PhysicsWorld::UpProbe launch_probe;
+        int slab_shapes[4] = {-1, -1, -1, -1};     // LOD 0 chunks floor..slab top
+        int slab_keys_y[4] = {0, 0, 0, 0};
+        int slab_nkeys = 0;
+        std::vector<float> after_launch;
+        std::vector<float> after_side;
+        bool crossed = false;
+        float side_at_cross = 0.0f;
+
+        // Phase B: a ceiling the world cannot fail to provide. A sphere of
+        // air dug a few metres under flat ground is a dome over the capsule,
+        // and a dome funnels any sideways slide back to its apex -- so if
+        // collision works the capsule MUST stop, whatever the terrain grew.
+        // Phase A depends on the world having a wide, level roof near spawn,
+        // and the v9 world does not; this does not depend on anything.
+        const float kCavR = 3.5f, kCavDepth = 7.0f;
+        bool cav_dug = false, cav_placed = false, cav_launched = false, cav_site = false;
+        float cav_x = 0.0f, cav_y = 0.0f, cav_z = 0.0f, cav_grade = 0.0f;
+        double cav_head_peak = -1e9;
+        engine::PhysicsWorld::UpProbe cav_probe;
+        int cav_shape = -1;
+        // How long an overhang chunk is a solid-filled heightfield: until its
+        // mesh shape lands, which waits in a 2-a-frame queue.
+        size_t peak_mesh_backlog = 0;
+        double backlog_clear_at = -1.0;
 
         for (;;) {
             MSG m = {};
@@ -1533,14 +1597,98 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             }
             if (total >= 10.5 && !launched) {
                 launched = true;
+                const float head = g_feet[1] + 2.0f * (kCapsuleHalf + kCapsuleRadius);
+                launch_probe = g_physics.probe_up(g_feet[0], head, g_feet[2], 60.0f);
+                // Every LOD 0 chunk the column passes through from the floor to
+                // the slab's top: which kind of body stands for each.
+                const float S0 = engine::lod_chunk_size(0);
+                const int kx = int(std::floor(ov_x / S0)), kz = int(std::floor(ov_z / S0));
+                const int y0 = int(std::floor(ov_ground / S0));
+                const int y1 = int(std::floor((ov_under + ov_thick) / S0));
+                for (int ky = y0; ky <= y1 && slab_nkeys < 4; ++ky) {
+                    engine::ChunkKey k; k.x = kx; k.y = ky; k.z = kz; k.lod = 0;
+                    slab_keys_y[slab_nkeys] = ky;
+                    slab_shapes[slab_nkeys++] = g_physics.chunk_shape(k);
+                }
                 g_physics.launch_character(45.0f);
             }
             if (placed_under) speed = 0.0f;
 
+            if (total >= 14.0 && !cav_dug) {
+                cav_dug = true;
+                // Flat land near spawn, well above the sea.
+                const engine::WorldGpu& wg = g_renderer.world();
+                const float sea = wg.params().sea_level;
+                for (int i = 0; i < 400 && !cav_site; ++i) {
+                    const float cx = 40.0f + 8.0f * float(i % 20), cz = 40.0f + 8.0f * float(i / 20);
+                    const float h = wg.height(cx, cz);
+                    if (h < sea + 8.0f) continue;
+                    float worst = 0.0f;
+                    const float o[4][2] = {{4, 0}, {-4, 0}, {0, 4}, {0, -4}};
+                    for (int d = 0; d < 4; ++d) {
+                        const float dh = std::fabs(wg.height(cx + o[d][0], cz + o[d][1]) - h);
+                        if (dh > worst) worst = dh;
+                    }
+                    if (worst > 1.5f) continue;
+                    cav_site = true;
+                    cav_x = cx; cav_z = cz; cav_grade = h;
+                    cav_y = h - kCavDepth;
+                }
+                if (cav_site) {
+                    g_renderer.dig(cav_x, cav_y, cav_z, kCavR, -4.0f, 1);
+                    // Stand on the surface above it while it remeshes, so
+                    // the chunks around it are the finest ones.
+                    g_physics.place_character(cav_x, cav_grade + 1.0f, cav_z);
+                }
+            }
+            if (total >= 17.0 && cav_site && !cav_placed) {
+                cav_placed = true;
+                // A metre up from the cavity's floor, where it is 4.9 m wide.
+                g_physics.place_character(cav_x, cav_y - kCavR + 1.0f, cav_z);
+            }
+            if (total >= 17.5 && cav_placed && !cav_launched) {
+                cav_launched = true;
+                const float head = g_feet[1] + 2.0f * (kCapsuleHalf + kCapsuleRadius);
+                cav_probe = g_physics.probe_up(g_feet[0], head, g_feet[2], 20.0f);
+                const float S0 = engine::lod_chunk_size(0);
+                engine::ChunkKey k;
+                k.x = int(std::floor(cav_x / S0));
+                k.y = int(std::floor((cav_y + kCavR) / S0));
+                k.z = int(std::floor(cav_z / S0));
+                k.lod = 0;
+                cav_shape = g_physics.chunk_shape(k);
+                g_physics.launch_character(45.0f);
+            }
+            if (total >= 14.0) speed = 0.0f;
+            {
+                const size_t bl = g_renderer.stats().mesh_backlog;
+                if (bl > peak_mesh_backlog) peak_mesh_backlog = bl;
+                if (bl == 0 && backlog_clear_at < 0.0 && total > 1.0) backlog_clear_at = total;
+                if (bl > 0) backlog_clear_at = -1.0;
+            }
+
             sync_sea(float(total));
             g_physics.update(float(dt), 0.0f, speed, false);
             g_physics.character_position(g_feet);
-            if (launched && g_feet[1] > launch_peak) launch_peak = g_feet[1];
+            if (launched && total < 14.0 && g_feet[1] > launch_peak) launch_peak = g_feet[1];
+            if (cav_launched) {
+                const double hd = double(g_feet[1]) + 2.0 * double(kCapsuleHalf + kCapsuleRadius);
+                if (hd > cav_head_peak) cav_head_peak = hd;
+            }
+            if (launched && total < 14.0 && !crossed &&
+                g_feet[1] + 2.0f * (kCapsuleHalf + kCapsuleRadius) > ov_under + 0.5f) {
+                crossed = true;
+                const float cx = g_feet[0] - ov_x, cz = g_feet[2] - ov_z;
+                side_at_cross = std::sqrt(cx * cx + cz * cz);
+            }
+            if (launched && total < 14.0 && after_launch.size() < 24) {
+                after_launch.push_back(g_feet[1]);
+                // How far it has moved sideways from where it was launched:
+                // a capsule that slides along an inclined underside and off
+                // its edge is not one that went through it.
+                const float sx = g_feet[0] - ov_x, sz = g_feet[2] - ov_z;
+                after_side.push_back(std::sqrt(sx * sx + sz * sz));
+            }
 
             g_camera.x = g_feet[0];
             g_camera.y = g_feet[1] + kEyeAboveFeet;
@@ -1554,7 +1702,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             fill_view(g_camera, w, h, float(total), v);
             g_renderer.render(v);
 
-            if (total > 2.0) {
+            if (total > 2.0 && total < 14.0) {
                 if (g_feet[1] > y_max) y_max = g_feet[1];
                 // Inside the ceiling's footprint in plan: if the character
                 // is here and below its underside, it is beneath the overhang.
@@ -1616,6 +1764,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(f, "the slab is %.2f m thick and stays solid %.1f m out in\n"
                             "every direction, against a capsule %.2f m across\n\n",
                          ov_thick, ov_span, kCapsuleRadius * 2.0f);
+            std::fprintf(f, "%s roof: underside rises at most %.2f m per metre (good: >= 3 m wide, <= 0.40)\n",
+                         ov_is_fallback ? "FALLBACK (no wide, level roof found)" : "a wide, near-level",
+                         ov_slope);
             std::fprintf(f, "frames inside the ceiling's footprint: %llu\n", under_frames);
             std::fprintf(f, "feet while under it: min %.2f m, max %.2f m\n",
                          under_frames ? y_under_min : 0.0,
@@ -1635,11 +1786,58 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                     " follows is not evidence about the ceiling\n",
                                  ov_span, kCapsuleRadius * 2.0f);
                 }
-                std::fprintf(f, "  the underside is at %.2f m, so %s\n", ov_under,
-                             launch_peak + double(kCapsuleHalf + kCapsuleRadius) * 2.0 <
-                                     double(ov_under) + 1.0
-                                 ? "it was STOPPED by the overhang"
-                                 : "it passed straight THROUGH the overhang");
+                // The verdict is about WHERE the head crossed the underside,
+                // not only whether it got higher than it.
+                const char* verdict =
+                    !crossed ? "it was STOPPED by the overhang"
+                    : side_at_cross >= ov_span
+                        ? "it SLID OFF the roof's edge and rose past it -- not a collision failure"
+                        : "it went THROUGH the overhang inside its footprint -- a COLLISION FAILURE";
+                std::fprintf(f, "  the underside is at %.2f m; ", ov_under);
+                if (crossed)
+                    std::fprintf(f, "the head crossed it %.2f m sideways, against a roof %.1f m wide; ",
+                                 side_at_cross, ov_span);
+                std::fprintf(f, "so %s\n", verdict);
+            }
+            if (launched) {
+                const char* kind[3] = {"NO BODY", "heightfield", "mesh shape"};
+                std::fprintf(f, "  at the launch, a ray up from the head: front faces %s, any face %s",
+                             launch_probe.hit_front ? "hit" : "missed",
+                             launch_probe.hit_any ? "hit" : "missed");
+                if (launch_probe.hit_any)
+                    std::fprintf(f, " at %.2f m (a %s, LOD %d)", launch_probe.dist_any,
+                                 launch_probe.is_mesh ? "mesh shape" : "heightfield",
+                                 launch_probe.lod);
+                std::fprintf(f, "\n  LOD 0 chunks in that column, floor to slab top:");
+                for (int i = 0; i < slab_nkeys; ++i)
+                    std::fprintf(f, " [y %d: %s]", slab_keys_y[i],
+                                 slab_shapes[i] >= 0 ? kind[slab_shapes[i]] : "?");
+                std::fprintf(f, "\n  feet over the first frames after launch (y m / metres sideways):");
+                for (size_t i = 0; i < after_launch.size(); ++i)
+                    std::fprintf(f, " %.2f/%.2f", after_launch[i], after_side[i]);
+                std::fprintf(f, "\n");
+            }
+            // Phase B's verdict. The apex of the dome is the roof; a skin of
+            // half a metre allows for Jolt's character padding and for the
+            // mesh sitting off the field at the voxel.
+            std::fprintf(f, "\nphase B, a cavity dug for the purpose (radius %.1f m, %.1f m under flat ground):\n",
+                         kCavR, kCavDepth);
+            if (!cav_site) {
+                std::fprintf(f, "  NO SITE: no flat land above the sea near spawn, so nothing was dug\n");
+            } else if (!cav_launched) {
+                std::fprintf(f, "  NOT RUN: the run ended before the launch\n");
+            } else {
+                const double apex = double(cav_y) + double(kCavR);
+                const char* kind[3] = {"NO BODY", "heightfield", "mesh shape"};
+                std::fprintf(f, "  at (%.0f, %.0f): dome apex at %.2f m, %.2f m of rock above it\n",
+                             cav_x, cav_z, apex, double(cav_grade) - apex);
+                std::fprintf(f, "  the chunk holding the apex is a %s; a ray up from the head %s",
+                             cav_shape >= 0 ? kind[cav_shape] : "?",
+                             cav_probe.hit_any ? "hit" : "MISSED");
+                if (cav_probe.hit_any) std::fprintf(f, " at %.2f m", cav_probe.dist_any);
+                std::fprintf(f, "\n  launched at 45 m/s, the head peaked at %.2f m: %s\n", cav_head_peak,
+                             cav_head_peak <= apex + 0.5 ? "STOPPED by the roof -- collision holds"
+                                                         : "went THROUGH the roof -- a COLLISION FAILURE");
             }
             std::fprintf(f, "chunks classified: %llu, needing a mesh: %llu (%.1f%%)\n",
                          st.chunks_classified, st.chunks_needing_mesh,
@@ -1647,6 +1845,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                                      double(st.chunks_classified) : 0.0);
             std::fprintf(f, "mesh shapes delivered: %llu, still waiting: %zu\n",
                          st.mesh_shapes_delivered, st.mesh_backlog);
+            std::fprintf(f, "mesh-shape backlog: peak %zu chunks, last cleared at %.1f s\n",
+                         peak_mesh_backlog, backlog_clear_at);
             std::fprintf(f, "physics bodies: %zu total, %zu of them mesh shapes\n",
                          g_physics.body_count(), g_physics.mesh_body_count());
             std::fprintf(f, "mesh vertices checked against the field: %llu, worst %.4f m at a %.1f m voxel\n",

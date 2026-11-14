@@ -905,9 +905,14 @@ void Renderer::consume_heights() {
         e.voxel = r.voxel[p];
         e.multi_surface_columns = flags ? flags[p] : 0;
         ++stats_.chunks_classified;
+        // A collision mesh only for chunks physics keeps. The readback is
+        // rationed (kMeshChunksPerFrame, 163 KB a chunk), and until a chunk's
+        // mesh lands its heightfield is SOLID up to its top surface -- the void
+        // under an overhang filled in. Coarse chunks nobody can stand on were
+        // queueing ahead of the fine ones: --overhang's backlog peaked at 271.
         if (e.multi_surface_columns) {
             ++stats_.chunks_needing_mesh;
-            mesh_wanted_.push_back(r.keys[p]);
+            if (r.keys[p].lod <= kCollisionMaxLod) mesh_wanted_.push_back(r.keys[p]);
         }
         const float* src = h + size_t(p) * kHeightSamples;
         e.h.assign(src, src + kHeightSamples);

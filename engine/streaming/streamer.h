@@ -68,6 +68,15 @@ namespace engine {
 // empty-chunk reclamation freed.
 static const int kLodCount = 8;
 
+// The coarsest LOD that gets collision. The character is always inside the
+// LOD 0 ring -- streaming follows the camera, and the camera rides the feet --
+// so a body at a 64 m voxel 7 km away is never stood on. LOD 2 is a 2 m voxel
+// and a +/-224 m ring: room for a fall from altitude to stream in under the
+// feet before they arrive. One constant, because two places act on it: what
+// physics is handed, and which chunks the renderer reads a collision MESH
+// back for -- the one that matters for overhangs, see consume_heights.
+static const int kCollisionMaxLod = 2;
+
 // Half-extent in chunks at every level: 7 x 7 columns per level.
 static const int kRingHalf = 3;
 
