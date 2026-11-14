@@ -22,6 +22,7 @@
 
 #include <cmath>
 #include <string>
+#include <unordered_map>
 
 namespace engine {
 
@@ -122,8 +123,18 @@ public:
     // before it ever reaches the ground -- measured at M1 as 768 chunks
     // resident and zero triangles. Evaluating layer 0 over the column costs
     // one fBm and bounds the surface to within the biome amplitudes.
+    //
+    // `core_lo`/`core_hi`, when asked for, are the band WITHOUT the overhang
+    // and cave padding: where the 2.5D ground itself can be. Streaming uses it
+    // to mesh the visible surface before the margins, which are mostly air
+    // and solid rock -- 84% of what a flight meshed came out empty.
+    //
+    // Cached per column. The world is static, the answer never changes, and
+    // computing it is 25 full height evaluations per column for ~392 columns
+    // every frame: about 2 ms of CPU, recomputing the same numbers.
     void column_band(float x0, float z0, float x1, float z1,
-                     float& lo, float& hi) const;
+                     float& lo, float& hi,
+                     float* core_lo = nullptr, float* core_hi = nullptr) const;
 
     ID3D12Resource* cells() const { return cells_.Get(); }
     ID3D12Resource* cell_offsets() const { return cell_offsets_.Get(); }
@@ -138,6 +149,9 @@ public:
     ID3D12Resource* world_cb() const { return world_cb_.Get(); }
 
 private:
+    struct ColumnSpan { float mn, mx; };   // sampled surface min/max
+    mutable std::unordered_map<unsigned long long, ColumnSpan> column_cache_;
+
     worldgen::SeedWorld      world_;
     worldgen::WorldParams    params_;
     worldgen::ArchetypeTable table_;

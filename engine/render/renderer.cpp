@@ -865,9 +865,16 @@ void Renderer::consume_heights() {
     // C++ side of the dialect, the same tolerance comparison B2 used on the
     // mesh -- and the only thing that would catch a ring read one frame early,
     // which returns a previous chunk's perfectly plausible terrain.
+    //
+    // At most kMeshBudgetPerFrame patches a frame. It is 81 full CPU field
+    // evaluations per patch, and once the budget adapted upward it was
+    // checking three times as many patches: the 99th-percentile frame went
+    // from 20 to 27 ms with the GPU's meshing time unchanged. A ring read early
+    // is wrong for EVERY patch in it, so a sample catches it as surely as all.
     double sum = 0.0;
     unsigned long long n = 0;
-    for (UINT p = 0; p < r.count; ++p) {
+    const UINT checked = r.count < kMeshBudgetPerFrame ? r.count : kMeshBudgetPerFrame;
+    for (UINT p = 0; p < checked; ++p) {
         const float* g = h + size_t(p) * kHeightSamples;
         const float v = r.voxel[p];
         for (UINT k = 0; k < kHeightGrid; k += 4) {
@@ -1037,7 +1044,8 @@ void Renderer::record_frame(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     ctx.pager = &pager_;
     ctx.frame = frame_index_;
     ctx.uploads = &brick_uploads_;
-    stats_.meshed_this_frame = streamer_.plan_work(mesher_, kMeshBudgetPerFrame, ctx);
+    stats_.mesh_budget = mesh_budget_;
+    stats_.meshed_this_frame = streamer_.plan_work(mesher_, mesh_budget_, ctx);
 
     for (size_t i = 0; i < brick_uploads_.size(); ++i) {
         const Brick* b = edits_.find(brick_uploads_[i]);
@@ -1137,6 +1145,18 @@ void Renderer::render(const ViewConstants& view) {
     mesher_.read_counts(stats_.vertices, stats_.indices, stats_.overflowed,
                         stats_.peak_slot_vertices, stats_.peak_slot_indices);
     stats_.mesh_ms = mesher_.last_mesh_ms();
+    // Grow the budget while meshing is cheap and there is work waiting;
+    // shrink it the moment the GPU time goes over. The timestamp is a frame
+    // or two old, which is why the steps are small.
+    if (adaptive_budget_) {
+        if (stats_.mesh_ms > kMeshTargetMs) {
+            mesh_budget_ = mesh_budget_ > kMeshBudgetPerFrame + 2 ? mesh_budget_ - 2
+                                                                  : kMeshBudgetPerFrame;
+        } else if (streamer_.pending_count() > mesh_budget_ &&
+                   stats_.mesh_ms < kMeshTargetMs * 0.8) {
+            mesh_budget_ = mesh_budget_ + 2 < kMeshBudgetMax ? mesh_budget_ + 2 : kMeshBudgetMax;
+        }
+    }
     stats_.resident = streamer_.resident_count();
     stats_.pending = streamer_.pending_count();
     stats_.free_slots = streamer_.free_slot_count();

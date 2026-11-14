@@ -64,9 +64,18 @@ const float kEyeAboveFeet = 1.60f;
 // Hand this frame's streamed height patches to physics, and drop the ones
 // whose chunk is gone. Called before the character moves, so it never steps on
 // terrain that was retired a frame ago.
+// The finest LODs only. The character is always inside the LOD 0 ring --
+// streaming follows the camera, and the camera rides the feet -- so a body
+// at a 64 m voxel 7 km away is never stood on, and building one cost about
+// 1.4 ms a frame once the sync ran during flight as well (--tab-test, fly
+// phase, uncapped). LOD 2 is a 2 m voxel and a +/-224 m ring: room for a fall
+// from altitude to stream in under the feet before they arrive.
+const int kPhysicsMaxLod = 2;
+
 void sync_physics_terrain() {
     const std::vector<engine::Renderer::PatchEvent>& added = g_renderer.patches_added();
     for (size_t i = 0; i < added.size(); ++i) {
+        if (added[i].key.lod > kPhysicsMaxLod) continue;
         g_physics.set_chunk(added[i].key, added[i].origin, added[i].voxel,
                             added[i].h.data());
     }
@@ -76,6 +85,9 @@ void sync_physics_terrain() {
         g_renderer.mesh_patches_added();
     for (size_t i = 0; i < meshes.size(); ++i) {
         const engine::Renderer::MeshPatchEvent& e = meshes[i];
+        // Not handed to physics, so not measured as though it were: the check
+        // below is about the shapes the character can stand on.
+        if (e.key.lod > kPhysicsMaxLod) continue;
         const size_t nv = e.verts.size() / 3;
         const float mS = engine::lod_chunk_size(e.key.lod);
         const float morigin[3] = {float(e.key.x) * mS, float(e.key.y) * mS,
@@ -121,6 +133,23 @@ void sync_sea(float t) {
     s.state = g_renderer.sea_state();
     s.time = t;
     g_physics.set_sea(s);
+}
+
+// One frame of physics for the window loop. --tab-test drives this same
+// function, so what it measures is what the window does.
+//
+// The terrain sync runs EVERY frame, walking or not. A chunk's heights reach
+// physics exactly once, in the frame its readback lands, and Renderer::render
+// clears those events at the start of the next frame. Syncing only while
+// walking threw away every chunk loaded during flight, so pressing Tab dropped
+// the character into a physics world with no ground in it: --tab-test measured
+// 0 terrain bodies at the drop and the feet at -334 m six seconds later.
+void step_window_physics(float dt, float t, float vx, float vz, bool jump, float swim) {
+    sync_physics_terrain();
+    if (!g_walk) return;
+    sync_sea(t);
+    g_physics.update(dt, vx, vz, jump, swim);
+    g_physics.character_position(g_feet);
 }
 bool g_captured = false;
 bool g_want_shot = false;
@@ -485,7 +514,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
                           dig_seconds > 0.0 || mode_dig_save || mode_dig_verify ||
-                          mode_dig_stress || sea_shot;
+                          mode_dig_stress || sea_shot ||
+                          std::string(cmdline ? cmdline : "").find("--tab-test") != std::string::npos;
 
     std::string error;
     if (!g_physics.init(error)) {
@@ -517,6 +547,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     g_renderer.set_water_debug(water_debug);
     if (no_water) g_renderer.set_water(false);
     if (no_lod_hold) g_renderer.set_lod_hold(false);
+    {
+        const std::string c2 = cmdline ? cmdline : "";
+        if (c2.find("--no-prioritise") != std::string::npos) g_renderer.set_prioritise(false);
+        if (c2.find("--adaptive-budget") != std::string::npos) g_renderer.set_adaptive_budget(true);
+    }
     if (lod_fade >= 0) g_renderer.set_lod_fade_frames(lod_fade);
     g_physics.set_column_height([](float x, float z) {
         return g_renderer.world().height(x, z);
@@ -1632,6 +1667,98 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (std::string(cmdline ? cmdline : "").find("--tab-test") != std::string::npos) {
+        // --tab-test: what pressing Tab does in the window. Fly for 4 s with
+        // the window loop's physics step running as it does in fly mode,
+        // then drop the character in where the camera is -- exactly the Tab
+        // handler -- and let it stand for 6 s. A character that ends up
+        // under the ground fell through it.
+        // Uncapped, so the fly phase's frame time says what the per-frame
+        // terrain sync costs while flying.
+        g_renderer.set_vsync(false);
+        g_walk = false;
+        const engine::WorldGpu& wg = g_renderer.world();
+        double fly_ms_sum = 0.0;
+        unsigned long long fly_frames = 0;
+        g_camera.x = 0.0f; g_camera.z = 0.0f;
+        g_camera.y = wg.height(0.0f, 0.0f) + 40.0f;
+        g_camera.yaw = 1.0f; g_camera.pitch = -0.3f;
+
+        LARGE_INTEGER tf, t0, tp;
+        QueryPerformanceFrequency(&tf);
+        QueryPerformanceCounter(&t0);
+        tp = t0;
+        bool dropped = false;
+        float drop_y = 0.0f, ground_at_drop = 0.0f;
+        size_t bodies_at_drop = 0;
+        float feet_min = 1e9f;
+        unsigned long long frames = 0, grounded_frames = 0;
+        for (;;) {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&m);
+                DispatchMessageA(&m);
+            }
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            const double total = double(now.QuadPart - t0.QuadPart) / double(tf.QuadPart);
+            double dt = double(now.QuadPart - tp.QuadPart) / double(tf.QuadPart);
+            tp = now;
+            if (dt > 0.1) dt = 0.1;
+            if (total >= 10.0) break;
+
+            if (!dropped && total >= 4.0) {
+                // The Tab handler, verbatim.
+                g_walk = true;
+                g_physics.place_character(g_camera.x, g_camera.y, g_camera.z);
+                dropped = true;
+                drop_y = g_camera.y;
+                ground_at_drop = wg.height(g_camera.x, g_camera.z);
+                bodies_at_drop = g_physics.body_count();
+            }
+            if (!g_walk) {
+                // Flying: forward at 30 m/s, as a person would before landing.
+                g_camera.x += std::sin(g_camera.yaw) * 30.0f * float(dt);
+                g_camera.z += std::cos(g_camera.yaw) * 30.0f * float(dt);
+                step_window_physics(float(dt), float(total), 0.0f, 0.0f, false, 0.0f);
+                if (total > 1.0) { fly_ms_sum += dt * 1000.0; ++fly_frames; }
+            } else {
+                step_window_physics(float(dt), float(total), 0.0f, 0.0f, false, 0.0f);
+                g_camera.x = g_feet[0];
+                g_camera.y = g_feet[1] + kEyeAboveFeet;
+                g_camera.z = g_feet[2];
+                if (g_feet[1] < feet_min) feet_min = g_feet[1];
+                if (g_physics.character_grounded()) ++grounded_frames;
+            }
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
+            if (w < 1.0f || h < 1.0f) continue;
+            engine::ViewConstants v = {};
+            fill_view(g_camera, w, h, float(total), v);
+            g_renderer.render(v);
+            ++frames;
+        }
+        const float ground_end = wg.height(g_feet[0], g_feet[2]);
+        const bool fell = g_feet[1] < ground_end - 2.0f;
+        if (FILE* f = std::fopen("build/tab_test.txt", "w")) {
+            if (frames == 0) std::fprintf(f, "VOID RUN: no frames rendered.\n\n");
+            std::fprintf(f, "fly 4 s at 30 m/s, press Tab, stand 6 s\n");
+            std::fprintf(f, "frames %llu; flying, uncapped: mean %.2f ms over %llu frames\n",
+                         frames, fly_frames ? fly_ms_sum / double(fly_frames) : 0.0, fly_frames);
+            std::fprintf(f, "dropped from y %.2f over ground %.2f, with %zu terrain bodies in physics\n",
+                         drop_y, ground_at_drop, bodies_at_drop);
+            std::fprintf(f, "feet at the end %.2f, ground there %.2f, lowest feet %.2f\n",
+                         g_feet[1], ground_end, feet_min);
+            std::fprintf(f, "frames standing on something: %llu\n", grounded_frames);
+            std::fprintf(f, "fell through the world: %s\n", fell ? "YES" : "no");
+            std::fclose(f);
+        }
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return fell ? 1 : 0;
+    }
+
     if (swim_seconds > 0.0) {
         // --swim: walk off a beach, swim out, turn round, swim back and walk
         // out. The thing being measured is the bug this replaces -- a
@@ -2160,6 +2287,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         unsigned long long hole_chunks[engine::kLodCount] = {0, 0, 0, 0, 0, 0, 0, 0};
         unsigned long long inner_hole_frames = 0, judged_frames = 0;
         size_t worst_inner = 0, peak_held = 0;
+        unsigned long long deficit_sum[engine::kLodCount] = {0, 0, 0, 0, 0, 0, 0, 0};
+        unsigned long long budget_sum = 0, budget_n = 0;
+        UINT budget_peak = 0;
         std::vector<double> frame_ms;
         frame_ms.reserve(20000);
         size_t max_pending = 0;
@@ -2216,9 +2346,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 }
                 if (inner) ++inner_hole_frames;
                 if (inner > worst_inner) worst_inner = inner;
+                const size_t* db = g_renderer.streamer().deficit_by_lod();
+                for (int L = 0; L < engine::kLodCount; ++L) deficit_sum[L] += db[L];
             }
             if (g_renderer.streamer().held_count() > peak_held)
                 peak_held = g_renderer.streamer().held_count();
+            {
+                const engine::FrameStats bs = g_renderer.stats();
+                budget_sum += bs.mesh_budget;
+                if (bs.mesh_budget > budget_peak) budget_peak = bs.mesh_budget;
+                ++budget_n;
+            }
         }
 
         const engine::FrameStats st = g_renderer.stats();
@@ -2251,6 +2389,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                          : (settle_left == 0 ? "yes" : "NO, gave up with chunks still queued"));
             if (fcl.find("--settle") != std::string::npos)
                 std::fprintf(f, "  settling took %.1f s, %zu still queued\n", settle_s, settle_left);
+            std::fprintf(f, "mesh budget per frame: mean %.1f, peak %u (floor %u, ceiling %u, GPU target %.1f ms)\n",
+                         budget_n ? double(budget_sum) / double(budget_n) : 0.0, budget_peak,
+                         engine::kMeshBudgetPerFrame, engine::kMeshBudgetMax, engine::kMeshTargetMs);
             std::fprintf(f, "LOD hold: %s; peak chunks held %zu, retired early for want of a"
                             " slot %llu\n",
                          no_lod_hold ? "OFF (old behaviour)" : "on",
@@ -2267,6 +2408,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                     std::fprintf(f, "  LOD %d: %llu frames, %llu chunk-frames%s\n", L,
                                  hole_frames[L], hole_chunks[L],
                                  L == engine::kLodCount - 1 ? "  (the horizon growing, not a hole in it)" : "");
+                }
+                // How late the detail is. Latency: frames from a surface chunk
+                // first being wanted to it starting to show. Deficit: surface
+                // chunks wanted and not yet shown, averaged per frame.
+                std::fprintf(f, "detail latency, surface chunks (frames; x16.7 ms at 60 Hz) and mean deficit per frame:\n");
+                std::fprintf(f, "  %-5s %6s %7s %6s %6s %9s\n", "LOD", "n", "median", "p90", "max", "deficit");
+                for (int L = 0; L < engine::kLodCount; ++L) {
+                    std::vector<int> lv = g_renderer.streamer().latency_frames(L);
+                    std::sort(lv.begin(), lv.end());
+                    const int med = lv.empty() ? 0 : lv[lv.size() / 2];
+                    const int p90 = lv.empty() ? 0 : lv[(lv.size() * 9) / 10];
+                    const int mx = lv.empty() ? 0 : lv.back();
+                    std::fprintf(f, "  %-5d %6zu %7d %6d %6d %9.2f\n", L, lv.size(), med, p90, mx,
+                                 judged_frames ? double(deficit_sum[L]) / double(judged_frames) : 0.0);
                 }
             }
             // An overflow is dropped geometry -- a hole. The peaks say how
@@ -2341,13 +2496,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             // Ctrl dives. Space is both jump and swim-up, so the way out of
             // the water is the key you would already be pressing.
             const float swim = (GetAsyncKeyState(VK_CONTROL) & 0x8000) ? -1.0f : 0.0f;
-            sync_physics_terrain();
-            sync_sea(t);
-            g_physics.update(float(dt), vx, vz, jump, swim);
-            g_physics.character_position(g_feet);
+            step_window_physics(float(dt), t, vx, vz, jump, swim);
             g_camera.x = g_feet[0];
             g_camera.y = g_feet[1] + kEyeAboveFeet;
             g_camera.z = g_feet[2];
+        } else {
+            step_window_physics(float(dt), t, 0.0f, 0.0f, false, 0.0f);
         }
 
         if (g_captured && GetForegroundWindow() == hwnd) {

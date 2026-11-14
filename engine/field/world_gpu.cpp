@@ -302,21 +302,39 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
 void WorldGpu::release_staging() { staging_.clear(); }
 
 void WorldGpu::column_band(float x0, float z0, float x1, float z1,
-                           float& lo, float& hi) const {
-    // The FULL height, not layer 0 alone. Sampling only the continent and then
-    // padding by the tallest biome amplitude is what made this band 610 m tall
-    // over a column whose surface moves 1.6 m -- 388 times what it needed, and
-    // 37 chunks of air per column at LOD 0 against a pool of 768. Measured by
-    // --band-report, which is also where the margin below comes from.
+                           float& lo, float& hi, float* core_lo, float* core_hi) const {
+    // Columns tile at whole metres (chunk sizes are 16 * 2^L), so the corner
+    // and the span identify one exactly.
+    const unsigned long long key =
+        (static_cast<unsigned long long>(static_cast<unsigned>(int(std::floor(x0))) & 0xFFFFFu)) |
+        (static_cast<unsigned long long>(static_cast<unsigned>(int(std::floor(z0))) & 0xFFFFFu) << 20) |
+        (static_cast<unsigned long long>(static_cast<unsigned>(int(x1 - x0)) & 0xFFFFFu) << 40);
     float mn = 1.0e9f, mx = -1.0e9f;
-    for (int j = 0; j <= 4; ++j) {
-        for (int i = 0; i <= 4; ++i) {
-            const float x = x0 + (x1 - x0) * float(i) * 0.25f;
-            const float z = z0 + (z1 - z0) * float(j) * 0.25f;
-            const float h = height(x, z);
-            if (h < mn) mn = h;
-            if (h > mx) mx = h;
+    std::unordered_map<unsigned long long, ColumnSpan>::const_iterator hit = column_cache_.find(key);
+    if (hit != column_cache_.end()) {
+        mn = hit->second.mn;
+        mx = hit->second.mx;
+    } else {
+        // The FULL height, not layer 0 alone. Sampling only the continent and
+        // then padding by the tallest biome amplitude is what made this band
+        // 610 m tall over a column whose surface moves 1.6 m -- 388 times what
+        // it needed, and 37 chunks of air per column at LOD 0 against a pool
+        // of 768. Measured by --band-report, which is also where the margin
+        // below comes from.
+        for (int j = 0; j <= 4; ++j) {
+            for (int i = 0; i <= 4; ++i) {
+                const float x = x0 + (x1 - x0) * float(i) * 0.25f;
+                const float z = z0 + (z1 - z0) * float(j) * 0.25f;
+                const float h = height(x, z);
+                if (h < mn) mn = h;
+                if (h > mx) mx = h;
+            }
         }
+        // Bounded: a long flight visits columns without end. 200k is ~5 MB.
+        if (column_cache_.size() > 200000) column_cache_.clear();
+        ColumnSpan c;
+        c.mn = mn; c.mx = mx;
+        column_cache_[key] = c;
     }
 
     // What the samples can miss between themselves, which grows with the
@@ -334,6 +352,8 @@ void WorldGpu::column_band(float x0, float z0, float x1, float z1,
     // this will cost.
     lo = mn - margin - params_.overhang_scale - 64.0f;
     hi = mx + margin + params_.overhang_scale;
+    if (core_lo) *core_lo = mn - margin;
+    if (core_hi) *core_hi = mx + margin;
 }
 
 void WorldGpu::band(float& lo, float& hi) const {

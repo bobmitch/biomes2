@@ -50,9 +50,13 @@ one frame at a fixed camera and writes a BMP without opening a window.
 The engine's headless modes all write a text file under `build/` and exit:
 `--shot`, `--flight <s>`, `--walk <s>`, `--overhang`, `--dig`, `--dig-save`,
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
-`--band-report`, `--sea-report`, `--swim` and `--blend-report`. `--flight`
-also takes `--settle`, `--holes` and `--flight-speed <m/s>`. It is a GUI subsystem binary, so a shell does not wait on it:
-run it with `Start-Process -Wait` or the file you read will be the last run's.
+`--band-report`, `--sea-report`, `--swim`, `--blend-report` and
+`--tab-test`. `--flight` also takes `--settle`, `--holes` and
+`--flight-speed <m/s>`; every mode takes the streaming A/B switches
+`--no-lod-hold`, `--no-prioritise`, `--adaptive-budget` and
+`--lod-fade <frames>`. It is a GUI subsystem binary, so a shell does not wait
+on it: run it with `Start-Process -Wait` or the file you read will be the
+last run's.
 
 ## Invariants — breaking one of these is a bug, not a tradeoff
 
@@ -211,16 +215,62 @@ run it with `Start-Process -Wait` or the file you read will be the last run's.
   drawn.** It did: retirement was immediate and replacement waited on an
   8-chunk-per-frame queue, so at 60 m/s 85% of frames had ground missing
   (`--flight 15 --vsync --settle --holes`). Now an unwanted chunk is HELD,
-  drawn, until nothing queued overlaps its footprint. It then dither-fades
-  out over 24 frames while its replacements fade in on the same clock, with
-  complementary 4×4 thresholds, so each pixel is drawn by exactly one. Holes
-  went to 0 at 15 and 60 m/s, with no fps change. Physics still drops the
-  chunk at once. A capture settles every fade first, so `--shot` is
-  pixel-identical with hold on or off. `--no-lod-hold` restores the old
-  behaviour for A/B, and `--lod-fade <frames>` sets the length.
+  drawn, until no CORE chunk queued overlaps its footprint. It then
+  dither-fades out over 16 frames while its replacements fade in on the
+  same clock, with complementary 4×4 thresholds, so each pixel is drawn by
+  exactly one. Holes went to 0 at 15 and 60 m/s. Physics still drops the
+  chunk at once. A capture settles every fade first, so `--shot` shows no
+  fade. `--no-lod-hold` restores the old behaviour, and `--lod-fade <frames>`
+  sets the length.
   **Measure holes from a settled world:** without `--settle` a flight spends
   its whole length on the initial load (a 1200-chunk backlog) and counts
   that as holes at every level.
+- **Holding traded holes for latency until the queue learned what matters.**
+  The first hold waited for a coarse chunk's WHOLE footprint, and 84% of what
+  gets meshed is air or solid rock in the band's overhang and cave padding.
+  LOD 0 detail at 60 m/s took 27 frames at the 90th percentile, up to 55.
+  The queue now meshes CORE chunks first (inside the column's sampled
+  surface range, from `column_band`'s `core_lo/core_hi`), nearest first, with
+  a boost for chunks that complete a held swap. Holds wait on core chunks
+  only. Result: 3 frames, max 5. LOD 3 went from 209 to 7, with holes still
+  0. `--flight --holes` prints latency and deficit per LOD;
+  `--no-prioritise` restores distance-only order for A/B. The cost is the
+  99th-percentile frame, 20.1 → 21.3 ms under vsync, consistent over runs.
+  Overhang-displaced surface outside the core band is meshed after the core
+  and does not hold a swap, so it can show a late patch. The hole metric
+  probes the 2.5D height and cannot see those.
+- **`column_band` made the engine CPU-bound for its whole life.** 25 full
+  height evaluations per column, ~392 columns, every frame, for a static
+  world: about 13 ms of a 13.6 ms frame. Every fps figure before this,
+  including the handover's 77, was measuring that loop. Cached per column,
+  the uncapped `--flight 10` frame is 0.37 ms (2,684 fps), with the same
+  1.1 M triangles. A/B'd by disabling only the cache lookup.
+- **The per-frame mesh budget is wired to more than the queue.**
+  `kReadbackChunksPerFrame` must be at least the budget: a chunk meshed past
+  the readback's capacity never reports its heights, so physics never gets
+  it, and an EMPTY chunk is only noticed through that readback, so its slot
+  is never returned and the pool fills with air. It was 8 = 8. Both now come
+  from `kMeshBudgetMax`. `--adaptive-budget`, which grows the budget while
+  GPU meshing is under 4 ms, is opt-in: it bought a frame or two of latency
+  and took the 99th-percentile frame to 27 ms through some CPU cost that
+  grows with chunks per frame and is NOT in the meshing timestamps. Not
+  found yet; the height-residual check was tried and capped, and was not it.
+- **Physics must receive terrain every frame, walking or not.** A chunk's
+  heights reach physics once, in the frame its readback lands, and
+  `Renderer::render` clears those events at the start of the next frame. The
+  window loop synced only while walking, so Tab after any flight dropped the
+  character into a physics world with no ground: 0 bodies, feet at -334 m
+  six seconds later. `step_window_physics` syncs every frame, and
+  `--tab-test` drives that same function. Physics now takes LOD 0–2 only
+  (`kPhysicsMaxLod`): the character is always inside the LOD 0 ring, and
+  bodies at coarse LODs cost about 1 ms a frame in flight for ground nobody
+  can reach. 524 bodies became 133.
+- **The first valid overhang collision test fails.** v9's terrain gave
+  `--overhang` a real ceiling at last: a slab 3.75 m thick, solid 1 m out in
+  every direction. Through v8 it only ever found spikes too thin to test
+  (0.0 m wide). The capsule launched upward passes straight THROUGH it, with
+  every mesh shape delivered and with physics at all LODs. This predates the
+  LOD 2 cap (A/B'd) and is not yet investigated.
 - **A gradient arm must not scale with the voxel.** `field_normal` took a
   central difference at half a voxel, which is 0.25 m at LOD 0 and 32 m at
   LOD 7 — a difference between two unrelated pieces of terrain, not a

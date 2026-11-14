@@ -100,7 +100,13 @@ static const UINT kHeightSamples = kHeightGrid * kHeightGrid;
 // start of frame N+2: with two frames in flight the CPU has already waited on
 // frame N's fence by then, so the map never blocks.
 static const UINT kReadbackRing = 3;
-static const UINT kReadbackChunksPerFrame = 8;
+// The most chunks the frame loop will mesh in one frame (the adaptive budget's
+// ceiling, see Renderer). The readback below MUST be at least this: a chunk
+// meshed past its capacity never has its heights read back, so physics never
+// gets it -- and an empty chunk is only noticed through that same readback,
+// so its slot is never given back and the pool slowly fills with air.
+static const UINT kMeshBudgetMax = 48;
+static const UINT kReadbackChunksPerFrame = kMeshBudgetMax;
 
 // Mesh readback for the chunks a heightfield cannot represent. Two a frame,
 // because one chunk's triangles are 163 KB against a height patch's 4.6 KB

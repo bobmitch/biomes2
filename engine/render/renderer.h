@@ -37,6 +37,11 @@ static const UINT kFrameCount = 2;
 // region meshes everything at once and the frame that does it is the one the
 // player notices.
 static const UINT kMeshBudgetPerFrame = 8;
+// The cap is now a FLOOR: the budget grows while the GPU's meshing time stays
+// under this, up to kMeshBudgetMax, and shrinks back when it does not. A fixed
+// 8 used 0.5 ms of a 16.7 ms frame at 15 m/s and still made distant detail
+// wait 30 frames. 4 ms is what leaves the 60 Hz frame room for the draw.
+static const double kMeshTargetMs = 4.0;   // only with --adaptive-budget
 
 struct ViewConstants {
     float cam_pos[3];    float time;
@@ -87,6 +92,7 @@ struct FrameStats {
     size_t resident = 0, pending = 0, free_slots = 0;
     UINT   vertices = 0, indices = 0, overflowed = 0;
     UINT   meshed_this_frame = 0;
+    UINT   mesh_budget = 0;        // what this frame was allowed
     double mesh_ms = 0.0;
 };
 
@@ -133,6 +139,13 @@ public:
     void  set_lod_hold(bool on) { streamer_.set_lod_hold(on); }
     void  set_lod_fade_frames(int n) { streamer_.set_fade_frames(n); }
     void  set_measure_holes(bool on) { streamer_.set_measure_holes(on); }
+    // Surface-first streaming (default on) and the GPU-time budget (default
+    // off -- see adaptive_budget_). Both switchable for A/B.
+    void  set_prioritise(bool on) { streamer_.set_prioritise(on); }
+    void  set_adaptive_budget(bool on) {
+        adaptive_budget_ = on;
+        if (!on) mesh_budget_ = kMeshBudgetPerFrame;
+    }
     const Streamer& streamer() const { return streamer_; }
     // 0 real shading, 1 depth, 2 foam, 3 normal, 4 displacement.
     void  set_water_debug(float m) { water_debug_ = m; }
@@ -242,6 +255,12 @@ private:
     WorldGpu    world_;
     ChunkMesher mesher_;
     Streamer    streamer_;
+    UINT        mesh_budget_ = kMeshBudgetPerFrame;
+    // OFF by default, measured: it took 60 m/s detail latency from 3 to 2
+    // frames at the 90th percentile and the 99th-percentile frame from 21 to
+    // 27 ms, with the GPU's meshing time unchanged -- a CPU cost that grows
+    // with chunks per frame, not yet found. --adaptive-budget turns it on.
+    bool        adaptive_budget_ = false;
     BrickStore  edits_;
     BrickPager  pager_;
     std::vector<BrickKey> dirty_bricks_;

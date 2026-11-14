@@ -43,8 +43,10 @@ of having them.
 | Land / islandness | same | 35.2% mean, 7.2 landmasses/seed, spawn mass 73.9% |
 | Volumetrics | same | 1.72% of subsurface is cave air, 11.6% of land columns overhang |
 | CPU vs GPU field | `engine --probe-field` | worst 0.000006 over densities spanning 18 m |
-| Frame cost | `engine --flight 10` | 74 fps, 2.49 ms meshing, 0 overflows (v8: 77 on its own terrain, 75 when re-measured the same day) |
+| Frame cost | `engine --flight 10` | 0.37 ms a frame, 2,684 fps, 1.1 M triangles, 0 overflows. Every earlier figure (74–77 fps) was CPU-bound on recomputing `column_band`; see CLAUDE.md |
 | LOD holes | `engine --flight 15 --vsync --settle --holes [--flight-speed 15]` | 0 frames with a hole at 15 and 60 m/s (`--no-lod-hold`, the old behaviour: 8.5% and 85.3%) |
+| LOD latency | same | 60 m/s, 90th percentile: LOD 0 3 frames, LOD 3 7 frames (hold without priority: 27 and 209); 99th-percentile frame 21.5 ms |
+| Tab after flight | `engine --tab-test` | lands on the ground, 133 terrain bodies (was 0 bodies and a fall to -334 m) |
 | Slot headroom | same | worst chunk wanted 2440 of 4096 vertices, 12816 of 24576 indices, but a 15 s, 60 m/s flight hit **3948** |
 | Walking | `engine --walk 20` | 120 m, feet 1.6 mm mean from the field, worst single-frame step 0.020 m, LOD 0 for all 1110 judged frames (v8: a 0.53 m step, which was a blend seam) |
 | Persistence | `engine --dig-save` then `--dig-verify` | −0.0000 m, SURVIVED |
@@ -87,7 +89,23 @@ What remains, in order:
   `validate` already computes and the engine does not.
 - No breath or drowning, no boat, and the sea moves no one sideways.
 
+### 1a. Overhang collision — the first valid test FAILS
+
+New and ahead of everything below. v9's terrain gave `--overhang` a real
+ceiling, a slab 3.75 m thick and solid 1 m out in every direction, and the
+launched capsule passes straight through it. Through v8 the test only ever
+found spikes too thin to mean anything, so this was never measurable before.
+The LOD 2 physics cap does not cause it (A/B'd at all LODs). Start with
+Jolt's back-face handling for `MeshShape` against `CharacterVirtual`, and
+whether the slab's chunk got a mesh shape at all rather than a heightfield.
+
 ### 2. Cap MeshShape at the fine LOD levels
+
+**Partly done on the CPU side:** `sync_physics_terrain` now hands physics
+LOD 0–2 only (`kPhysicsMaxLod` in `main.cpp`). That cut bodies from 524 to
+133 in `--tab-test`. The GPU still classifies and stages mesh shapes for
+coarse chunks that are then dropped, so the `cs_heights` gate below would
+still save that work.
 
 529 of 1895 chunks (27.9%) are flagged as needing a collision mesh, and 534 of
 694 physics bodies are mesh shapes — at coarse voxels where a mesh vertex sits

@@ -166,11 +166,22 @@ public:
     // a LOD change is missing until the queue reaches it -- kept for A/B.
     void set_lod_hold(bool on) { hold_ = on; }
     void set_fade_frames(int n) { fade_frames_ = n < 0 ? 0 : n; }
+    // Surface-first queue order and holds that wait on the core surface only.
+    // Off is distance-only order, holds waiting on everything -- for A/B.
+    void set_prioritise(bool on) { prioritise_ = on; }
     // Count, each update, surface chunks that are queued with nothing drawn
     // over their footprint. Costs a height query per queued chunk.
     void set_measure_holes(bool on) { measure_holes_ = on; }
     // Holes found by the last update, per LOD.
     const size_t* holes_by_lod() const { return holes_; }
+    // Detail DEFICIT, per LOD: surface chunks wanted but not yet on screen,
+    // whether or not something coarser is covering for them. Holes are the
+    // part with nothing covering. Measured with holes.
+    const size_t* deficit_by_lod() const { return deficit_; }
+    // Frames from a surface chunk first being wanted to it starting to show,
+    // per LOD, for every one that made it. The number the eye calls "the
+    // detail arrives late".
+    const std::vector<int>& latency_frames(int lod) const { return latency_[lod]; }
     size_t held_count() const { return held_.size(); }
     size_t fading_in_count() const { return fading_in_.size(); }
     unsigned long long forced_retires() const { return forced_retires_; }
@@ -231,6 +242,7 @@ public:
         ++frame_;
         cam_[0] = cx; cam_[1] = cy; cam_[2] = cz;
         desired_.clear();
+        desired_core_.clear();
 
         const float band_lo = band_lo_, band_hi = band_hi_;
 
@@ -259,10 +271,11 @@ public:
                     // where the surface is here costs one fBm and usually
                     // leaves two or three.
                     float col_lo = band_lo, col_hi = band_hi;
+                    float core_lo = band_lo, core_hi = band_hi;
                     if (bounds_) {
                         bounds_->column_band(float(i) * S, float(k) * S,
                                              float(i + 1) * S, float(k + 1) * S,
-                                             col_lo, col_hi);
+                                             col_lo, col_hi, &core_lo, &core_hi);
                     }
                     const int cj0 = int(std::floor(col_lo / S));
                     const int cj1 = int(std::floor(col_hi / S));
@@ -304,6 +317,10 @@ public:
                         ChunkKey key;
                         key.x = i; key.y = j; key.z = k; key.lod = lod;
                         desired_.push_back(key);
+                        // Where the ground itself can be, without the overhang
+                        // and cave padding: meshed first, and the only chunks
+                        // a held LOD swap waits for.
+                        desired_core_.push_back(y1 >= core_lo && y0 <= core_hi ? 1 : 0);
                     }
                 }
             }
@@ -346,11 +363,39 @@ public:
             Pending p;
             p.key = k;
             p.dist2 = dx * dx + dy * dy + dz * dz;
+            p.core = desired_core_[i] != 0;
+            // Completing a LOD swap that is being held is detail the player
+            // gets the moment it lands, so it goes ahead of a chunk at the
+            // same distance that is not holding anything up.
+            if (p.core && prioritise_) {
+                for (size_t h = 0; h < held_.size(); ++h) {
+                    if (held_[h].fade_start < 0 && xz_overlap(held_[h].key, k)) {
+                        p.dist2 *= 0.5f;
+                        break;
+                    }
+                }
+            }
+            if (!prioritise_) p.core = true;   // old order: distance alone
             queue_.push_back(p);
         }
-        std::sort(queue_.begin(), queue_.end(), by_distance);
+        // The visible surface first, nearest first; then the margins, which
+        // are mostly air and solid rock and meshed to nothing 84% of the time.
+        std::sort(queue_.begin(), queue_.end(), by_priority);
 
-        if (measure_holes_) count_holes();
+        if (measure_holes_) {
+            // When each queued chunk first became wanted, and forget the ones
+            // that stopped being wanted before they ever showed.
+            for (size_t q = 0; q < queue_.size(); ++q) {
+                if (queued_since_.find(queue_[q].key) == queued_since_.end())
+                    queued_since_[queue_[q].key] = frame_;
+            }
+            for (std::unordered_map<ChunkKey, int, ChunkKeyHash>::iterator it =
+                     queued_since_.begin(); it != queued_since_.end();) {
+                if (wanted_.find(it->first) == wanted_.end()) it = queued_since_.erase(it);
+                else ++it;
+            }
+            count_holes();
+        }
         advance_fades();
     }
 
@@ -447,6 +492,8 @@ public:
                 FadeIn f;
                 f.key = k; f.slot = slot; f.start = -1;
                 fading_in_.push_back(f);
+            } else {
+                note_visible(k);   // drawn the frame it is meshed
             }
 
             Planned p;
@@ -600,8 +647,10 @@ private:
             Held& h = held_[i];
             if (h.fade_start >= 0) continue;
             bool waiting = false;
+            // Only the CORE surface blocks: margin chunks are mostly air and
+            // rock, and waiting on them held new detail back for no picture.
             for (size_t q = 0; q < queue_.size() && !waiting; ++q) {
-                if (xz_overlap(queue_[q].key, h.key)) waiting = true;
+                if (queue_[q].core && xz_overlap(queue_[q].key, h.key)) waiting = true;
             }
             if (!waiting) h.fade_start = frame_;
         }
@@ -615,7 +664,7 @@ private:
             for (size_t h = 0; h < held_.size() && !blocked; ++h) {
                 if (held_[h].fade_start < 0 && xz_overlap(held_[h].key, f.key)) blocked = true;
             }
-            if (!blocked) f.start = frame_;
+            if (!blocked) { f.start = frame_; note_visible(f.key); }
         }
         // Finish what has run its course.
         for (size_t i = 0; i < held_.size();) {
@@ -641,14 +690,34 @@ private:
     // its footprint -- no hold, and no resident chunk at another level. The
     // outermost level's new ground is the horizon growing rather than a hole
     // in it, so it is counted under its own LOD and read separately.
+    // Does the ground pass through this chunk at its centre column? A probe,
+    // not a guarantee -- the measurement's notion of "a chunk you would see".
+    bool is_surface_chunk(const ChunkKey& k) const {
+        if (!bounds_) return false;
+        const float S = lod_chunk_size(k.lod);
+        const float h = bounds_->height((float(k.x) + 0.5f) * S, (float(k.z) + 0.5f) * S);
+        return h >= float(k.y) * S && h < float(k.y + 1) * S;
+    }
+
+    void note_visible(const ChunkKey& k) {
+        if (!measure_holes_) return;
+        std::unordered_map<ChunkKey, int, ChunkKeyHash>::iterator it = queued_since_.find(k);
+        if (it == queued_since_.end()) return;
+        if (is_surface_chunk(k)) latency_[k.lod].push_back(frame_ - it->second);
+        queued_since_.erase(it);
+    }
+
     void count_holes() {
-        for (int l = 0; l < kLodCount; ++l) holes_[l] = 0;
+        for (int l = 0; l < kLodCount; ++l) { holes_[l] = 0; deficit_[l] = 0; }
         if (!bounds_) return;
+        for (size_t i = 0; i < fading_in_.size(); ++i) {
+            if (fading_in_[i].start < 0 && is_surface_chunk(fading_in_[i].key))
+                ++deficit_[fading_in_[i].key.lod];
+        }
         for (size_t q = 0; q < queue_.size(); ++q) {
             const ChunkKey& k = queue_[q].key;
-            const float S = lod_chunk_size(k.lod);
-            const float h = bounds_->height((float(k.x) + 0.5f) * S, (float(k.z) + 0.5f) * S);
-            if (h < float(k.y) * S || h >= float(k.y + 1) * S) continue;
+            if (!is_surface_chunk(k)) continue;
+            ++deficit_[k.lod];
             bool covered = false;
             for (size_t i = 0; i < held_.size() && !covered; ++i) {
                 if (xz_overlap(held_[i].key, k)) covered = true;
@@ -665,20 +734,31 @@ private:
     std::vector<Held>   held_;
     std::vector<FadeIn> fading_in_;
     int   frame_ = 0;
-    int   fade_frames_ = 24;
+    // 16 frames, about 0.27 s at 60 Hz: long enough to read as a fade rather
+    // than a pop, and a third sooner to full detail than the first 24.
+    int   fade_frames_ = 16;
     bool  hold_ = true;
     bool  measure_holes_ = false;
     size_t holes_[kLodCount] = {0, 0, 0, 0, 0, 0, 0, 0};
+    size_t deficit_[kLodCount] = {0, 0, 0, 0, 0, 0, 0, 0};
+    std::vector<int> latency_[kLodCount];
+    std::unordered_map<ChunkKey, int, ChunkKeyHash> queued_since_;
     unsigned long long forced_retires_ = 0;
     float cam_[3] = {0.0f, 0.0f, 0.0f};
 
     struct Pending {
         ChunkKey key;
         float    dist2;
+        bool     core;   // may hold the 2.5D surface
     };
-    static bool by_distance(const Pending& a, const Pending& b) { return a.dist2 < b.dist2; }
+    static bool by_priority(const Pending& a, const Pending& b) {
+        if (a.core != b.core) return a.core;
+        return a.dist2 < b.dist2;
+    }
 
     std::vector<ChunkKey> desired_;
+    std::vector<unsigned char> desired_core_;
+    bool prioritise_ = true;
     std::unordered_map<ChunkKey, UINT, ChunkKeyHash> resident_;
     std::unordered_map<ChunkKey, int, ChunkKeyHash>  wanted_;
     std::vector<Pending> queue_;
