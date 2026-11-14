@@ -148,6 +148,9 @@ public:
     // Surface-first queue order and holds that wait on the core surface only.
     // Off is distance-only order, holds waiting on everything -- for A/B.
     void set_prioritise(bool on) { prioritise_ = on; }
+    // Rings snapped to the coarser level's grid (default on); off is the
+    // camera-centred 7-wide ring, for A/B.
+    void set_align(bool on) { align_ = on; }
     // Count, each update, surface chunks that are queued with nothing drawn
     // over their footprint. Costs a height query per queued chunk.
     void set_measure_holes(bool on) { measure_holes_ = on; }
@@ -164,6 +167,8 @@ public:
     size_t held_count() const { return held_.size(); }
     size_t fading_in_count() const { return fading_in_.size(); }
     unsigned long long forced_retires() const { return forced_retires_; }
+    // Frames in which a chunk was queued and no slot was free for it.
+    unsigned long long starved_frames() const { return starved_frames_; }
 
     // Per-slot (mode, v) for the draw: mode 0 drawn, 1 fading in (drawn where
     // the dither threshold is below v), 2 fading out (drawn where it is at or
@@ -234,15 +239,35 @@ public:
             const int ci = int(std::floor(cx / S));
             const int ck = int(std::floor(cz / S));
 
-            const float bx0 = float(ci - kRingHalf) * S;
-            const float bx1 = float(ci + kRingHalf + 1) * S;
-            const float bz0 = float(ck - kRingHalf) * S;
-            const float bz1 = float(ck + kRingHalf + 1) * S;
+            // The ring's chunk range. Centred on the camera's chunk it is 7
+            // wide, and an odd width cannot sit on the coarser level's grid
+            // (2 of these chunks per coarse one) -- so about half the time the
+            // ring's edge fell in the MIDDLE of a coarse chunk. The coarse
+            // level drops only chunks the finer ring covers COMPLETELY, so
+            // that half-covered coarse chunk stayed and was drawn over a whole
+            // column of fine ones: two meshes of the same ground in one place,
+            // the coarse one poking through wherever it was higher -- a ledge
+            // along the ring.
+            //
+            // Aligned, the ring is 8 wide and starts on an even chunk, so it
+            // tiles the coarse grid exactly: a coarse chunk is either fully
+            // covered (and the LOD hold cross-fades it out) or fully outside.
+            // At least 3 chunks of margin remain on every side of the camera.
+            // The outermost level has nothing coarser, so it stays centred.
+            int i0 = ci - kRingHalf, i1 = ci + kRingHalf;
+            int k0 = ck - kRingHalf, k1 = ck + kRingHalf;
+            if (align_ && lod < kLodCount - 1) {
+                i0 = 2 * floor_div2(ci - kRingHalf); i1 = i0 + 2 * kRingHalf + 1;
+                k0 = 2 * floor_div2(ck - kRingHalf); k1 = k0 + 2 * kRingHalf + 1;
+            }
 
+            const float bx0 = float(i0) * S;
+            const float bx1 = float(i1 + 1) * S;
+            const float bz0 = float(k0) * S;
+            const float bz1 = float(k1 + 1) * S;
 
-
-            for (int k = ck - kRingHalf; k <= ck + kRingHalf; ++k) {
-                for (int i = ci - kRingHalf; i <= ci + kRingHalf; ++i) {
+            for (int k = k0; k <= k1; ++k) {
+                for (int i = i0; i <= i1; ++i) {
                     // The vertical range is per COLUMN, not global. Over the
                     // real world a global band spans about 700 m, which is 44
                     // chunks of air per column at LOD 0; the pool fills with
@@ -463,7 +488,11 @@ public:
             // the old behaviour -- a hole -- but only for the chunk the pool
             // could not afford, and counted so it shows if it ever matters.
             if (free_slots_.empty() && !held_.empty()) force_retire_farthest();
-            if (free_slots_.empty()) break;
+            if (free_slots_.empty()) {
+                // The pool is dry with work waiting: what was a silent hole.
+                ++starved_frames_;
+                break;
+            }
             const ChunkKey& k = queue_[i].key;
             const UINT slot = free_slots_.back();
             free_slots_.pop_back();
@@ -723,6 +752,7 @@ private:
     std::vector<int> latency_[kLodCount];
     std::unordered_map<ChunkKey, int, ChunkKeyHash> queued_since_;
     unsigned long long forced_retires_ = 0;
+    unsigned long long starved_frames_ = 0;
     float cam_[3] = {0.0f, 0.0f, 0.0f};
 
     struct Pending {
@@ -738,6 +768,8 @@ private:
     std::vector<ChunkKey> desired_;
     std::vector<unsigned char> desired_core_;
     bool prioritise_ = true;
+    bool align_ = true;
+    static int floor_div2(int a) { return a >= 0 ? a / 2 : -((1 - a) / 2); }
     std::unordered_map<ChunkKey, UINT, ChunkKeyHash> resident_;
     std::unordered_map<ChunkKey, int, ChunkKeyHash>  wanted_;
     std::vector<Pending> queue_;

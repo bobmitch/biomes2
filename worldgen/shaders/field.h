@@ -55,6 +55,25 @@ WG_FN float layer1_danger(float x, float z, float r, float w, float freq, int oc
 // eleven loose scalars while a WGSL generator forbade structs; ADR-002
 // retired that, and layer 6's cave parameters would have made it thirteen.
 
+// How far a ridged crest is rounded, in noise units: |n| becomes
+// sqrt(n*n + k*k) near the crest and stays |n| away from it.
+//
+// The ridged noise's 1 - 2|n| is a knife-edge, and a voxel grid samples a
+// knife-edge as zigzag teeth: the "toothed ledges" along every ridge line,
+// 2.7% of a rough hillside (engine --mesh-debug 2). Rounding the crest cut
+// that to 1.8% at this k and the teeth went with it. It also lowers each
+// crest's tip by up to 2k in ridged units, so ridged land reads slightly
+// more weathered; that trade was chosen by eye at k = 0.05 over 0.1.
+//
+// sqrt(n*n + k*k) - k would keep the tips and lift EVERYTHING else by 2k --
+// whole ridged hillsides rose many metres in the A/B. Do not "fix" it to that.
+// sqrt only: invariant 9.
+static const float kCrestRound = 0.05f;
+
+WG_FN float crest_abs(float n, float k) {
+    return k > 0.0f ? sqrt(n * n + k * k) : abs(n);
+}
+
 // fBm with a warp from rolling to ridged. ridge_blend 0 is plain fBm; 1 is
 // ridged peaks. Not a blend of billow against ridged -- those are mirror
 // images of each other and cancel to a flat field at the midpoint.
@@ -65,7 +84,7 @@ WG_FN float fbm_shaped(float x, float y, int octaves, float lacunarity, float ga
     float norm = 0.0f;
     for (int o = 0; o < octaves; o = o + 1) {
         const float n = simplex2(x * freq, y * freq, seed + asuint(o) * 0x9E3779B1u);
-        const float ridged = 1.0f - 2.0f * abs(n);
+        const float ridged = 1.0f - 2.0f * crest_abs(n, kCrestRound);
         const float v = n * (1.0f - ridge_blend) + ridged * ridge_blend;
         const float w = octave_weight(base_period / freq, voxel);
         sum = sum + amp * w * v;
@@ -224,9 +243,14 @@ WG_FN float river_carve(float h, float d, float width, float depth) {
 
 // Ridged 3D noise. The creases are what make an overhang: a plain fBm
 // displacement just makes the surface wobble.
-WG_FN float ridged3(float x, float y, float z, int octaves, float lacunarity, float gain, uint seed, float base_period, float voxel) {
+//
+// `crest` rounds the crest (kCrestRound for the overhang term). The caves pass
+// 0, which keeps the exact abs: cave_field thresholds the crest with a
+// smoothstep up to 0.97, so a rounded crest topping out at 0.9 would narrow
+// every tunnel -- a different change from the one that was decided.
+WG_FN float ridged3(float x, float y, float z, int octaves, float lacunarity, float gain, uint seed, float base_period, float voxel, float crest) {
     const float n = fbm3_lod(x, y, z, octaves, lacunarity, gain, seed, base_period, voxel);
-    return 1.0f - 2.0f * abs(n);
+    return 1.0f - 2.0f * crest_abs(n, crest);
 }
 
 // Tunnels, as the intersection of two ridged fields. Each field's crest is a
@@ -235,8 +259,8 @@ WG_FN float ridged3(float x, float y, float z, int octaves, float lacunarity, fl
 // and cos, and invariant 9 forbids libm upstream of the golden hash.
 WG_FN float cave_field(float x, float y, float z, float freq, uint seed, float voxel) {
     const float bp = 1.0f / freq;
-    const float a = ridged3(x * freq, y * freq, z * freq, 2, 2.0f, 0.5f, seed, bp, voxel);
-    const float b = ridged3(x * freq, y * freq, z * freq, 2, 2.0f, 0.5f, seed + 0x9E3779B1u, bp, voxel);
+    const float a = ridged3(x * freq, y * freq, z * freq, 2, 2.0f, 0.5f, seed, bp, voxel, 0.0f);
+    const float b = ridged3(x * freq, y * freq, z * freq, 2, 2.0f, 0.5f, seed + 0x9E3779B1u, bp, voxel, 0.0f);
     const float ta = wg_smoothstep(0.62f, 0.97f, a);
     const float tb = wg_smoothstep(0.62f, 0.97f, b);
     return ta * tb;
@@ -256,7 +280,7 @@ WG_FN float layer6_density(float x, float y, float z, float height, BiomeProfile
     if (p.overhang_strength > 0.0f) {
         const float bp = 1.0f / overhang_freq;
         const float rg = ridged3(x * overhang_freq, y * overhang_freq, z * overhang_freq,
-                                 3, 2.0f, 0.5f, seed_overhang, bp, voxel);
+                                 3, 2.0f, 0.5f, seed_overhang, bp, voxel, kCrestRound);
         d = d + p.overhang_strength * overhang_scale * rg;
     }
     if (p.cave_density > 0.0f) {

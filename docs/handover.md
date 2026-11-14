@@ -5,9 +5,9 @@ this was written. Read [`CLAUDE.md`](../CLAUDE.md) first — the invariants and
 the traps live there and are **not** repeated here. This file is the state of
 play; that file is the law.
 
-Written 2026-11-13, at `generator_version` 8. The numbers were updated the
-same day at version 9 (the continuous cell blend), with the v8 values kept
-where they moved.
+Written 2026-11-13, at `generator_version` 8. The numbers were updated at
+version 9 (the continuous cell blend) and version 10 (rounded ridged
+crests), with older values kept where they moved.
 
 ## Where it stands
 
@@ -38,10 +38,10 @@ of having them.
 
 | Check | Command | Value |
 | --- | --- | --- |
-| Generator gate | `build\validate.exe` | ALL CHECKS PASSED, 8 seeds at version 9 |
+| Generator gate | `build\validate.exe` | ALL CHECKS PASSED, 8 seeds at version 10 |
 | Blend seams | same | 0 seeds over 5 cm; worst 0.014 m base, 0.036 m 3D, over 398,211 crossings (v8: steps up to 178 m) |
 | Land / islandness | same | 35.2% mean, 7.2 landmasses/seed, spawn mass 73.9% |
-| Volumetrics | same | 1.72% of subsurface is cave air, 11.6% of land columns overhang |
+| Volumetrics | same | 1.72% of subsurface is cave air, 10.6% of land columns overhang (11.6% before v10 rounded the crests) |
 | CPU vs GPU field | `engine --probe-field` | worst 0.000006 over densities spanning 18 m |
 | Frame cost | `engine --flight 10` | 0.37 ms a frame, 2,684 fps, 1.1 M triangles, 0 overflows. Every earlier figure (74–77 fps) was CPU-bound on recomputing `column_band`; see CLAUDE.md |
 | LOD holes | `engine --flight 15 --vsync --settle --holes [--flight-speed 15]` | 0 frames with a hole at 15 and 60 m/s (`--no-lod-hold`, the old behaviour: 8.5% and 85.3%) |
@@ -98,23 +98,21 @@ stop. It stops, and a no-mesh-shape mutant fails. The collision mesh is now
 read back for LOD 0–2 only, so an overhang chunk is a solid heightfield for
 less time (backlog peak 271 → 45). CLAUDE.md has the detail.
 
-### 1b. LOD seams show as toothed ledges
+### 1b. ~~Toothed ledges~~ — creases, rounded in v10
 
-The V grooves along every chunk border were the skirt lip, which is now a
-real curtain skirt (CLAUDE.md). What remains is the STEP where a finer ring
-meets a coarser one: on a rough hillside the curtain is visible on 3.7% of
-the frame, almost all of it along the ring boundaries. The coarse mesh is up
-to about a coarse voxel off the fine one, so covering the crack cannot help.
-The fix is stitching: transition cells, or morphing the fine chunk's border
-vertices onto the coarse surface. The magenta curtain debug
-(`length(i.nrm) < 0.9` in `mesh.hlsl`) is the instrument.
+NOT LOD seams: the debug tint that said so counted creases as curtain. With
+an exact detector (`--mesh-debug 1`/`2`), the rough hillside showed curtain
+on 0.48% of the frame and creases on 2.71%. The creases were the ridged
+noise's knife-edge crest; v10 rounds it (k = 0.05, chosen by eye), and
+creases are 1.8%. Caves are deliberately left sharp. CLAUDE.md has the
+detail and the wrong variant to avoid.
 
-### 1c. Rough terrain runs the slot pool dry
+### 1c. ~~Rough terrain runs the slot pool dry~~ — fixed
 
-`--shot --no-water --cam 2420 118 3390 0.75 -0.18` finishes its capture
-with 0 free slots, 96 chunks never meshed and 5 overflowing their slot.
-Those are holes, and it happened with the old lip too. Nothing outside the
-shot's `.txt` says so. Measure in the frame loop before sizing anything.
+Pool 768 × 4608 → 1536 × 6144. On a 60 m/s rough-terrain flight the old pool
+never settled and had 1654 starved frames and 384 early retires; the new
+one settled in 3 s with none. `--slot-report` and the flight's starved-frame
+count are the instruments.
 
 ### 2. Cap MeshShape at the fine LOD levels
 

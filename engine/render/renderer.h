@@ -122,6 +122,9 @@ public:
     // says nothing about how much headroom there is.
     void set_vsync(bool on) { vsync_ = on; }
     bool tearing_available() const { return tearing_ok_; }
+    // What the slot pool is actually holding, after a capture: per-chunk
+    // vertex and index counts against the caps, and memory against the GPU.
+    void slot_report(const char* path);
     void set_mode(Mode m) { mode_ = m; }
     Mode mode() const { return mode_; }
 
@@ -142,6 +145,9 @@ public:
     // Surface-first streaming (default on) and the GPU-time budget (default
     // off -- see adaptive_budget_). Both switchable for A/B.
     void  set_prioritise(bool on) { streamer_.set_prioritise(on); }
+    void  set_lod_align(bool on) { streamer_.set_align(on); }
+    // 1 tints the skirt curtain magenta, 2 tints sharp creases cyan.
+    void  set_mesh_debug(float m) { mesh_debug_ = m; }
     void  set_adaptive_budget(bool on) {
         adaptive_budget_ = on;
         if (!on) mesh_budget_ = kMeshBudgetPerFrame;
@@ -273,6 +279,7 @@ private:
     float       sea_state_ = 0.25f;
     bool        water_ = true;
     float       water_debug_ = 0.0f;
+    float       mesh_debug_ = 0.0f;
 
     ComPtr<ID3D12Fence> fence_;
     HANDLE              fence_event_ = nullptr;
@@ -314,6 +321,7 @@ private:
     bool ready_ = false;
     bool vsync_ = true;
     bool tearing_ok_ = false;
+    unsigned long long adapter_vram_ = 0;   // dedicated video memory, bytes
 };
 
 }  // namespace engine

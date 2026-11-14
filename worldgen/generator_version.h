@@ -39,7 +39,11 @@ namespace worldgen {
 //      with the fifth nearest. The 4-cell blend had been cutting a live
 //      weight wherever the 4th and 5th traded places -- straight-line steps
 //      in the heightfield up to 63 m, and dark serrated overhang walls.
-static const int kGeneratorVersion = 9;
+//  10  rounded ridged crests (kCrestRound = 0.05) in layer 4's ridged octaves
+//      and layer 6's overhang term. The knife-edge 1 - 2|n| rendered as
+//      zigzag teeth along every ridge line; rounding cut them from 2.7% to
+//      1.8% of a rough hillside. Caves keep the exact abs.
+static const int kGeneratorVersion = 10;
 
 }  // namespace worldgen
 

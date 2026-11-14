@@ -24,7 +24,9 @@ cbuffer MeshConstants : register(b0) {
     // Non-zero when the mesh is being drawn as wireframe over the raymarch.
     // The overlay is useless if the edges are shaded like the terrain they sit
     // on, which is how the first attempt came out.
-    float  wire;     float slot_vertices;  float2 pad1;
+    float  wire;     float slot_vertices;
+    // 0 off; 1 skirt curtain magenta; 2 sharp creases cyan. See ps_main.
+    float  mesh_debug; float pad1;
 };
 
 struct VSOut {
@@ -32,6 +34,7 @@ struct VSOut {
     float3 world : TEXCOORD0;
     float3 nrm   : TEXCOORD1;
     nointerpolation float2 fade : TEXCOORD2;
+    float  skirt : TEXCOORD3;   // 1 at a skirt vertex, 0 at a surface vertex
 };
 
 // No input layout. With an index buffer bound, SV_VertexID is already the
@@ -46,6 +49,9 @@ VSOut vs_main(uint vid : SV_VertexID) {
     o.nrm = v.nrm;
     // Indices are absolute, so the vertex id says which slot this is.
     o.fade = g_fade[vid / uint(slot_vertices)];
+    // Exact: the kernel stores a skirt vertex's normal at half length. A
+    // surface triangle is 0 everywhere; a curtain triangle is not.
+    o.skirt = dot(v.nrm, v.nrm) < 0.5f ? 1.0f : 0.0f;
     return o;
 }
 
@@ -72,6 +78,15 @@ float4 ps_main(VSOut i) : SV_Target {
         else                 clip(t - i.fade.y);   // fading out
     }
     if (wire > 0.5f) return float4(1.0f, 0.25f, 0.65f, 1.0f);
+    // Debug views. The first attempt at "where is the curtain visible" tested
+    // the interpolated normal's length, which a sharp CREASE also shortens --
+    // it counted the terrain's ridge lines as seams and sent a whole
+    // investigation the wrong way. The skirt flag is exact; the crease view
+    // is the normal-length test, but only where the flag is zero.
+    if (mesh_debug > 0.5f && mesh_debug < 1.5f && i.skirt > 0.001f)
+        return float4(1.0f, 0.0f, 1.0f, 1.0f);
+    if (mesh_debug > 1.5f && i.skirt <= 0.001f && length(i.nrm) < 0.9f)
+        return float4(0.0f, 1.0f, 1.0f, 1.0f);
     const float3 n = normalize(i.nrm);
     const float3 sun = normalize(float3(0.45f, 0.78f, 0.35f));
     const float  lam = saturate(dot(n, sun));

@@ -59,12 +59,20 @@ static const UINT kChunkCorners    = 34;
 // one vertex per cell (32,768), which no surface reaches: a chunk holds a
 // sheet through a volume, not a solid. Overflow is counted rather than assumed
 // away.
-static const UINT kSlots        = 768;
-// 4608: the skirt adds a second vertex for every border cell the surface
-// crosses, ~130-260 a chunk, and the worst chunk of a flight already wanted
-// 3948 of the old 4096. Must stay under 65536 -- cs_vertices packs the
-// surface and skirt indices into 16 bits each, and slot_caps packs the caps.
-static const UINT kSlotVertices = 4608;
+// 1536. 768 ran dry on rough ground: --shot --slot-report over the hillside
+// at (2420, 3390) held geometry in all 768 with 96 chunks still queued --
+// holes -- and LOD swaps hold up to ~230 more while they cross-fade. The pool
+// is ~450 MB at these caps against a 20 GB card; a variable-size allocator
+// would recover the ~65% of each slot a typical chunk leaves empty, and is
+// the thing to build if memory ever matters.
+static const UINT kSlots        = 1536;
+// 6144. The skirt adds a second vertex for every border cell the surface
+// crosses (~130-260 a chunk), and the rough hillside's heaviest chunk wanted
+// 5250 against the 4608 before this -- 4 chunks over the cap, which is
+// dropped geometry. 6144 is 17% over the worst seen. Must stay under 65536:
+// cs_vertices packs the surface and skirt indices into 16 bits each, and
+// slot_caps packs the caps (36864 indices).
+static const UINT kSlotVertices = 6144;
 // Six per vertex, not a round number. A closed quad surface has about as many
 // quads as vertices -- each quad owns four, each vertex is shared by four --
 // so the index count tracks the vertex count at 6 per vertex, and a cap that
@@ -72,7 +80,7 @@ static const UINT kSlotVertices = 4608;
 // with. Measured at 5.7 on the worst chunk of a flight, which wanted 19578
 // indices against the old 16384 and silently lost the rest. Four chunks of a
 // 15 s flight came out with holes in them.
-static const UINT kSlotIndices  = kSlotVertices * 6;   // 27648
+static const UINT kSlotIndices  = kSlotVertices * 6;   // 36864
 
 struct MeshVertex {
     float pos[3];
@@ -211,6 +219,10 @@ public:
     // by the same two frames as everything else on this path, which is
     // harmless: the slot's contents do not change while it stays resident.
     void         slot_counts(UINT slot, UINT& vertices, UINT& indices);
+    // Every slot's counters UNCLAMPED, (vertices, indices) pairs: a counter
+    // past the cap says how far the chunk overshot, which the clamped read
+    // hides. Valid after a counter copy has landed.
+    void         read_all_counts(std::vector<UINT>& out);
 
     ID3D12Resource* vertices()  const { return vertices_.Get(); }
     ID3D12Resource* indices()   const { return indices_.Get(); }

@@ -43,7 +43,7 @@ cbuffer ChunkConstants : register(b0) {
     uint   slot_caps;      // vertex cap in the low 16 bits, index cap in the high
     uint   brick_first;    // this chunk's run in the brick header array
     uint   brick_count;
-    float  skirt;          // how many voxels the lip drops, from the C++ side
+    float  skirt;          // how deep the skirt curtain reaches, in voxels
     uint   pad1;
 };
 

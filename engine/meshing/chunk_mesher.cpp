@@ -590,6 +590,17 @@ void ChunkMesher::unmap_mesh(UINT ring) {
     mesh_readback_[ring]->Unmap(0, &none);
 }
 
+void ChunkMesher::read_all_counts(std::vector<UINT>& out) {
+    out.assign(size_t(kSlots) * 2, 0);
+    void* p = nullptr;
+    D3D12_RANGE r = {0, SIZE_T(kSlots) * 2 * 4};
+    if (FAILED(counter_readback_->Map(0, &r, &p))) return;
+    const UINT* c = static_cast<const UINT*>(p);
+    for (size_t i = 0; i < out.size(); ++i) out[i] = c[i];
+    D3D12_RANGE none = {0, 0};
+    counter_readback_->Unmap(0, &none);
+}
+
 void ChunkMesher::slot_counts(UINT slot, UINT& verts, UINT& inds) {
     verts = 0;
     inds = 0;

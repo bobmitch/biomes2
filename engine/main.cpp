@@ -544,6 +544,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     {
         const std::string c2 = cmdline ? cmdline : "";
         if (c2.find("--no-prioritise") != std::string::npos) g_renderer.set_prioritise(false);
+        if (c2.find("--no-lod-align") != std::string::npos) g_renderer.set_lod_align(false);
+        const size_t md = c2.find("--mesh-debug");
+        if (md != std::string::npos) g_renderer.set_mesh_debug(float(std::atof(c2.c_str() + md + 12)));
         if (c2.find("--adaptive-budget") != std::string::npos) g_renderer.set_adaptive_budget(true);
     }
     if (lod_fade >= 0) g_renderer.set_lod_fade_frames(lod_fade);
@@ -627,6 +630,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (debug_layer) {
             g_renderer.drain_debug_messages("build/d3d12_validation.txt");
             g_renderer.dump_draw_args("build/draw_args.txt");
+        }
+
+        if (std::string(cmdline ? cmdline : "").find("--slot-report") != std::string::npos) {
+            g_renderer.slot_report((shot_path + ".slots.txt").c_str());
         }
 
         // --pick px py [px py ...]: what is AT a pixel. Marches the CPU
@@ -727,6 +734,32 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                              term, crease);
                 std::fprintf(pf, "  ring LOD %d (voxel %.1f m), %.2f m from a chunk edge\n",
                              lod, lod >= 0 ? engine::lod_voxel(lod) : 0.0f, edge);
+                // What is actually resident around the hit, per LOD: the hit's
+                // column and its four neighbours, at the hit's y-level and one
+                // either side. G = holds geometry, e = resident but meshed
+                // empty, . = not resident.
+                for (int L = 0; L < engine::kLodCount; ++L) {
+                    const float S = engine::lod_chunk_size(L);
+                    const int cx = int(std::floor(hx / S)), cy = int(std::floor(hy / S));
+                    const int cz = int(std::floor(hz / S));
+                    const int off[5][2] = {{0, 0}, {-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+                    bool any = false;
+                    std::string row;
+                    for (int c = 0; c < 5; ++c) {
+                        row += c == 0 ? " here[" : (c == 1 ? " -x[" : c == 2 ? " +x[" : c == 3 ? " -z[" : " +z[");
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            engine::ChunkKey k;
+                            k.x = cx + off[c][0]; k.y = cy + dy; k.z = cz + off[c][1]; k.lod = L;
+                            UINT sl = 0;
+                            const bool res = g_renderer.streamer().slot_of(k, sl);
+                            row += !res ? '.' : (sl == engine::kNoSlot ? 'e' : 'G');
+                            if (res) any = true;
+                        }
+                        row += "]";
+                    }
+                    if (any) std::fprintf(pf, "    LOD %d chunk (%d,%d,%d), y-levels below/at/above:%s\n",
+                                          L, cx, cy, cz, row.c_str());
+                }
 
                 // The region-cell blend either side of the hit, half a metre
                 // each way along the surface normal's horizontal part. The
@@ -2426,6 +2459,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // work to do, while uncapped it covers a fraction of a millimetre.
         g_renderer.set_vsync(flight_vsync);
         g_camera.x = 0.0f; g_camera.y = 34.0f; g_camera.z = 0.0f;
+        // --flight-from x y z: start somewhere else -- rough ground is where
+        // the slot pool ran dry, and the origin is gentle.
+        {
+            const std::string fc = cmdline ? cmdline : "";
+            const size_t ff = fc.find("--flight-from");
+            float fx, fy, fz;
+            if (ff != std::string::npos &&
+                std::sscanf(fc.c_str() + ff + 13, "%f %f %f", &fx, &fy, &fz) == 3) {
+                g_camera.x = fx; g_camera.y = fy; g_camera.z = fz;
+            }
+        }
         g_camera.pitch = -0.22f;
         g_camera.speed = 60.0f;
         const std::string fcl = cmdline ? cmdline : "";
@@ -2587,6 +2631,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(f, "mesh budget per frame: mean %.1f, peak %u (floor %u, ceiling %u, GPU target %.1f ms)\n",
                          budget_n ? double(budget_sum) / double(budget_n) : 0.0, budget_peak,
                          engine::kMeshBudgetPerFrame, engine::kMeshBudgetMax, engine::kMeshTargetMs);
+            std::fprintf(f, "frames with work queued and no free slot: %llu\n",
+                         g_renderer.streamer().starved_frames());
             std::fprintf(f, "LOD hold: %s; peak chunks held %zu, retired early for want of a"
                             " slot %llu\n",
                          no_lod_hold ? "OFF (old behaviour)" : "on",

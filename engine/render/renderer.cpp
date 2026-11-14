@@ -58,7 +58,8 @@ struct MeshConstants {
     float far_plane;
     float wire;
     float slot_vertices;   // so the vertex shader can tell which slot it is in
-    float pad1[2];
+    float mesh_debug;      // 0 off, 1 skirt curtain, 2 creases
+    float pad1;
 };
 
 std::string hr_text(const char* what, HRESULT hr) {
@@ -168,6 +169,7 @@ bool Renderer::create_device(std::string& error, bool debug_layer) {
         if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
         if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0,
                                         IID_PPV_ARGS(&device_)))) {
+            adapter_vram_ = desc.DedicatedVideoMemory;
             break;
         }
     }
@@ -735,6 +737,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         const bool wire = (mode_ == Mode::Wireframe);
         mc.wire = wire ? 1.0f : 0.0f;
         mc.slot_vertices = static_cast<float>(kSlotVertices);
+        mc.mesh_debug = mesh_debug_;
         streamer_.fill_visibility(static_cast<float*>(fade_cpu_[frame_]));
         cmd_->SetPipelineState(wire ? mesh_wire_pso_.Get() : mesh_pso_.Get());
         cmd_->SetGraphicsRootSignature(mesh_root_.Get());
@@ -1811,6 +1814,59 @@ bool Renderer::dig(float x, float y, float z, float radius, float strength,
     streamer_.invalidate_box(lo, hi);
     stats_.chunks_invalidated = streamer_.last_invalidated();
     return true;
+}
+
+void Renderer::slot_report(const char* path) {
+    FILE* f = std::fopen(path, "w");
+    if (!f) return;
+    std::vector<UINT> c;
+    mesher_.read_all_counts(c);
+    const UINT edges[] = {0, 256, 512, 1024, 2048, 3072, 4096, kSlotVertices};
+    const int nb = int(sizeof(edges) / sizeof(edges[0]));
+    unsigned long long hist[16] = {0};
+    std::vector<UINT> used_v, used_i;
+    UINT over_v = 0, over_i = 0, worst_v = 0, worst_i = 0;
+    for (UINT s = 0; s < kSlots; ++s) {
+        const UINT v = c[s * 2], i = c[s * 2 + 1];
+        if (v > worst_v) worst_v = v;
+        if (i > worst_i) worst_i = i;
+        if (v > kSlotVertices) ++over_v;
+        if (i > kSlotIndices) ++over_i;
+        if (v == 0) continue;
+        used_v.push_back(v); used_i.push_back(i);
+        int b = 0;
+        while (b + 1 < nb && v > edges[b + 1]) ++b;
+        if (v > kSlotVertices) b = nb;
+        ++hist[b];
+    }
+    std::sort(used_v.begin(), used_v.end());
+    std::sort(used_i.begin(), used_i.end());
+    const double slot_bytes = double(kSlotVertices) * sizeof(MeshVertex) +
+                              double(kSlotIndices) * 4.0 + double(kHeightSamples) * 4.0;
+    std::fprintf(f, "slot pool: %u slots of %u vertices / %u indices, %.0f KB each, %.0f MB total\n",
+                 kSlots, kSlotVertices, kSlotIndices, slot_bytes / 1024.0,
+                 slot_bytes * kSlots / (1024.0 * 1024.0));
+    std::fprintf(f, "GPU dedicated memory: %.0f MB\n", double(adapter_vram_) / (1024.0 * 1024.0));
+    std::fprintf(f, "slots holding geometry: %zu; free %zu; chunks still queued %zu\n",
+                 used_v.size(), streamer_.free_slot_count(), streamer_.pending_count());
+    if (!used_v.empty()) {
+        std::fprintf(f, "vertices per chunk: median %u, 90th %u, 99th %u, max %u\n",
+                     used_v[used_v.size() / 2], used_v[used_v.size() * 9 / 10],
+                     used_v[used_v.size() * 99 / 100], worst_v);
+        std::fprintf(f, "indices per chunk:  median %u, 90th %u, 99th %u, max %u\n",
+                     used_i[used_i.size() / 2], used_i[used_i.size() * 9 / 10],
+                     used_i[used_i.size() * 99 / 100], worst_i);
+        unsigned long long sv = 0;
+        for (size_t k = 0; k < used_v.size(); ++k) sv += used_v[k];
+        std::fprintf(f, "share of reserved vertex space used: %.1f%%\n",
+                     100.0 * double(sv) / (double(used_v.size()) * kSlotVertices));
+    }
+    std::fprintf(f, "over the cap: %u on vertices, %u on indices\n", over_v, over_i);
+    std::fprintf(f, "vertex histogram:\n");
+    for (int b = 0; b + 1 < nb; ++b)
+        std::fprintf(f, "  %5u - %5u: %llu\n", edges[b] + 1, edges[b + 1], hist[b]);
+    std::fprintf(f, "  over the cap: %llu\n", hist[nb]);
+    std::fclose(f);
 }
 
 void Renderer::shutdown() {

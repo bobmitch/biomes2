@@ -52,7 +52,9 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
 `--band-report`, `--sea-report`, `--swim`, `--blend-report` and
 `--tab-test`. `--flight` also takes `--settle`, `--holes` and
-`--flight-speed <m/s>`; every mode takes the streaming A/B switches
+`--flight-speed <m/s>` and `--flight-from x y z`; `--shot` takes
+`--slot-report`; every mode takes `--mesh-debug 1|2` (curtain, creases) and
+the streaming A/B switches `--no-lod-align`,
 `--no-lod-hold`, `--no-prioritise`, `--adaptive-budget` and
 `--lod-fade <frames>`. It is a GUI subsystem binary, so a shell does not wait
 on it: run it with `Start-Process -Wait` or the file you read will be the
@@ -186,17 +188,50 @@ last run's.
   vertices and +19% triangles, and slots are now 4608 vertices.
   `g_cell_vertex` packs the surface index (low 16 bits) and the skirt index
   (high 16 bits).
-- **The toothed ledges along curved lines are LOD seams, not chunk seams.**
-  Tinting the curtain magenta on a rough hillside showed it visible almost
-  only along the ring boundaries, 3.7% of the frame: the coarse level's mesh
-  sits up to about a coarse voxel off the fine one, and the cover shows as a
-  zigzag-topped wall. The lip showed the same rims. Covering the crack cannot
-  remove a step; transition cells (Transvoxel-style) or morphing the fine
-  side's border onto the coarse surface would.
-- **Rough terrain runs the 768-slot pool dry.** The hillside shot at
-  (2420, 118, 3390) ends its capture with 0 free slots, 96 chunks never
-  meshed and 5 overflowing a slot, with the old lip as well as the skirt.
-  Those are holes, and nothing flags them outside the shot's `.txt`.
+- **The toothed ledges are CREASES, not LOD seams.** They were called seams
+  for a whole commit, on the strength of a debug tint that marked pixels
+  whose interpolated normal was short. A sharp crease shortens it too, so
+  the tint counted ridge lines as curtain. `--mesh-debug 1` now flags the
+  curtain exactly: the vertex shader passes a 0/1 skirt flag, non-zero only
+  on curtain triangles. `--mesh-debug 2` shows creases (short normal, flag
+  zero). On the rough hillside at (2420, 118, 3390): curtain 0.48% of the
+  frame, creases 2.71%. The creases are the ridged noise's `1 - 2|n|`, a
+  knife-edge crest in layer 4's ridged octaves and in layer 6's 3D term,
+  which a voxel grid samples as zigzag teeth.
+  Two seam fixes built on the wrong diagnosis were measured and judged:
+  - **Seam conformance** (blend a ring-edge chunk's density to the coarser
+    level's field) moved the curtain from 0.48% to 0.47%. Removed: two
+    kernel passes and a remesh-on-ring-move mechanism for nothing.
+  - **Ring alignment** is kept. A 7-wide camera-centred ring's edge fell
+    mid-way across a coarser chunk about half the time, and the coarser
+    level keeps chunks only partly covered, so two meshes of the same ground
+    were drawn in one place. Rings are now 8 wide on the coarser grid
+    (`--no-lod-align` for A/B). It costs ~2% of the uncapped frame and 22%
+    more resident chunks, and removes the double-drawn ground by
+    construction. The curtain view cannot see that benefit, so it is
+    unmeasured.
+  **Crests are rounded since v10** (`kCrestRound` = 0.05 in `field.h`,
+  `crest_abs`), in layer 4's ridged octaves and layer 6's overhang term.
+  Hillside creases went 2.70% → 1.80% (k 0.1 gave 1.25%), and the teeth went
+  with them. It lowers every ridge tip slightly, so ridged land reads a
+  little weathered; 0.05 over 0.1 was chosen by eye. The caves pass 0 and
+  keep the exact `abs`: `cave_field` thresholds the crest with a smoothstep
+  up to 0.97, and a rounded crest topping out at 0.9 would narrow every
+  tunnel. `sqrt(n*n + k*k) - k` is WRONG: it lifts the whole ridged field by
+  2k, and the A/B camera ended up inside a hill.
+- **Rough terrain ran the slot pool dry; it is 1536 × 6144 now.**
+  `--shot --slot-report` writes per-chunk vertex and index counts against
+  the caps. On the hillside the 768 × 4608 pool held geometry in every slot
+  with 96 chunks queued, and 4 chunks were over the cap (max 5250). A
+  60 m/s `--flight ... --flight-from 2420 140 3390` never finished settling
+  (91 queued after 30 s), had 1654 frames with work and no free slot, and
+  retired 384 held chunks early (each a hole). The hole metric saw only 3
+  frames of it, because a chunk with no slot is invisible to a metric that
+  looks for surface chunks without cover. With the bigger pool: settled in
+  3 s, 0 starved frames, 0 early retires, 0 overflows, same frame time.
+  ~440 MB against a 20 GB card. The flight report now counts starved frames.
+  A variable-size allocator would recover the ~65% of each slot a typical
+  chunk leaves empty, if memory ever matters.
 - **The biome blend looks at four cells, and its weight reached further than
   four.** `blend_width` (500 m) let a FIFTH cell carry weight, and where the
   4th and 5th traded places along a straight bisector that weight vanished
@@ -352,7 +387,7 @@ it.
 **LOD agreement is asserted.** Octave weights fall to zero between four and
 two voxels of period, faded rather than cut, and the harness checks that
 every LOD from 0.5 m to 64 m matches LOD 0 within its own voxel size. The
-worst case is currently 0.45 of a voxel (0.41 before v9's blend fix). Normalise by the FULL amplitude,
+worst case is currently 0.41 of a voxel (v10; it was 0.45 at v9). Normalise by the FULL amplitude,
 never the faded one: rescaling the survivors changes the shape of what
 remains, which is the thing LOD agreement forbids.
 
