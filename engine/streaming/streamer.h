@@ -17,26 +17,14 @@
 // crack of sky shows through.
 //
 // This comment used to end "Skirts cover it -- see the skirt pass". There was
-// no skirt pass. It was written at B3 and went unchallenged for the obvious
-// reason: with five levels the seams were close to the camera and the cracks
-// were sub-pixel, so nothing contradicted it. Eight levels put seven seams in
-// frame and a ground shot went from 71 cracks to 569. The lip in
-// cs_vertices is the skirt now, and it is a lip rather than a real skirt
-// pass -- cheap, and measured at zero sky pixels below the horizon.
-//
-// The reason to revisit it is not cosmetic. The lip is BAKED into surface
-// vertices, which makes g_vertices mean two things at once: the surface, and
-// the surface plus a rendering fudge. That is precisely how it reached Jolt
-// and put a character two voxels into the ground, and it is why
-// is_lip_vertex() has to reconstruct a cell index from a position -- which it
-// cannot do exactly, so the predicate has a deliberate failure direction.
-//
-// A real skirt pass removes all of that rather than patching it: separate
-// quads hanging from the chunk border, appended AFTER the surface geometry.
-// Every stored surface vertex stays true, no predicate is needed anywhere,
-// and the physics copy excludes the skirt by index range instead of by
-// guessing from coordinates. If the lip causes trouble a second time, that is
-// the fix, not a better predicate.
+// no skirt pass. Then there was a LIP -- the border cells' vertices dropped
+// two voxels -- and the note here said that if it caused trouble a second
+// time, a real skirt pass was the fix, not a better predicate. It did: the
+// lip dropped the vertex row two same-LOD neighbours share from BOTH sides,
+// and every chunk border was a V groove (see cs_vertices). So the skirt is now
+// real: extra curtain geometry hung from the mesh border into the solid, with
+// every surface vertex left true. What remains visible is the STEP between
+// two levels at a ring boundary, which no crack cover can remove.
 // ---------------------------------------------------------------------------
 #ifndef ENGINE_STREAMER_H
 #define ENGINE_STREAMER_H
@@ -99,36 +87,18 @@ inline float lod_chunk_size(int lod) { return lod_voxel(lod) * float(kChunkOwned
 // there first.
 static const UINT kNoSlot = 0xFFFFFFFFu;
 
-// The skirt lip sits on the outermost ring of cells, deliberately two voxels
-// below the isosurface. Every check that measures a vertex against the field
-// has to skip those, or it reports the lip depth instead of the error it was
-// built to find -- measured: slot 0's worst residual went from 0.60 m to
-// 1.33 m the moment the lip went in, which would have masked any real
-// disagreement up to a metre.
+// A skirt vertex: the hidden end of the curtain cs_quads hangs from a chunk's
+// border edge to cover the crack between LOD levels. It is two voxels into the
+// solid on purpose, so anything that measures a vertex against the field, and
+// the collision mesh, must leave it out.
 //
-// A chunk meshes kChunkCells cells from its origin, and the lip is the first
-// and last of them in X and Z.
-//
-// The STRICT inequalities are deliberate; do not relax them to <= and >=.
-//
-// The kernel lips by cell index, and a cell-0 vertex occupies lx in [0, voxel]
-// INCLUSIVE, so a vertex landing exactly on lx == voxel is lipped there and
-// missed here. That looks like an off-by-one, and <= appears to fix it. It
-// does not: a cell-ONE vertex also sits at lx == voxel when its crossings
-// average to the cell's near face, and the kernel does NOT lip that one, so
-// <= would raise legitimate ground by two voxels.
-//
-// The position cannot tell the two apart -- that information was lost when
-// the cell index stopped travelling with the vertex -- so neither form is
-// correct and the choice is which way to be wrong. Strict leaves a one-vertex
-// PIT in the collision mesh; relaxed leaves a one-vertex SPIKE, and a spike is
-// what stops a character or launches one. Both need a crossing to land exactly
-// on a cell face, which needs a density of exactly zero at a corner.
-inline bool is_lip_vertex(const float pos[3], const float origin[3], float voxel) {
-    const float span = voxel * float(kChunkCells);
-    const float lx = pos[0] - origin[0];
-    const float lz = pos[2] - origin[2];
-    return lx < voxel || lx > span - voxel || lz < voxel || lz > span - voxel;
+// Exact, by construction: the kernel stores a skirt vertex's normal at HALF
+// length (shading normalises, so it looks identical). The predicate this
+// replaced, is_lip_vertex, had to guess from a position whether a vertex sat
+// in a border cell, could not do it exactly, and documented which way it
+// chose to be wrong. The lip it served was itself the bug -- see cs_vertices.
+inline bool is_skirt_vertex(const float nrm[3]) {
+    return nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2] < 0.5f;
 }
 
 struct ChunkKey {

@@ -99,6 +99,24 @@ The LOD 2 physics cap does not cause it (A/B'd at all LODs). Start with
 Jolt's back-face handling for `MeshShape` against `CharacterVirtual`, and
 whether the slab's chunk got a mesh shape at all rather than a heightfield.
 
+### 1b. LOD seams show as toothed ledges
+
+The V grooves along every chunk border were the skirt lip, which is now a
+real curtain skirt (CLAUDE.md). What remains is the STEP where a finer ring
+meets a coarser one: on a rough hillside the curtain is visible on 3.7% of
+the frame, almost all of it along the ring boundaries. The coarse mesh is up
+to about a coarse voxel off the fine one, so covering the crack cannot help.
+The fix is stitching: transition cells, or morphing the fine chunk's border
+vertices onto the coarse surface. The magenta curtain debug
+(`length(i.nrm) < 0.9` in `mesh.hlsl`) is the instrument.
+
+### 1c. Rough terrain runs the slot pool dry
+
+`--shot --no-water --cam 2420 118 3390 0.75 -0.18` finishes its capture
+with 0 free slots, 96 chunks never meshed and 5 overflowing their slot.
+Those are holes, and it happened with the old lip too. Nothing outside the
+shot's `.txt` says so. Measure in the frame loop before sizing anything.
+
 ### 2. Cap MeshShape at the fine LOD levels
 
 **Partly done on the CPU side:** `sync_physics_terrain` now hands physics

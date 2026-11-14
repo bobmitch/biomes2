@@ -89,17 +89,12 @@ void sync_physics_terrain() {
         // below is about the shapes the character can stand on.
         if (e.key.lod > kPhysicsMaxLod) continue;
         const size_t nv = e.verts.size() / 3;
-        const float mS = engine::lod_chunk_size(e.key.lod);
-        const float morigin[3] = {float(e.key.x) * mS, float(e.key.y) * mS,
-                                  float(e.key.z) * mS};
-        const float mvoxel = engine::lod_voxel(e.key.lod);
         for (size_t k = 0; k < nv; k += 7) {
             const float vy = e.verts[k * 3 + 1];
             if (vy < g_mesh_y_lo) g_mesh_y_lo = vy;
             if (vy > g_mesh_y_hi) g_mesh_y_hi = vy;
-            // Same exclusion as the capture check: the lip is not an error.
-            const float vpos[3] = {e.verts[k * 3 + 0], vy, e.verts[k * 3 + 2]};
-            if (engine::is_lip_vertex(vpos, morigin, mvoxel)) continue;
+            // No skirt to exclude: the renderer leaves skirt vertices out of
+            // the patch, so every vertex here is a surface vertex.
             const float d = g_renderer.world().density(e.verts[k * 3 + 0], vy,
                                                       e.verts[k * 3 + 2]);
             const double a = d < 0.0f ? -double(d) : double(d);

@@ -978,46 +978,42 @@ void Renderer::consume_meshes() {
         MeshPatchEvent e;
         e.key = m.keys[p];
 
-        // Undo the skirt lip on the way to Jolt. These vertices are two
-        // voxels below the isosurface ON PURPOSE, to cover the crack between
-        // LOD levels -- and the buffer the renderer draws from is the same
-        // buffer the collision mesh is built from, so a character standing
-        // where a chunk edge happens to fall stood two voxels low.
+        // Surface vertices are true now -- nothing to undo. The skirt
+        // curtain is left out of the collision mesh entirely: any triangle
+        // touching a skirt vertex is dropped. It sits two voxels inside the
+        // solid, so a character could only ever meet it through a crack it
+        // exists to cover, and a shape is cheaper without it.
         //
-        // That cost 0.53 m of apparent non-determinism in --dig-verify,
-        // because WHICH edges are underfoot differs between a chunk that was
-        // meshed and then invalidated by an edit and one meshed fresh. It was
-        // read as the edits failing to persist. They were persisting the
-        // whole time.
-        //
-        // Undone rather than dropped: the offset is exact and known, so
-        // adding it back restores the surface the mesher actually found,
-        // where discarding the ring would leave the collision mesh with a
-        // gap at every chunk edge.
-        //
-        // cs_heights reads the density grid rather than these vertices, so
-        // the HeightFieldShape path was never affected -- which is why this
-        // only ever showed on the 16-27% of chunks that need a MeshShape.
-        const float mS = lod_chunk_size(e.key.lod);
-        const float morigin[3] = {float(e.key.x) * mS, float(e.key.y) * mS,
-                                  float(e.key.z) * mS};
-        const float mvoxel = lod_voxel(e.key.lod);
-        e.verts.resize(size_t(nv) * 3);
+        // The lip this replaced was BAKED into surface vertices and had to be
+        // undone here by guessing from positions which ones it had moved;
+        // getting that wrong put a character two voxels low wherever a chunk
+        // edge fell underfoot, and cost a day as a fake persistence failure.
+        // Compacted: skirt vertices are not in the patch at all, so nothing
+        // downstream -- physics, or the residual check in main.cpp, which
+        // sees positions only -- needs a predicate to leave them out.
+        std::vector<unsigned> remap(nv, 0xFFFFFFFFu);
+        e.verts.reserve(size_t(nv) * 3);
         for (UINT i = 0; i < nv; ++i) {
-            e.verts[size_t(i) * 3 + 0] = mv[i].pos[0];
-            e.verts[size_t(i) * 3 + 1] = mv[i].pos[1];
-            e.verts[size_t(i) * 3 + 2] = mv[i].pos[2];
-            if (is_lip_vertex(mv[i].pos, morigin, mvoxel)) {
-                e.verts[size_t(i) * 3 + 1] += mvoxel * kSkirtVoxels;
-            }
+            if (is_skirt_vertex(mv[i].nrm)) continue;
+            remap[i] = unsigned(e.verts.size() / 3);
+            e.verts.push_back(mv[i].pos[0]);
+            e.verts.push_back(mv[i].pos[1]);
+            e.verts.push_back(mv[i].pos[2]);
         }
         // Pool indices are absolute so the draw needs no rebasing; a shape
         // built from this chunk's vertices alone does.
         const unsigned vbase = slot * kSlotVertices;
         e.idx.reserve(ni);
-        for (UINT i = 0; i < ni; ++i) {
-            const unsigned v = mi[i] - vbase;
-            e.idx.push_back(v < nv ? v : 0);
+        for (UINT t = 0; t + 2 < ni; t += 3) {
+            unsigned tri[3];
+            bool keep = true;
+            for (int c = 0; c < 3; ++c) {
+                const unsigned v = mi[t + c] - vbase;
+                if (v >= nv || remap[v] == 0xFFFFFFFFu) { keep = false; break; }
+                tri[c] = remap[v];
+            }
+            if (!keep) continue;
+            e.idx.push_back(tri[0]); e.idx.push_back(tri[1]); e.idx.push_back(tri[2]);
         }
         mesh_patches_added_.push_back(e);
         ++stats_.mesh_shapes_delivered;
@@ -1351,9 +1347,9 @@ bool Renderer::check_against_field(float& max_err, float& mean_err, UINT& checke
 
     double sum = 0.0;
     for (size_t i = 0; i < verts.size(); ++i) {
-        // The lip is off the isosurface on purpose; measuring it here would
+        // The skirt is off the isosurface on purpose; measuring it here would
         // report the skirt depth and hide everything smaller.
-        if (have_key && is_lip_vertex(verts[i].pos, origin, voxel)) continue;
+        if (is_skirt_vertex(verts[i].nrm)) continue;
         const float d = world_.density(verts[i].pos[0], verts[i].pos[1],
                                        verts[i].pos[2]);
         const float a = d < 0.0f ? -d : d;
@@ -1636,9 +1632,9 @@ void Renderer::normal_check(const char* path) {
         float worst_at[3] = {0.0f, 0.0f, 0.0f};
         for (size_t i = 0; i < verts.size(); i += 3) {
             const MeshVertex& v = verts[i];
-            // The lip is pushed off the isosurface on purpose and its normal
-            // is whatever the field says where it landed.
-            if (is_lip_vertex(v.pos, origin, voxel)) continue;
+            // The skirt is off the isosurface on purpose, and its normal is
+            // the surface vertex's at half length.
+            if (is_skirt_vertex(v.nrm)) continue;
 
             float truth[3], control[3];
             cpu_normal(world_, v.pos[0], v.pos[1], v.pos[2], voxel, 0.25f, truth);

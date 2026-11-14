@@ -278,21 +278,84 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
     // chunk's voxel and the harness bounds LOD disagreement at one voxel of
     // the coarser level. The lip sits on the ghost ring, which is the cell the
     // neighbour starts at, so the neighbour's own surface covers it.
-    if (id.x == 0u || id.x == kCells - 1u || id.z == 0u || id.z == kCells - 1u) {
-        world.y -= voxel * skirt;
-    }
+    //
+    // THAT WAS WRONG, and this replaced it. The lip dropped the cells at
+    // id == 0 AND id == kCells - 1, and a chunk's ghost cell is its
+    // neighbour's cell 0 -- so the one row of vertices two same-LOD
+    // neighbours share was dropped by BOTH of them. Nothing covered it: this
+    // chunk's quads end at that row and the neighbour's begin there. Every
+    // chunk border was a V groove two voxels deep, 1 m at LOD 0 and 8 m at
+    // LOD 3, and where it crossed a ridge the silhouette had a V notch cut in
+    // it. A/B with the lip at 0 made them disappear (and let 1147 crack
+    // pixels through, which is what the lip was for).
+    //
+    // Same-LOD neighbours need nothing: they compute that shared row from the
+    // same densities and weld exactly. The crack is only ever between levels,
+    // so the cover is now a real skirt -- EXTRA geometry, never a moved
+    // surface vertex. A border cell gets a second vertex two voxels into the
+    // solid along -normal (into rock under an overhang too, not just down),
+    // and cs_quads hangs a curtain between the two from every mesh-border
+    // edge. Every stored surface vertex is now true.
+    //
+    // The skirt vertex carries its normal at HALF length. Shading normalises,
+    // so it looks identical; the CPU tests the length (is_skirt_vertex) to
+    // keep the curtain out of physics and out of every check that measures a
+    // vertex against the field. Do not normalise vertex normals in a kernel.
+    const float3 nrm = field_normal(world);
+    const bool border = id.x == 0u || id.x == kCells - 1u ||
+                        id.z == 0u || id.z == kCells - 1u;
+    const uint need = border ? 2u : 1u;
 
     uint local_slot;
-    InterlockedAdd(g_counters[slot * 2u + 0u], 1u, local_slot);
-    if (local_slot >= vertex_cap()) return;   // slot full; pass 3 drops the quads
+    InterlockedAdd(g_counters[slot * 2u + 0u], need, local_slot);
+    if (local_slot + need > vertex_cap()) return;   // slot full; pass 3 drops the quads
 
     Vertex v;
     v.pos = world;
-    v.nrm = field_normal(world);
+    v.nrm = nrm;
     g_vertices[vbase + local_slot] = v;
     // Slot-relative, so the draw's BaseVertexLocation does the rebasing and an
-    // index never has to be rewritten when a chunk moves slot.
-    g_cell_vertex[ci] = local_slot;
+    // index never has to be rewritten when a chunk moves slot. Packed: the
+    // surface vertex in the low 16 bits, the skirt vertex (or 0xFFFF) in the
+    // high 16. A slot holds 4608 vertices, well inside 16 bits.
+    uint skirt_slot = 0xFFFFu;
+    if (border) {
+        Vertex s;
+        s.pos = world - nrm * (voxel * skirt);
+        s.nrm = nrm * 0.5f;
+        skirt_slot = local_slot + 1u;
+        g_vertices[vbase + skirt_slot] = s;
+    }
+    g_cell_vertex[ci] = (local_slot & 0xFFFFu) | (skirt_slot << 16);
+}
+
+// Is the edge from cell a to cell b on the chunk's outer X/Z boundary -- the
+// edge of the mesh, with no quad beyond it in this chunk? c is a cell of the
+// same quad off that edge. True when a and b lie on a border face and c is
+// one cell inside it.
+bool border_side(uint3 a, uint3 b, uint3 c) {
+    const uint hi = kCells - 1u;
+    if (a.x == b.x && ((a.x == hi && c.x == hi - 1u) || (a.x == 0u && c.x == 1u))) return true;
+    if (a.z == b.z && ((a.z == hi && c.z == hi - 1u) || (a.z == 0u && c.z == 1u))) return true;
+    return false;
+}
+
+// A curtain quad from a mesh-border edge down to its skirt vertices, both
+// windings: which side of it faces the viewer depends on which of the two
+// LODs at the seam is higher there, so either can be the one seen.
+void emit_curtain(uint a, uint b) {
+    const uint sa = a >> 16, sb = b >> 16;
+    if (sa == 0xFFFFu || sb == 0xFFFFu) return;
+    uint base;
+    InterlockedAdd(g_counters[slot * 2u + 1u], 12u, base);
+    if (base + 12u > index_cap()) return;
+    const uint o = ibase + base;
+    const uint va = vbase + (a & 0xFFFFu), vb = vbase + (b & 0xFFFFu);
+    const uint wa = vbase + sa, wb = vbase + sb;
+    g_indices[o + 0] = va; g_indices[o + 1] = vb; g_indices[o + 2]  = wb;
+    g_indices[o + 3] = va; g_indices[o + 4] = wb; g_indices[o + 5]  = wa;
+    g_indices[o + 6] = va; g_indices[o + 7] = wb; g_indices[o + 8]  = vb;
+    g_indices[o + 9] = va; g_indices[o + 10] = wa; g_indices[o + 11] = wb;
 }
 
 // ---------------------------------------------------------------------------
@@ -324,12 +387,23 @@ void cs_quads(uint3 id : SV_DispatchThreadID) {
         const uint3 ua = unit_axis((axis + 1u) % 3u);
         const uint3 ub = unit_axis((axis + 2u) % 3u);
 
-        const uint c00 = g_cell_vertex[cell_index(id - ua - ub)];
-        const uint c10 = g_cell_vertex[cell_index(id - ub)];
-        const uint c11 = g_cell_vertex[cell_index(id)];
-        const uint c01 = g_cell_vertex[cell_index(id - ua)];
-        if (c00 == 0xFFFFFFFFu || c10 == 0xFFFFFFFFu ||
-            c11 == 0xFFFFFFFFu || c01 == 0xFFFFFFFFu) continue;
+        const uint3 p00 = id - ua - ub, p10 = id - ub, p11 = id, p01 = id - ua;
+        const uint k00 = g_cell_vertex[cell_index(p00)];
+        const uint k10 = g_cell_vertex[cell_index(p10)];
+        const uint k11 = g_cell_vertex[cell_index(p11)];
+        const uint k01 = g_cell_vertex[cell_index(p01)];
+        // Low 16 bits: the surface vertex (0xFFFF: none). High: the skirt's.
+        const uint c00 = k00 & 0xFFFFu, c10 = k10 & 0xFFFFu;
+        const uint c11 = k11 & 0xFFFFu, c01 = k01 & 0xFFFFu;
+        if (c00 == 0xFFFFu || c10 == 0xFFFFu || c11 == 0xFFFFu || c01 == 0xFFFFu) continue;
+
+        // The skirt: a curtain from each side of this quad that is the edge of
+        // the chunk's mesh. A side whose two cells sit on a border face, with
+        // the quad's other cells one step inside, has nothing beyond it here.
+        if (border_side(p00, p10, p01)) emit_curtain(k00, k10);
+        if (border_side(p10, p11, p00)) emit_curtain(k10, k11);
+        if (border_side(p11, p01, p10)) emit_curtain(k11, k01);
+        if (border_side(p01, p00, p11)) emit_curtain(k01, k00);
 
         uint base;
         InterlockedAdd(g_counters[slot * 2u + 1u], 6u, base);

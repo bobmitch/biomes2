@@ -46,11 +46,10 @@ using Microsoft::WRL::ComPtr;
 // paid for.
 static const UINT kChunkOwnedCells = 32;
 
-// How far the skirt lip drops the outermost ring of cells, in voxels. It is
-// plumbed to the kernel through ChunkConstants rather than written twice,
-// because the C++ side has to be able to UNDO it exactly: the same vertices
-// go to the renderer, which wants the lip, and to Jolt, which must not have
-// it. Two literals that have to agree is how that goes wrong quietly.
+// How deep the skirt curtain reaches into the solid, in voxels. Two, because
+// the coarser neighbour's voxel is twice this one's and the harness bounds
+// LOD disagreement at one coarse voxel. Plumbed through ChunkConstants rather
+// than written twice.
 static const float kSkirtVoxels = 2.0f;
 static const UINT kChunkCells      = 33;
 static const UINT kChunkCorners    = 34;
@@ -61,7 +60,11 @@ static const UINT kChunkCorners    = 34;
 // sheet through a volume, not a solid. Overflow is counted rather than assumed
 // away.
 static const UINT kSlots        = 768;
-static const UINT kSlotVertices = 4096;
+// 4608: the skirt adds a second vertex for every border cell the surface
+// crosses, ~130-260 a chunk, and the worst chunk of a flight already wanted
+// 3948 of the old 4096. Must stay under 65536 -- cs_vertices packs the
+// surface and skirt indices into 16 bits each, and slot_caps packs the caps.
+static const UINT kSlotVertices = 4608;
 // Six per vertex, not a round number. A closed quad surface has about as many
 // quads as vertices -- each quad owns four, each vertex is shared by four --
 // so the index count tracks the vertex count at 6 per vertex, and a cap that
@@ -69,7 +72,7 @@ static const UINT kSlotVertices = 4096;
 // with. Measured at 5.7 on the worst chunk of a flight, which wanted 19578
 // indices against the old 16384 and silently lost the rest. Four chunks of a
 // 15 s flight came out with holes in them.
-static const UINT kSlotIndices  = kSlotVertices * 6;   // 24576
+static const UINT kSlotIndices  = kSlotVertices * 6;   // 27648
 
 struct MeshVertex {
     float pos[3];

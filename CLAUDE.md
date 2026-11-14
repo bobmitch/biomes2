@@ -165,29 +165,38 @@ last run's.
   not, and from 1400 m up it spent the whole pool on the air around the camera
   and returned an empty sky over 483,590 triangles it never reached.
 - There was no skirt pass for five years' worth of commits, while a comment in
-  `streamer.h` said there was. Nothing contradicted it because at five LOD
-  levels the seams were near the camera and sub-pixel. Eight levels took a
-  ground shot from 71 cracks to 569. The fix is a lip in `cs_vertices`: the
-  outermost ring of cells drops two voxels, so neighbouring chunks overlap
-  vertically. Measured 0 sky pixels below the horizon afterwards.
-  **The lip is wrong for everything except drawing, and `g_vertices` is read
-  by more than the draw.** `is_lip_vertex` in `streamer.h` finds it and
-  `kSkirtVoxels` is the depth, plumbed to the kernel through `ChunkConstants`
-  so the CPU can undo it exactly rather than keep a second literal.
-  Two consumers, and the first version of this only handled one:
-  - checks that measure a vertex against the field must SKIP it — counting it
-    took slot 0's worst residual from 0.60 m to 1.33 m, masking any real
-    disagreement up to a metre;
-  - the collision mesh handed to Jolt must UNDO it — a character standing
-    where a chunk edge fell stood two voxels low, which read as 0.53 m of
-    non-determinism in `--dig-verify` and was diagnosed as the edits failing
-    to persist. They were persisting the whole time.
-
-  `cs_heights` reads the density grid rather than these vertices, so the
-  HeightFieldShape path was never affected — which is why it looked
-  intermittent, appearing only on the 16–27% of chunks that need a MeshShape.
-  "It is below the surface, so it cannot matter" was the reasoning that let it
-  through, and it was never measured.
+  `streamer.h` said there was. Eight LOD levels took a ground shot from 71
+  cracks to 569. The first fix was a LIP: the outermost ring of cells dropped
+  two voxels. **The lip was itself the V-shaped seam bug.** A chunk's ghost
+  cell is its neighbour's cell 0, so the one vertex row two same-LOD
+  neighbours share was dropped by BOTH, and nothing covered it. Every chunk
+  border was a V groove two voxels deep (1 m at LOD 0, 8 m at LOD 3), with a
+  V notch wherever it crossed a ridge. Lip-at-0 A/B made the Vs vanish and let
+  1147 crack pixels through. Before that, the lip had also put a character
+  two voxels low at chunk edges via the collision mesh, which read as 0.53 m
+  of fake non-persistence in `--dig-verify`.
+  **Now a real skirt, and surface vertices are never moved.** Same-LOD
+  neighbours weld exactly at their shared row. Each border cell gets a second
+  vertex two voxels into the solid along −normal, and `cs_quads` hangs a
+  double-sided curtain from every mesh-border edge on an X/Z face
+  (`border_side`). A skirt vertex's normal is stored at HALF length; shading
+  normalises it, and `is_skirt_vertex` tests the length exactly. Do not
+  normalise normals in the kernel. The physics patch is compacted without
+  skirt vertices, so nothing downstream needs a predicate. It costs +12%
+  vertices and +19% triangles, and slots are now 4608 vertices.
+  `g_cell_vertex` packs the surface index (low 16 bits) and the skirt index
+  (high 16 bits).
+- **The toothed ledges along curved lines are LOD seams, not chunk seams.**
+  Tinting the curtain magenta on a rough hillside showed it visible almost
+  only along the ring boundaries, 3.7% of the frame: the coarse level's mesh
+  sits up to about a coarse voxel off the fine one, and the cover shows as a
+  zigzag-topped wall. The lip showed the same rims. Covering the crack cannot
+  remove a step; transition cells (Transvoxel-style) or morphing the fine
+  side's border onto the coarse surface would.
+- **Rough terrain runs the 768-slot pool dry.** The hillside shot at
+  (2420, 118, 3390) ends its capture with 0 free slots, 96 chunks never
+  meshed and 5 overflowing a slot, with the old lip as well as the skirt.
+  Those are holes, and nothing flags them outside the shot's `.txt`.
 - **The biome blend looks at four cells, and its weight reached further than
   four.** `blend_width` (500 m) let a FIFTH cell carry weight, and where the
   4th and 5th traded places along a straight bisector that weight vanished
