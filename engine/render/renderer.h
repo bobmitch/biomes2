@@ -148,6 +148,9 @@ public:
     void  set_lod_align(bool on) { streamer_.set_align(on); }
     // 1 tints the skirt curtain magenta, 2 tints sharp creases cyan.
     void  set_mesh_debug(float m) { mesh_debug_ = m; }
+    // Surface texture: 0 flat, 1 noise detail (default), 2 metric grid, 3 both.
+    void  set_texture_mode(float m) { texture_mode_ = m; }
+    float texture_mode() const { return texture_mode_; }
     void  set_adaptive_budget(bool on) {
         adaptive_budget_ = on;
         if (!on) mesh_budget_ = kMeshBudgetPerFrame;
@@ -280,6 +283,7 @@ private:
     bool        water_ = true;
     float       water_debug_ = 0.0f;
     float       mesh_debug_ = 0.0f;
+    float       texture_mode_ = 1.0f;
 
     ComPtr<ID3D12Fence> fence_;
     HANDLE              fence_event_ = nullptr;

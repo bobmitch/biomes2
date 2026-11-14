@@ -59,9 +59,11 @@ of having them.
 `engine.exe` is a GUI binary: a shell does not wait on it. Use
 `Start-Process -Wait`, or read the last run's file by mistake.
 
-**Startup takes 15–20 seconds** before the first frame — it compiles the field
-shaders and builds the whole seed. The process burns a core with no window up
-and looks exactly like a hang. It is not one. Do not debug it; wait.
+**Startup is about 1 s warm, about 8 s cold.** Shaders are cached under
+`build/shader_cache/` by a hash of their preprocessed source, so only an
+edited shader (or anything it includes, field.h among them) recompiles. A
+cold start is a fresh checkout or an edit to the field. It had grown to 45 s,
+40 of it one kernel; `build/startup.txt` splits every start by phase.
 
 ## What is open, in the order I would take it
 

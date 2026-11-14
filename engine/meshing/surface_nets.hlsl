@@ -198,10 +198,27 @@ float3 field_normal(float3 p) {
     // being sampled here is smooth at coarse levels. A short arm on a smooth
     // field is the correct gradient; a long arm on it is still wrong.
     const float e = min(0.5f * voxel, 0.25f);
-    float3 g = float3(
-        real_terrain_density(p.x + e, p.y, p.z, voxel) - real_terrain_density(p.x - e, p.y, p.z, voxel),
-        real_terrain_density(p.x, p.y + e, p.z, voxel) - real_terrain_density(p.x, p.y - e, p.z, voxel),
-        real_terrain_density(p.x, p.y, p.z + e, voxel) - real_terrain_density(p.x, p.y, p.z - e, voxel));
+    // Six field evaluations in a [loop], not six written out. FXC inlines
+    // everything, so six calls were six copies of the whole field, and every
+    // generator change grew all six: compiling this kernel took 40 of the 45
+    // seconds before the first frame (build/startup.txt). In a loop the field
+    // is compiled once. The arithmetic is identical -- 0 + a then + (-b) is
+    // exactly a - b in IEEE, and p + (-e) is exactly p - e -- so the normals
+    // are bit-for-bit what the unrolled form gave.
+    float3 g = float3(0.0f, 0.0f, 0.0f);
+    [loop] for (uint k = 0u; k < 6u; ++k) {
+        const uint  axis = k >> 1;
+        const float s = (k & 1u) != 0u ? -e : e;
+        float3 q = p;
+        if (axis == 0u) q.x = p.x + s;
+        else if (axis == 1u) q.y = p.y + s;
+        else q.z = p.z + s;
+        const float d = real_terrain_density(q.x, q.y, q.z, voxel);
+        const float sd = (k & 1u) != 0u ? -d : d;
+        if (axis == 0u) g.x = g.x + sd;
+        else if (axis == 1u) g.y = g.y + sd;
+        else g.z = g.z + sd;
+    }
 
     // Inside a fully carved cave, layer 6 pins the density at exactly
     // -cave_carve, so over a short arm the field is CONSTANT and the gradient

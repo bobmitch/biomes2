@@ -354,6 +354,43 @@ last run's.
   and an overflow is dropped geometry, which is a hole.
   `--flight` prints what the worst chunk actually wanted.
 
+### Startup, shaders and the cache
+
+- **Shaders are cached** under `build/shader_cache/<hash>.cso`. The hash covers
+  the preprocessed source with its includes, the entry point, target, flags
+  and compiler version, so editing a shader or anything it includes (field.h)
+  recompiles it and nothing else. Warm start ~1 s, cold ~8 s.
+  `--no-shader-cache` forces compiles; `--check-dialect` always compiles,
+  because compiling is the thing it checks. `build/startup.txt` times every
+  shader and init phase on every start.
+- **How a field call is written decides compile time.** Startup had grown to
+  45 s, 40 of it `cs_vertices`, because `field_normal` wrote its six field
+  evaluations out longhand and FXC compiled six whole copies of the field.
+  The same six calls in a `[loop]` compile in 3.3 s with bit-identical normals
+  (`--normal-check` 0.0° at every voxel). `[unroll]` on that loop does NOT
+  compile (X3511, too large), so a "faster unrolled" variant is not
+  available.
+- **A failed compile looked like a cache miss.** The log line was written
+  before the result was checked, and a failed compile is never cached, so
+  each run "recompiled". It now logs FAILED. That run also hung: the report
+  modes (`--band-report`, `--probe-field`, `--normal-check`,
+  `--blend-report`) were missing from the headless list, so the failure put
+  up the invisible modal box the gotcha above warns about. They are headless
+  now.
+- **The stale-report trap caught this session too.** A flight that failed at
+  init left the PREVIOUS run's `flight.txt` in place, and its numbers were
+  read as the failed variant's. Delete the report before the run and check
+  `build/engine_error.txt` after; numbers identical to the digit to an earlier
+  run are the tell.
+
+### Surface texture
+
+`T` in the window, or `--texture 0|1|2|3`: flat, noise detail (default), a
+metric grid (1 m lines, heavier every 10 m), both. Procedural and
+triplanar, in `mesh.hlsl`, antialiased with `fwidth` and faded where a pixel
+covers the pattern. It costs ~0.1 ms of a 0.3 ms uncapped frame. `M` toggles
+wireframe. The window title shows both.
+
 ## Testing
 
 `tools/validate` runs 200 seeds and exits non-zero on any failure. It asserts

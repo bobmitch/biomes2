@@ -15,7 +15,8 @@
 //   Space       jump; in the sea, swim up -- and out over a ledge
 //   Ctrl        in the sea, dive
 //   [ ]         sea state, calm to storm
-//   M           raymarch / mesh / wireframe overlay
+//   M           shaded / wireframe
+//   T           surface texture: flat, detail (default), 1 m/10 m grid, both
 //   F5          reload every shader and remesh
 //   F2          write a capture to build/shot.bmp
 // ---------------------------------------------------------------------------
@@ -184,6 +185,13 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 float m = g_renderer.water_debug() + 1.0f;
                 if (m > 4.5f) m = 0.0f;
                 g_renderer.set_water_debug(m);
+                return 0;
+            }
+            if (wp == 'T') {
+                // Surface texture: flat, noise detail, metric grid, both.
+                float m = g_renderer.texture_mode() + 1.0f;
+                if (m > 3.5f) m = 0.0f;
+                g_renderer.set_texture_mode(m);
                 return 0;
             }
             if (wp == 'M') {
@@ -465,7 +473,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return run_sea_report("build/sea_report.txt");
     }
 
+    if (std::string(cmdline ? cmdline : "").find("--no-shader-cache") != std::string::npos) {
+        engine::shader_cache_enabled() = false;
+    }
+
     if (std::string(cmdline ? cmdline : "").find("--check-dialect") != std::string::npos) {
+        // Always a real compile: a cache hit would answer "did it compile
+        // last time", which is not the question.
+        engine::shader_cache_enabled() = false;
         engine::ComPtr<ID3DBlob> blob;
         std::string err;
         const bool ok = engine::compile_shader("engine/field/dialect_probe.hlsl",
@@ -504,7 +519,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     // time a shader failed to compile -- ten minutes of nothing, with the real
     // error already written to build/engine_error.txt. A mode that was asked
     // to run without a human is headless whatever it is called.
-    const bool headless = !shot_path.empty() || flight_seconds > 0.0 ||
+    // The report modes too. --band-report was missing from this list, so a
+    // shader that failed to compile put a modal box behind every window and
+    // the run hung until it was killed -- the trap the comment above names,
+    // found again by a [unroll] experiment that did not compile.
+    const std::string hl = cmdline ? cmdline : "";
+    const bool report_mode = hl.find("--band-report") != std::string::npos ||
+                             hl.find("--probe-field") != std::string::npos ||
+                             hl.find("--normal-check") != std::string::npos ||
+                             hl.find("--blend-report") != std::string::npos;
+    const bool headless = report_mode || !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
                           dig_seconds > 0.0 || mode_dig_save || mode_dig_verify ||
@@ -522,7 +546,27 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         }
         return 1;
     }
-    if (!g_renderer.init(hwnd, error, debug_layer)) {
+    const double init_t0 = engine::startup_now_ms();
+    const bool init_ok = g_renderer.init(hwnd, error, debug_layer);
+    {
+        // Where startup went. The 15-20 s before the first frame was always
+        // described as "shader compilation plus the world build" and never
+        // split; this splits it.
+        const double init_ms = engine::startup_now_ms() - init_t0;
+        if (FILE* sf = std::fopen("build/startup.txt", "w")) {
+            double compile_ms = 0.0;
+            const std::vector<std::pair<std::string, double> >& lg = engine::startup_log();
+            for (size_t i = 0; i < lg.size(); ++i) {
+                std::fprintf(sf, "%9.0f ms  %s\n", lg[i].second, lg[i].first.c_str());
+                if (lg[i].first.compare(0, 8, "compile ") == 0) compile_ms += lg[i].second;
+            }
+            std::fprintf(sf, "renderer init: %.0f ms, of which shader compiles %.0f ms "
+                             "(shader cache %s)\n",
+                         init_ms, compile_ms, engine::shader_cache_enabled() ? "on" : "OFF");
+            std::fclose(sf);
+        }
+    }
+    if (!init_ok) {
         // To a file as well as a box: a headless run exits with a code and no
         // other trace of why, which is a long way to debug blind.
         if (FILE* ef = std::fopen("build/engine_error.txt", "w")) {
@@ -547,6 +591,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (c2.find("--no-lod-align") != std::string::npos) g_renderer.set_lod_align(false);
         const size_t md = c2.find("--mesh-debug");
         if (md != std::string::npos) g_renderer.set_mesh_debug(float(std::atof(c2.c_str() + md + 12)));
+        const size_t tx = c2.find("--texture");
+        if (tx != std::string::npos) g_renderer.set_texture_mode(float(std::atof(c2.c_str() + tx + 9)));
         if (c2.find("--adaptive-budget") != std::string::npos) g_renderer.set_adaptive_budget(true);
     }
     if (lod_fade >= 0) g_renderer.set_lod_fade_frames(lod_fade);
@@ -1024,12 +1070,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     // is the right answer.
     //
     // This is NOT why a window takes a while to appear. Startup compiles the
-    // field shaders and builds the whole seed before the first frame, which
-    // is about fifteen to twenty seconds -- during which the process burns a
-    // core with no window up, and looks exactly like a hang. It is not one.
-    // I diagnosed it as one and was wrong; the guard below is defensive, not
-    // a fix. No SetForegroundWindow: grabbing focus twenty seconds after
-    // launch would interrupt whatever the user moved on to.
+    // field shaders (unless cached -- see shader_compile.h) and builds the
+    // whole seed before the first frame: ~1 s warm, ~8 s cold, with
+    // build/startup.txt saying where it went. During a cold start the process
+    // burns a core with no window up and looks like a hang. It is not one.
+    // No SetForegroundWindow: grabbing focus seconds after launch would
+    // interrupt whatever the user moved on to.
     ShowWindow(hwnd, show == SW_HIDE ? SW_SHOWNORMAL : show);
 
     // The three holes both runs use. Fixed so the two processes agree
@@ -2781,10 +2827,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             const engine::FrameStats st = g_renderer.stats();
             char title[300];
             std::snprintf(title, sizeof(title),
-                          "biomes2 engine - %s - %.0f fps (worst %.1f ms) - "
+                          "biomes2 engine - %s [M] %s [T] - %.0f fps (worst %.1f ms) - "
                           "%zu chunks, %u tris - %u meshed/frame in %.3f ms - "
                           "%zu pending, %zu slots free%s%s",
-                          g_renderer.mode() == engine::Mode::Mesh ? "mesh" : "wireframe",
+                          g_renderer.mode() == engine::Mode::Mesh ? "shaded" : "wireframe",
+                          g_renderer.texture_mode() < 0.5f ? "flat"
+                          : g_renderer.texture_mode() < 1.5f ? "detail"
+                          : g_renderer.texture_mode() < 2.5f ? "grid" : "detail+grid",
                           fps_frames / fps_accum, worst_frame_ms,
                           st.resident, st.indices / 3,
                           st.meshed_this_frame, st.mesh_ms,

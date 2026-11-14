@@ -59,7 +59,7 @@ struct MeshConstants {
     float wire;
     float slot_vertices;   // so the vertex shader can tell which slot it is in
     float mesh_debug;      // 0 off, 1 skirt curtain, 2 creases
-    float pad1;
+    float texture_mode;    // 0 flat, 1 noise detail, 2 metric grid, 3 both
 };
 
 std::string hr_text(const char* what, HRESULT hr) {
@@ -589,7 +589,9 @@ bool Renderer::reload_shaders(std::string& error) {
 }
 
 bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
+    double t0 = startup_now_ms();
     if (!create_device(error, debug_layer)) return false;
+    startup_log().push_back(std::make_pair(std::string("phase: device"), startup_now_ms() - t0));
     if (!create_swapchain(hwnd, error)) return false;
     if (!create_rtvs(error)) return false;
 
@@ -615,9 +617,13 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
 
     UINT64 tsfreq = 0;
     queue_->GetTimestampFrequency(&tsfreq);
+    t0 = startup_now_ms();
     if (!mesher_.init(device_.Get(), tsfreq, error)) return false;
+    startup_log().push_back(std::make_pair(std::string("phase: meshing kernels + buffers"), startup_now_ms() - t0));
+    t0 = startup_now_ms();
     if (!create_mesh_pipeline(error)) return false;
     if (!create_water_pipeline(error)) return false;
+    startup_log().push_back(std::make_pair(std::string("phase: draw pipelines"), startup_now_ms() - t0));
     streamer_.init();
     pager_.init(kMaxBricks);
 
@@ -625,7 +631,9 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     // is static for the run, so this is the only place it happens.
     allocators_[frame_]->Reset();
     cmd_->Reset(allocators_[frame_].Get(), nullptr);
+    t0 = startup_now_ms();
     if (!world_.build(device_.Get(), cmd_.Get(), 0, error)) return false;
+    startup_log().push_back(std::make_pair(std::string("phase: world build (CPU seed + upload)"), startup_now_ms() - t0));
     mesher_.set_world(&world_);
     {
         float lo = 0.0f, hi = 0.0f;
@@ -738,6 +746,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         mc.wire = wire ? 1.0f : 0.0f;
         mc.slot_vertices = static_cast<float>(kSlotVertices);
         mc.mesh_debug = mesh_debug_;
+        mc.texture_mode = texture_mode_;
         streamer_.fill_visibility(static_cast<float*>(fade_cpu_[frame_]));
         cmd_->SetPipelineState(wire ? mesh_wire_pso_.Get() : mesh_pso_.Get());
         cmd_->SetGraphicsRootSignature(mesh_root_.Get());
