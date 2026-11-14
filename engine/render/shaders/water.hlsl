@@ -38,7 +38,7 @@ cbuffer WaterConstants : register(b0) {
     float3 cam_right;  float tan_half_fov;
     float3 cam_up;     float pad1;
     float  sea_level;  float sea_state;  float grid_cells;  float extent;
-    float  debug_mode; float3 pad0;
+    float  debug_mode; float cam_water; float2 pad0;
 };
 
 struct VSOut {
@@ -90,7 +90,23 @@ VSOut vs_main(uint vid : SV_VertexID) {
     const float2 ndc = (float2(float(ix), float(iz)) / grid_cells * 2.0f - 1.0f) * over;
 
     const float3 dir = screen_ray(ndc);
-    const float  plane_y = sea_level;
+
+    // The plane the grid is laid on decides only WHERE vertices sample the
+    // sea; their heights come from ww_surface below. Still sea level is the
+    // right plane for any camera above every trough, and a swimmer is not
+    // one: an eye floating in a trough is above the water around it and
+    // BELOW sea level, so every downward ray missed the plane, went to the
+    // far plane, and the water nearest the swimmer was never drawn. --swim at
+    // a storm photographed the seabed through nothing, with the swell hanging
+    // overhead like a ceiling.
+    //
+    // So when the eye is above the water directly under it, lay the grid
+    // half a metre beneath the eye if that is lower. Any camera more than
+    // half a metre above sea level gets exactly the old plane. cam_water is
+    // the C++ ww_height_at, the function physics floats the swimmer on.
+    // A SUBMERGED camera keeps sea level and the looking-up branch below.
+    float plane_y = sea_level;
+    if (cam_pos.y >= cam_water) plane_y = min(sea_level, cam_pos.y - 0.5f);
 
     // Where this ray meets the sea. Rays going up, or so near parallel that
     // the intersection is past the far plane, are pinned to the far plane so

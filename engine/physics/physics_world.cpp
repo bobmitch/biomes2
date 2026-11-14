@@ -1,4 +1,5 @@
 #include "engine/physics/physics_world.h"
+#include "engine/render/water_wave.h"
 
 #include <Jolt/RegisterTypes.h>
 #include <Jolt/Core/Factory.h>
@@ -248,29 +249,117 @@ void PhysicsWorld::place_character(float x, float y, float z) {
     if (!impl_ || !impl_->character) return;
     impl_->character->SetPosition(JPH::RVec3(x, y, z));
     impl_->character->SetLinearVelocity(JPH::Vec3::sZero());
+    // A teleport is not motion: the next step must not read the jump in
+    // water height between the old place and the new as the sea rising.
+    sea_here_ = false;
+    medium_ = Medium::Dry;
 }
 
 void PhysicsWorld::launch_character(float vy) {
     pending_launch_ = vy;
 }
 
-void PhysicsWorld::update(float dt, float vx, float vz, bool jump) {
+void PhysicsWorld::update(float dt, float vx, float vz, bool jump, float swim) {
     if (!impl_ || !impl_->character) return;
     if (dt > 0.05f) dt = 0.05f;
 
     JPH::CharacterVirtual* c = impl_->character;
     const JPH::Vec3 gravity = impl_->system.GetGravity();
 
-    JPH::Vec3 v = c->GetLinearVelocity();
+    // Where the water is, from the same function the shader draws. Asked at
+    // the start of the step, so a swimmer is judged against the surface it is
+    // in now rather than one it will be in after moving -- a frame's lag at
+    // most, which the buoyancy spring cannot tell from the wave itself.
     const bool on_ground = c->GetGroundState() == JPH::CharacterVirtual::EGroundState::OnGround;
-    if (on_ground) {
-        v.SetY(0.0f);
-        if (jump) v.SetY(7.5f);
-    } else {
-        v += gravity * dt;
+    {
+        const JPH::RVec3 at = c->GetPosition();
+        const float fx = float(at.GetX()), fy = float(at.GetY()), fz = float(at.GetZ());
+        const bool was_here = sea_here_;
+        const float was_y = water_y_;
+        sea_here_ = false;
+        submerged_ = 0.0f;
+        if (sea_.on && column_height_) {
+            // water.hlsl's clip(depth + 0.02): drawn wherever the base column
+            // is below sea level, give or take its two centimetres.
+            sea_here_ = column_height_(fx, fz) < sea_.level + 0.02f;
+            if (sea_here_) {
+                water_y_ = sea_.level + ww_height_at(fx, fz, sea_.time, sea_.state);
+                float sub = water_y_ - fy;
+                const float body = 2.0f * (half_height_ + radius_);
+                submerged_ = sub < 0.0f ? 0.0f : (sub > body ? body : sub);
+            }
+        }
+        // How fast the surface under the character is rising, ALONG ITS PATH
+        // -- the wave's own motion and the swimmer crossing its slope, both of
+        // which the body has to follow. Clamped because a step that streams
+        // in after a stall has a meaningless dt.
+        water_rate_ = 0.0f;
+        if (sea_here_ && was_here && dt > 1e-4f) {
+            const float r = (water_y_ - was_y) / dt;
+            water_rate_ = r > 10.0f ? 10.0f : (r < -10.0f ? -10.0f : r);
+        }
+
+        // In the water with nothing underfoot is swimming, however little of
+        // the body is wet: a swimmer lifted clear by a crest that then drops
+        // away is still a swimmer, and calling that wading turned off the
+        // buoyancy exactly when it was about to be needed. Standing on the
+        // bottom is wading until the water is deep enough to float in.
+        if (submerged_ <= 0.0f) {
+            medium_ = Medium::Dry;
+        } else if (!on_ground) {
+            medium_ = Medium::Swimming;
+        } else if (medium_ == Medium::Swimming) {
+            if (submerged_ < kSwimLeave) medium_ = Medium::Wading;
+        } else {
+            medium_ = submerged_ > kSwimEnter ? Medium::Swimming : Medium::Wading;
+        }
     }
-    v.SetX(vx);
-    v.SetZ(vz);
+
+    JPH::Vec3 v = c->GetLinearVelocity();
+    float hscale = 1.0f;
+    if (medium_ != Medium::Dry) {
+        // Water drags at the legs: full speed at the waterline down to
+        // swimming speed at the depth where swimming takes over. One curve
+        // for both modes, so a frame that flickers between them in the
+        // shallows does not jerk the speed.
+        const float f = submerged_ / kSwimEnter;
+        hscale = 1.0f - (1.0f - kSwimSpeed) * (f > 1.0f ? 1.0f : f);
+    }
+    if (medium_ == Medium::Swimming) {
+        // Archimedes, linearised: lift in proportion to how much of the body
+        // is under, balancing gravity exactly at kFloatDepth. That is a spring
+        // of stiffness g / kFloatDepth -- omega 4.0 rad/s at this gravity --
+        // so the drag below is about 0.74 of critical: one small overshoot
+        // when you drop in, then it rides the swell. Gravity here is 22, not
+        // 9.81, so these are tuned to the world, not to the textbook.
+        const float g = gravity.GetY();
+        const float wet = submerged_ / kFloatDepth;
+        float ay = g * (1.0f - wet);
+        float intent = swim + (jump ? 1.0f : 0.0f);
+        if (intent > 1.0f) intent = 1.0f;
+        if (intent < -1.0f) intent = -1.0f;
+        // Thrust pushes against water, so it stops working once the body is
+        // nearly out of it: a swimmer can lunge onto a ledge about a metre up
+        // and cannot fly.
+        if (intent < 0.0f || submerged_ > 0.3f) ay += 30.0f * intent;
+        // Drag acts on velocity RELATIVE TO THE WATER. The first version
+        // damped absolute velocity, which in a storm is a force holding the
+        // swimmer down while a crest rises past at 3 m/s: --swim at sea state
+        // 1 measured the feet 1.9 m under on average against a balance of
+        // 1.35, and the eye under for 60% of frames. Scaled by how much of the
+        // body is in the water, so a swimmer thrown clear falls like one.
+        const float drag = 6.0f * (wet > 1.0f ? 1.0f : wet);
+        v.SetY((v.GetY() + (ay + drag * water_rate_) * dt) / (1.0f + drag * dt));
+    } else {
+        if (on_ground) {
+            v.SetY(0.0f);
+            if (jump) v.SetY(7.5f);
+        } else {
+            v += gravity * dt;
+        }
+    }
+    v.SetX(vx * hscale);
+    v.SetZ(vz * hscale);
     if (pending_launch_ != 0.0f) {
         v.SetY(pending_launch_);
         pending_launch_ = 0.0f;
@@ -283,6 +372,12 @@ void PhysicsWorld::update(float dt, float vx, float vz, bool jump) {
     // The hand-written version of B4 reached for the same step-down at 0.4 m
     // after measuring 483 airborne frames in 897 without it.
     JPH::CharacterVirtual::ExtendedUpdateSettings s;
+    // ...and it is exactly wrong for a swimmer: anything within half a metre
+    // below gets snapped onto, so a float over shallow water would be dragged
+    // down to walk the seabed -- the bug this whole mode exists to remove.
+    if (medium_ == Medium::Swimming && submerged_ >= kSwimLeave) {
+        s.mStickToFloorStepDown = JPH::Vec3::sZero();
+    }
     c->ExtendedUpdate(dt, gravity, s,
                       impl_->system.GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
                       impl_->system.GetDefaultLayerFilter(Layers::MOVING),

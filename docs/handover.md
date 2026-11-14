@@ -44,7 +44,9 @@ of having them.
 | Slot headroom | same | worst chunk wanted 2342 of 4096 vertices, 13152 of 24576 indices |
 | Walking | `engine --walk 20` | 120 m, feet 3.8 mm from the field, LOD 0 for all 1103 judged frames |
 | Persistence | `engine --dig-save` then `--dig-verify` | −0.0000 m, SURVIVED |
-| Sea | `engine --sea-report` | 0.20 m calm to 7.51 m storm, mean holds sea level to 2.4 mm |
+| Sea | `engine --sea-report` | 0.20 m calm to 7.51 m storm, mean holds sea level to 2.4 mm; waterline inversion misses by 0.05 mm |
+| Swimming | `engine --swim 40` | 0 of ~611 deep-water frames on the seabed, feet 1.34 m under (balance 1.35), eye never under, back on land |
+| Swimming, storm | `engine --swim 40 --sea-state 1` | 0 of ~513 on the seabed, feet 1.29 m under, eye under 10.9% of frames (worst 0.18 m) |
 | Residency | `engine --band-report` | 1129 chunks wanted, band clears the surface by 34 m everywhere |
 | Normals | `engine --normal-check` | 0.0° at every voxel, control carries 161° at 64 m |
 
@@ -57,24 +59,29 @@ and looks exactly like a hang. It is not one. Do not debug it; wait.
 
 ## What is open, in the order I would take it
 
-### 1. The sea has no physics
+### 1. ~~The sea has no physics~~ — done 2026-11-13
 
-`physics_world` and `streamer.h` contain no reference to it — checked, not
-assumed. A character walks into the ocean and keeps walking along the seabed.
+The character floats, swims, wades and walks back out. The waterline is
+`ww_height_at` in `water_wave.h`, the function the shader draws. Water stays
+out of residency (`--band-report` is byte-identical before and after). See
+CLAUDE.md's sea section for the three traps it hit.
 
-This is first not because the sea is newest but because **the generator is
-validated against sea travel the engine cannot perform.** `validate` asserts
-`boat connect — 0 seeds with a biome unreachable by sea` on every seed, and
-land fraction was deliberately tuned below the percolation threshold to make
-an archipelago: 7.2 landmasses a seed with the spawn mass holding 74% of the
-land. About a quarter of the world is across water by design. Until something
-can cross it, the world being measured as good and the world being played are
-different worlds.
+What remains, in order:
 
-Keep water **out of residency** when you do this. `--band-report`'s "worst
-miss" compares the band against `worldgen::terrain_height`; a water surface
-feeding residency would leave that check passing while measuring something
-else. The waterline is a physics question, not a streaming one.
+- **No underwater rendering.** A submerged camera sees the seabed lit as dry
+  land, with the surface overhead as a translucent sheet. In a storm this is
+  10.9% of swimming frames, so it is visible. It needs fog and tint in
+  `mesh.hlsl` when the eye is below `cam_water`, which the water constants
+  already carry.
+- **One `--swim` run came back short of the beach.** It had 1522 frames where
+  every other run had about 2390. It was not reproduced in three re-runs, and
+  it predates the step-clamp accounting the report now prints. If it recurs,
+  read "simulated time lost" first.
+- **Nothing has yet swum from one landmass to another.** `--swim` goes about
+  50 m out and back. A crossing is the test that would close the gap between
+  `boat connect` and the engine. It needs a route between two masses, which
+  `validate` already computes and the engine does not.
+- No breath or drowning, no boat, and the sea moves no one sideways.
 
 ### 2. Cap MeshShape at the fine LOD levels
 

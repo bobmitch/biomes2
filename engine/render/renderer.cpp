@@ -1,5 +1,6 @@
 #include "engine/render/renderer.h"
 #include "engine/render/shader_compile.h"
+#include "engine/render/water_wave.h"
 
 #include <d3dcompiler.h>
 #include <cmath>
@@ -47,7 +48,8 @@ struct WaterConstants {
     float grid_cells;
     float extent;
     float debug_mode;
-    float pad0[3];
+    float cam_water;   // world y of the sea surface directly at the camera
+    float pad0[2];
 };
 
 struct MeshConstants {
@@ -746,6 +748,11 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         wc.grid_cells = static_cast<float>(kWaterCells);
         wc.extent = kFarPlane;
         wc.debug_mode = water_debug_;
+        // The same question physics asks of the same function, so the
+        // shader's idea of "is the eye above the water here" and the
+        // swimmer's are one answer rather than two that usually agree.
+        wc.cam_water = wc.sea_level + ww_height_at(view.cam_pos[0], view.cam_pos[2],
+                                                   view.time, sea_state_);
 
         cmd_->SetPipelineState(water_pso_.Get());
         cmd_->SetGraphicsRootSignature(water_root_.Get());

@@ -11,6 +11,10 @@
 //
 //   WASD / QE   fly, shift to sprint
 //   mouse       look (click to capture, Esc to release)
+//   Tab         walk (a capsule under physics) / fly
+//   Space       jump; in the sea, swim up -- and out over a ledge
+//   Ctrl        in the sea, dive
+//   [ ]         sea state, calm to storm
 //   M           raymarch / mesh / wireframe overlay
 //   F5          reload every shader and remesh
 //   F2          write a capture to build/shot.bmp
@@ -103,6 +107,20 @@ void sync_physics_terrain() {
     }
     const std::vector<engine::ChunkKey>& gone = g_renderer.patches_removed();
     for (size_t i = 0; i < gone.size(); ++i) g_physics.remove_chunk(gone[i]);
+}
+
+// Hand physics the sea the renderer is about to draw: same level, same sea
+// state, same clock. `t` must be the time this frame passes to fill_view, or
+// the swimmer bobs on a swell that is somewhere else on screen. --no-water
+// turns the physics off with the drawing, because a sea you cannot see but
+// can float on is the same disagreement the other way round.
+void sync_sea(float t) {
+    engine::SeaParams s;
+    s.on = g_renderer.water();
+    s.level = g_renderer.world().params().sea_level;
+    s.state = g_renderer.sea_state();
+    s.time = t;
+    g_physics.set_sea(s);
 }
 bool g_captured = false;
 bool g_want_shot = false;
@@ -233,6 +251,7 @@ static int run_sea_report(const char* path) {
     const float span = 420.0f;  // metres, several of the longest wavelength
     double worst_mean = 0.0;
     bool ok = true;
+    double inv_miss[11] = {0}, inv_naive[11] = {0};
 
     for (int s = 0; s <= 10; s += 2) {
         const float state = float(s) / 10.0f;
@@ -255,6 +274,20 @@ static int run_sea_report(const char* path) {
                     // ny is cos of the angle from vertical; smaller means steeper.
                     const double sl = nrm.y > 1e-6f ? (1.0 / nrm.y) : 1e6;
                     if (sl > slope) slope = sl;
+
+                    // The waterline physics asks for: the surface ABOVE
+                    // (x, z), not the water that started there. Every
+                    // fourth sample is plenty to find the worst case.
+                    if ((i & 3) == 0 && (j & 3) == 0) {
+                        const ww_float2 r = ww_rest_point(x, z, t, state, 0.0f);
+                        ww_float3 n2;
+                        const ww_float3 q = ww_surface(r.x, r.y, t, state, 1.0f, 0.0f, n2);
+                        const double mx = double(q.x) - x, mz = double(q.z) - z;
+                        const double miss = std::sqrt(mx * mx + mz * mz);
+                        if (miss > inv_miss[s]) inv_miss[s] = miss;
+                        const double naive = std::fabs(double(p.y) - double(q.y));
+                        if (naive > inv_naive[s]) inv_naive[s] = naive;
+                    }
                 }
             }
         }
@@ -269,6 +302,21 @@ static int run_sea_report(const char* path) {
 
     std::fprintf(f, "\nmean surface height must stay at sea level: worst |mean| %.4f m -> %s\n",
                  worst_mean, ok ? "PASS" : "FAIL (the sea rises with the weather)");
+
+    // The swimmer's waterline. ww_height_at inverts the Gerstner throw so it
+    // returns the surface directly above a point; "naive" is what you would
+    // get by skipping that and reading the water that STARTED there.
+    std::fprintf(f, "\nwaterline inversion (%d Newton steps), what physics floats on:\n",
+                 WW_INVERT_STEPS);
+    std::fprintf(f, "%-6s %16s %22s\n", "state", "miss-m (horiz)", "naive-error-m (vert)");
+    bool inv_ok = true;
+    for (int s = 0; s <= 10; s += 2) {
+        std::fprintf(f, "%-6.1f %16.6f %22.3f\n", float(s) / 10.0f, inv_miss[s], inv_naive[s]);
+        if (inv_miss[s] > 0.001) inv_ok = false;
+    }
+    std::fprintf(f, "inversion lands within 1 mm of the asked point: %s\n",
+                 inv_ok ? "PASS" : "FAIL (raise WW_INVERT_STEPS)");
+    if (!inv_ok) ok = false;
     std::fprintf(f, "\nmax-slope is 1/n.y, so 1.00 is flat and the Gerstner limit is\n");
     std::fprintf(f, "where crests come to a point. Steepness rises with the sea\n");
     std::fprintf(f, "state on purpose -- sharpening crests is most of what makes a\n");
@@ -288,6 +336,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     bool  no_water = false;
     double flight_seconds = 0.0;
     double walk_seconds = 0.0;
+    double swim_seconds = 0.0;
     double overhang_seconds = 0.0;
     double dig_seconds = 0.0;
     bool mode_dig_save = false, mode_dig_verify = false, mode_dig_stress = false;
@@ -316,6 +365,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             size_t p = cl.find_first_not_of(" \t", wk + 6);
             if (p != std::string::npos && cl[p] != '-') walk_seconds = std::atof(cl.c_str() + p);
             if (walk_seconds <= 0.0) walk_seconds = 8.0;
+        }
+        const size_t sw = cl.find("--swim");
+        if (sw != std::string::npos) {
+            swim_seconds = 40.0;
+            size_t p = cl.find_first_not_of(" \t", sw + 6);
+            if (p != std::string::npos && cl[p] != '-') swim_seconds = std::atof(cl.c_str() + p);
+            if (swim_seconds <= 0.0) swim_seconds = 40.0;
         }
         const size_t fl = cl.find("--flight");
         if (fl != std::string::npos) {
@@ -405,7 +461,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     // error already written to build/engine_error.txt. A mode that was asked
     // to run without a human is headless whatever it is called.
     const bool headless = !shot_path.empty() || flight_seconds > 0.0 ||
-                          walk_seconds > 0.0 || overhang_seconds > 0.0 ||
+                          walk_seconds > 0.0 || swim_seconds > 0.0 ||
+                          overhang_seconds > 0.0 ||
                           dig_seconds > 0.0 || mode_dig_save || mode_dig_verify ||
                           mode_dig_stress || sea_shot;
 
@@ -438,6 +495,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     g_renderer.set_sea_state(sea_state);
     g_renderer.set_water_debug(water_debug);
     if (no_water) g_renderer.set_water(false);
+    g_physics.set_column_height([](float x, float z) {
+        return g_renderer.world().height(x, z);
+    });
 
     if (sea_shot) {
         // Waves are metres tall and the world is twenty kilometres wide,
@@ -647,6 +707,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 }
             }
 
+            sync_sea(float(total));
             g_physics.update(float(dt), 0.0f, 0.0f, false);
             g_physics.character_position(g_feet);
             if (total > 12.0) settled = g_feet[1];
@@ -846,6 +907,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 g_physics.place_character(dig_at[0], ground_before + 12.0f, dig_at[2]);
             }
 
+            sync_sea(float(total));
             g_physics.update(float(dt), 0.0f, 0.0f, false);
             g_physics.character_position(g_feet);
             if (brought_back) ground_returned = g_feet[1];
@@ -1113,6 +1175,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             }
             if (placed_under) speed = 0.0f;
 
+            sync_sea(float(total));
             g_physics.update(float(dt), 0.0f, speed, false);
             g_physics.character_position(g_feet);
             if (launched && g_feet[1] > launch_peak) launch_peak = g_feet[1];
@@ -1237,6 +1300,271 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (swim_seconds > 0.0) {
+        // --swim: walk off a beach, swim out, turn round, swim back and walk
+        // out. The thing being measured is the bug this replaces -- a
+        // character walking along the seabed in water over its head -- so the
+        // headline number is frames spent standing in deep water, and it is
+        // only worth anything beside the count of deep-water frames it is out
+        // of.
+        const engine::WorldGpu& wg = g_renderer.world();
+        const float sea = wg.params().sea_level;
+        const float state = g_renderer.sea_state();
+        // "Deep" is deep enough that no trough at this sea state can put the
+        // floating feet on the bottom: float depth, plus the full amplitude
+        // the trough can fall, plus a metre. Below this, touching the seabed
+        // while swimming is legitimate and is not counted.
+        const float deep = engine::PhysicsWorld::kFloatDepth +
+                           ww_total_amplitude(state) + 1.0f;
+
+        // A beach: the nearest coast to the origin along any of 72 spokes
+        // where the land side is low enough to walk down (under 6 m, 20 m
+        // in) and the sea side stays sea and gets deep within 40 m.
+        float best_rc = 1e9f, dir_x = 0.0f, dir_z = 1.0f;
+        for (int sp = 0; sp < 72; ++sp) {
+            const float a = 6.2831853f * float(sp) / 72.0f;
+            const float dx = std::sin(a), dz = std::cos(a);
+            float rc = -1.0f;
+            for (float r = 20.0f; r < 6000.0f && r < best_rc; r += 5.0f) {
+                if (wg.height(dx * r, dz * r) < sea) { rc = r; break; }
+            }
+            if (rc < 0.0f) continue;
+            const float land = wg.height(dx * (rc - 20.0f), dz * (rc - 20.0f));
+            if (land < sea || land > sea + 6.0f) continue;
+            bool open = true;
+            for (float r = rc; r <= rc + 70.0f; r += 5.0f) {
+                if (wg.height(dx * r, dz * r) >= sea) { open = false; break; }
+            }
+            if (!open) continue;
+            if (sea - wg.height(dx * (rc + 40.0f), dz * (rc + 40.0f)) < deep) continue;
+            best_rc = rc; dir_x = dx; dir_z = dz;
+        }
+
+        FILE* f = std::fopen("build/swim.txt", "w");
+        if (best_rc >= 1e9f) {
+            if (f) {
+                std::fprintf(f, "no beach found within 6 km of the origin that is walkable on\n"
+                                "the land side and deeper than %.2f m 40 m out. Nothing was swum.\n",
+                             deep);
+                std::fclose(f);
+            }
+            g_renderer.shutdown();
+            g_physics.shutdown();
+            return 1;
+        }
+
+        g_renderer.set_vsync(true);
+        g_walk = true;
+        const float sx = dir_x * (best_rc - 20.0f), sz = dir_z * (best_rc - 20.0f);
+        g_physics.place_character(sx, Spawn::above(sx, sz), sz);
+        g_physics.character_position(g_feet);
+        const float yaw_out = std::atan2(dir_x, dir_z);
+        g_camera.pitch = -0.05f;
+
+        LARGE_INTEGER wfreq, wstart, wprev;
+        QueryPerformanceFrequency(&wfreq);
+        QueryPerformanceCounter(&wstart);
+        wprev = wstart;
+
+        unsigned long long frames = 0, judged = 0;
+        unsigned long long n_dry = 0, n_wade = 0, n_swim = 0;
+        unsigned long long deep_frames = 0, deep_standing = 0, deep_clear = 0;
+        unsigned long long eye_under = 0, fully_under = 0;
+        double eye_min = 1e9, eye_max = -1e9, eye_sum = 0.0;
+        double flt_min = 1e9, flt_max = -1e9, flt_sum = 0.0;
+        double out_max = -1e9, swum = 0.0, deepest_column = 0.0;
+        bool shot_taken = false;
+        bool returned = false;
+        double shot_eye_local = 0.0, shot_eye_sea = 0.0;
+        double clamp_lost = 0.0, worst_dt = 0.0;
+
+        for (;;) {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&m);
+                DispatchMessageA(&m);
+            }
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            const double total = double(now.QuadPart - wstart.QuadPart) / double(wfreq.QuadPart);
+            const double dt = double(now.QuadPart - wprev.QuadPart) / double(wfreq.QuadPart);
+            wprev = now;
+            if (total >= swim_seconds) break;
+            // PhysicsWorld::update clamps a step to 50 ms, so a slow frame
+            // loses simulated time and the character covers less ground than
+            // the clock says. One calm run came back short of the beach on
+            // 1522 frames where every other run took ~2390; without this
+            // number that read as a swimming failure.
+            if (dt > 0.05) clamp_lost += dt - 0.05;
+            if (dt > worst_dt) worst_dt = dt;
+
+            // Out for the first half, back for the second. Standing still for
+            // the first 1.5 s while residency fills, so the walk starts on
+            // ground rather than mid-fall.
+            const bool back = total >= swim_seconds * 0.5;
+            g_camera.yaw = back ? yaw_out + 3.14159265f : yaw_out;
+            const float sy = std::sin(g_camera.yaw), cy = std::cos(g_camera.yaw);
+            const float spd = total < 1.5 ? 0.0f : 6.0f;
+            sync_physics_terrain();
+            sync_sea(float(total));
+            const float px = g_feet[0], pz = g_feet[2];
+            g_physics.update(float(dt), sy * spd, cy * spd, false);
+            g_physics.character_position(g_feet);
+
+            g_camera.x = g_feet[0];
+            g_camera.y = g_feet[1] + kEyeAboveFeet;
+            g_camera.z = g_feet[2];
+
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
+            if (w < 1.0f || h < 1.0f) continue;
+            engine::ViewConstants v = {};
+            fill_view(g_camera, w, h, float(total), v);
+            g_renderer.render(v);
+            ++frames;
+            if (total < 1.5) continue;
+            ++judged;
+
+            const engine::Medium md = g_physics.medium();
+            if (md == engine::Medium::Dry) ++n_dry;
+            else if (md == engine::Medium::Wading) ++n_wade;
+            else ++n_swim;
+            if (md == engine::Medium::Swimming) {
+                swum += std::sqrt((g_feet[0] - px) * (g_feet[0] - px) +
+                                  (g_feet[2] - pz) * (g_feet[2] - pz));
+            }
+
+            const double along = double(g_feet[0]) * dir_x + double(g_feet[2]) * dir_z;
+            if (along - best_rc > out_max) out_max = along - best_rc;
+
+            const float column = sea - wg.height(g_feet[0], g_feet[2]);
+            if (column > deepest_column) deepest_column = column;
+            if (column > deep) {
+                ++deep_frames;
+                // The old behaviour, exactly: standing on the bottom in water
+                // over your head. Measured as Jolt's ground contact, not as
+                // the medium label -- the first version of this counted
+                // "not labelled swimming", and a storm reported 53 failures
+                // that were all a swimmer thrown clear of a trough with
+                // nothing underneath it at all.
+                if (g_physics.character_grounded()) ++deep_standing;
+                if (md == engine::Medium::Dry) ++deep_clear;
+            }
+
+            if (md == engine::Medium::Swimming && g_physics.sea_present()) {
+                const double wy = g_physics.water_surface();
+                // Eye against the surface ABOVE the eye, recomputed here
+                // rather than reusing the feet's: the same column, but a
+                // check that read physics' own number back would be a check
+                // of nothing.
+                const double eye_y = double(g_feet[1]) + kEyeAboveFeet;
+                const double surf = double(sea) +
+                    ww_height_at(g_feet[0], g_feet[2], float(total), state);
+                const double clear = eye_y - surf;
+                if (clear < eye_min) eye_min = clear;
+                if (clear > eye_max) eye_max = clear;
+                eye_sum += clear;
+                if (clear < 0.0) ++eye_under;
+                // How far under the feet float, against the same surface
+                // physics used at the start of the step.
+                const double fl = wy - double(g_feet[1]);
+                if (fl < flt_min) flt_min = fl;
+                if (fl > flt_max) flt_max = fl;
+                flt_sum += fl;
+                if (g_physics.submersion() >= 2.0f * (kCapsuleHalf + kCapsuleRadius) - 1e-3f)
+                    ++fully_under;
+            }
+
+            // A first-person frame after the turn, looking back at the beach:
+            // the waterline at eye level, which is the thing a screenshot
+            // can judge and a number cannot. Taken when the eye is clear of
+            // the water -- and, in a sea big enough to have them, in a TROUGH,
+            // below still sea level, which is the vantage the water grid
+            // could not draw from. The first version shot at the turn
+            // whatever was happening, and twice photographed a camera 7 cm
+            // under the surface that the report then had to explain.
+            const double eye_local = double(g_camera.y) - (double(sea) +
+                ww_height_at(g_camera.x, g_camera.z, float(total), state));
+            const bool trough_sea = ww_total_amplitude(state) > 1.5f;
+            const bool vantage = md == engine::Medium::Swimming && eye_local > 0.2 &&
+                                 (!trough_sea || double(g_camera.y) < double(sea) - 1.0);
+            if (back && !shot_taken && (vantage || total >= swim_seconds * 0.8)) {
+                shot_taken = true;
+                engine::ViewConstants cv = {};
+                fill_view(g_camera, 1280.0f, 720.0f, float(total), cv);
+                g_renderer.set_mode(engine::Mode::Mesh);
+                std::string err;
+                g_renderer.capture(cv, "build/swim.bmp", err);
+                shot_eye_local = double(g_camera.y) - (double(sea) +
+                    ww_height_at(g_camera.x, g_camera.z, float(total), state));
+                shot_eye_sea = double(g_camera.y) - double(sea);
+            }
+        }
+        returned = g_physics.medium() == engine::Medium::Dry && g_physics.character_grounded();
+
+        const engine::FrameStats st = g_renderer.stats();
+        if (f) {
+            // An engine run that never got a window size renders nothing and
+            // judges nothing, and its verdicts below would still print.
+            if (judged == 0 || st.chunks_classified == 0) {
+                std::fprintf(f, "VOID RUN: %llu frames judged, %llu chunks classified."
+                                " Nothing below means anything.\n\n",
+                             judged, st.chunks_classified);
+            }
+            std::fprintf(f, "swim off a beach and back, %.1f s, sea state %.2f\n",
+                         swim_seconds, state);
+            std::fprintf(f, "beach: coast %.0f m from the origin along (%.3f, %.3f), "
+                            "start 20 m inland\n", best_rc, dir_x, dir_z);
+            std::fprintf(f, "frames %llu, judged %llu (after 1.5 s of streaming)\n",
+                         frames, judged);
+            std::fprintf(f, "worst frame %.0f ms; simulated time lost to the 50 ms step "
+                            "clamp: %.1f s of %.1f\n",
+                         worst_dt * 1000.0, clamp_lost, swim_seconds);
+            std::fprintf(f, "  dry %llu, wading %llu, swimming %llu\n", n_dry, n_wade, n_swim);
+            std::fprintf(f, "furthest out: %.1f m past the coast, deepest column %.1f m\n",
+                         out_max, deepest_column);
+            std::fprintf(f, "distance swum: %.1f m\n", swum);
+            std::fprintf(f, "\n'deep' is a column over %.2f m: float depth %.2f + the sea's "
+                            "full amplitude %.2f + 1 m\n",
+                         deep, engine::PhysicsWorld::kFloatDepth, ww_total_amplitude(state));
+            std::fprintf(f, "frames in deep water: %llu\n", deep_frames);
+            std::fprintf(f, "  of which standing on the seabed: %llu -> %s\n",
+                         deep_standing,
+                         deep_frames == 0 ? "NOT TESTED (never reached deep water)"
+                                          : (deep_standing == 0 ? "PASS" : "FAIL"));
+            std::fprintf(f, "  of which clear of the water entirely (a trough fell away): %llu\n",
+                         deep_clear);
+            if (n_swim) {
+                std::fprintf(f, "\nwhile swimming, against the surface from water_wave.h:\n");
+                std::fprintf(f, "  feet below the surface: min %.3f m, mean %.3f m, max %.3f m "
+                                "(buoyancy balances at %.2f m)\n",
+                             flt_min, flt_sum / double(n_swim), flt_max,
+                             engine::PhysicsWorld::kFloatDepth);
+                std::fprintf(f, "  eye above the surface:  min %.3f m, mean %.3f m, max %.3f m\n",
+                             eye_min, eye_sum / double(n_swim), eye_max);
+                std::fprintf(f, "  frames with the eye under: %llu of %llu (%.1f%%)\n",
+                             eye_under, n_swim, 100.0 * double(eye_under) / double(n_swim));
+                std::fprintf(f, "  frames fully submerged: %llu\n", fully_under);
+            }
+            std::fprintf(f, "\nback on dry ground at the end: %s%s\n", returned ? "yes" : "NO",
+                         !returned && clamp_lost > 2.0
+                             ? " -- but the step clamp ate enough time to explain it"
+                             : "");
+            std::fprintf(f, "chunks classified %llu, physics bodies %zu\n",
+                         st.chunks_classified, g_physics.body_count());
+            // Which side of the water the eye was on when the picture was
+            // taken: a picture of the sea is unreadable without it.
+            std::fprintf(f, "shot at the turn: build/swim.bmp, eye %+.2f m from the water above"
+                            " it, %+.2f m from still sea level\n",
+                         shot_eye_local, shot_eye_sea);
+            std::fclose(f);
+        }
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return 0;
+    }
+
     if (walk_seconds > 0.0) {
         g_renderer.set_vsync(true);
         g_walk = true;
@@ -1253,6 +1581,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         double resid_sum = 0.0, resid_max = 0.0;
         double sink_max = 0.0, hover_max = 0.0, excess_sum = 0.0, excess_max = 0.0;
         unsigned long long steep_frames = 0;
+        unsigned long long wet_wading = 0, wet_swimming = 0;
         unsigned long long lod_frames[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         double lod_resid[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         double lod_max[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -1278,6 +1607,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             const float sp = 6.0f;
             sync_physics_terrain();
             const float px = g_feet[0], pz = g_feet[2];
+            sync_sea(float(total));
             g_physics.update(float(dt), sy * sp, cy * sp, false);
             g_physics.character_position(g_feet);
             travelled += std::sqrt((g_feet[0] - px) * (g_feet[0] - px) +
@@ -1304,6 +1634,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             // character's limit is 50, so the third is expected, not a fault.
             if (!g_physics.character_supported()) ++airborne;
             else if (!g_physics.character_grounded()) ++steep_frames;
+            // The walk never set out to reach the sea. If it does, its
+            // ground numbers stop being about ground, so say so.
+            if (g_physics.medium() == engine::Medium::Wading) ++wet_wading;
+            else if (g_physics.medium() == engine::Medium::Swimming) ++wet_swimming;
 
             // Give the world a second to stream in and the capsule a moment to
             // land before judging it.
@@ -1371,6 +1705,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                             " max %.4f m, mean %.4f m\n",
                          excess_max, settled_frames ? excess_sum / double(settled_frames) : 0.0);
             std::fprintf(f, "frames on a slope too steep to stand on: %llu\n", steep_frames);
+            std::fprintf(f, "frames in the sea: wading %llu, swimming %llu\n",
+                         wet_wading, wet_swimming);
             std::fprintf(f, "worst single-frame vertical step: %.4f m\n", worst_step);
             std::fprintf(f, "static bodies in the physics world: %zu\n",
                          g_physics.body_count());
@@ -1576,8 +1912,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             const float vx = (sy * mz + cy * mx) * sp;
             const float vz = (cy * mz - sy * mx) * sp;
             const bool jump = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+            // Ctrl dives. Space is both jump and swim-up, so the way out of
+            // the water is the key you would already be pressing.
+            const float swim = (GetAsyncKeyState(VK_CONTROL) & 0x8000) ? -1.0f : 0.0f;
             sync_physics_terrain();
-            g_physics.update(float(dt), vx, vz, jump);
+            sync_sea(t);
+            g_physics.update(float(dt), vx, vz, jump, swim);
             g_physics.character_position(g_feet);
             g_camera.x = g_feet[0];
             g_camera.y = g_feet[1] + kEyeAboveFeet;
@@ -1622,13 +1962,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::snprintf(title, sizeof(title),
                           "biomes2 engine - %s - %.0f fps (worst %.1f ms) - "
                           "%zu chunks, %u tris - %u meshed/frame in %.3f ms - "
-                          "%zu pending, %zu slots free%s",
+                          "%zu pending, %zu slots free%s%s",
                           g_renderer.mode() == engine::Mode::Mesh ? "mesh" : "wireframe",
                           fps_frames / fps_accum, worst_frame_ms,
                           st.resident, st.indices / 3,
                           st.meshed_this_frame, st.mesh_ms,
                           st.pending, st.free_slots,
-                          st.overflowed ? " - SLOT OVERFLOW" : "");
+                          st.overflowed ? " - SLOT OVERFLOW" : "",
+                          !g_walk ? ""
+                          : g_physics.medium() == engine::Medium::Swimming ? " - swimming"
+                          : g_physics.medium() == engine::Medium::Wading   ? " - wading"
+                                                                           : "");
             SetWindowTextA(hwnd, title);
             fps_accum = 0.0;
             fps_frames = 0;

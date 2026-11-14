@@ -49,8 +49,8 @@ one frame at a fixed camera and writes a BMP without opening a window.
 
 The engine's headless modes all write a text file under `build/` and exit:
 `--shot`, `--flight <s>`, `--walk <s>`, `--overhang`, `--dig`, `--dig-save`,
-`--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field` and
-`--band-report`. It is a GUI subsystem binary, so a shell does not wait on it:
+`--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
+`--band-report`, `--sea-report` and `--swim`. It is a GUI subsystem binary, so a shell does not wait on it:
 run it with `Start-Process -Wait` or the file you read will be the last run's.
 
 ## Invariants — breaking one of these is a bug, not a tradeoff
@@ -369,13 +369,42 @@ coast, which is the only vantage a 7 m swell reads as a swell from),
 The water asks the SHARED FIELD FUNCTION how deep it is, so the shoreline is
 the real one at every LOD. That is M1 paying off somewhere other than terrain.
 
-**The sea is DRAW-TIME ONLY.** `physics_world` and `streamer.h` contain no
-reference to it — checked, not assumed. A character walks into the sea and
-keeps walking along the seabed; there is no buoyancy, no swimming and no
-waterline. Residency is deliberately untouched by it, which is also what keeps
-`--band-report`'s "worst miss" honest: that check compares the band against
-`worldgen::terrain_height`, and a water surface influencing residency would
-silently make it a check on something else.
+**The sea is swimmable, and it is still not in residency.** Physics has no
+water body. The character asks `ww_height_at` in `water_wave.h` each step,
+the same function the shader draws, with the same level, sea state and
+clock. Whether there is sea in a column at all is the shader's own rule:
+`real_terrain_height` below sea level. `streamer.h` still contains no
+reference to the sea. Keep it that way: `--band-report`'s "worst miss"
+compares the band against `worldgen::terrain_height`, and a water surface
+feeding residency would leave that check passing while it measured something
+else. Adding swimming left the band report byte-identical.
+
+`--swim [s]` walks off the nearest gentle beach, swims out, turns and comes
+back. Its headline is **frames standing on the seabed in water too deep to
+stand in**, printed beside the number of deep-water frames it is out of. It
+also prints where the eye sat relative to the water when the shot was taken.
+
+Three things that cost time here and will again:
+
+- **`ww_surface` returns where the water that STARTED at (x, z) went to,**
+  not the surface above (x, z). Gerstner waves move water sideways. The
+  shader never needs the inverse and physics always does. Reading the surface
+  at the swimmer's own point is 1.41 m wrong in a storm. `ww_rest_point`
+  inverts the throw with Newton, and `--sea-report` prints the miss at every
+  sea state (about 0.05 mm, float precision).
+- **Buoyancy drag must act on velocity relative to the water.** Damping
+  absolute velocity is a force holding the swimmer down while a crest rises
+  past. In a storm it put the feet 1.9 m under against a balance of 1.35,
+  with the eye under for 60% of frames. Damping relative to the water gives
+  1.29 m and 11%.
+- **The projected water grid assumed the camera was above every trough.** A
+  swimmer's eye floating in a trough is above the water around it and below
+  sea level. Every downward ray missed the plane, and the water nearest the
+  swimmer was never drawn: 1.1% of the bottom quarter of the frame was water,
+  and 99.6% after the fix. A camera more than 0.5 m above sea level gets the
+  old plane (A/B: 1 pixel in 921,600 differed, by 2 levels).
+  **A submerged camera has no underwater rendering:** the seabed is lit like
+  dry land, with the surface overhead.
 
 `--overhang` no longer has a landmark to aim at: it searches for a real
 ceiling and reports what it found. Near spawn the layer-6 overhangs are

@@ -155,6 +155,25 @@ WW_FN float ww_total_amplitude_lod(float sea_state, float min_wavelength) {
 // `fade` scales displacement toward zero, for distance: a 5 m wave sampled
 // every 167 m near the horizon is noise, and the honest thing to draw there is
 // a flat sheet with a sheen on it rather than aliasing confetti.
+// One wave's amplitude (x), wavenumber (y) and Gerstner Q (z). Factored out
+// because two functions need the identical numbers: the surface itself, and
+// the inversion below that the physics asks. A second copy of the Q formula
+// is exactly how a swimmer ends up floating on a different sea than the one
+// drawn.
+WW_FN WW_F3 ww_wave(int i, float total, float steep, float min_wavelength) {
+    const float wl = ww_wavelength(i);
+    const float a = total * ww_amplitude_share(i) * ww_wave_lod(wl, min_wavelength);
+    const float k = 6.2831853f / wl;
+    // Steepness is shared out over the waves so the SUM stays under the
+    // self-intersection limit. Per-wave steepness would be within bounds
+    // individually and fold the surface where crests coincided.
+    const float q = steep / (float(WW_WAVES) * k * (a > 1e-6f ? a : 1e-6f));
+    const float qc = q * k * a > 1.0f ? 1.0f / (k * (a > 1e-6f ? a : 1e-6f)) : q;
+    WW_F3 r;
+    r.x = a; r.y = k; r.z = qc;
+    return r;
+}
+
 WW_FN WW_F3 ww_surface(float x, float z, float t, float sea_state, float fade,
                        float min_wavelength, WW_OUT_F3 out_normal) {
     const float total = ww_total_amplitude(sea_state) * fade;
@@ -167,15 +186,11 @@ WW_FN WW_F3 ww_surface(float x, float z, float t, float sea_state, float fade,
 
     for (int i = 0; i < WW_WAVES; i = i + 1) {
         const WW_F2  d = ww_direction(i);
-        const float  wl = ww_wavelength(i);
-        const float  a = total * ww_amplitude_share(i) * ww_wave_lod(wl, min_wavelength);
-        const float  k = 6.2831853f / wl;
+        const WW_F3  wv = ww_wave(i, total, steep, min_wavelength);
+        const float  a = wv.x;
+        const float  k = wv.y;
+        const float  qc = wv.z;
         const float  w = ww_angular_speed(k);
-        // Steepness is shared out over the waves so the SUM stays under the
-        // self-intersection limit. Per-wave steepness would be within bounds
-        // individually and fold the surface where crests coincided.
-        const float  q = steep / (float(WW_WAVES) * k * (a > 1e-6f ? a : 1e-6f));
-        const float  qc = q * k * a > 1.0f ? 1.0f / (k * (a > 1e-6f ? a : 1e-6f)) : q;
 
         const float phase = k * (d.x * x + d.y * z) - w * t;
         const float s = ww_sin(phase);
@@ -197,6 +212,73 @@ WW_FN WW_F3 ww_surface(float x, float z, float t, float sea_state, float fade,
     out_normal.y = ny * inv;
     out_normal.z = nz * inv;
     return p;
+}
+
+// Newton steps ww_rest_point takes. --sea-report prints the horizontal miss
+// this leaves at every sea state; read it before changing this.
+#define WW_INVERT_STEPS 4
+
+// The point that RESTS somewhere and is DISPLACED to (x, z) -- the inverse of
+// ww_surface's horizontal throw.
+//
+// This is the question physics asks and the shader never does. The shader
+// starts from a rest point and draws wherever it lands; a swimmer starts from
+// where it IS and needs the surface above that spot. Evaluating ww_surface at
+// the swimmer's own (x, z) answers a different question -- the height of the
+// water that started there, which has since moved sideways by up to the
+// Gerstner throw -- and at a storm that is a crest a metre or more off.
+// --sea-report prints how far off, beside the miss this leaves.
+//
+// Newton rather than the plain fixed point: the throw's Jacobian has norm up
+// to the steepness, 0.85 at full storm, so the fixed point would gain barely
+// a bit per step exactly when the answer matters most. The determinant stays
+// at least (1 - steepness)^2 > 0 because ww_steepness is capped below 1 --
+// the same cap that keeps the drawn surface from folding through itself.
+WW_FN WW_F2 ww_rest_point(float x, float z, float t, float sea_state,
+                          float min_wavelength) {
+    const float total = ww_total_amplitude(sea_state);
+    const float steep = ww_steepness(sea_state);
+    float rx = x, rz = z;
+    for (int it = 0; it < WW_INVERT_STEPS; it = it + 1) {
+        float px = rx, pz = rz;
+        float jxx = 1.0f, jxz = 0.0f, jzz = 1.0f;   // symmetric
+        for (int i = 0; i < WW_WAVES; i = i + 1) {
+            const WW_F2 d = ww_direction(i);
+            const WW_F3 wv = ww_wave(i, total, steep, min_wavelength);
+            const float a = wv.x;
+            const float k = wv.y;
+            const float qc = wv.z;
+            const float phase = k * (d.x * rx + d.y * rz) - ww_angular_speed(k) * t;
+            const float s = ww_sin(phase);
+            const float c = ww_cos(phase);
+            px = px + qc * a * d.x * c;
+            pz = pz + qc * a * d.y * c;
+            const float g = qc * a * k * s;
+            jxx = jxx - g * d.x * d.x;
+            jxz = jxz - g * d.x * d.y;
+            jzz = jzz - g * d.y * d.y;
+        }
+        const float ex = px - x;
+        const float ez = pz - z;
+        const float det = jxx * jzz - jxz * jxz;
+        const float inv = det > 1e-6f ? 1.0f / det : 1.0f;
+        rx = rx - (jzz * ex - jxz * ez) * inv;
+        rz = rz - (jxx * ez - jxz * ex) * inv;
+    }
+    WW_F2 r;
+    r.x = rx; r.y = rz;
+    return r;
+}
+
+// Height of the sea surface directly above (x, z), relative to sea level, at
+// full detail and no distance fade -- which is what the drawn sea carries
+// within a few metres of the camera, where the grid is finer than the
+// shortest wave by an order of magnitude.
+WW_FN float ww_height_at(float x, float z, float t, float sea_state) {
+    const WW_F2 r = ww_rest_point(x, z, t, sea_state, 0.0f);
+    WW_F3 n;
+    const WW_F3 p = ww_surface(r.x, r.y, t, sea_state, 1.0f, 0.0f, n);
+    return p.y;
 }
 
 #endif  // ENGINE_WATER_WAVE_H

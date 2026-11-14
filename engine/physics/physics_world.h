@@ -23,6 +23,7 @@
 #include <Jolt/Core/TempAllocator.h>
 #include <Jolt/Core/JobSystemThreadPool.h>
 
+#include <functional>
 #include <memory>
 #include <unordered_map>
 
@@ -41,6 +42,22 @@ static const JPH::BroadPhaseLayer NON_MOVING(0);
 static const JPH::BroadPhaseLayer MOVING(1);
 static const JPH::uint NUM_LAYERS = 2;
 }  // namespace BroadPhaseLayers
+
+// What the character is in. Wading is ground movement slowed by the water;
+// swimming is buoyancy instead of ground.
+enum class Medium { Dry, Wading, Swimming };
+
+// The sea, as physics sees it. There is NO water body in Jolt: the sea is a
+// function, and the character asks it each step. That keeps it out of the
+// broadphase, out of the chunk bodies and -- the constraint that matters --
+// out of residency: streamer.h never learns the sea exists, so --band-report
+// keeps measuring the band against the terrain alone.
+struct SeaParams {
+    bool  on = false;
+    float level = 0.0f;     // world y of still water
+    float state = 0.0f;     // 0 calm .. 1 storm, the renderer's dial
+    float time = 0.0f;      // the SAME clock the frame's water draw is given
+};
 
 class PhysicsWorld {
 public:
@@ -73,8 +90,39 @@ public:
     // overhang is collision at all: walking cannot reach it.
     void launch_character(float vy);
 
-    // vx/vz is the desired horizontal velocity in metres per second.
-    void update(float dt, float vx, float vz, bool jump);
+    // vx/vz is the desired horizontal velocity in metres per second. `swim`
+    // is vertical intent in water, -1 dive to +1 surface; `jump` counts as +1
+    // there, so one key gets you out of the water and over the lip.
+    void update(float dt, float vx, float vz, bool jump, float swim = 0.0f);
+
+    // The sea. Set every frame, because time and sea state move.
+    void set_sea(const SeaParams& s) { sea_ = s; }
+    // The BASE terrain's column height, which is the shader's rule for where
+    // sea exists at all: water.hlsl clips wherever real_terrain_height is
+    // above sea level. Using the same rule is what stops a pit dug on a beach
+    // filling with water nobody can see, or a cave under the sea floor being
+    // dry while the sea is drawn over it.
+    void set_column_height(std::function<float(float, float)> fn) {
+        column_height_ = fn;
+    }
+
+    Medium medium() const { return medium_; }
+    // World y of the displaced surface above the character, last step. Only
+    // meaningful when sea_present().
+    float  water_surface() const { return water_y_; }
+    bool   sea_present() const { return sea_here_; }
+    // Metres of the character below the surface, 0 dry to 2.3 fully under.
+    float  submersion() const { return submerged_; }
+
+    // Buoyancy balances gravity at this depth of the feet below the surface,
+    // which puts the eye (1.6 m above the feet) 0.25 m clear of still water.
+    static constexpr float kFloatDepth = 1.35f;
+    // Hysteresis on Swimming, so floating at kFloatDepth in a swell does not
+    // flicker between swimming and wading every wave.
+    static constexpr float kSwimEnter = 1.05f;
+    static constexpr float kSwimLeave = 0.85f;
+    // Horizontal speed in water as a fraction of the asked-for speed.
+    static constexpr float kSwimSpeed = 0.5f;
 
     void  character_position(float out[3]) const;
     bool  character_grounded() const;
@@ -97,6 +145,15 @@ private:
     // upward velocity it finds. Setting the velocity directly from outside
     // is silently undone on the next step.
     float  pending_launch_ = 0.0f;
+
+    SeaParams sea_;
+    std::function<float(float, float)> column_height_;
+    Medium medium_ = Medium::Dry;
+    bool   sea_here_ = false;
+    float  water_y_ = 0.0f;
+    float  submerged_ = 0.0f;
+    float  water_rate_ = 0.0f;   // m/s the surface rises along the path
+
     float radius_ = 0.35f;
     float half_height_ = 0.80f;
 };
