@@ -343,6 +343,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     bool flight_vsync = false;
     double shot_altitude = 0.0;
     bool   sea_shot = false;
+    bool   have_cam = false;
+    bool   no_lod_hold = false;
+    int    lod_fade = -1;
+    float  cam_arg[5] = {0, 0, 0, 0, 0};
     {
         const std::string cl = cmdline ? cmdline : "";
         const size_t at = cl.find("--shot");
@@ -409,6 +413,23 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             size_t p = cl.find_first_not_of(" 	", al + 10);
             if (p != std::string::npos && cl[p] != '-') shot_altitude = std::atof(cl.c_str() + p);
             if (shot_altitude <= 0.0) shot_altitude = 1200.0;
+        }
+        // --cam x y z yaw pitch: an exact vantage for --shot, so a picture
+        // someone points at can be rebuilt and A/B'd rather than described.
+        const size_t ca = cl.find("--cam");
+        if (ca != std::string::npos) {
+            float c[5] = {0, 0, 0, 0, 0};
+            if (std::sscanf(cl.c_str() + ca + 5, "%f %f %f %f %f",
+                            &c[0], &c[1], &c[2], &c[3], &c[4]) == 5) {
+                have_cam = true;
+                for (int k = 0; k < 5; ++k) cam_arg[k] = c[k];
+            }
+        }
+        no_lod_hold = cl.find("--no-lod-hold") != std::string::npos;
+        const size_t lf = cl.find("--lod-fade");
+        if (lf != std::string::npos) lod_fade = std::atoi(cl.c_str() + lf + 10);
+        if (cl.find("--no-overhang") != std::string::npos) {
+            engine::WorldGpu::diag_no_overhang = true;
         }
         start_overlay = cl.find("--wire") != std::string::npos;
         debug_layer = cl.find("--debuglayer") != std::string::npos;
@@ -495,6 +516,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     g_renderer.set_sea_state(sea_state);
     g_renderer.set_water_debug(water_debug);
     if (no_water) g_renderer.set_water(false);
+    if (no_lod_hold) g_renderer.set_lod_hold(false);
+    if (lod_fade >= 0) g_renderer.set_lod_fade_frames(lod_fade);
     g_physics.set_column_height([](float x, float z) {
         return g_renderer.world().height(x, z);
     });
@@ -560,6 +583,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 g_camera.pitch = -0.30f;
             }
         }
+        if (have_cam) {
+            g_camera.x = cam_arg[0]; g_camera.y = cam_arg[1]; g_camera.z = cam_arg[2];
+            g_camera.yaw = cam_arg[3]; g_camera.pitch = cam_arg[4];
+        }
         engine::ViewConstants v = {};
         fill_view(g_camera, 1280.0f, 720.0f, 0.0f, v);
 
@@ -572,6 +599,163 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_renderer.drain_debug_messages("build/d3d12_validation.txt");
             g_renderer.dump_draw_args("build/draw_args.txt");
         }
+
+        // --pick px py [px py ...]: what is AT a pixel. Marches the CPU
+        // field along that pixel's ray and reports the hit, how far the 3D
+        // terms moved the surface off the 2.5D heightfield, and how sharp the
+        // field is there. The dark patches went two rounds of confident wrong
+        // explanations for want of exactly this: a world position.
+        const std::string cls = cmdline ? cmdline : "";
+        const size_t pk = cls.find("--pick");
+        if (pk != std::string::npos) {
+            const std::string pp = shot_path + ".pick.txt";
+            FILE* pf = std::fopen(pp.c_str(), "w");
+            const engine::WorldGpu& wg = g_renderer.world();
+            float fwd[3], right[3], up[3];
+            g_camera.basis(fwd, right, up);
+            const char* s = cls.c_str() + pk + 6;
+            float px = 0.0f, py = 0.0f;
+            int used = 0;
+            while (pf && std::sscanf(s, "%f %f%n", &px, &py, &used) == 2) {
+                s += used;
+                const float nx = ((px + 0.5f) / 1280.0f) * 2.0f - 1.0f;
+                const float ny = 1.0f - ((py + 0.5f) / 720.0f) * 2.0f;
+                float d[3];
+                for (int k = 0; k < 3; ++k) {
+                    d[k] = fwd[k] + right[k] * nx * v.tan_half_fov * v.aspect +
+                           up[k] * ny * v.tan_half_fov;
+                }
+                const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                for (int k = 0; k < 3; ++k) d[k] /= dl;
+                float t0 = 0.0f, t1 = -1.0f;
+                for (float t = 0.0f; t < 12000.0f; t += (t < 200.0f ? 0.1f : 2.0f)) {
+                    if (wg.density(g_camera.x + d[0] * t, g_camera.y + d[1] * t,
+                                   g_camera.z + d[2] * t) > 0.0f) { t1 = t; break; }
+                    t0 = t;
+                }
+                std::fprintf(pf, "pixel (%.0f, %.0f): ", px, py);
+                if (t1 < 0.0f) { std::fprintf(pf, "no hit within 2 km\n"); continue; }
+                for (int it = 0; it < 30; ++it) {
+                    const float tm = 0.5f * (t0 + t1);
+                    if (wg.density(g_camera.x + d[0] * tm, g_camera.y + d[1] * tm,
+                                   g_camera.z + d[2] * tm) > 0.0f) t1 = tm; else t0 = tm;
+                }
+                const float hx = g_camera.x + d[0] * t1, hy = g_camera.y + d[1] * t1,
+                            hz = g_camera.z + d[2] * t1;
+                const float e = 0.05f;
+                float g[3] = {
+                    wg.density(hx + e, hy, hz) - wg.density(hx - e, hy, hz),
+                    wg.density(hx, hy + e, hz) - wg.density(hx, hy - e, hz),
+                    wg.density(hx, hy, hz + e) - wg.density(hx, hy, hz - e)};
+                const float gl = std::sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
+                // Outward normal points toward air, which is -grad(density).
+                const float n[3] = {-g[0] / gl, -g[1] / gl, -g[2] / gl};
+                const float h = wg.height(hx, hz);
+                // The 3D terms' contribution here: density minus the
+                // heightfield's own (h - y). Near the surface that is the
+                // overhang displacement; caves are masked off near grade.
+                const float term = wg.density(hx, hy, hz) - (h - hy);
+                // Crease sharpness: the largest second difference of that term
+                // over a 0.5 m step, in metres. A smooth field gives a few
+                // centimetres; a knife edge gives metres.
+                float crease = 0.0f;
+                const float st = 0.5f;
+                const float c0 = term;
+                for (int ax = 0; ax < 3; ++ax) {
+                    float o[3] = {0, 0, 0};
+                    o[ax] = st;
+                    const float tp = wg.density(hx + o[0], hy + o[1], hz + o[2]) -
+                                     (wg.height(hx + o[0], hz + o[2]) - (hy + o[1]));
+                    const float tm2 = wg.density(hx - o[0], hy - o[1], hz - o[2]) -
+                                      (wg.height(hx - o[0], hz - o[2]) - (hy - o[1]));
+                    const float c = std::fabs(tp - 2.0f * c0 + tm2);
+                    if (c > crease) crease = c;
+                }
+                // Which LOD ring owns the hit: the finest level whose 7x7
+                // columns around the camera's chunk reach it.
+                int lod = -1;
+                for (int L = 0; L < engine::kLodCount; ++L) {
+                    const float S = engine::lod_chunk_size(L);
+                    const int cx = int(std::floor(g_camera.x / S)), cz = int(std::floor(g_camera.z / S));
+                    const int hxk = int(std::floor(hx / S)), hzk = int(std::floor(hz / S));
+                    if (std::abs(hxk - cx) <= engine::kRingHalf &&
+                        std::abs(hzk - cz) <= engine::kRingHalf) { lod = L; break; }
+                }
+                const float S = lod >= 0 ? engine::lod_chunk_size(lod) : 0.0f;
+                float edge = 0.0f;
+                if (S > 0.0f) {
+                    const float fx = hx / S - std::floor(hx / S), fz = hz / S - std::floor(hz / S);
+                    const float ex = (fx < 1.0f - fx ? fx : 1.0f - fx) * S;
+                    const float ez = (fz < 1.0f - fz ? fz : 1.0f - fz) * S;
+                    edge = ex < ez ? ex : ez;
+                }
+                std::fprintf(pf, "hit (%.2f, %.2f, %.2f) at %.1f m\n", hx, hy, hz, t1);
+                std::fprintf(pf, "  normal (%.2f, %.2f, %.2f) -- %s\n", n[0], n[1], n[2],
+                             n[1] < 0.0f ? "FACES DOWN" : (n[1] < 0.3f ? "near vertical" : "faces up"));
+                std::fprintf(pf, "  heightfield y %.2f, so the 3D terms moved the surface %+.2f m\n",
+                             h, hy - h);
+                std::fprintf(pf, "  3D term at the hit %+.2f m; crease (2nd diff over 0.5 m) %.3f m\n",
+                             term, crease);
+                std::fprintf(pf, "  ring LOD %d (voxel %.1f m), %.2f m from a chunk edge\n",
+                             lod, lod >= 0 ? engine::lod_voxel(lod) : 0.0f, edge);
+
+                // The region-cell blend either side of the hit, half a metre
+                // each way along the surface normal's horizontal part. The
+                // field blends biome properties over the 4 NEAREST cells only;
+                // if a 5th would still have had weight, the blend jumps where
+                // the 4th and 5th trade places -- a straight bisector.
+                const worldgen::SeedWorld& sw = wg.world();
+                const worldgen::WorldParams& wp = wg.params();
+                const float hl = std::sqrt(n[0] * n[0] + n[2] * n[2]);
+                {
+                    // A STEP is a change that does not shrink with the
+                    // distance: compare 2 mm across against 2 cm across.
+                    const float ux = hl > 1e-4f ? n[0] / hl : 1.0f;
+                    const float uz = hl > 1e-4f ? n[2] / hl : 0.0f;
+                    float jh[2], jt[2];
+                    const float arms[2] = {0.001f, 0.01f};
+                    for (int a = 0; a < 2; ++a) {
+                        const float r = arms[a];
+                        const float ax = hx - ux * r, az = hz - uz * r;
+                        const float bx = hx + ux * r, bz = hz + uz * r;
+                        jh[a] = wg.height(bx, bz) - wg.height(ax, az);
+                        jt[a] = (wg.density(bx, hy, bz) - (wg.height(bx, bz) - hy)) -
+                                (wg.density(ax, hy, az) - (wg.height(ax, az) - hy));
+                    }
+                    std::fprintf(pf, "  across the line: heightfield %+.4f m over 2 mm, %+.4f m over"
+                                     " 2 cm; 3D term %+.4f over 2 mm, %+.4f over 2 cm\n",
+                                 jh[0], jh[1], jt[0], jt[1]);
+                }
+                for (int side = -1; side <= 1; side += 2) {
+                    const float qx = hx + (hl > 1e-4f ? n[0] / hl : 1.0f) * 0.5f * float(side);
+                    const float qz = hz + (hl > 1e-4f ? n[2] / hl : 0.0f) * 0.5f * float(side);
+                    const float wx = qx + wp.warp_amp * ::fbm(qx * wp.warp_freq,
+                                         qz * wp.warp_freq, 2, 2.0f, 0.5f, sw.s_wx);
+                    const float wz = qz + wp.warp_amp * ::fbm(qx * wp.warp_freq,
+                                         qz * wp.warp_freq, 2, 2.0f, 0.5f, sw.s_wz);
+                    std::vector<std::pair<float, int> > all;
+                    for (size_t c = 0; c < sw.pts.size(); ++c) {
+                        const float ddx = sw.pts[c].first - wx, ddz = sw.pts[c].second - wz;
+                        all.push_back(std::make_pair(std::sqrt(ddx * ddx + ddz * ddz), int(c)));
+                    }
+                    std::partial_sort(all.begin(), all.begin() + 6, all.end());
+                    std::fprintf(pf, "  %s side: heightfield %.2f m, nearest cells (dist-d0 m, "
+                                     "biome, overhang, weight):",
+                                 side < 0 ? "-" : "+", wg.height(qx, qz));
+                    for (int k = 0; k < 6; ++k) {
+                        const int b = sw.biome[all[k].second];
+                        const float t = 1.0f - (all[k].first - all[0].first) / wp.blend_width;
+                        const float wt = t > 0.0f ? t * t : 0.0f;
+                        std::fprintf(pf, " %s[%.0f b%d %.2f w%.3f]", k == 4 ? "| " : "",
+                                     all[k].first - all[0].first, b,
+                                     b >= 0 ? wg.table()[b].overhang_strength : -1.0f, wt);
+                    }
+                    std::fprintf(pf, "\n");
+                }
+            }
+            if (pf) std::fclose(pf);
+        }
+
         g_renderer.shutdown();
         g_physics.shutdown();
 
@@ -594,6 +778,154 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
 
     if (std::string(cmdline ? cmdline : "").find("--normal-check") != std::string::npos) {
         g_renderer.normal_check("build/normal_check.txt");
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return 0;
+    }
+
+    if (std::string(cmdline ? cmdline : "").find("--blend-report") != std::string::npos) {
+        // --blend-report: is the region-cell blend continuous? The field
+        // blends biome properties over the 4 NEAREST cells, with a weight
+        // that is non-zero out to blend_width. Where a 5th cell would still
+        // have weight, the 4th and 5th trading places is a jump, on a
+        // straight bisector. This walks random lines across the disc, finds
+        // every place the nearest-4 set changes, and measures the step in the
+        // heightfield and in the 3D term there -- a step being a change that
+        // does not shrink with the distance it is measured over.
+        const engine::WorldGpu& wg = g_renderer.world();
+        const worldgen::SeedWorld& sw = wg.world();
+        const worldgen::WorldParams& wp = wg.params();
+        const float sea = wp.sea_level;
+
+        struct Near { int id[5]; float d[5]; };
+        auto nearest5 = [&](float x, float z, Near& o) {
+            const float wx = x + wp.warp_amp * ::fbm(x * wp.warp_freq, z * wp.warp_freq,
+                                                     2, 2.0f, 0.5f, sw.s_wx);
+            const float wz = z + wp.warp_amp * ::fbm(x * wp.warp_freq, z * wp.warp_freq,
+                                                     2, 2.0f, 0.5f, sw.s_wz);
+            for (int k = 0; k < 5; ++k) { o.id[k] = -1; o.d[k] = 3e38f; }
+            for (size_t c = 0; c < sw.pts.size(); ++c) {
+                const float dx = sw.pts[c].first - wx, dz = sw.pts[c].second - wz;
+                const float d = std::sqrt(dx * dx + dz * dz);
+                if (d >= o.d[4]) continue;
+                int k = 4;
+                while (k > 0 && o.d[k - 1] > d) { o.d[k] = o.d[k - 1]; o.id[k] = o.id[k - 1]; --k; }
+                o.d[k] = d; o.id[k] = int(c);
+            }
+        };
+        auto set_key = [](const Near& n) {
+            int s[4] = {n.id[0], n.id[1], n.id[2], n.id[3]};
+            std::sort(s, s + 4);
+            return (unsigned long long)(s[0] & 0xFFFF) | ((unsigned long long)(s[1] & 0xFFFF) << 16) |
+                   ((unsigned long long)(s[2] & 0xFFFF) << 32) | ((unsigned long long)(s[3] & 0xFFFF) << 48);
+        };
+        auto term_at = [&](float x, float z) {
+            const float h = wg.height(x, z);
+            return wg.density(x, h, z);   // (h - y) is 0 at y = h
+        };
+
+        unsigned long long rng = 0x9E3779B97F4A7C15ull;
+        auto rnd = [&]() {
+            rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+            return float((rng >> 40) & 0xFFFFFF) / float(0x1000000);
+        };
+
+        int swaps = 0, weighted = 0, weighted_land = 0;
+        std::vector<double> hsteps, tsteps;
+        double hmax = 0.0, tmax = 0.0;
+        float hmax_at[2] = {0, 0}, tmax_at[2] = {0, 0};
+        const int kLines = 300;
+        const float kLen = 3000.0f, kStep = 2.0f;
+        for (int L = 0; L < kLines; ++L) {
+            float sx, sz;
+            do { sx = (rnd() * 2.0f - 1.0f) * wp.radius; sz = (rnd() * 2.0f - 1.0f) * wp.radius; }
+            while (sx * sx + sz * sz > 0.8f * wp.radius * wp.radius);
+            float dx, dz, dl;
+            do { dx = rnd() * 2.0f - 1.0f; dz = rnd() * 2.0f - 1.0f; dl = std::sqrt(dx * dx + dz * dz); }
+            while (dl > 1.0f || dl < 0.1f);
+            dx /= dl; dz /= dl;
+            Near prev; nearest5(sx, sz, prev);
+            unsigned long long pk = set_key(prev);
+            for (float s = kStep; s <= kLen; s += kStep) {
+                Near cur; nearest5(sx + dx * s, sz + dz * s, cur);
+                const unsigned long long ck = set_key(cur);
+                if (ck != pk) {
+                    ++swaps;
+                    // Bisect to the crossing.
+                    float a = s - kStep, b = s;
+                    for (int it = 0; it < 30; ++it) {
+                        const float m = 0.5f * (a + b);
+                        Near q; nearest5(sx + dx * m, sz + dz * m, q);
+                        if (set_key(q) == pk) a = m; else b = m;
+                    }
+                    const float cx = sx + dx * 0.5f * (a + b), cz = sz + dz * 0.5f * (a + b);
+                    Near q; nearest5(cx, cz, q);
+                    // Weight the 4th/5th carry at the crossing, where they tie.
+                    const float t = 1.0f - (q.d[3] - q.d[0]) / wp.blend_width;
+                    const bool both_land = sw.biome[q.id[3]] >= 0 || sw.biome[q.id[4]] >= 0;
+                    if (t > 0.0f && both_land) {
+                        ++weighted;
+                        const float h = wg.height(cx, cz);
+                        if (h > sea) ++weighted_land;
+                        const float r1 = 0.001f, r2 = 0.01f;
+                        const float h1 = wg.height(cx + dx * r1, cz + dz * r1) - wg.height(cx - dx * r1, cz - dz * r1);
+                        const float h2 = wg.height(cx + dx * r2, cz + dz * r2) - wg.height(cx - dx * r2, cz - dz * r2);
+                        const float t1 = term_at(cx + dx * r1, cz + dz * r1) - term_at(cx - dx * r1, cz - dz * r1);
+                        const float t2 = term_at(cx + dx * r2, cz + dz * r2) - term_at(cx - dx * r2, cz - dz * r2);
+                        // The part that does not scale with the arm is the step.
+                        const double hs = std::fabs(double(h1) - double(h2) * 0.1) / 0.9;
+                        const double ts = std::fabs(double(t1) - double(t2) * 0.1) / 0.9;
+                        hsteps.push_back(hs); tsteps.push_back(ts);
+                        if (hs > hmax) { hmax = hs; hmax_at[0] = cx; hmax_at[1] = cz; }
+                        if (ts > tmax) { tmax = ts; tmax_at[0] = cx; tmax_at[1] = cz; }
+                    }
+                    pk = ck;
+                }
+            }
+        }
+        std::sort(hsteps.begin(), hsteps.end());
+        std::sort(tsteps.begin(), tsteps.end());
+        auto pct = [](const std::vector<double>& v, double p) {
+            return v.empty() ? 0.0 : v[size_t(p * double(v.size() - 1))];
+        };
+        auto over = [](const std::vector<double>& v, double th) {
+            int n = 0; for (size_t i = 0; i < v.size(); ++i) if (v[i] > th) ++n; return n;
+        };
+        if (FILE* f = std::fopen("build/blend_report.txt", "w")) {
+            std::fprintf(f, "region-cell blend continuity, %d random lines of %.0f m, %zu cells, "
+                            "blend_width %.0f m\n", kLines, kLen, sw.pts.size(), wp.blend_width);
+            std::fprintf(f, "places the nearest-4 set changes: %d\n", swaps);
+            std::fprintf(f, "  where the cell leaving or joining still had weight: %d (%d on land)\n",
+                         weighted, weighted_land);
+            std::fprintf(f, "\nheightfield step at those places (m):\n");
+            std::fprintf(f, "  median %.4f, 90th %.4f, 99th %.4f, max %.4f at (%.0f, %.0f)\n",
+                         pct(hsteps, 0.5), pct(hsteps, 0.9), pct(hsteps, 0.99), hmax,
+                         hmax_at[0], hmax_at[1]);
+            std::fprintf(f, "  over 0.05 m: %d, over 0.25 m (half a LOD 0 voxel): %d, over 1 m: %d\n",
+                         over(hsteps, 0.05), over(hsteps, 0.25), over(hsteps, 1.0));
+            std::fprintf(f, "\n3D term (overhang) step at those places (m):\n");
+            std::fprintf(f, "  median %.4f, 90th %.4f, 99th %.4f, max %.4f at (%.0f, %.0f)\n",
+                         pct(tsteps, 0.5), pct(tsteps, 0.9), pct(tsteps, 0.99), tmax,
+                         tmax_at[0], tmax_at[1]);
+            std::fprintf(f, "  over 0.05 m: %d, over 0.25 m: %d, over 1 m: %d\n",
+                         over(tsteps, 0.05), over(tsteps, 0.25), over(tsteps, 1.0));
+            // What the worst places look like: their six nearest cells, and
+            // how many of the weighted ones are land. A step that survives
+            // a continuous weight must come from the normalisation instead.
+            const float* worst[2] = {hmax_at, tmax_at};
+            const char*  name[2] = {"height", "3D term"};
+            for (int wv = 0; wv < 2; ++wv) {
+                Near q; nearest5(worst[wv][0], worst[wv][1], q);
+                std::fprintf(f, "\nworst %s step at (%.0f, %.0f), heightfield %.1f m; nearest five"
+                                " (dist-d0, biome):", name[wv], worst[wv][0], worst[wv][1],
+                             wg.height(worst[wv][0], worst[wv][1]));
+                for (int k = 0; k < 5; ++k) {
+                    std::fprintf(f, " [%.0f b%d]", q.d[k] - q.d[0], sw.biome[q.id[k]]);
+                }
+                std::fprintf(f, "\n");
+            }
+            std::fclose(f);
+        }
         g_renderer.shutdown();
         g_physics.shutdown();
         return 0;
@@ -1377,6 +1709,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         bool returned = false;
         double shot_eye_local = 0.0, shot_eye_sea = 0.0;
         double clamp_lost = 0.0, worst_dt = 0.0;
+        engine::Camera shot_cam = g_camera;
+        float shot_time = 0.0f;
 
         for (;;) {
             MSG m = {};
@@ -1499,6 +1833,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 shot_eye_local = double(g_camera.y) - (double(sea) +
                     ww_height_at(g_camera.x, g_camera.z, float(total), state));
                 shot_eye_sea = double(g_camera.y) - double(sea);
+                shot_cam = g_camera;
+                shot_time = float(total);
             }
         }
         returned = g_physics.medium() == engine::Medium::Dry && g_physics.character_grounded();
@@ -1558,6 +1894,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(f, "shot at the turn: build/swim.bmp, eye %+.2f m from the water above"
                             " it, %+.2f m from still sea level\n",
                          shot_eye_local, shot_eye_sea);
+            std::fprintf(f, "  rebuild it: --shot <path> --cam %.2f %.2f %.2f %.4f %.4f"
+                            " (water time was %.2f s)\n",
+                         shot_cam.x, shot_cam.y, shot_cam.z, shot_cam.yaw, shot_cam.pitch,
+                         shot_time);
             std::fclose(f);
         }
         g_renderer.shutdown();
@@ -1766,12 +2106,60 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         g_camera.x = 0.0f; g_camera.y = 34.0f; g_camera.z = 0.0f;
         g_camera.pitch = -0.22f;
         g_camera.speed = 60.0f;
+        const std::string fcl = cmdline ? cmdline : "";
+        float flight_speed = 60.0f;
+        {
+            const size_t fs = fcl.find("--flight-speed");
+            if (fs != std::string::npos) flight_speed = float(std::atof(fcl.c_str() + fs + 14));
+            if (flight_speed <= 0.0f) flight_speed = 60.0f;
+        }
+        // --settle: hover until nothing is queued before the clock starts.
+        // Without it the flight begins in an empty world and spends its whole
+        // length on the initial load -- a 1200-chunk backlog that never
+        // drains at 60 m/s -- and every "hole" past LOD 2 is that load, not a
+        // LOD transition.
+        double settle_s = 0.0;
+        size_t settle_left = 0;
+        if (fcl.find("--settle") != std::string::npos) {
+            LARGE_INTEGER sf, s0, s1;
+            QueryPerformanceFrequency(&sf);
+            QueryPerformanceCounter(&s0);
+            for (;;) {
+                MSG m = {};
+                while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&m);
+                    DispatchMessageA(&m);
+                }
+                RECT cr;
+                GetClientRect(hwnd, &cr);
+                const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
+                QueryPerformanceCounter(&s1);
+                settle_s = double(s1.QuadPart - s0.QuadPart) / double(sf.QuadPart);
+                if (w < 1.0f || h < 1.0f) { if (settle_s > 30.0) break; continue; }
+                engine::ViewConstants v = {};
+                fill_view(g_camera, w, h, 0.0f, v);
+                g_renderer.render(v);
+                const engine::FrameStats ss = g_renderer.stats();
+                settle_left = ss.pending;
+                if ((ss.pending == 0 && g_renderer.streamer().held_count() == 0) ||
+                    settle_s > 30.0) break;
+            }
+        }
 
         LARGE_INTEGER ffreq, fstart, fprev;
         QueryPerformanceFrequency(&ffreq);
         QueryPerformanceCounter(&fstart);
         fprev = fstart;
 
+        // --holes: count, every frame, surface chunks queued with nothing drawn
+        // over them -- the LOD pop. Off by default because the count costs a
+        // height query per queued chunk, which would be charged to the fps.
+        const bool measure_holes = std::string(cmdline ? cmdline : "").find("--holes") != std::string::npos;
+        g_renderer.set_measure_holes(measure_holes);
+        unsigned long long hole_frames[engine::kLodCount] = {0, 0, 0, 0, 0, 0, 0, 0};
+        unsigned long long hole_chunks[engine::kLodCount] = {0, 0, 0, 0, 0, 0, 0, 0};
+        unsigned long long inner_hole_frames = 0, judged_frames = 0;
+        size_t worst_inner = 0, peak_held = 0;
         std::vector<double> frame_ms;
         frame_ms.reserve(20000);
         size_t max_pending = 0;
@@ -1797,7 +2185,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_camera.yaw = float(total) * 0.25f;
             float fwd[3], right[3], up[3];
             g_camera.basis(fwd, right, up);
-            const float step = 60.0f * float(dt < 0.1 ? dt : 0.1);
+            const float step = flight_speed * float(dt < 0.1 ? dt : 0.1);
             g_camera.x += fwd[0] * step;
             g_camera.z += fwd[2] * step;
 
@@ -1816,6 +2204,21 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (st.mesh_ms > 0.0) { mesh_ms_sum += st.mesh_ms; ++mesh_ms_n; }
             // The first frames include pipeline warm-up and an empty world.
             if (total > 0.5) frame_ms.push_back(dt * 1000.0);
+            // After the first two seconds, which are the world loading from
+            // nothing and would count every chunk as a hole.
+            if (measure_holes && total > 2.0) {
+                ++judged_frames;
+                const size_t* hb = g_renderer.streamer().holes_by_lod();
+                size_t inner = 0;
+                for (int L = 0; L < engine::kLodCount; ++L) {
+                    if (hb[L]) { ++hole_frames[L]; hole_chunks[L] += hb[L]; }
+                    if (L < engine::kLodCount - 1) inner += hb[L];
+                }
+                if (inner) ++inner_hole_frames;
+                if (inner > worst_inner) worst_inner = inner;
+            }
+            if (g_renderer.streamer().held_count() > peak_held)
+                peak_held = g_renderer.streamer().held_count();
         }
 
         const engine::FrameStats st = g_renderer.stats();
@@ -1843,6 +2246,29 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(f, "at the end: %zu chunks resident, %u triangles, %zu slots free\n",
                          st.resident, st.indices / 3, st.free_slots);
             std::fprintf(f, "slots overflowed: %u\n", st.overflowed);
+            std::fprintf(f, "speed %.0f m/s; settled first: %s\n", flight_speed,
+                         fcl.find("--settle") == std::string::npos ? "no"
+                         : (settle_left == 0 ? "yes" : "NO, gave up with chunks still queued"));
+            if (fcl.find("--settle") != std::string::npos)
+                std::fprintf(f, "  settling took %.1f s, %zu still queued\n", settle_s, settle_left);
+            std::fprintf(f, "LOD hold: %s; peak chunks held %zu, retired early for want of a"
+                            " slot %llu\n",
+                         no_lod_hold ? "OFF (old behaviour)" : "on",
+                         peak_held, g_renderer.streamer().forced_retires());
+            if (measure_holes) {
+                std::fprintf(f, "holes (a queued surface chunk with nothing drawn over it), "
+                                "%llu frames judged after 2 s:\n", judged_frames);
+                std::fprintf(f, "  frames with a hole inside the view (LOD 0-%d): %llu (%.1f%%),"
+                                " worst frame %zu chunks\n",
+                             engine::kLodCount - 2, inner_hole_frames,
+                             judged_frames ? 100.0 * double(inner_hole_frames) / double(judged_frames) : 0.0,
+                             worst_inner);
+                for (int L = 0; L < engine::kLodCount; ++L) {
+                    std::fprintf(f, "  LOD %d: %llu frames, %llu chunk-frames%s\n", L,
+                                 hole_frames[L], hole_chunks[L],
+                                 L == engine::kLodCount - 1 ? "  (the horizon growing, not a hole in it)" : "");
+                }
+            }
             // An overflow is dropped geometry -- a hole. The peaks say how
             // much a chunk actually wanted, so the slot can be sized from a
             // measurement instead of doubled on a guess.

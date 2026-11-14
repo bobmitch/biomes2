@@ -73,6 +73,12 @@ struct WorldConstants {
 
 class WorldGpu {
 public:
+    // DIAGNOSTIC ONLY: zero every biome's overhang_strength after the seed is
+    // built, on both the GPU table and the CPU copy, so a shot can be A/B'd
+    // with layer 6's overhang term removed and nothing else moved. Applied
+    // after build_world so rivers, cells and shafts are the real ones.
+    static bool diag_no_overhang;
+
     // Builds the seed on the CPU and uploads it. The CPU copy is kept: the
     // tolerance check compares against it, and physics has no other source.
     bool build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,

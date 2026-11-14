@@ -104,8 +104,10 @@ BiomeProfile empty_profile() {
 // The four nearest cells, from the bucket grid. A 5x5 neighbourhood spans
 // several cell spacings at about two cells per bucket, which is why the CPU
 // version only falls back to a ring search when this finds nothing.
-int cell_nearest4(float x, float z, out int4 out_idx, out float4 out_dist) {
-    float bd0 = 3.0e38f, bd1 = 3.0e38f, bd2 = 3.0e38f, bd3 = 3.0e38f;
+// `out_d5` is the FIFTH nearest's distance, which the blend weight needs; see
+// blend_weight in worldgen/shaders/field.h.
+int cell_nearest4(float x, float z, out int4 out_idx, out float4 out_dist, out float out_d5) {
+    float bd0 = 3.0e38f, bd1 = 3.0e38f, bd2 = 3.0e38f, bd3 = 3.0e38f, bd4 = 3.0e38f;
     int   bi0 = -1, bi1 = -1, bi2 = -1, bi3 = -1;
 
     const int B = w_cell_buckets;
@@ -128,15 +130,21 @@ int cell_nearest4(float x, float z, out int4 out_idx, out float4 out_dist) {
                 // looped: HLSL cannot index a local array dynamically without
                 // spilling it to scratch, which costs more than four compares.
                 if (d2 < bd0) {
+                    bd4 = bd3;
                     bd3 = bd2; bi3 = bi2; bd2 = bd1; bi2 = bi1;
                     bd1 = bd0; bi1 = bi0; bd0 = d2; bi0 = ci;
                 } else if (d2 < bd1) {
+                    bd4 = bd3;
                     bd3 = bd2; bi3 = bi2; bd2 = bd1; bi2 = bi1;
                     bd1 = d2; bi1 = ci;
                 } else if (d2 < bd2) {
+                    bd4 = bd3;
                     bd3 = bd2; bi3 = bi2; bd2 = d2; bi2 = ci;
                 } else if (d2 < bd3) {
+                    bd4 = bd3;
                     bd3 = d2; bi3 = ci;
+                } else if (d2 < bd4) {
+                    bd4 = d2;
                 }
             }
         }
@@ -144,6 +152,7 @@ int cell_nearest4(float x, float z, out int4 out_idx, out float4 out_dist) {
 
     out_idx = int4(bi0, bi1, bi2, bi3);
     out_dist = float4(sqrt(bd0), sqrt(bd1), sqrt(bd2), sqrt(bd3));
+    out_d5 = bd4 < 3.0e38f ? sqrt(bd4) : 3.0e38f;
     int found = 0;
     if (bi0 >= 0) ++found;
     if (bi1 >= 0) ++found;
@@ -162,29 +171,32 @@ float real_terrain_base(float x, float z, float r, float voxel) {
     const float wx = x + w_warp_amp * fbm(x * w_warp_freq, z * w_warp_freq, 2, 2.0f, 0.5f, w_s_wx);
     const float wz = z + w_warp_amp * fbm(x * w_warp_freq, z * w_warp_freq, 2, 2.0f, 0.5f, w_s_wz);
 
-    int4 idx; float4 dist;
-    const int found = cell_nearest4(wx, wz, idx, dist);
+    int4 idx; float4 dist; float d5;
+    const int found = cell_nearest4(wx, wz, idx, dist, d5);
     if (found == 0) return layer4_height(continent, w_continent_scale, 0.0f, w_sea_level);
 
     float h[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float wt[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const int ids[4] = {idx.x, idx.y, idx.z, idx.w};
     const float ds[4] = {dist.x, dist.y, dist.z, dist.w};
+    float wall = 0.0f;
 
     [unroll] for (int k = 0; k < 4; ++k) {
         if (k >= found || ids[k] < 0) continue;
+        // Ocean cells count toward the total weight; see blend_divisor.
+        const float wk = blend_weight(ds[k], ds[0], d5, w_blend_width);
+        wall += wk;
         const int b = (int)g_cells[ids[k]].z;
         if (b < 0) continue;
-        const float t = 1.0f - (ds[k] - ds[0]) / w_blend_width;
-        if (t <= 0.0f) continue;
-        wt[k] = t * t;
+        if (wk <= 0.0f) continue;
+        wt[k] = wk;
         // Heights are blended across the boundary, never noise parameters:
         // interpolating octave counts produces mush exactly where the player
         // is looking.
         h[k] = layer4_profile(x, z, w_biome_freq, profile_of(b), w_s_height, voxel);
     }
 
-    const float blended = layer4_blend(h[0], wt[0], h[1], wt[1], h[2], wt[2], h[3], wt[3]);
+    const float blended = layer4_blend(h[0], wt[0], h[1], wt[1], h[2], wt[2], h[3], wt[3], wall);
     return layer4_height(continent, w_continent_scale, blended, w_sea_level);
 }
 
@@ -260,20 +272,20 @@ float real_terrain_density(float x, float y, float z, float voxel) {
 
     const float wx = x + w_warp_amp * fbm(x * w_warp_freq, z * w_warp_freq, 2, 2.0f, 0.5f, w_s_wx);
     const float wz = z + w_warp_amp * fbm(x * w_warp_freq, z * w_warp_freq, 2, 2.0f, 0.5f, w_s_wz);
-    int4 idx; float4 dist;
-    const int found = cell_nearest4(wx, wz, idx, dist);
+    int4 idx; float4 dist; float d5;
+    const int found = cell_nearest4(wx, wz, idx, dist, d5);
 
     BiomeProfile p = empty_profile();
     const int ids[4] = {idx.x, idx.y, idx.z, idx.w};
     const float ds[4] = {dist.x, dist.y, dist.z, dist.w};
-    float wsum = 0.0f;
+    float wsum = 0.0f, wall = 0.0f;
     [unroll] for (int k = 0; k < 4; ++k) {
         if (k >= found || ids[k] < 0) continue;
+        const float wt = blend_weight(ds[k], ds[0], d5, w_blend_width);
+        wall += wt;
         const int b = (int)g_cells[ids[k]].z;
         if (b < 0) continue;
-        const float t = 1.0f - (ds[k] - ds[0]) / w_blend_width;
-        if (t <= 0.0f) continue;
-        const float wt = t * t;
+        if (wt <= 0.0f) continue;
         const BiomeProfile q = profile_of(b);
         p.overhang_strength += wt * q.overhang_strength;
         p.cave_density      += wt * q.cave_density;
@@ -281,8 +293,9 @@ float real_terrain_density(float x, float y, float z, float voxel) {
         p.cave_depth_max    += wt * q.cave_depth_max;
         wsum += wt;
     }
-    if (wsum > 0.0f) {
-        const float inv = 1.0f / wsum;
+    const float div = blend_divisor(wsum, wall);
+    if (div > 0.0f) {
+        const float inv = 1.0f / div;
         p.overhang_strength *= inv;
         p.cave_density *= inv;
         p.cave_depth_min *= inv;

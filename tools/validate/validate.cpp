@@ -63,6 +63,9 @@ struct SeedResult {
     bool  spawn_calmest = false;
     float slope_gentle = 1.0f;  // share of land under 30 degrees
     float lod_worst = 0.0f;     // worst |h(LOD) - h(0)| as a multiple of that voxel
+    float seam_h = 0.0f;        // worst heightfield STEP where the nearest-4 cell set changes
+    float seam_t = 0.0f;        // the same for the layer-6 3D term
+    int   seam_crossings = 0;   // places measured
     float cave_fraction = 0.0f;   // subsurface samples that are air
     float overhang_cols = 0.0f;   // land columns whose surface is crossed twice or more
     int   entrance_trunks = 0;      // shafts that reached cave air
@@ -336,6 +339,86 @@ static SeedResult eval_seed(uint64_t world_seed,
         out.lod_worst = worst;
     }
 
+    // --- blend seams ---
+    // The field blends biome properties over the 4 nearest cells. Up to v8
+    // a fifth could still carry weight, and where the 4th and 5th traded
+    // places that weight was cut: straight-line steps in the heightfield up
+    // to 63 m, and overhang walls along the same lines. The golden hash
+    // samples one point per 156 m and never saw a feature a few metres wide,
+    // which is how it lasted eight generator versions.
+    //
+    // So this walks straight lines across the disc, finds every place the
+    // nearest-4 set changes, and measures the STEP there: the change across
+    // 2 mm less a tenth of the change across 2 cm. A slope scales with the
+    // distance and cancels; a step does not. Metres, worst over the seed.
+    {
+        const float R = wp.radius;
+        auto key_at = [&](float x, float z) {
+            const float wx = x + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wx);
+            const float wz = z + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wz);
+            int id[4] = {-1, -1, -1, -1};
+            float dd[4];
+            w.lookup.nearest4(w.pts, wx, wz, id, dd);
+            std::sort(id, id + 4);
+            return (static_cast<uint64_t>(id[0] & 0xFFFF)) | (static_cast<uint64_t>(id[1] & 0xFFFF) << 16) |
+                   (static_cast<uint64_t>(id[2] & 0xFFFF) << 32) | (static_cast<uint64_t>(id[3] & 0xFFFF) << 48);
+        };
+        // Layer 4's base, BEFORE the river carve: the carve has its own
+        // discontinuity where two segments of different widths meet (up to
+        // 0.37 m, measured while building this check), which is layer 5's
+        // and would otherwise be charged to the blend.
+        auto hgt = [&](float x, float z) {
+            return terrain_base(w, wp, table, x, z, std::sqrt(x * x + z * z) / R);
+        };
+        // The 3D term at a FIXED height, so anything that moves the
+        // heightfield cancels and what is left is the overhang/cave blend.
+        auto term = [&](float x, float y, float z) {
+            const float h = terrain_height(w, wp, table, x, z, std::sqrt(x * x + z * z) / R);
+            return terrain_density(w, wp, table, x, y, z) - (h - y);
+        };
+        // Two headings, neither axis-aligned, eight lines each.
+        const float dirs[2][2] = {{0.8f, 0.6f}, {-0.6f, 0.8f}};
+        float worst_h = 0.0f, worst_t = 0.0f;
+        int crossings = 0;
+        for (int dh = 0; dh < 2; ++dh) {
+            const float dx = dirs[dh][0], dz = dirs[dh][1];
+            const float px = -dz, pz = dx;      // perpendicular, for the offsets
+            for (int li = 0; li < 8; ++li) {
+                const float off = (static_cast<float>(li) / 7.0f * 2.0f - 1.0f) * 0.7f * R;
+                const float half = std::sqrt(0.81f * R * R - off * off);
+                const float ox = px * off, oz = pz * off;
+                const float step = 4.0f;
+                uint64_t prev = key_at(ox - dx * half, oz - dz * half);
+                for (float s = -half + step; s <= half; s += step) {
+                    const uint64_t cur = key_at(ox + dx * s, oz + dz * s);
+                    if (cur == prev) continue;
+                    float a = s - step, b = s;
+                    for (int it = 0; it < 28; ++it) {
+                        const float m = 0.5f * (a + b);
+                        if (key_at(ox + dx * m, oz + dz * m) == prev) a = m; else b = m;
+                    }
+                    const float c = 0.5f * (a + b);
+                    const float cx = ox + dx * c, cz = oz + dz * c;
+                    const float r1 = 0.001f, r2 = 0.01f;
+                    const float h1 = hgt(cx + dx * r1, cz + dz * r1) - hgt(cx - dx * r1, cz - dz * r1);
+                    const float h2 = hgt(cx + dx * r2, cz + dz * r2) - hgt(cx - dx * r2, cz - dz * r2);
+                    const float y0 = hgt(cx, cz);
+                    const float t1 = term(cx + dx * r1, y0, cz + dz * r1) - term(cx - dx * r1, y0, cz - dz * r1);
+                    const float t2 = term(cx + dx * r2, y0, cz + dz * r2) - term(cx - dx * r2, y0, cz - dz * r2);
+                    const float sh = std::fabs(h1 - h2 * 0.1f) / 0.9f;
+                    const float st = std::fabs(t1 - t2 * 0.1f) / 0.9f;
+                    worst_h = std::max(worst_h, sh);
+                    worst_t = std::max(worst_t, st);
+                    ++crossings;
+                    prev = cur;
+                }
+            }
+        }
+        out.seam_h = worst_h;
+        out.seam_t = worst_t;
+        out.seam_crossings = crossings;
+    }
+
     // --- layer 6 volumetrics ---
     // A column with more than one sign change above the ground is an actual
     // overhang. Without this, overhang_strength could be doing nothing but
@@ -504,6 +587,9 @@ struct Summary {
     int slope_failures = 0;      // under 60% of land walkable
     int lod_failures = 0;        // a LOD disagreeing by more than its voxel
     float max_lod_worst = 0.0f;
+    int   seam_failures = 0;     // a blend step over 5 cm anywhere measured
+    float max_seam_h = 0.0f, max_seam_t = 0.0f;
+    long  seam_crossings = 0;
     float mean_cave_fraction = 0.0f, mean_overhang_cols = 0.0f;
     int river_failures = 0;      // no rivers, or one that climbs or never reaches the sea
     float mean_river_segments = 0.0f;
@@ -565,6 +651,13 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
         if (r.slope_gentle < 0.60f) ++sm.slope_failures;
         if (r.lod_worst > 1.0f) ++sm.lod_failures;
         sm.max_lod_worst = std::max(sm.max_lod_worst, r.lod_worst);
+        // 5 cm: a tenth of a LOD 0 voxel, and two orders of magnitude above
+        // what the continuous blend measures (worst 7 mm, which is slope
+        // leaking through the 2 mm arm on steep ground, not a step).
+        if (r.seam_h > 0.05f || r.seam_t > 0.05f) ++sm.seam_failures;
+        sm.max_seam_h = std::max(sm.max_seam_h, r.seam_h);
+        sm.max_seam_t = std::max(sm.max_seam_t, r.seam_t);
+        sm.seam_crossings += r.seam_crossings;
         sm.mean_cave_fraction += r.cave_fraction;
         sm.mean_overhang_cols += r.overhang_cols;
         // 8 is a degeneracy guard, not a target: the measured spread over
@@ -1689,6 +1782,10 @@ int main(int argc, char** argv) {
         std::snprintf(d, sizeof(d), "worst LOD differs from LOD 0 by %.2f of its voxel "
                       "(limit 1.00)", s.max_lod_worst);
         line("LOD agreement", s.lod_failures == 0, d);
+        std::snprintf(d, sizeof(d), "%d seeds step over 5 cm where the cell blend changes hands; "
+                      "worst %.3f m base, %.3f m 3D, %ld crossings",
+                      s.seam_failures, s.max_seam_h, s.max_seam_t, s.seam_crossings);
+        line("blend seams", s.seam_failures == 0, d);
         std::snprintf(d, sizeof(d), "%.0f segments/seed, all descending and reaching the sea",
                       s.mean_river_segments);
         line("river sanity", s.river_failures == 0, d);
@@ -1728,6 +1825,10 @@ int main(int argc, char** argv) {
                          s.spawn_failures == 0 && s.slope_failures == 0 &&
                          land_mean_ok &&
                          s.river_failures == 0 && s.lod_failures == 0 &&
+                         s.seam_failures == 0 &&
+                         // It printed FAIL and never failed the run: the
+                         // entrance check was missing from this conjunction.
+                         s.entrance_failures == 0 &&
                          ns <= 400.0 && golden_ok && sheet_ok;
         std::printf("\n%s\n", all ? "ALL CHECKS PASSED" : "FAILED");
         return all ? 0 : 1;

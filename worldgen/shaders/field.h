@@ -119,13 +119,58 @@ WG_FN float layer4_profile(float x, float z, float freq, BiomeProfile p, uint se
     return p.base_elevation + p.amplitude * (shaped * 2.0f - 1.0f);
 }
 
+// A cell's blend weight, from its distance dk, the nearest cell's d0 and the
+// FIFTH nearest's d5. Shared by every caller on both backends.
+//
+// The blend only ever looks at the four nearest cells, and a weight that is
+// non-zero out to `width` beyond the nearest can be carried by a fifth. Where
+// the fourth and fifth trade places -- a straight bisector -- that weight
+// vanished in one step. Measured over 300 random 3 km lines on one seed:
+// 791 steps of more than a metre in the heightfield, the largest 63 m, and
+// the same cut multiplied by layer 6 drew 1.2 m overhang walls along the
+// bisector that rendered as a dark serrated seam.
+//
+// Subtracting the weight the fifth cell WOULD have makes every weight reach
+// zero exactly as its cell ties with the fifth, so the swap is continuous.
+// Wherever the fifth is beyond `width`, which is most of the world, the
+// subtraction is zero and the weight is what it always was.
+WG_FN float blend_weight(float dk, float d0, float d5, float width) {
+    float t5 = 1.0f - (d5 - d0) / width;
+    if (t5 < 0.0f) t5 = 0.0f;
+    const float t = 1.0f - (dk - d0) / width - t5;
+    return t > 0.0f ? t * t : 0.0f;
+}
+
+// What a land-biome blend divides by. `wland` is the summed weight of the
+// LAND cells, `wall` of every cell including ocean ones (which carry no
+// profile).
+//
+// Dividing by wland alone renormalises over land, which is the design -- a
+// land biome's profile reaches all the way to its coast. But where the only
+// land cell among the four is the one leaving, its weight falls to zero while
+// its renormalised SHARE stays 100%, and the value drops off a cliff when it
+// goes: v9's continuous weights still left a 63 m height step and 351 overhang
+// walls over a metre, every one with three ocean cells nearest.
+//
+// Flooring the divisor at 5% of the total weight fades the land profile out
+// across that fringe instead. Anywhere land holds 5% of the weight the result
+// is exactly the old one. The floor is RELATIVE to the total because near a
+// five-way junction every weight shrinks together, and an absolute floor
+// would flatten real land there.
+WG_FN float blend_divisor(float wland, float wall) {
+    const float floor_w = 0.05f * wall;
+    return wland > floor_w ? wland : floor_w;
+}
+
 // Weighted mix of up to four neighbouring cells' heights. Weights come from
 // smoothed distance to the cell boundary and are the caller's business: which
-// cells are near a point is an index question, not a field one.
-WG_FN float layer4_blend(float h0, float w0, float h1, float w1, float h2, float w2, float h3, float w3) {
+// cells are near a point is an index question, not a field one. `wall` is the
+// total weight including ocean cells, whose h and w the caller passes as 0.
+WG_FN float layer4_blend(float h0, float w0, float h1, float w1, float h2, float w2, float h3, float w3, float wall) {
     const float wsum = w0 + w1 + w2 + w3;
-    if (wsum > 0.0f) {
-        return (h0 * w0 + h1 * w1 + h2 * w2 + h3 * w3) / wsum;
+    const float div = blend_divisor(wsum, wall);
+    if (div > 0.0f) {
+        return (h0 * w0 + h1 * w1 + h2 * w2 + h3 * w3) / div;
     }
     return h0;
 }

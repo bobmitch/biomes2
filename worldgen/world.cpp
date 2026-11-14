@@ -120,22 +120,28 @@ float terrain_base(const SeedWorld& w, const WorldParams& wp,
 
     int   idx[4];
     float dist[4];
-    const int found = w.lookup.nearest4(w.pts, wx, wz, idx, dist);
+    float d5 = 3.4e38f;
+    const int found = w.lookup.nearest4(w.pts, wx, wz, idx, dist, &d5);
 
     float h[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float wt[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float wall = 0.0f;
     for (int k = 0; k < found; ++k) {
+        // Smoothed distance to the boundary: the gap between this cell and the
+        // nearest one, which is twice the distance to the bisector -- less
+        // what the fifth cell would carry, or the blend steps where the
+        // fourth and fifth trade places (blend_weight in field.h). Ocean
+        // cells count toward the total, which blend_divisor needs.
+        const float wk = blend_weight(dist[k], dist[0], d5, wp.blend_width);
+        wall = wall + wk;
         const int b = w.biome[idx[k]];
         if (b < 0) continue;
         const BiomeArchetype& a = table[b];
         h[k] = layer4_profile(x, z, wp.biome_freq, profile_of(a), w.s_height, voxel);
-        // Smoothed distance to the boundary: the gap between this cell and the
-        // nearest one, which is twice the distance to the bisector.
-        const float t = 1.0f - (dist[k] - dist[0]) / wp.blend_width;
-        wt[k] = t > 0.0f ? t * t : 0.0f;
+        wt[k] = wk;
     }
 
-    const float blended = layer4_blend(h[0], wt[0], h[1], wt[1], h[2], wt[2], h[3], wt[3]);
+    const float blended = layer4_blend(h[0], wt[0], h[1], wt[1], h[2], wt[2], h[3], wt[3], wall);
     return layer4_height(cont, wp.continent_scale, blended, wp.sea_level);
 }
 
@@ -198,7 +204,8 @@ float terrain_density(const SeedWorld& w, const WorldParams& wp,
     const float wz = z + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wz);
     int   idx[4];
     float dist[4];
-    const int found = w.lookup.nearest4(w.pts, wx, wz, idx, dist);
+    float d5 = 3.4e38f;
+    const int found = w.lookup.nearest4(w.pts, wx, wz, idx, dist, &d5);
 
     BiomeProfile p;
     p.base_elevation = 0.0f;
@@ -213,12 +220,12 @@ float terrain_density(const SeedWorld& w, const WorldParams& wp,
     p.cave_depth_min = 0.0f;
     p.cave_depth_max = 0.0f;
 
-    float wsum = 0.0f;
+    float wsum = 0.0f, wall = 0.0f;
     for (int k = 0; k < found; ++k) {
+        const float wt = blend_weight(dist[k], dist[0], d5, wp.blend_width);
+        wall = wall + wt;
         const int b = w.biome[idx[k]];
         if (b < 0) continue;
-        const float t = 1.0f - (dist[k] - dist[0]) / wp.blend_width;
-        const float wt = t > 0.0f ? t * t : 0.0f;
         if (wt <= 0.0f) continue;
         const BiomeArchetype& a = table[b];
         p.overhang_strength = p.overhang_strength + wt * a.overhang_strength;
@@ -227,8 +234,9 @@ float terrain_density(const SeedWorld& w, const WorldParams& wp,
         p.cave_depth_max    = p.cave_depth_max    + wt * a.cave_depth_max;
         wsum = wsum + wt;
     }
-    if (wsum > 0.0f) {
-        const float inv = 1.0f / wsum;
+    const float div = blend_divisor(wsum, wall);
+    if (div > 0.0f) {
+        const float inv = 1.0f / div;
         p.overhang_strength = p.overhang_strength * inv;
         p.cave_density      = p.cave_density * inv;
         p.cave_depth_min    = p.cave_depth_min * inv;

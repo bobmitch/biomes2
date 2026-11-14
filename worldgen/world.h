@@ -165,10 +165,14 @@ struct CellLookup {
     // were found. A 5x5 bucket neighbourhood spans several cell spacings at
     // ~2 cells per bucket, so it reaches far enough; the ring search below is
     // the fallback when it does not.
+    //
+    // `dist5`, when asked for, is the distance to the FIFTH nearest. The blend
+    // needs it: see blend_weight in field.h for why four cells were never
+    // enough on their own.
     int nearest4(const std::vector<std::pair<float, float> >& pts, float x, float z,
-                 int* idx, float* dist) const {
-        float best_d[4] = {3.4e38f, 3.4e38f, 3.4e38f, 3.4e38f};
-        int   best_i[4] = {-1, -1, -1, -1};
+                 int* idx, float* dist, float* dist5 = nullptr) const {
+        float best_d[5] = {3.4e38f, 3.4e38f, 3.4e38f, 3.4e38f, 3.4e38f};
+        int   best_i[5] = {-1, -1, -1, -1, -1};
         const int bx = std::min(B - 1, std::max(0, static_cast<int>((x + R) / bucket)));
         const int bz = std::min(B - 1, std::max(0, static_cast<int>((z + R) / bucket)));
         for (int j = bz - 2; j <= bz + 2; ++j) {
@@ -179,9 +183,9 @@ struct CellLookup {
                 for (size_t m = 0; m < bk.size(); ++m) {
                     const float dx = pts[bk[m]].first - x, dz = pts[bk[m]].second - z;
                     const float d2 = dx * dx + dz * dz;
-                    for (int s = 0; s < 4; ++s) {
+                    for (int s = 0; s < 5; ++s) {
                         if (d2 < best_d[s]) {
-                            for (int t = 3; t > s; --t) {
+                            for (int t = 4; t > s; --t) {
                                 best_d[t] = best_d[t - 1];
                                 best_i[t] = best_i[t - 1];
                             }
@@ -200,6 +204,7 @@ struct CellLookup {
             dist[found] = std::sqrt(best_d[s]);
             ++found;
         }
+        if (dist5) *dist5 = best_i[4] >= 0 ? std::sqrt(best_d[4]) : 3.4e38f;
         if (found == 0) {
             const int one = nearest(pts, x, z);
             if (one >= 0) {

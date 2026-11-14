@@ -41,7 +41,7 @@ void cs_probe(uint3 id : SV_DispatchThreadID) {
     p.cave_depth_min = 8.0f;
     p.cave_depth_max = 220.0f;
     acc += layer4_profile(x, z, 1.0f / 900.0f, p, 0xABCDEF01u, 0.0f);
-    acc += layer4_blend(1.0f, 0.5f, 2.0f, 0.25f, 3.0f, 0.125f, 4.0f, 0.125f);
+    acc += layer4_blend(1.0f, 0.5f, 2.0f, 0.25f, 3.0f, 0.125f, 4.0f, 0.125f, 1.0f);
     acc += layer4_height(0.3f, 140.0f, 12.0f, 0.0f);
 
     // Layer 5: the river channel.

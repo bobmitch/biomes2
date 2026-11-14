@@ -50,7 +50,8 @@ one frame at a fixed camera and writes a BMP without opening a window.
 The engine's headless modes all write a text file under `build/` and exit:
 `--shot`, `--flight <s>`, `--walk <s>`, `--overhang`, `--dig`, `--dig-save`,
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
-`--band-report`, `--sea-report` and `--swim`. It is a GUI subsystem binary, so a shell does not wait on it:
+`--band-report`, `--sea-report`, `--swim` and `--blend-report`. `--flight`
+also takes `--settle`, `--holes` and `--flight-speed <m/s>`. It is a GUI subsystem binary, so a shell does not wait on it:
 run it with `Start-Process -Wait` or the file you read will be the last run's.
 
 ## Invariants — breaking one of these is a bug, not a tradeoff
@@ -183,6 +184,43 @@ run it with `Start-Process -Wait` or the file you read will be the last run's.
   intermittent, appearing only on the 16–27% of chunks that need a MeshShape.
   "It is below the surface, so it cannot matter" was the reasoning that let it
   through, and it was never measured.
+- **The biome blend looks at four cells, and its weight reached further than
+  four.** `blend_width` (500 m) let a FIFTH cell carry weight, and where the
+  4th and 5th traded places along a straight bisector that weight vanished
+  in one step. Through v8 that was 791 heightfield steps over 1 m per 900 km
+  of transect, up to 63 m. Layer 6 multiplied the same cut into overhang
+  walls a metre high, which rendered as the dark serrated seams: a straight
+  45° step drawn at 0.5 m voxels zigzags. Two halves fixed it, both in
+  `field.h`. `blend_weight` subtracts the weight the 5th cell would carry, so
+  every weight reaches zero as its cell ties with the 5th. `blend_divisor`
+  floors the land-only normaliser at 5% of the total weight, ocean included.
+  Without the floor, a lone land cell among ocean cells kept a 100% share
+  until the instant it left. `validate`'s **blend seams** check asserts no
+  step over 5 cm, and was mutation-tested against each half.
+  **The golden hash could not see any of it** — one sample per 156 m against
+  a seam a few metres wide — which is how it lasted eight versions. The walk
+  had been stepping over one: worst single-frame step 0.53 m on v8, 0.02 m
+  on v9.
+  `engine.exe --blend-report` surveys it; `--shot --cam x y z yaw pitch
+  --pick px py` names what is at a pixel; `--no-overhang` A/Bs layer 6.
+- **The river carve steps where two segments of different widths meet**, up to
+  0.37 m, found while building the seam check and NOT fixed: the carve takes
+  the nearest segment's width, and that switches on the bisector between them.
+  All 5 cases seen were within 35 m of an axis, which is unexplained.
+- **A LOD change must not retire the old chunk before its replacement is
+  drawn.** It did: retirement was immediate and replacement waited on an
+  8-chunk-per-frame queue, so at 60 m/s 85% of frames had ground missing
+  (`--flight 15 --vsync --settle --holes`). Now an unwanted chunk is HELD,
+  drawn, until nothing queued overlaps its footprint. It then dither-fades
+  out over 24 frames while its replacements fade in on the same clock, with
+  complementary 4×4 thresholds, so each pixel is drawn by exactly one. Holes
+  went to 0 at 15 and 60 m/s, with no fps change. Physics still drops the
+  chunk at once. A capture settles every fade first, so `--shot` is
+  pixel-identical with hold on or off. `--no-lod-hold` restores the old
+  behaviour for A/B, and `--lod-fade <frames>` sets the length.
+  **Measure holes from a settled world:** without `--settle` a flight spends
+  its whole length on the initial load (a 1200-chunk backlog) and counts
+  that as holes at every level.
 - **A gradient arm must not scale with the voxel.** `field_normal` took a
   central difference at half a voxel, which is 0.25 m at LOD 0 and 32 m at
   LOD 7 — a difference between two unrelated pieces of terrain, not a
@@ -209,7 +247,7 @@ run it with `Start-Process -Wait` or the file you read will be the last run's.
 
 `tools/validate` runs 200 seeds and exits non-zero on any failure. It asserts
 presence, quota, radial ordering, land fraction, adjacency, edge taper, home
-landmass, boat connectivity, spawn, slope budget, river sanity, LOD agreement,
+landmass, boat connectivity, spawn, slope budget, river sanity, LOD agreement, blend seams,
 cave entrances, throughput and the golden hashes, and emits a 64-seed contact
 sheet — look at it. Automated checks cannot tell you whether a world is
 interesting.
@@ -238,7 +276,7 @@ it.
 **LOD agreement is asserted.** Octave weights fall to zero between four and
 two voxels of period, faded rather than cut, and the harness checks that
 every LOD from 0.5 m to 64 m matches LOD 0 within its own voxel size. The
-worst case is currently 0.41 of a voxel. Normalise by the FULL amplitude,
+worst case is currently 0.45 of a voxel (0.41 before v9's blend fix). Normalise by the FULL amplitude,
 never the faded one: rescaling the survivors changes the shape of what
 remains, which is the thing LOD agreement forbids.
 
@@ -340,8 +378,17 @@ though they pointed away from the sun — and fixing it did not remove the
 patches. What is ruled out, by measurement: holes, NaN normals, inverted
 normals, and the normal formula. What is left is that they are geometry —
 zoomed in they have a lit sunward rim and a dark shadow face, so they read as
-coherent raised shapes. Identifying WHICH geometry needs a world position for
-one of them, which nothing currently reports.
+coherent raised shapes.
+
+**`--shot ... --pick px py ...` now gives that world position**, and it moved
+this forward. On v9's 1400 m vista, 8 dark blobs picked: all on LOD 6–7 (32 m
+and 64 m voxels), and at 6 of the 8 the TRUE field surface under the pixel
+faces UP (normal y 0.90–0.98, gentle ground). So the dark is not in the
+terrain. It is in the coarse mesh drawn over it, whose vertices sit up to
+tens of metres off the real surface. Untested next guess: such a vertex
+samples the field gradient somewhere it does not describe the ground, such
+as the cave band. The near-field dark SEAMS were a different bug (the blend
+seams below), and fixing them left these blobs where they were.
 
 **Both pixel detectors above stop working once water is in frame.** The sea
 sits near the clear colour, so a crack count on a seascape returns thousands of

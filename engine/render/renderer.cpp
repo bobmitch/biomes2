@@ -57,7 +57,8 @@ struct MeshConstants {
     float cam_pos[3];
     float far_plane;
     float wire;
-    float pad1[3];
+    float slot_vertices;   // so the vertex shader can tell which slot it is in
+    float pad1[2];
 };
 
 std::string hr_text(const char* what, HRESULT hr) {
@@ -381,6 +382,29 @@ bool Renderer::create_water_pipeline(std::string& error) {
     if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (water)", hr); return false; }
     water_pso_ = pso;
 
+    // The LOD fade state, one per frame in flight for the same reason as the
+    // constant buffer below. kSlots float2s, rewritten every frame.
+    if (!fade_buf_[0]) {
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = kSlots * 2 * sizeof(float);
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        for (UINT i = 0; i < kFrameCount; ++i) {
+            const HRESULT fh = device_->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr, IID_PPV_ARGS(&fade_buf_[i]));
+            if (FAILED(fh)) { error = hr_text("CreateCommittedResource (fade)", fh); return false; }
+            D3D12_RANGE none = {0, 0};
+            fade_buf_[i]->Map(0, &none, &fade_cpu_[i]);
+        }
+    }
+
     // One constant buffer per frame in flight. A single buffer would be
     // rewritten by the CPU while the GPU was still reading the previous
     // frame's copy of it.
@@ -455,7 +479,8 @@ bool Renderer::create_water_pipeline(std::string& error) {
 
 bool Renderer::create_mesh_pipeline(std::string& error) {
     if (!mesh_root_) {
-        D3D12_ROOT_PARAMETER params[2] = {};
+        // 24 DWORDs of constants + two root SRVs at 2 each = 28 of the 64.
+        D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         params[0].Constants.ShaderRegister = 0;
@@ -463,9 +488,13 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
         params[1].Descriptor.ShaderRegister = 0;
+        // Per-slot LOD cross-fade state, (mode, v) as Streamer::fill_visibility.
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        params[2].Descriptor.ShaderRegister = 1;
 
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 2;
+        rsd.NumParameters = 3;
         rsd.pParameters = params;
         rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
@@ -705,11 +734,14 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     {
         const bool wire = (mode_ == Mode::Wireframe);
         mc.wire = wire ? 1.0f : 0.0f;
+        mc.slot_vertices = static_cast<float>(kSlotVertices);
+        streamer_.fill_visibility(static_cast<float*>(fade_cpu_[frame_]));
         cmd_->SetPipelineState(wire ? mesh_wire_pso_.Get() : mesh_pso_.Get());
         cmd_->SetGraphicsRootSignature(mesh_root_.Get());
         cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
         cmd_->SetGraphicsRootShaderResourceView(
             1, mesher_.vertices()->GetGPUVirtualAddress());
+        cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
         cmd_->IASetIndexBuffer(&ibv);
         // One command per slot. A retired or never-used slot has all-zero
         // arguments and the command processor skips it, which is cheaper than
@@ -1181,6 +1213,8 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
     stats_.pending = streamer_.pending_count();
     stats_.free_slots = streamer_.free_slot_count();
     stats_.empty_resident = streamer_.empty_resident();
+    // A still of a finished world: no chunk mid-fade in a screenshot.
+    streamer_.settle_fades();
 
     const D3D12_RESOURCE_DESC rd = targets_[frame_]->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};

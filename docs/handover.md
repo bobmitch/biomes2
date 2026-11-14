@@ -5,7 +5,9 @@ this was written. Read [`CLAUDE.md`](../CLAUDE.md) first — the invariants and
 the traps live there and are **not** repeated here. This file is the state of
 play; that file is the law.
 
-Written 2026-11-13, at `generator_version` 8.
+Written 2026-11-13, at `generator_version` 8. The numbers were updated the
+same day at version 9 (the continuous cell blend), with the v8 values kept
+where they moved.
 
 ## Where it stands
 
@@ -36,13 +38,15 @@ of having them.
 
 | Check | Command | Value |
 | --- | --- | --- |
-| Generator gate | `build\validate.exe` | ALL CHECKS PASSED, 8 seeds at version 8 |
+| Generator gate | `build\validate.exe` | ALL CHECKS PASSED, 8 seeds at version 9 |
+| Blend seams | same | 0 seeds over 5 cm; worst 0.014 m base, 0.036 m 3D, over 398,211 crossings (v8: steps up to 178 m) |
 | Land / islandness | same | 35.2% mean, 7.2 landmasses/seed, spawn mass 73.9% |
 | Volumetrics | same | 1.72% of subsurface is cave air, 11.6% of land columns overhang |
 | CPU vs GPU field | `engine --probe-field` | worst 0.000006 over densities spanning 18 m |
-| Frame cost | `engine --flight 10` | 77 fps, 2.32 ms meshing, 946k triangles, 0 overflows |
-| Slot headroom | same | worst chunk wanted 2342 of 4096 vertices, 13152 of 24576 indices |
-| Walking | `engine --walk 20` | 120 m, feet 3.8 mm from the field, LOD 0 for all 1103 judged frames |
+| Frame cost | `engine --flight 10` | 74 fps, 2.49 ms meshing, 0 overflows (v8: 77 on its own terrain, 75 when re-measured the same day) |
+| LOD holes | `engine --flight 15 --vsync --settle --holes [--flight-speed 15]` | 0 frames with a hole at 15 and 60 m/s (`--no-lod-hold`, the old behaviour: 8.5% and 85.3%) |
+| Slot headroom | same | worst chunk wanted 2440 of 4096 vertices, 12816 of 24576 indices, but a 15 s, 60 m/s flight hit **3948** |
+| Walking | `engine --walk 20` | 120 m, feet 1.6 mm mean from the field, worst single-frame step 0.020 m, LOD 0 for all 1110 judged frames (v8: a 0.53 m step, which was a blend seam) |
 | Persistence | `engine --dig-save` then `--dig-verify` | −0.0000 m, SURVIVED |
 | Sea | `engine --sea-report` | 0.20 m calm to 7.51 m storm, mean holds sea level to 2.4 mm; waterline inversion misses by 0.05 mm |
 | Swimming | `engine --swim 40` | 0 of ~611 deep-water frames on the seabed, feet 1.34 m under (balance 1.35), eye never under, back on land |
@@ -120,7 +124,13 @@ This is the expensive one. The 64 m is a literal in `WorldGpu::column_band`
 and widening it is not the answer; a vertical residency scheme is. Noted in
 the source at the place that will pay for it.
 
-### 5. The dark patches on distant terrain — unexplained
+### 5. The dark patches on distant terrain — narrowed, not explained
+
+`--shot --altitude 1400 --pick ...` put world positions on eight of them. All
+eight are on LOD 6–7, and at six the true surface faces UP. So the dark is the
+coarse mesh, not the terrain. CLAUDE.md has the detail and the untested next
+guess. The near-field dark SEAMS were a different bug, the blend seams, fixed
+in v9.
 
 Not a blocker, but do not let anyone call it settled. **Two confident
 explanations have already been disproved.** What is ruled out by measurement:

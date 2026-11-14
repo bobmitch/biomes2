@@ -128,6 +128,12 @@ public:
     void  set_sea_state(float s) { sea_state_ = s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s); }
     float sea_state() const { return sea_state_; }
     void  set_water(bool on) { water_ = on; }
+    // LOD transitions: hold the outgoing chunk until its replacements are
+    // meshed, then dither-cross-fade over `frames`. See Streamer.
+    void  set_lod_hold(bool on) { streamer_.set_lod_hold(on); }
+    void  set_lod_fade_frames(int n) { streamer_.set_fade_frames(n); }
+    void  set_measure_holes(bool on) { streamer_.set_measure_holes(on); }
+    const Streamer& streamer() const { return streamer_; }
     // 0 real shading, 1 depth, 2 foam, 3 normal, 4 displacement.
     void  set_water_debug(float m) { water_debug_ = m; }
     float water_debug() const { return water_debug_; }
@@ -225,6 +231,8 @@ private:
     ComPtr<ID3D12PipelineState> water_pso_;
     ComPtr<ID3D12Resource>      water_indices_;
     ComPtr<ID3D12Resource>      water_cb_[kFrameCount];
+    ComPtr<ID3D12Resource>      fade_buf_[kFrameCount];
+    void*                       fade_cpu_[kFrameCount] = {};
     void*                       water_cb_cpu_[kFrameCount] = {};
     D3D12_INDEX_BUFFER_VIEW     water_ibv_ = {};
     UINT                        water_index_count_ = 0;

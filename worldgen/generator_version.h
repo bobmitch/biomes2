@@ -35,7 +35,11 @@ namespace worldgen {
 //   6  a 35% mean land fraction: the world becomes an archipelago
 //   7  A5: 3D density, caves and overhangs
 //   8  A7: cave entrances
-static const int kGeneratorVersion = 8;
+//   9  continuous region-cell blend: weights now fall to zero as a cell ties
+//      with the fifth nearest. The 4-cell blend had been cutting a live
+//      weight wherever the 4th and 5th traded places -- straight-line steps
+//      in the heightfield up to 63 m, and dark serrated overhang walls.
+static const int kGeneratorVersion = 9;
 
 }  // namespace worldgen
 

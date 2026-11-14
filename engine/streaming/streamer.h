@@ -159,7 +159,61 @@ public:
     // Per-column bounds, when there is a world to ask.
     void set_bounds(const WorldGpu* w) { bounds_ = w; }
 
+    // LOD transitions. With hold on, a chunk that stops being wanted keeps its
+    // slot and keeps drawing until everything replacing its footprint has
+    // meshed, then cross-fades out over `fade_frames` while the replacements
+    // fade in. Off is the old behaviour -- retire at once, and the ground under
+    // a LOD change is missing until the queue reaches it -- kept for A/B.
+    void set_lod_hold(bool on) { hold_ = on; }
+    void set_fade_frames(int n) { fade_frames_ = n < 0 ? 0 : n; }
+    // Count, each update, surface chunks that are queued with nothing drawn
+    // over their footprint. Costs a height query per queued chunk.
+    void set_measure_holes(bool on) { measure_holes_ = on; }
+    // Holes found by the last update, per LOD.
+    const size_t* holes_by_lod() const { return holes_; }
+    size_t held_count() const { return held_.size(); }
+    size_t fading_in_count() const { return fading_in_.size(); }
+    unsigned long long forced_retires() const { return forced_retires_; }
+
+    // Per-slot (mode, v) for the draw: mode 0 drawn, 1 fading in (drawn where
+    // the dither threshold is below v), 2 fading out (drawn where it is at or
+    // above v). The two are exact complements at equal v, so a chunk and its
+    // replacement on one clock never both draw a pixel.
+    void fill_visibility(float* out) const {
+        for (UINT s = 0; s < kSlots; ++s) { out[s * 2] = 0.0f; out[s * 2 + 1] = 1.0f; }
+        const float n = float(fade_frames_ > 0 ? fade_frames_ : 1);
+        for (size_t i = 0; i < fading_in_.size(); ++i) {
+            const FadeIn& f = fading_in_[i];
+            float v = f.start < 0 ? 0.0f : float(frame_ - f.start) / n;
+            if (v > 1.0f) v = 1.0f;
+            out[f.slot * 2] = 1.0f; out[f.slot * 2 + 1] = v;
+        }
+        for (size_t i = 0; i < held_.size(); ++i) {
+            const Held& h = held_[i];
+            float v = h.fade_start < 0 ? 0.0f : float(frame_ - h.fade_start) / n;
+            if (v > 1.0f) v = 1.0f;
+            out[h.slot * 2] = 2.0f; out[h.slot * 2 + 1] = v;
+        }
+        // Retired but not yet zeroed on the GPU -- a capture that stops right
+        // after an update leaves these, and they would draw the old ground.
+        for (size_t i = 0; i < retire_.size(); ++i) {
+            out[retire_[i] * 2] = 2.0f; out[retire_[i] * 2 + 1] = 1.0f;
+        }
+    }
+
+    // A capture is one still frame of a world that has finished loading:
+    // every fade is over. Held chunks become fully invisible (and retire on
+    // the next update), and everything fading in is simply drawn.
+    void settle_fades() {
+        fading_in_.clear();
+        for (size_t i = 0; i < held_.size(); ++i) {
+            held_[i].fade_start = frame_ - (fade_frames_ > 0 ? fade_frames_ : 1);
+        }
+    }
+
     void init() {
+        held_.clear();
+        fading_in_.clear();
         free_slots_.clear();
         free_slots_.reserve(kSlots);
         // Handed out from the back, so the first chunks take slot 0 upward and
@@ -174,6 +228,8 @@ public:
     // Recompute what should be resident. Fills the queue with what is missing
     // and the retire list with what is no longer wanted.
     void update(float cx, float cy, float cz) {
+        ++frame_;
+        cam_[0] = cx; cam_[1] = cy; cam_[2] = cz;
         desired_.clear();
 
         const float band_lo = band_lo_, band_hi = band_hi_;
@@ -266,11 +322,10 @@ public:
         for (std::unordered_map<ChunkKey, UINT, ChunkKeyHash>::iterator it = resident_.begin();
              it != resident_.end();) {
             if (wanted_.find(it->first) == wanted_.end()) {
+                // Physics lets go now, as it always did: a held chunk is a
+                // picture of terrain that is no longer the resident truth.
                 retired_keys_.push_back(it->first);
-                if (it->second != kNoSlot) {
-                    retire_.push_back(it->second);
-                    free_slots_.push_back(it->second);
-                }
+                if (it->second != kNoSlot) retire_or_hold(it->first, it->second);
                 it = resident_.erase(it);
             } else {
                 ++it;
@@ -294,6 +349,9 @@ public:
             queue_.push_back(p);
         }
         std::sort(queue_.begin(), queue_.end(), by_distance);
+
+        if (measure_holes_) count_holes();
+        advance_fades();
     }
 
     // Retire first, then mesh up to `budget` chunks. Returns how many were
@@ -323,10 +381,10 @@ public:
                                hi[2] < z0 || lo[2] > z1);
             if (!hit) { ++it; continue; }
             retired_keys_.push_back(it->first);
-            if (it->second != kNoSlot) {
-                retire_.push_back(it->second);
-                free_slots_.push_back(it->second);
-            }
+            // Held like any other replacement: the ground stays drawn, without
+            // the edit, until the remesh WITH it lands, rather than leaving a
+            // hole the size of the chunk for the frames in between.
+            if (it->second != kNoSlot) retire_or_hold(it->first, it->second);
             it = resident_.erase(it);
             ++last_invalidated_;
         }
@@ -339,6 +397,13 @@ public:
     void release_empty(const ChunkKey& k) {
         std::unordered_map<ChunkKey, UINT, ChunkKeyHash>::iterator it = resident_.find(k);
         if (it == resident_.end() || it->second == kNoSlot) return;
+        for (size_t i = 0; i < fading_in_.size(); ++i) {
+            if (fading_in_[i].slot == it->second) {
+                fading_in_[i] = fading_in_.back();
+                fading_in_.pop_back();
+                break;
+            }
+        }
         free_slots_.push_back(it->second);
         it->second = kNoSlot;
         ++empty_resident_;
@@ -369,10 +434,20 @@ public:
     UINT plan_work(ChunkMesher& mesher, UINT budget, EditContext& ctx) {
         planned_.clear();
         for (size_t i = 0; i < queue_.size() && planned_.size() < budget; ++i) {
+            // Holding old chunks must never starve their own replacements:
+            // with the pool dry, give back the farthest hold early. That is
+            // the old behaviour -- a hole -- but only for the chunk the pool
+            // could not afford, and counted so it shows if it ever matters.
+            if (free_slots_.empty() && !held_.empty()) force_retire_farthest();
             if (free_slots_.empty()) break;
             const ChunkKey& k = queue_[i].key;
             const UINT slot = free_slots_.back();
             free_slots_.pop_back();
+            if (hold_ && fade_frames_ > 0) {
+                FadeIn f;
+                f.key = k; f.slot = slot; f.start = -1;
+                fading_in_.push_back(f);
+            }
 
             Planned p;
             p.key = k;
@@ -467,6 +542,136 @@ public:
     size_t free_slot_count() const { return free_slots_.size(); }
 
 private:
+    struct Held   { ChunkKey key; UINT slot; int fade_start; };   // -1: waiting
+    struct FadeIn { ChunkKey key; UINT slot; int start; };        // -1: waiting
+
+    static bool xz_overlap(const ChunkKey& a, const ChunkKey& b) {
+        const float sa = lod_chunk_size(a.lod), sb = lod_chunk_size(b.lod);
+        return float(a.x) * sa < float(b.x + 1) * sb && float(b.x) * sb < float(a.x + 1) * sa &&
+               float(a.z) * sa < float(b.z + 1) * sb && float(b.z) * sb < float(a.z + 1) * sa;
+    }
+
+    void free_now(UINT slot) {
+        retire_.push_back(slot);
+        free_slots_.push_back(slot);
+    }
+
+    void retire_or_hold(const ChunkKey& key, UINT slot) {
+        // A chunk still waiting to fade in was never on screen: nothing to hold.
+        for (size_t i = 0; i < fading_in_.size(); ++i) {
+            if (fading_in_[i].slot != slot) continue;
+            const bool never_shown = fading_in_[i].start < 0;
+            fading_in_[i] = fading_in_.back();
+            fading_in_.pop_back();
+            if (never_shown) { free_now(slot); return; }
+            break;
+        }
+        if (!hold_) { free_now(slot); return; }
+        Held h;
+        h.key = key; h.slot = slot; h.fade_start = -1;
+        held_.push_back(h);
+    }
+
+    void force_retire_farthest() {
+        size_t best = 0;
+        float bd = -1.0f;
+        for (size_t i = 0; i < held_.size(); ++i) {
+            const float S = lod_chunk_size(held_[i].key.lod);
+            const float dx = (float(held_[i].key.x) + 0.5f) * S - cam_[0];
+            const float dz = (float(held_[i].key.z) + 0.5f) * S - cam_[2];
+            const float d = dx * dx + dz * dz;
+            if (d > bd) { bd = d; best = i; }
+        }
+        free_now(held_[best].slot);
+        held_[best] = held_.back();
+        held_.pop_back();
+        ++forced_retires_;
+    }
+
+    // Start, advance and finish the cross-fades. Called at the end of update,
+    // once the queue says what is still missing.
+    void advance_fades() {
+        if (!hold_) return;
+        // A hold starts fading out once nothing queued overlaps its footprint:
+        // everything replacing it has meshed. Ignoring y is deliberate -- the
+        // surface can be in any chunk of the column, and a hold over a column
+        // whose replacement is still coming would otherwise let go early.
+        for (size_t i = 0; i < held_.size(); ++i) {
+            Held& h = held_[i];
+            if (h.fade_start >= 0) continue;
+            bool waiting = false;
+            for (size_t q = 0; q < queue_.size() && !waiting; ++q) {
+                if (xz_overlap(queue_[q].key, h.key)) waiting = true;
+            }
+            if (!waiting) h.fade_start = frame_;
+        }
+        // A replacement starts fading in when no hold over it is still
+        // waiting -- the same frame those holds start fading out, so the two
+        // run on one clock and their dither patterns are exact complements.
+        for (size_t i = 0; i < fading_in_.size(); ++i) {
+            FadeIn& f = fading_in_[i];
+            if (f.start >= 0) continue;
+            bool blocked = false;
+            for (size_t h = 0; h < held_.size() && !blocked; ++h) {
+                if (held_[h].fade_start < 0 && xz_overlap(held_[h].key, f.key)) blocked = true;
+            }
+            if (!blocked) f.start = frame_;
+        }
+        // Finish what has run its course.
+        for (size_t i = 0; i < held_.size();) {
+            if (held_[i].fade_start >= 0 && frame_ - held_[i].fade_start >= fade_frames_) {
+                free_now(held_[i].slot);
+                held_[i] = held_.back();
+                held_.pop_back();
+            } else {
+                ++i;
+            }
+        }
+        for (size_t i = 0; i < fading_in_.size();) {
+            if (fading_in_[i].start >= 0 && frame_ - fading_in_[i].start >= fade_frames_) {
+                fading_in_[i] = fading_in_.back();
+                fading_in_.pop_back();
+            } else {
+                ++i;
+            }
+        }
+    }
+
+    // A hole: a queued chunk that holds the surface, with nothing drawn over
+    // its footprint -- no hold, and no resident chunk at another level. The
+    // outermost level's new ground is the horizon growing rather than a hole
+    // in it, so it is counted under its own LOD and read separately.
+    void count_holes() {
+        for (int l = 0; l < kLodCount; ++l) holes_[l] = 0;
+        if (!bounds_) return;
+        for (size_t q = 0; q < queue_.size(); ++q) {
+            const ChunkKey& k = queue_[q].key;
+            const float S = lod_chunk_size(k.lod);
+            const float h = bounds_->height((float(k.x) + 0.5f) * S, (float(k.z) + 0.5f) * S);
+            if (h < float(k.y) * S || h >= float(k.y + 1) * S) continue;
+            bool covered = false;
+            for (size_t i = 0; i < held_.size() && !covered; ++i) {
+                if (xz_overlap(held_[i].key, k)) covered = true;
+            }
+            for (std::unordered_map<ChunkKey, UINT, ChunkKeyHash>::const_iterator it =
+                     resident_.begin(); it != resident_.end() && !covered; ++it) {
+                if (it->second == kNoSlot || it->first.lod == k.lod) continue;
+                if (xz_overlap(it->first, k)) covered = true;
+            }
+            if (!covered) ++holes_[k.lod];
+        }
+    }
+
+    std::vector<Held>   held_;
+    std::vector<FadeIn> fading_in_;
+    int   frame_ = 0;
+    int   fade_frames_ = 24;
+    bool  hold_ = true;
+    bool  measure_holes_ = false;
+    size_t holes_[kLodCount] = {0, 0, 0, 0, 0, 0, 0, 0};
+    unsigned long long forced_retires_ = 0;
+    float cam_[3] = {0.0f, 0.0f, 0.0f};
+
     struct Pending {
         ChunkKey key;
         float    dist2;

@@ -81,6 +81,8 @@ bool make_default(ID3D12Device* d, UINT64 bytes, ComPtr<ID3D12Resource>& out,
         staging_.push_back(stage);                                                  \
     } while (0)
 
+bool WorldGpu::diag_no_overhang = false;
+
 bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
                      uint64_t seed, std::string& error) {
     // Throws on a malformed table, naming every violated invariant at once.
@@ -112,6 +114,9 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
 
     worldgen::AssignParams ap;
     world_ = worldgen::build_world(seed, params_, table_, ap);
+    if (diag_no_overhang) {
+        for (size_t i = 0; i < table_.size(); ++i) table_.biomes[i].overhang_strength = 0.0f;
+    }
 
     const int ncells = static_cast<int>(world_.pts.size());
     const int nbiomes = static_cast<int>(table_.size());
