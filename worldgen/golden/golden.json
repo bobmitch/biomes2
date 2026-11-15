@@ -1,14 +1,14 @@
 {
-  "generator_version": 12,
+  "generator_version": 13,
   "_note": "Pinned by tools/validate --bless. A diff here is a world change: revert it, or bump generator_version. Hashes come from the C++ build with contraction disabled, which ADR-001 makes the determinism authority -- a GPU cannot produce a stable hash.",
   "seeds": [
-    { "seed": 0, "hash": "0xf22246e4b6181404" },
-    { "seed": 1, "hash": "0x1e90974c519c8c85" },
-    { "seed": 2, "hash": "0x16dc79994cb48f41" },
-    { "seed": 3, "hash": "0xb8d942a3c836b470" },
-    { "seed": 4, "hash": "0x5e6c7a434f167378" },
-    { "seed": 5, "hash": "0xdd3ac96d717f29a1" },
-    { "seed": 6, "hash": "0xda672b76649388c4" },
-    { "seed": 7, "hash": "0xe383ac8a06b17ff4" }
+    { "seed": 0, "hash": "0x9f1f0b2501edd741" },
+    { "seed": 1, "hash": "0x9f0be034f153c6dd" },
+    { "seed": 2, "hash": "0xa823aa5e7ca7d1fa" },
+    { "seed": 3, "hash": "0x438cc136c02650c1" },
+    { "seed": 4, "hash": "0x4374ae0478f7bf5f" },
+    { "seed": 5, "hash": "0x8b1ceb1640842966" },
+    { "seed": 6, "hash": "0x9631ed8b250b6fee" },
+    { "seed": 7, "hash": "0xc304b8ebcc659b44" }
   ]
 }

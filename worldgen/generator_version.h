@@ -50,7 +50,12 @@ namespace worldgen {
 //  12  layer 8, trees: one candidate per 4 m cell, kept by biome density
 //      inside seeded patches, species by biome weight and altitude band.
 //      A tree is a pure function of its cell, which is its save identity.
-static const int kGeneratorVersion = 12;
+//  13  layer 8's river exclusion fixed. v12 wrote it as one expression that
+//      read the river width in the same expression as the call that writes
+//      it; MSVC and GCC evaluated it in different orders and grew different
+//      forests, so v12 never existed on Linux. Trees now keep a metre clear
+//      of every channel on both.
+static const int kGeneratorVersion = 13;
 
 }  // namespace worldgen
 

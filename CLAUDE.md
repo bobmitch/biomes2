@@ -147,6 +147,17 @@ last run's.
   and walk mode strafed along (+cos, -sin), so both were mirrored, while fly
   mode's A/D, which use `basis()`, were right. Take sideways directions from
   `basis()`, never from a hand-written sin/cos pair.
+- **Never read an out-parameter in the expression that writes it.**
+  `nearest_river(..., rw, rd) < rw + 1.0f` reads `rw` beside the call that
+  sets it, and C++ leaves the operands' order unspecified. MSVC read `rw`
+  first (still 0) and kept trees in river channels; GCC called first and
+  kept them out. Every terrain sample and every river segment agreed bit
+  for bit between the OSes and v12's trees did not: 95 trees in a tile on
+  Windows, 42 on Linux. Not floating point at all -- the two-OS matrix
+  caught it anyway, which is the case for keeping it. The gate's failure
+  report now prints per-layer hashes, per-tile tree counts with reject
+  reasons, and the river buffer's hash; one CI run each took it from
+  "8 of 8 moved" to the line. Fixed in v13.
 - **`SV_VertexID` does NOT include `BaseVertexLocation` on this driver.**
   Every tree model was drawn with its own base vertex and every one read
   model 0's vertices through its own indices. LOD 0 trunks lined up by
@@ -416,7 +427,8 @@ wireframe. The window title shows both.
 
 ### Trees
 
-**Placement is layer 8, in `worldgen/`, under the golden hash (v12).** One
+**Placement is layer 8, in `worldgen/`, under the golden hash (v12, fixed
+in v13 -- see the out-parameter gotcha).** One
 candidate per 4 m cell; the cell's hash decides the jitter, the keep test,
 species, height, yaw and mesh variant, so a tree is a pure function of its
 cell and `tree_id(i, j)` is its save identity -- nothing is stored. Per biome,

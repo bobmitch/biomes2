@@ -356,7 +356,13 @@ bool tree_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTabl
     const float slope2 = (hx * hx + hz * hz) / (4.0f * e * e);
     if (slope2 > tt.max_slope * tt.max_slope) TREE_NO(TREE_SLOPE);
     float rw = 0.0f, rd = 0.0f;
-    if (nearest_river(w, wp, x, z, rw, rd) < rw + 1.0f) TREE_NO(TREE_RIVER);
+    // Two statements, not one. `nearest_river(...) < rw + 1.0f` reads rw in
+    // the same expression as the call that writes it, and C++ leaves that
+    // order unspecified: MSVC read rw first (still 0, so almost nothing was
+    // ever rejected) and GCC called first (the real width). v12 grew 95
+    // trees in a tile on Windows and 42 on Linux from this line alone.
+    const float river_d = nearest_river(w, wp, x, z, rw, rd);
+    if (river_d < rw + 1.0f) TREE_NO(TREE_RIVER);
 
     // Which species: biome weight times altitude fit. The fit is what moves
     // a forest from oak to fir uphill, and what makes the treeline.
