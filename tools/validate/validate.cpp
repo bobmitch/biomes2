@@ -86,6 +86,8 @@ struct SeedResult {
     // gate fails these say WHICH layer moved; on a two-OS split that is the
     // difference between a day of guessing and one CI run.
     uint64_t layer_hash[4] = {0, 0, 0, 0};
+    uint64_t river_hash = 0;          // the layer-5 segment buffer, bit-exact
+    int      river_count = 0;
     std::string tree_dump;            // the first trees hashed, bit-exact
     std::string tile_dump;            // per hashed tile: tree count and hash
     float mean_patch_cells = 0.0f;
@@ -647,6 +649,21 @@ static SeedResult eval_seed(uint64_t world_seed,
         }
         out.hash = h;
         for (int k = 0; k < 4; ++k) out.layer_hash[k] = lh[k];
+        // Rivers by their buffer, NOT in the pinned hash: a diagnostic. The
+        // grid samples every 78 m and can miss a channel 38 m wide.
+        {
+            uint64_t rh = 0xCBF29CE484222325ull;
+            for (size_t m = 0; m < w.rivers.size(); ++m) {
+                const SeedWorld::RiverSeg& r = w.rivers[m];
+                uint32_t b[6];
+                std::memcpy(&b[0], &r.ax, 4); std::memcpy(&b[1], &r.az, 4);
+                std::memcpy(&b[2], &r.bx, 4); std::memcpy(&b[3], &r.bz, 4);
+                std::memcpy(&b[4], &r.width, 4); std::memcpy(&b[5], &r.depth, 4);
+                for (int k = 0; k < 6; ++k) rh = fnv1a(rh, b[k]);
+            }
+            out.river_hash = rh;
+            out.river_count = static_cast<int>(w.rivers.size());
+        }
     }
 
     // Spearman over biomes that got cells.
@@ -1195,6 +1212,8 @@ static const int kGoldenSeeds = 8;
 // Per-layer hashes and seed 0's first trees, from the last golden_hashes.
 static uint64_t g_layer_hash[kGoldenSeeds][4];
 static std::string g_seed0_trees;
+static uint64_t g_river_hash[kGoldenSeeds];
+static int g_river_count[kGoldenSeeds];
 
 static void golden_hashes(const WorldParams& wp, const ArchetypeTable& table,
                           const AssignParams& ap,
@@ -1214,6 +1233,8 @@ static void golden_hashes(const WorldParams& wp, const ArchetypeTable& table,
                 const SeedResult r = eval_seed(static_cast<uint64_t>(i), gw, table, ap);
                 hashes[i] = r.hash;
                 for (int k = 0; k < 4; ++k) g_layer_hash[i][k] = r.layer_hash[k];
+                g_river_hash[i] = r.river_hash;
+                g_river_count[i] = r.river_count;
                 if (i == 0) g_seed0_trees = r.tree_dump + "    seed 0's tiles:\n" + r.tile_dump;
             }
         }));
@@ -1336,6 +1357,9 @@ static int run_golden_gate(const WorldParams& wp, const ArchetypeTable& table,
                         static_cast<unsigned long long>(g_layer_hash[i][2]),
                         static_cast<unsigned long long>(g_layer_hash[i][3]));
         }
+        for (size_t i = 0; i < now.size(); ++i)
+            std::printf("    seed %llu rivers: %d segments, %016llx\n", static_cast<unsigned long long>(now[i].first),
+                        g_river_count[i], static_cast<unsigned long long>(g_river_hash[i]));
         std::printf("    seed 0's first trees, bit-exact:\n%s", g_seed0_trees.c_str());
         std::printf("\n  Saves store edits as absolute density against the base\n");
         std::printf("  terrain, so a world that changes under them corrupts them.\n");
@@ -1355,6 +1379,9 @@ static int run_golden_gate(const WorldParams& wp, const ArchetypeTable& table,
                         static_cast<unsigned long long>(g_layer_hash[i][2]),
                         static_cast<unsigned long long>(g_layer_hash[i][3]));
         }
+        for (size_t i = 0; i < now.size(); ++i)
+            std::printf("    seed %llu rivers: %d segments, %016llx\n", static_cast<unsigned long long>(now[i].first),
+                        g_river_count[i], static_cast<unsigned long long>(g_river_hash[i]));
         std::printf("    seed 0's first trees, bit-exact:\n%s", g_seed0_trees.c_str());
     }
     return 0;
