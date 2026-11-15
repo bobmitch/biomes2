@@ -87,6 +87,7 @@ struct SeedResult {
     // difference between a day of guessing and one CI run.
     uint64_t layer_hash[4] = {0, 0, 0, 0};
     std::string tree_dump;            // the first trees hashed, bit-exact
+    std::string tile_dump;            // per hashed tile: tree count and hash
     float mean_patch_cells = 0.0f;
     float mean_patch_km2 = 0.0f;
     std::vector<int>   biome_cells;   // per biome
@@ -612,6 +613,23 @@ static SeedResult eval_seed(uint64_t world_seed,
                     h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(t.yaw01 * 4096.0f)));
                 }
                 out.golden_trees += static_cast<int>(ts.size());
+                {
+                    uint64_t th = 0xCBF29CE484222325ull;
+                    for (size_t m = 0; m < ts.size(); ++m) {
+                        uint32_t bx, by, bz, bh;
+                        std::memcpy(&bx, &ts[m].x, 4); std::memcpy(&by, &ts[m].y, 4);
+                        std::memcpy(&bz, &ts[m].z, 4); std::memcpy(&bh, &ts[m].height, 4);
+                        th = fnv1a(th, ts[m].id);
+                        th = fnv1a(th, (uint64_t(bx) << 32) | by);
+                        th = fnv1a(th, (uint64_t(bz) << 32) | bh);
+                        th = fnv1a(th, (uint64_t(ts[m].species) << 16) | ts[m].variant);
+                    }
+                    char line[128];
+                    std::snprintf(line, sizeof line, "      tile %2d at cell (%d, %d): %3zu trees, %016llx
+",
+                                  tiles, ci, cj, ts.size(), static_cast<unsigned long long>(th));
+                    out.tile_dump += line;
+                }
             }
         }
         out.hash = h;
@@ -1183,7 +1201,8 @@ static void golden_hashes(const WorldParams& wp, const ArchetypeTable& table,
                 const SeedResult r = eval_seed(static_cast<uint64_t>(i), gw, table, ap);
                 hashes[i] = r.hash;
                 for (int k = 0; k < 4; ++k) g_layer_hash[i][k] = r.layer_hash[k];
-                if (i == 0) g_seed0_trees = r.tree_dump;
+                if (i == 0) g_seed0_trees = r.tree_dump + "    seed 0's tiles:
+" + r.tile_dump;
             }
         }));
     }
