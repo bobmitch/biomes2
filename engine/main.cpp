@@ -269,6 +269,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (wp == 'C') { g_renderer.clear_lights(); return 0; }
+            // The mist (ADR-004 L4), for A/B.
+            if (wp == 'N') { g_renderer.set_fog(!g_renderer.fog()); return 0; }
             if (wp == 'H') { g_time_lapse = !g_time_lapse; return 0; }
             if (wp == VK_OEM_COMMA || wp == VK_OEM_PERIOD) {
                 g_renderer.set_ev_comp(g_renderer.ev_comp() + (wp == VK_OEM_PERIOD ? 0.5f : -0.5f));
@@ -725,6 +727,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // Local lights (ADR-004 L3): carry a torch; local shadows off for A/B.
         if (c2.find("--torch") != std::string::npos) g_renderer.set_carried_torch(true);
         if (c2.find("--no-light-shadows") != std::string::npos) g_renderer.set_light_shadows(false);
+        // The mist (ADR-004 L4): off, or thicker or thinner than authored.
+        if (c2.find("--no-fog") != std::string::npos) g_renderer.set_fog(false);
+        const size_t fdn = c2.find("--fog-density");
+        if (fdn != std::string::npos) g_renderer.set_fog_density(float(std::atof(c2.c_str() + fdn + 13)));
         // Time of day (ADR-004 L2), hours: --time 6.5 is half past six.
         const size_t tod = c2.find("--time");
         if (tod != std::string::npos) g_renderer.set_time_of_day(float(std::atof(c2.c_str() + tod + 6)));
@@ -1054,6 +1060,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 std::fprintf(f, "sky: %02d:%02d, sun %.1f deg up; key light the %s, %.4g lux; sky on level ground %.4g lux\n",
                              int(sf.hours), int((sf.hours - float(int(sf.hours))) * 60.0f), sf.sun_elevation_deg,
                              sf.key_is_moon ? "moon" : "sun", kl, sm);
+                const engine::Renderer::PostTimes& pt = g_renderer.post_times();
+                std::fprintf(f, "gpu: atmosphere %.3f ms, mist inject %.3f ms, mist integrate %.3f ms, "
+                                "post chain in all %.3f ms (smoothed over the still's frames)\n",
+                             pt.atmosphere, pt.mist_inject, pt.mist_integrate, pt.post_total);
                 const engine::Renderer::SkyCheck& sk = g_renderer.last_sky_check();
                 if (sk.valid)
                     std::fprintf(f, "sky table GPU vs CPU: %d texels, mean %.3f%%, worst %.3f%% at (%.0f, %.0f)\n",

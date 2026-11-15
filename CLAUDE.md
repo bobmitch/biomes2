@@ -57,7 +57,8 @@ The engine's headless modes all write a text file under `build/` and exit:
 references), `--lights-report` (ADR-004 L3: local lights at night, six
 configurations timed) and `--fell` (with `--fell-save` / `--fell-verify`).
 Every mode takes `--time <hours>` (ADR-004 L2: 14 by default, which is the
-pre-L2 sun), `--torch` (carry one) and `--no-light-shadows`; `--shot` also
+pre-L2 sun), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
+`--fog-density <k>` (a multiplier on the authored mist); `--shot` also
 takes `--lights <n>` (campfires round the camera) and `--ground` (the
 `--cam` x and z at eye height on the ground). `--flight` also takes `--settle`, `--holes` and
 `--flight-speed <m/s>` and `--flight-from x y z`; `--shot` takes
@@ -671,6 +672,51 @@ BRDF as the sun (`direct_light`, `leaf_light` in `lighting.hlsli`).
   walking 2.10 (L2) -> 2.18 ms. Spot lights are implemented, with a
   one-face shadow, but nothing places one yet.
 - Keys: `F` carries a torch, `V` drops a campfire 4 m ahead, `C` clears them.
+
+### Mist and volumetric light (ADR-004 L4)
+
+A froxel volume, 160 x 90 x 128, view-aligned and log-spaced from 0.5 m to
+6 km (`fog.hlsl`). `cs_fog_inject` gives each froxel the mist's density and
+the light it scatters to the eye -- the key light through its cascade shadow
+(one tap; this is what makes shafts behind trunks), the sky and the ground,
+and every local light in its cluster through its own shadow (a torch's glow,
+a campfire's halo) -- blended 1:12 with last frame's, reprojected, from a
+Halton-jittered depth in the slice. `cs_fog_integrate` accumulates it front
+to back. The composite applies it at each pixel's VIEW depth over the
+atmosphere's aerial perspective, and its far end over the sky.
+
+- **Where the mist is: `engine/render/fog.{h,cpp}`**, a 256^2 map over the
+  disc baked once per seed on the CPU from `worldgen::biome_mix` and the
+  heights -- density at the surface, thinning height, the surface it lies
+  on (ground, or the sea). Per-biome `fog` blocks and a top-level `fog`
+  block (sea fog, haze, morning, wind, patch size, phase, albedo) in
+  archetypes.json; presentation only, the golden gate confirmed it. The
+  shader adds wind-drifted patches and the hour (thickest just after dawn).
+  **The central, safe biomes and the sea are the misty ones on purpose**,
+  to keep the wider map to be found: visibility 1.5-5 km at noon, much less
+  at 07:00, when the lowlands fill and the peaks stand out.
+- **Densities are MIDDAY values.** The first pass authored them as morning
+  mist, the morning factor multiplied UP from them, and noon was a grey
+  veil; a haze floor of 8e-5/m also double-counted L2's aerosol (an optical
+  depth of 0.48 over 6 km). Both fixed; haze is now 1e-5.
+- **The shafts are measured, not judged**: at fixed exposure (`--ev100 13`),
+  the sunward sky between the crowns of a wood at 07:00 is luma 152 with no
+  mist, 195 with mist and no sun shadows, 176 with both -- the canopy takes
+  back almost half of what the mist adds.
+- **Every `--shot` prints the post chain's GPU times** (timestamps, smoothed
+  over the still's frames): mist inject 0.095 ms by day, 0.142 at night with
+  a torch and campfires, integrate ~0.02; `--no-fog` skips both passes. A
+  timestamp with no barrier before it is written while the dispatches before
+  it still run -- the atmosphere first read 0 ms, its time inside the
+  mist's -- so a stamp goes after the transitions that follow a pass.
+  Frame-time A/B could not resolve this on a noisy day (mist off measured
+  SLOWER than on).
+- `N` toggles the mist in the window. The sea's own sky reflection does not
+  see the mist yet; distant sea under sea fog reads right because the
+  composite fogs it.
+- **The exploration layer is not built**: mist that lifts where you have
+  been, or weather that rolls in. The hook is `FogMap` -- one density
+  function, read in one place -- and ADR-004's L4 section lists the options.
 
 - **Cracks are counted in the engine, as UNDRAWN pixels** (ADR-004 L0):
   below the horizon, far depth, and both HDR scene targets still at their

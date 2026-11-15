@@ -49,6 +49,8 @@ cbuffer PostConstants : register(b0) {
     float3 sky_moon_dir; float pad3;
     float3 sun_disk;     float pad4;         // disk radiance seen from the camera, nits
     float3 moon_disk;    float pad5;
+    float3 cam_fwd;      float fog_on;       // the mist (L4): fog.hlsl's integrated volume
+    float  fog_near;     float fog_log_ratio; float2 pad6;
 };
 
 Texture2D<float>  g_depth   : register(t0);
@@ -60,6 +62,7 @@ Texture2D<float4> g_hist0   : register(t5);
 Texture2D<float4> g_hist1   : register(t6);
 Texture2D<float4> g_skyview : register(t7);   // atmosphere.hlsl: the sky round the camera
 Texture3D<float4> g_ap      : register(t8);   // atmosphere.hlsl: in-scatter (rgb), transmittance (a)
+Texture3D<float4> g_fog     : register(t9);   // fog.hlsl: in-scatter (rgb), transmittance (a), to each slice's far side
 
 RWTexture2D<float>  u_ao    : register(u0);
 RWTexture2D<float4> u_scene : register(u1);
@@ -185,6 +188,23 @@ float4 aerial(float2 uv, float dist) {
     return s;
 }
 
+// The mist between the eye and view depth z (L4). Slice s of the volume holds
+// what has accumulated by the FAR side of the slice, view depth
+// near * e^((s + 1) / 128 * ln(far / near)); nearer than slice 0's far side
+// fades from nothing.
+float4 mist(float2 uv, float z) {
+    if (fog_on < 0.5f) return float4(0.0f, 0.0f, 0.0f, 1.0f);
+    const float n = 128.0f;
+    const float z1 = fog_near * exp(fog_log_ratio / n);
+    if (z <= z1) {
+        const float4 s0 = g_fog.SampleLevel(g_linear, float3(uv, 0.5f / n), 0);
+        const float f = saturate(z / z1);
+        return float4(s0.rgb * f, lerp(1.0f, s0.a, f));
+    }
+    const float w = log(z / fog_near) / fog_log_ratio * n;
+    return g_fog.SampleLevel(g_linear, float3(uv, saturate((w - 0.5f) / n)), 0);
+}
+
 // --- composite ----------------------------------------------------------------
 
 float ao_upsample(int2 p, float z) {
@@ -250,7 +270,10 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
         const float3 d = normalize(world_at(uv, 1.0f) - cam_pos);
         const float vis = saturate(amb.g / kSkyClearG);
         const float4 apf = aerial(uv, far_plane);
-        u_scene[p] = float4(dir * apf.a + apf.rgb * (1.0f - vis) + sky_at(d) * vis, 1.0f);
+        float3 c = dir * apf.a + apf.rgb * (1.0f - vis) + sky_at(d) * vis;
+        // The whole depth of the mist: it hides the horizon, as it should.
+        const float4 mf = mist(uv, 1e9f);
+        u_scene[p] = float4(c * mf.a + mf.rgb, 1.0f);
         return;
     }
     const float3 P = world_at(uv, z);
@@ -263,6 +286,9 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     // The atmosphere between the eye and the surface.
     const float4 ap = aerial(uv, length(P - cam_pos));
     c = c * ap.a + ap.rgb;
+    // Then the mist, which is nearer than the bulk of the air.
+    const float4 mf = mist(uv, dot(P - cam_pos, cam_fwd));
+    c = c * mf.a + mf.rgb;
     float mark = 1.0f;
     if (debug > 0.5f && debug < 1.5f) { c = ao.xxx; mark = 0.0f; }
     if (debug > 1.5f && debug < 2.5f) { c = cs.xxx; mark = 0.0f; }

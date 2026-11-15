@@ -244,7 +244,7 @@ Each one is measured with an instrument, not judged only by eye.
 | **L1** ✅ | Units, auto-exposure, tonemap, PBR materials, biome terrain materials | a histogram report; A/B stills |
 | **L2** ✅ | Hillaire atmosphere, aerial perspective, time of day (`--time`, a key) | `--sky-report`: sun and sky radiance against reference values |
 | **L3** ✅ | Clustered local lights, shadow atlas, a torch you can carry | `--lights-report`: lights per cluster, shadow budget, ms |
-| **L4** | Froxel volumetric fog: sun, local lights, height and local media | A/B stills; ms |
+| **L4** ✅ | Froxel volumetric fog: sun, local lights, height and local media | A/B stills; ms |
 | **L5** | RT scene: BLAS per chunk and per tree model, TLAS; `gi_trace` / `gi_occluded` on DXR; ray-traced sun shadow A/B against the cascades | `--rt-report`: BLAS count and memory, build ms, agreement with the CSM |
 | **L6** | DDGI cascades, relocation, classification, visibility, behind `gi_diffuse` / `gi_sky_visibility`; every surface shader switched to the interface | `--gi-report`; **`--leak-test`**: dig a sealed chamber, measure its luminance with no light inside (must be ~0), then light a torch in it (must fill it) |
 | **L6b** | The SDF tracer: a second `gi_trace` from the density field, A/B against DXR on the same probes | per-ray agreement with DXR; `--leak-test` on both |
@@ -352,6 +352,48 @@ the day it does not.
 - **Not done:** stars, moon phases, night-vision tone (Purkinje), clouds,
   and light shafts through the haze (L4's froxels). The sea is still the
   weakest surface.
+
+## L4 — done, 2026-11-15
+
+- **The volume:** 160 x 90 x 128 froxels, log-spaced 0.5 m to 6 km, injected
+  with density and in-scattered light (the key light through its cascade
+  shadow, the sky and ground, every local light in the froxel's cluster
+  through its own shadow), temporally reprojected, integrated front to back,
+  and applied by view depth over the aerial perspective. GPU: 0.10 ms to
+  inject by day, 0.14 with a torch and campfires, 0.02 to integrate.
+- **Local media are a baked map per seed** -- per-biome mist and sea fog
+  from archetypes.json, blended with the generator's own biome weights,
+  lying on the ground or the sea and thinning with height -- plus wind-
+  drifted patches, morning mist and a thin haze. The central, safe biomes
+  and the sea are misty by design: visibility 1.5-5 km at noon, a sea of
+  mist with peaks standing out of it at dawn.
+- **Light shafts** are the cascade shadow in the mist: at fixed exposure the
+  sunward haze in a wood reads 152 / 176 / 195 luma with no mist / mist /
+  mist unshadowed.
+- **Not done:** smoke over fires and mist in caves as local volumes (the
+  density function has room for them); the sea's reflection does not see the
+  mist; the volume's resolution is not yet a quality tier.
+
+### The exploration layer: options, not built
+
+The mist is the hook for keeping the wider map to be found. What turns it
+from weather into a mechanic is a design decision, recorded here to be
+taken with the game, not by the renderer:
+
+1. **Mist that remembers** -- an explored mask over the disc (a few hundred
+   texels a side, saved with the edits) that thins the mist where the
+   player has been. The map reveals itself by walking it; return trips are
+   clear. Cheapest, most legible, and a save-format change.
+2. **Mist as weather** -- banks that form and drift on the seed and the
+   clock, independent of the player. Rewards timing and patience over
+   coverage; no save state.
+3. **Landmarks above the mist** -- already true of peaks at dawn. Making it
+   deliberate (towers, great trees, a light on a hill authored to clear the
+   mist) gives the player something to walk towards.
+
+These combine. The natural first step is (1) on top of what is here, with
+(3) as level design; (2) is a weather system and belongs with storms, which
+`sea_state` already anticipates.
 
 ## L3 — done, 2026-11-15
 

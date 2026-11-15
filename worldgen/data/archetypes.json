@@ -34,6 +34,8 @@
     {"id": 8, "ground": [0.47, 0.42, 0.35], "ground_roughness": 0.92, "rock": [0.34, 0.31, 0.28], "rock_roughness": 0.78}
   ],
   "seabed": {"ground": [0.62, 0.57, 0.45], "ground_roughness": 0.85, "rock": [0.45, 0.43, 0.38], "rock_roughness": 0.75},
+  "_note_fog": "Mist (ADR-004 L4). Presentation only, like ground and materials: nothing here reaches the golden hash or a save. A biome's fog block is the MIDDAY mist's extinction per metre at the surface (visibility is about 3.9 / density: 0.0012 is 3 km, 0.004 one km, 0.04 a hundred metres) -- morning multiplies it -- and the height in metres over which it thins by e; the engine blends them with the weights layer 4 blends heights with and bakes a map once per seed. sea_fog is the same over open water. The central, safe biomes and the sea are the misty ones on purpose: the wider map should be found, not seen. haze is a thin floor everywhere; morning multiplies the mist round dawn; wind drifts its patches, metres per second; patch is the size of the patches in metres; phase_g how forward the droplets scatter; albedo the share of light they scatter rather than absorb.",
+  "fog": {"sea_fog": {"density": 0.0016, "height": 120.0}, "haze": 0.00001, "morning": 3.0, "wind": [1.5, 0.6], "patch": 160.0, "phase_g": 0.55, "albedo": 0.95},
   "sea_level": 0.0,
   "biomes": [
     {
@@ -42,7 +44,7 @@
       "adjacency_forbid": ["glacier", "rift"], "allow_island": true,
       "base_elevation": 12.0, "amplitude": 18.0, "octaves": 4, "lacunarity": 2.0, "gain": 0.50, "ridge_blend": 0.05, "flatness": 1.60,
       "overhang_strength": 0.00, "cave_density": 0.00, "cave_depth_band": [8.0, 120.0],
-      "material_id": 0, "water_level_offset": 0.0,
+      "fog": {"density": 0.0012, "height": 90.0}, "material_id": 0, "water_level_offset": 0.0,
       "ground": {"grass": 1.00, "cover": 0.85, "height": [0.25, 0.60], "color": [0.28, 0.44, 0.11], "dry_color": [0.58, 0.52, 0.26], "dry": 0.15, "narrow": 0, "flowers": 0.10, "bushes": 0.012},
       "trees": {"density": 0.30, "cover": 0.20, "species": {"oak": 3, "birch": 2, "maple": 1}}
     },
@@ -52,7 +54,7 @@
       "adjacency_forbid": [], "allow_island": true,
       "base_elevation": 20.0, "amplitude": 38.0, "octaves": 5, "lacunarity": 2.0, "gain": 0.50, "ridge_blend": 0.20, "flatness": 1.25,
       "overhang_strength": 0.10, "cave_density": 0.00, "cave_depth_band": [10.0, 160.0],
-      "material_id": 1, "water_level_offset": 0.0,
+      "fog": {"density": 0.0009, "height": 60.0}, "material_id": 1, "water_level_offset": 0.0,
       "ground": {"grass": 0.55, "cover": 0.70, "height": [0.15, 0.40], "color": [0.20, 0.35, 0.09], "dry_color": [0.45, 0.42, 0.20], "dry": 0.10, "narrow": 0, "flowers": 0.015, "bushes": 0.09},
       "trees": {"density": 0.55, "cover": 0.80, "species": {"oak": 3, "maple": 2.5, "beech": 2.5, "birch": 2, "pine": 0.6, "fir": 0.4}}
     },
@@ -62,7 +64,7 @@
       "adjacency_forbid": [], "allow_island": true,
       "base_elevation": 3.0, "amplitude": 8.0, "octaves": 4, "lacunarity": 2.1, "gain": 0.45, "ridge_blend": 0.00, "flatness": 2.40,
       "overhang_strength": 0.00, "cave_density": 0.00, "cave_depth_band": [6.0, 60.0],
-      "material_id": 2, "water_level_offset": 0.0,
+      "fog": {"density": 0.0025, "height": 60.0}, "material_id": 2, "water_level_offset": 0.0,
       "ground": {"grass": 0.95, "cover": 0.80, "height": [0.55, 1.15], "color": [0.30, 0.42, 0.15], "dry_color": [0.55, 0.50, 0.28], "dry": 0.25, "narrow": 1, "flowers": 0.02, "bushes": 0.03},
       "trees": {"density": 0.35, "cover": 0.45, "species": {"willow": 3, "alder": 3, "birch": 2}}
     },
@@ -72,7 +74,7 @@
       "adjacency_forbid": [], "allow_island": false,
       "base_elevation": 90.0, "amplitude": 140.0, "octaves": 6, "lacunarity": 2.0, "gain": 0.52, "ridge_blend": 0.70, "flatness": 0.85,
       "overhang_strength": 0.35, "cave_density": 0.00, "cave_depth_band": [20.0, 260.0],
-      "material_id": 3, "water_level_offset": 0.0,
+      "fog": {"density": 0.0005, "height": 150.0}, "material_id": 3, "water_level_offset": 0.0,
       "ground": {"grass": 0.65, "cover": 0.65, "height": [0.10, 0.30], "color": [0.34, 0.42, 0.16], "dry_color": [0.55, 0.48, 0.26], "dry": 0.45, "narrow": 0, "flowers": 0.04, "bushes": 0.05},
       "trees": {"density": 0.22, "cover": 0.40, "species": {"pine": 3, "fir": 2, "birch": 1}}
     },
@@ -82,7 +84,7 @@
       "adjacency_forbid": [], "allow_island": true,
       "base_elevation": 45.0, "amplitude": 70.0, "octaves": 5, "lacunarity": 2.2, "gain": 0.48, "ridge_blend": 0.55, "flatness": 1.10,
       "overhang_strength": 0.45, "cave_density": 0.00, "cave_depth_band": [12.0, 180.0],
-      "material_id": 4, "water_level_offset": 0.0,
+      "fog": {"density": 0.0, "height": 0.0}, "material_id": 4, "water_level_offset": 0.0,
       "ground": {"grass": 0.18, "cover": 0.30, "height": [0.15, 0.35], "color": [0.42, 0.42, 0.20], "dry_color": [0.62, 0.54, 0.30], "dry": 0.80, "narrow": 0, "flowers": 0.0, "bushes": 0.02},
       "trees": {"density": 0.08, "cover": 0.25, "species": {"scrub": 3, "snag": 1}}
     },
@@ -92,7 +94,7 @@
       "adjacency_forbid": [], "allow_island": false,
       "base_elevation": 55.0, "amplitude": 60.0, "octaves": 5, "lacunarity": 2.0, "gain": 0.50, "ridge_blend": 0.30, "flatness": 1.20,
       "overhang_strength": 0.15, "cave_density": 0.00, "cave_depth_band": [10.0, 150.0],
-      "material_id": 5, "water_level_offset": 0.0,
+      "fog": {"density": 0.0007, "height": 90.0}, "material_id": 5, "water_level_offset": 0.0,
       "ground": {"grass": 0.35, "cover": 0.50, "height": [0.12, 0.30], "color": [0.24, 0.34, 0.14], "dry_color": [0.48, 0.44, 0.26], "dry": 0.30, "narrow": 0, "flowers": 0.01, "bushes": 0.08},
       "trees": {"density": 0.55, "cover": 0.75, "species": {"spruce": 4, "fir": 3, "pine": 1.5, "birch": 0.5}}
     },
@@ -102,7 +104,7 @@
       "adjacency_forbid": [], "allow_island": true,
       "base_elevation": 35.0, "amplitude": 85.0, "octaves": 5, "lacunarity": 2.3, "gain": 0.55, "ridge_blend": 0.80, "flatness": 0.95,
       "overhang_strength": 0.55, "cave_density": 0.00, "cave_depth_band": [15.0, 220.0],
-      "material_id": 6, "water_level_offset": 0.0,
+      "fog": {"density": 0.0012, "height": 120.0}, "material_id": 6, "water_level_offset": 0.0,
       "trees": {"density": 0.08, "cover": 0.35, "species": {"snag": 1}}
     },
     {
@@ -111,7 +113,7 @@
       "adjacency_forbid": ["meadows"], "allow_island": true,
       "base_elevation": 110.0, "amplitude": 95.0, "octaves": 5, "lacunarity": 2.0, "gain": 0.48, "ridge_blend": 0.45, "flatness": 1.05,
       "overhang_strength": 0.25, "cave_density": 0.00, "cave_depth_band": [18.0, 200.0],
-      "material_id": 7, "water_level_offset": 0.0
+      "fog": {"density": 0.0008, "height": 100.0}, "material_id": 7, "water_level_offset": 0.0
     },
     {
       "name": "rift",
@@ -119,7 +121,7 @@
       "adjacency_forbid": ["meadows"], "allow_island": false,
       "base_elevation": 70.0, "amplitude": 165.0, "octaves": 6, "lacunarity": 2.1, "gain": 0.56, "ridge_blend": 0.90, "flatness": 0.75,
       "overhang_strength": 0.70, "cave_density": 0.00, "cave_depth_band": [25.0, 320.0],
-      "material_id": 8, "water_level_offset": 0.0,
+      "fog": {"density": 0.0, "height": 0.0}, "material_id": 8, "water_level_offset": 0.0,
       "ground": {"grass": 0.05, "cover": 0.20, "height": [0.10, 0.25], "color": [0.40, 0.40, 0.22], "dry_color": [0.58, 0.52, 0.32], "dry": 0.90, "narrow": 0, "flowers": 0.0, "bushes": 0.0}
     }
   ]

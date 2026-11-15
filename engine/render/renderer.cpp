@@ -146,7 +146,7 @@ void light_face(const float pos[3], const float fwd[3], const float up_hint[3], 
 // else -- which the post chain combines (scene_out.hlsli, post.hlsl).
 const DXGI_FORMAT kSceneFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
-// Matches cbuffer PostConstants in post.hlsl: 384 bytes.
+// Matches cbuffer PostConstants in post.hlsl: 416 bytes.
 struct PostConstants {
     float inv_view_proj[16];
     float view_proj[16];
@@ -169,8 +169,27 @@ struct PostConstants {
     float sky_moon_dir[3]; float pad3;
     float sun_disk[3];     float pad4;
     float moon_disk[3];    float pad5;
+    float cam_fwd[3];      float fog_on;
+    float fog_near;        float fog_log_ratio; float pad6[2];
 };
-static_assert(sizeof(PostConstants) == 384, "PostConstants must match post.hlsl");
+static_assert(sizeof(PostConstants) == 416, "PostConstants must match post.hlsl");
+
+// Matches cbuffer FogConstants in fog.hlsl.
+struct FogConstants {
+    float prev_view_proj[16];
+    float cam_pos[3];   float time;
+    float cam_right[3]; float tan_half_fov;
+    float cam_up[3];    float aspect;
+    float cam_fwd[3];   float jitter;
+    float near_z;       float log_ratio; UINT history_valid; float time_factor;
+    float map_extent;   float haze;      float sea_level;    float patch;
+    float wind[2];      float phase_g;   float albedo;
+    float screen_w;     float screen_h;  float density_scale; float pad0;
+};
+static_assert(sizeof(FogConstants) == 192, "FogConstants must match fog.hlsl");
+// The mist's froxels: 160 x 90 x 128, log-spaced from 0.5 m to 6 km.
+const UINT  kFogX = 160, kFogY = 90, kFogZ = 128;
+const float kFogNear = 0.5f, kFogFar = 6000.0f;
 
 // Matches cbuffer AtmosphereConstants in atmosphere.hlsl.
 struct AtmosphereConstants {
@@ -856,8 +875,10 @@ bool Renderer::create_shadow_resources(std::string& error) {
     // [16..17] the atmosphere's static tables, [18..19] its per-frame UAVs,
     // [24..28] the local lights (L3): lights, cluster counts and items, the
     // shadow atlas and its faces -- reached by every lit pipeline through a
-    // second range of the table that starts at the sun's map, [0].
-    hd.NumDescriptors = 32;
+    // second range of the table that starts at the sun's map, [0];
+    // [29..35] the mist (L4): its map, two inject volumes (this frame's and
+    // last's, swapping), the integrated volume, and their UAVs.
+    hd.NumDescriptors = 48;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srv_heap_));
     if (FAILED(hr)) { error = hr_text("shared srv heap", hr); return false; }
@@ -1049,6 +1070,328 @@ void Renderer::record_shadows(const ViewConstants& view) {
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     cmd_->ResourceBarrier(1, &b);
+}
+
+// ---------------------------------------------------------------------------
+// Volumetric mist (ADR-004 L4): fog.h for where the mist is, fog.hlsl for the
+// froxels, post.hlsl's composite for applying it.
+// ---------------------------------------------------------------------------
+
+bool Renderer::create_fog(std::string& error) {
+    if (!fog_map_.build(world_, "worldgen/data/archetypes.json", error)) return false;
+
+    // Timestamps for the post chain: five a frame per frame in flight.
+    {
+        D3D12_QUERY_HEAP_DESC qd = {};
+        qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qd.Count = 5 * kFrameCount;
+        HRESULT hr = device_->CreateQueryHeap(&qd, IID_PPV_ARGS(&post_queries_));
+        if (FAILED(hr)) { error = hr_text("post query heap", hr); return false; }
+        D3D12_HEAP_PROPERTIES rh = {};
+        rh.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = 5 * kFrameCount * 8;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        hr = device_->CreateCommittedResource(&rh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                              IID_PPV_ARGS(&post_query_rb_));
+        if (FAILED(hr)) { error = hr_text("post query readback", hr); return false; }
+        queue_->GetTimestampFrequency(&post_query_freq_);
+    }
+
+    D3D12_HEAP_PROPERTIES dh = {};
+    dh.Type = D3D12_HEAP_TYPE_DEFAULT;
+    auto tex = [&](ComPtr<ID3D12Resource>& out, bool vol, UINT w, UINT h, UINT d, DXGI_FORMAT fmt, bool uav,
+                   D3D12_RESOURCE_STATES state, const char* what) -> bool {
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = vol ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = w;
+        rd.Height = h;
+        rd.DepthOrArraySize = UINT16(d);
+        rd.MipLevels = 1;
+        rd.Format = fmt;
+        rd.SampleDesc.Count = 1;
+        rd.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+        const HRESULT hr = device_->CreateCommittedResource(&dh, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr, IID_PPV_ARGS(&out));
+        if (FAILED(hr)) { error = hr_text(what, hr); return false; }
+        return true;
+    };
+    const DXGI_FORMAT f16 = DXGI_FORMAT_R16G16B16A16_FLOAT, f32 = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    const D3D12_RESOURCE_STATES ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (!tex(fog_map_tex_, false, FogMap::kSize, FogMap::kSize, 1, f32, false, D3D12_RESOURCE_STATE_COPY_DEST, "mist map")) return false;
+    // Inject volume 0 starts as the one written, 1 as last frame's (read).
+    if (!tex(fog_inject_[0], true, kFogX, kFogY, kFogZ, f16, true, ua, "mist inject 0")) return false;
+    if (!tex(fog_inject_[1], true, kFogX, kFogY, kFogZ, f16, true, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "mist inject 1")) return false;
+    if (!tex(fog_integrated_, true, kFogX, kFogY, kFogZ, f16, true, ua, "mist integrated")) return false;
+    fog_cur_ = 0;
+    fog_hist_valid_ = false;
+
+    // The map's texels, staged for the first frame.
+    {
+        const D3D12_RESOURCE_DESC dd = fog_map_tex_->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+        UINT64 total = 0;
+        device_->GetCopyableFootprints(&dd, 0, 1, 0, &fp, nullptr, nullptr, &total);
+        D3D12_HEAP_PROPERTIES uh = {};
+        uh.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = total;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        HRESULT hr = device_->CreateCommittedResource(&uh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                      nullptr, IID_PPV_ARGS(&fog_map_up_));
+        if (FAILED(hr)) { error = hr_text("mist map upload", hr); return false; }
+        unsigned char* p = nullptr;
+        fog_map_up_->Map(0, nullptr, reinterpret_cast<void**>(&p));
+        const std::vector<float>& t = fog_map_.texels();
+        for (int y = 0; y < FogMap::kSize; ++y)
+            std::memcpy(p + fp.Offset + size_t(y) * fp.Footprint.RowPitch, &t[size_t(y) * FogMap::kSize * 4],
+                        size_t(FogMap::kSize) * 16);
+        fog_map_up_->Unmap(0, nullptr);
+        fog_uploaded_ = false;
+    }
+
+    // [29] map, [30..31] inject SRVs, [32] integrated SRV, [33..34] inject
+    // UAVs, [35] integrated UAV.
+    const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto slot = [&](UINT i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE c = srv_heap_->GetCPUDescriptorHandleForHeapStart();
+        c.ptr += SIZE_T(i) * inc;
+        return c;
+    };
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = f32;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        device_->CreateShaderResourceView(fog_map_tex_.Get(), &sd, slot(29));
+        sd.Format = f16;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        sd.Texture3D.MipLevels = 1;
+        device_->CreateShaderResourceView(fog_inject_[0].Get(), &sd, slot(30));
+        device_->CreateShaderResourceView(fog_inject_[1].Get(), &sd, slot(31));
+        device_->CreateShaderResourceView(fog_integrated_.Get(), &sd, slot(32));
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = f16;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        ud.Texture3D.WSize = kFogZ;
+        device_->CreateUnorderedAccessView(fog_inject_[0].Get(), nullptr, &ud, slot(33));
+        device_->CreateUnorderedAccessView(fog_inject_[1].Get(), nullptr, &ud, slot(34));
+        device_->CreateUnorderedAccessView(fog_integrated_.Get(), nullptr, &ud, slot(35));
+    }
+
+    for (UINT f = 0; f < kFrameCount; ++f) {
+        D3D12_HEAP_PROPERTIES uh = {};
+        uh.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = 256;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const HRESULT hr = device_->CreateCommittedResource(&uh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                            nullptr, IID_PPV_ARGS(&fog_cb_[f]));
+        if (FAILED(hr)) { error = hr_text("mist cb", hr); return false; }
+        fog_cb_[f]->Map(0, nullptr, &fog_cb_cpu_[f]);
+    }
+
+    // Root signature: the mist's constants, the frame's shadow-and-light
+    // constants, the lit pipelines' shadow table (sun map + local lights),
+    // and one-descriptor tables for the map, the history, this frame's
+    // inject volume read and written, and the integrated volume.
+    {
+        D3D12_DESCRIPTOR_RANGE shadow[2] = {};
+        shadow[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        shadow[0].NumDescriptors = 1;
+        shadow[0].BaseShaderRegister = 8;
+        shadow[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        shadow[1].NumDescriptors = 5;
+        shadow[1].BaseShaderRegister = 20;
+        shadow[1].OffsetInDescriptorsFromTableStart = 24;
+        D3D12_DESCRIPTOR_RANGE one[5] = {};
+        const D3D12_DESCRIPTOR_RANGE_TYPE kinds[5] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                                                      D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                                                      D3D12_DESCRIPTOR_RANGE_TYPE_UAV};
+        const UINT regs[5] = {0, 1, 2, 0, 1};
+        D3D12_ROOT_PARAMETER p[8] = {};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        p[0].Descriptor.ShaderRegister = 0;
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        p[1].Descriptor.ShaderRegister = 2;
+        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[2].DescriptorTable.NumDescriptorRanges = 2;
+        p[2].DescriptorTable.pDescriptorRanges = shadow;
+        for (int k = 0; k < 5; ++k) {
+            one[k].RangeType = kinds[k];
+            one[k].NumDescriptors = 1;
+            one[k].BaseShaderRegister = regs[k];
+            p[3 + k].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            p[3 + k].DescriptorTable.NumDescriptorRanges = 1;
+            p[3 + k].DescriptorTable.pDescriptorRanges = &one[k];
+        }
+        for (int k = 0; k < 8; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_STATIC_SAMPLER_DESC ss[2] = {};
+        ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        ss[0].AddressU = ss[0].AddressV = ss[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        ss[0].MaxLOD = D3D12_FLOAT32_MAX;
+        ss[0].ShaderRegister = 0;
+        ss[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        ss[1].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+        ss[1].AddressU = ss[1].AddressV = ss[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        ss[1].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+        ss[1].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        ss[1].MaxLOD = D3D12_FLOAT32_MAX;
+        ss[1].ShaderRegister = 1;
+        ss[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rsd = {};
+        rsd.NumParameters = 8;
+        rsd.pParameters = p;
+        rsd.NumStaticSamplers = 2;
+        rsd.pStaticSamplers = ss;
+        ComPtr<ID3DBlob> sig, err;
+        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+        if (FAILED(hr)) {
+            error = std::string("mist root signature: ") + (err ? static_cast<const char*>(err->GetBufferPointer()) : "");
+            return false;
+        }
+        hr = device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&fog_root_));
+        if (FAILED(hr)) { error = hr_text("CreateRootSignature (mist)", hr); return false; }
+    }
+    return create_fog_pipelines(error);
+}
+
+bool Renderer::create_fog_pipelines(std::string& error) {
+    const char* entries[2] = {"cs_fog_inject", "cs_fog_integrate"};
+    ComPtr<ID3D12PipelineState>* outs[2] = {&fog_inject_pso_, &fog_integrate_pso_};
+    for (int k = 0; k < 2; ++k) {
+        ComPtr<ID3DBlob> cs;
+        if (!compile_shader("engine/render/shaders/fog.hlsl", entries[k], "cs_5_1", cs, error)) return false;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cd = {};
+        cd.pRootSignature = fog_root_.Get();
+        cd.CS.pShaderBytecode = cs->GetBufferPointer();
+        cd.CS.BytecodeLength = cs->GetBufferSize();
+        if (FAILED(device_->CreateComputePipelineState(&cd, IID_PPV_ARGS(outs[k]->GetAddressOf())))) {
+            error = "mist compute pso";
+            return false;
+        }
+    }
+    return true;
+}
+
+void Renderer::record_fog() {
+    auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+        D3D12_RESOURCE_BARRIER rb = {};
+        rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        rb.Transition.pResource = r;
+        rb.Transition.StateBefore = a;
+        rb.Transition.StateAfter = b;
+        rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd_->ResourceBarrier(1, &rb);
+    };
+    const D3D12_RESOURCE_STATES ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    const D3D12_RESOURCE_STATES nps = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES ps = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (!fog_uploaded_) {
+        const D3D12_RESOURCE_DESC dd = fog_map_tex_->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+        device_->GetCopyableFootprints(&dd, 0, 1, 0, &fp, nullptr, nullptr, nullptr);
+        D3D12_TEXTURE_COPY_LOCATION d = {}, s = {};
+        d.pResource = fog_map_tex_.Get();
+        d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        s.pResource = fog_map_up_.Get();
+        s.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        s.PlacedFootprint = fp;
+        cmd_->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+        tr(fog_map_tex_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, nps);
+        fog_uploaded_ = true;
+    }
+
+    // A camera that jumped starts the mist's history over, as TAA's does.
+    const float jx = cur_cam_[0] - prev_cam_[0], jy = cur_cam_[1] - prev_cam_[1], jz = cur_cam_[2] - prev_cam_[2];
+    if (jx * jx + jy * jy + jz * jz > 400.0f) fog_hist_valid_ = false;
+
+    FogConstants fc = {};
+    std::memcpy(fc.prev_view_proj, prev_vp_, sizeof fc.prev_view_proj);
+    for (int k = 0; k < 3; ++k) {
+        fc.cam_pos[k] = cur_cam_[k];
+        fc.cam_right[k] = cur_right_[k];
+        fc.cam_up[k] = cur_up_[k];
+        fc.cam_fwd[k] = cur_fwd_[k];
+    }
+    fc.time = cur_time_;
+    fc.tan_half_fov = cur_tan_;
+    fc.aspect = cur_aspect_;
+    // Where in its slice each froxel samples this frame: a Halton walk, which
+    // the temporal blend turns into an average over the slice.
+    fc.jitter = halton(int(post_frame_ % 16) + 1, 2);
+    fc.near_z = kFogNear;
+    fc.log_ratio = std::log(kFogFar / kFogNear);
+    fc.history_valid = fog_hist_valid_ ? 1u : 0u;
+    fc.time_factor = fog_map_.time_factor(time_hours_);
+    const FogSettings& fs = fog_map_.settings();
+    fc.map_extent = fog_map_.extent();
+    fc.haze = fs.haze;
+    fc.sea_level = world_.params().sea_level;
+    fc.patch = fs.patch;
+    fc.wind[0] = fs.wind[0];
+    fc.wind[1] = fs.wind[1];
+    fc.phase_g = fs.phase_g;
+    fc.albedo = fs.albedo;
+    fc.screen_w = float(width_);
+    fc.screen_h = float(height_);
+    fc.density_scale = fog_density_;
+    std::memcpy(fog_cb_cpu_[frame_], &fc, sizeof fc);
+
+    // The sun's shadow map and the light atlas are read by pixel shaders
+    // elsewhere; this pass reads them from compute too.
+    tr(shadow_map_.Get(), ps, ps | nps);
+    tr(light_atlas_.Get(), ps, ps | nps);
+
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
+    cmd_->SetDescriptorHeaps(1, heaps);
+    const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto at = [&](UINT i) {
+        D3D12_GPU_DESCRIPTOR_HANDLE g = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+        g.ptr += UINT64(i) * inc;
+        return g;
+    };
+    const UINT cur = fog_cur_, prev = fog_cur_ ^ 1u;
+    cmd_->SetComputeRootSignature(fog_root_.Get());
+    cmd_->SetComputeRootConstantBufferView(0, fog_cb_[frame_]->GetGPUVirtualAddress());
+    cmd_->SetComputeRootConstantBufferView(1, shadow_cb_[frame_]->GetGPUVirtualAddress());
+    cmd_->SetComputeRootDescriptorTable(2, at(0));
+    cmd_->SetComputeRootDescriptorTable(3, at(29));
+    cmd_->SetComputeRootDescriptorTable(4, at(30 + prev));      // last frame's inject volume
+    cmd_->SetComputeRootDescriptorTable(5, at(30 + cur));       // this frame's, read by the integrate pass
+    cmd_->SetComputeRootDescriptorTable(6, at(33 + cur));       // this frame's, written
+    cmd_->SetComputeRootDescriptorTable(7, at(35));
+    cmd_->SetPipelineState(fog_inject_pso_.Get());
+    cmd_->Dispatch((kFogX + 7) / 8, (kFogY + 7) / 8, kFogZ);
+    tr(fog_inject_[cur].Get(), ua, nps);
+    if (post_queries_) cmd_->EndQuery(post_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, UINT(frame_) * 5 + 2);
+    cmd_->SetPipelineState(fog_integrate_pso_.Get());
+    cmd_->Dispatch((kFogX + 7) / 8, (kFogY + 7) / 8, 1);
+    if (post_queries_) cmd_->EndQuery(post_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, UINT(frame_) * 5 + 3);
+    tr(fog_integrated_.Get(), ua, nps);
+
+    tr(shadow_map_.Get(), ps | nps, ps);
+    tr(light_atlas_.Get(), ps | nps, ps);
+
+    // Last frame's volume becomes the one written next frame.
+    tr(fog_inject_[prev].Get(), nps, ua);
+    fog_cur_ = prev;
+    fog_hist_valid_ = fog_on_;
 }
 
 // ---------------------------------------------------------------------------
@@ -1773,6 +2116,7 @@ bool Renderer::reload_shaders(std::string& error) {
     if (!create_post_pipelines(error)) return false;
     if (!create_atmosphere_pipelines(error)) return false;
     if (!create_lights_pipelines(error)) return false;
+    if (fog_root_ && !create_fog_pipelines(error)) return false;
     // Everything resident was built by the old kernel, so start again.
     streamer_.init();
     return true;
@@ -1869,6 +2213,9 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     t0 = startup_now_ms();
     if (!foliage_.init(device_.Get(), &world_, "worldgen/data/archetypes.json", error)) return false;
     startup_log().push_back(std::make_pair(std::string("phase: foliage pipelines"), startup_now_ms() - t0));
+    t0 = startup_now_ms();
+    if (!create_fog(error)) return false;
+    startup_log().push_back(std::make_pair(std::string("phase: mist map + volumes"), startup_now_ms() - t0));
 
     ready_ = true;
     return true;
@@ -2054,14 +2401,21 @@ bool Renderer::create_post_pipelines(std::string& error) {
         D3D12_DESCRIPTOR_RANGE sr = {};
         sr.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr.NumDescriptors = 9;
+        // t9, the mist's integrated volume, sits at heap [32]: 29 past the
+        // table's start at [3].
+        D3D12_DESCRIPTOR_RANGE sr2[2] = {sr, {}};
+        sr2[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr2[1].NumDescriptors = 1;
+        sr2[1].BaseShaderRegister = 9;
+        sr2[1].OffsetInDescriptorsFromTableStart = 29;
         D3D12_DESCRIPTOR_RANGE ur = {};
         ur.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         ur.NumDescriptors = 4;
         D3D12_ROOT_PARAMETER p[5] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[1].DescriptorTable.NumDescriptorRanges = 1;
-        p[1].DescriptorTable.pDescriptorRanges = &sr;
+        p[1].DescriptorTable.NumDescriptorRanges = 2;
+        p[1].DescriptorTable.pDescriptorRanges = sr2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[2].DescriptorTable.NumDescriptorRanges = 1;
         p[2].DescriptorTable.pDescriptorRanges = &ur;
@@ -2173,6 +2527,26 @@ bool Renderer::create_post_pipelines(std::string& error) {
 
 void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     const bool wire = mode_ == Mode::Wireframe;
+    // Last time this frame index ran, its stamps were resolved; its fence
+    // has been waited for, so they can be read now.
+    const UINT q0 = UINT(frame_) * 5;
+    if (post_queries_ && post_query_pending_[frame_] && post_query_freq_) {
+        UINT64* t = nullptr;
+        D3D12_RANGE rr = {q0 * 8, (q0 + 5) * 8};
+        if (SUCCEEDED(post_query_rb_->Map(0, &rr, reinterpret_cast<void**>(&t)))) {
+            const UINT64* s = t + q0;
+            const double k = 1000.0 / double(post_query_freq_);
+            auto ema = [](float& v, double x) { v = v == 0.0f ? float(x) : float(0.95 * v + 0.05 * x); };
+            ema(post_times_.atmosphere, double(s[1] - s[0]) * k);
+            ema(post_times_.mist_inject, double(s[2] - s[1]) * k);
+            ema(post_times_.mist_integrate, double(s[3] - s[2]) * k);
+            ema(post_times_.post_total, double(s[4] - s[0]) * k);
+            D3D12_RANGE nr = {0, 0};
+            post_query_rb_->Unmap(0, &nr);
+        }
+        post_query_pending_[frame_] = false;
+    }
+    if (post_queries_) cmd_->EndQuery(post_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q0 + 0);
     // TAA only reprojects static surfaces by depth; a camera that jumped
     // (Tab, a teleport, the first frame) starts the history over.
     const float jx = cur_cam_[0] - prev_cam_[0], jy = cur_cam_[1] - prev_cam_[1], jz = cur_cam_[2] - prev_cam_[2];
@@ -2191,6 +2565,10 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
         pc.moon_disk[k] = sky_frame_.moon_disk[k];
     }
     pc.cam_alt_km = sky_frame_.cam_alt_km;
+    for (int k = 0; k < 3; ++k) pc.cam_fwd[k] = cur_fwd_[k];
+    pc.fog_on = (fog_on_ && !wire) ? 1.0f : 0.0f;
+    pc.fog_near = kFogNear;
+    pc.fog_log_ratio = std::log(kFogFar / kFogNear);
     pc.near_plane = kNearPlane;
     pc.far_plane = kFarPlane;
     pc.sharpen = taa_on_ && !wire ? 0.5f : 0.0f;
@@ -2248,8 +2626,19 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     };
     // The sky-view table and the aerial-perspective volume for this frame.
     record_atmosphere();
+    // The transitions first: a timestamp with no barrier in front of it is
+    // written while the dispatches before it still run, and the
+    // atmosphere's time showed up as 0 with the mist's taking it.
     tr(sky_view_tex_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     tr(ap_tex_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (post_queries_) cmd_->EndQuery(post_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q0 + 1);
+    // The mist's froxels (L4), injected and integrated -- or nothing at all.
+    if (fog_on_ && !wire) {
+        record_fog();
+    } else if (post_queries_) {
+        cmd_->EndQuery(post_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q0 + 2);
+        cmd_->EndQuery(post_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q0 + 3);
+    }
     tr(depth_.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, read);
     tr(hdr_direct_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
     tr(hdr_ambient_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
@@ -2327,6 +2716,11 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     hist_cur_ ^= 1u;
     std::memcpy(prev_vp_, view_proj_nj_, sizeof prev_vp_);
     for (int k = 0; k < 3; ++k) prev_cam_[k] = cur_cam_[k];
+    if (post_queries_) {
+        cmd_->EndQuery(post_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q0 + 4);
+        cmd_->ResolveQueryData(post_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q0, 5, post_query_rb_.Get(), UINT64(q0) * 8);
+        post_query_pending_[frame_] = true;
+    }
     ++post_frame_;
 }
 
@@ -2377,7 +2771,15 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         }
     }
     std::memcpy(view_proj_, mc.view_proj, sizeof view_proj_);
-    for (int k = 0; k < 3; ++k) cur_cam_[k] = view.cam_pos[k];
+    for (int k = 0; k < 3; ++k) {
+        cur_cam_[k] = view.cam_pos[k];
+        cur_fwd_[k] = view.cam_fwd[k];
+        cur_right_[k] = view.cam_right[k];
+        cur_up_[k] = view.cam_up[k];
+    }
+    cur_tan_ = view.tan_half_fov;
+    cur_aspect_ = view.aspect;
+    cur_time_ = view.time;
     mc.cam_pos[0] = view.cam_pos[0];
     mc.cam_pos[1] = view.cam_pos[1];
     mc.cam_pos[2] = view.cam_pos[2];

@@ -20,6 +20,7 @@
 #include "engine/render/rt_check.h"
 #include "engine/render/sky.h"
 #include "engine/render/local_lights.h"
+#include "engine/render/fog.h"
 
 #include <unordered_map>
 #include <vector>
@@ -255,6 +256,18 @@ public:
         uint32_t overflowed = 0, max_in_cluster = 0, clusters_lit = 0, cluster_items = 0;
     };
     const LightStats& light_stats() const { return light_stats_; }
+
+    // Volumetric mist (ADR-004 L4). On by default; N in the window and
+    // --no-fog for A/B; a density multiplier for tuning.
+    void set_fog(bool on) { fog_on_ = on; fog_hist_valid_ = false; }
+    bool fog() const { return fog_on_; }
+    void set_fog_density(float k) { fog_density_ = k; }
+    const FogMap& fog_map() const { return fog_map_; }
+    // GPU time of the post chain's parts, ms, smoothed over frames: the
+    // atmosphere's tables, the mist's inject and integrate, the whole chain.
+    // Frame-time A/B cannot resolve passes this small on a noisy machine.
+    struct PostTimes { float atmosphere = 0, mist_inject = 0, mist_integrate = 0, post_total = 0; };
+    const PostTimes& post_times() const { return post_times_; }
     // What the meter saw in the last capture(): the histogram and the
     // exposure it chose. bins[k] covers log2 nits kLumLogMin + k * step.
     struct ExposureReport {
@@ -429,6 +442,24 @@ private:
     SkyFrame sky_frame_;
     float    time_hours_ = 14.0f;
     float    sky_hours_ = -1.0f, sky_cam_y_ = -1.0e9f;   // what sky_frame_ was evaluated for
+    // Volumetric mist (ADR-004 L4).
+    bool create_fog(std::string& error);
+    bool create_fog_pipelines(std::string& error);
+    void record_fog();
+    FogMap fog_map_;
+    PostTimes post_times_;
+    ComPtr<ID3D12QueryHeap> post_queries_;
+    ComPtr<ID3D12Resource>  post_query_rb_;
+    UINT64 post_query_freq_ = 0;
+    bool   post_query_pending_[kFrameCount] = {};
+    bool   fog_on_ = true, fog_hist_valid_ = false, fog_uploaded_ = false;
+    float  fog_density_ = 1.0f;
+    UINT   fog_cur_ = 0;
+    ComPtr<ID3D12Resource> fog_map_tex_, fog_map_up_, fog_inject_[2], fog_integrated_;
+    ComPtr<ID3D12Resource> fog_cb_[kFrameCount];
+    void* fog_cb_cpu_[kFrameCount] = {};
+    ComPtr<ID3D12RootSignature> fog_root_;
+    ComPtr<ID3D12PipelineState> fog_inject_pso_, fog_integrate_pso_;
     // Local lights (ADR-004 L3).
     bool create_lights(std::string& error);
     bool create_lights_pipelines(std::string& error);
@@ -473,6 +504,9 @@ private:
     float prev_vp_[16] = {};        // last frame, unjittered
     float prev_cam_[3] = {0, 0, 0};
     float cur_cam_[3] = {0, 0, 0};
+    // The camera's basis this frame, for the mist's froxels (L4).
+    float cur_fwd_[3] = {0, 0, 1}, cur_right_[3] = {1, 0, 0}, cur_up_[3] = {0, 1, 0};
+    float cur_tan_ = 1.0f, cur_aspect_ = 1.0f, cur_time_ = 0.0f;
     float jitter_[2] = {0, 0};
     UINT  hist_cur_ = 0;
     bool  hist_valid_ = false;
