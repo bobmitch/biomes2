@@ -261,8 +261,10 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
         pd.SampleMask = UINT_MAX;
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pd.NumRenderTargets = 1;
-        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // The renderer's two HDR targets: direct and ambient (scene_out.hlsli).
+        pd.NumRenderTargets = 2;
+        pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        pd.RTVFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
         pd.SampleDesc.Count = 1;
         const HRESULT hr = device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&out));

@@ -25,6 +25,7 @@
 //   F6 / F9     save / load: dig edits and felled trees, under build/
 //   L           sun shadows on / off
 //   G           ground cover (grass, flowers, bushes) on / off
+//   Y O J       TAA, ambient occlusion, contact shadows on / off
 // ---------------------------------------------------------------------------
 #include "engine/render/renderer.h"
 #include "engine/render/water_wave.h"
@@ -236,6 +237,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (wp == 'L') { g_renderer.set_shadows(!g_renderer.shadows()); return 0; }
             if (wp == 'G') { g_renderer.set_foliage(!g_renderer.foliage_on()); return 0; }
+            if (wp == 'Y') { g_renderer.set_taa(!g_renderer.taa()); return 0; }
+            if (wp == 'O') { g_renderer.set_ao(!g_renderer.ao()); return 0; }
+            if (wp == 'J') { g_renderer.set_contact(!g_renderer.contact()); return 0; }
             if (wp == VK_F6) { g_want_save = true; return 0; }
             if (wp == VK_F9) { g_want_load = true; return 0; }
             if (wp == VK_F5) {
@@ -635,6 +639,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (c2.find("--no-trees") != std::string::npos) g_renderer.set_trees(false);
         if (c2.find("--no-shadows") != std::string::npos) g_renderer.set_shadows(false);
         if (c2.find("--no-foliage") != std::string::npos) g_renderer.set_foliage(false);
+        if (c2.find("--no-taa") != std::string::npos) g_renderer.set_taa(false);
+        if (c2.find("--no-ao") != std::string::npos) g_renderer.set_ao(false);
+        if (c2.find("--no-contact") != std::string::npos) g_renderer.set_contact(false);
+        if (c2.find("--no-post") != std::string::npos) {
+            g_renderer.set_taa(false); g_renderer.set_ao(false); g_renderer.set_contact(false);
+        }
+        const size_t pdb = c2.find("--post-debug");
+        if (pdb != std::string::npos) g_renderer.set_post_debug(float(std::atof(c2.c_str() + pdb + 12)));
         const size_t fd = c2.find("--foliage-debug");
         if (fd != std::string::npos) g_renderer.foliage_settings().debug = float(std::atof(c2.c_str() + fd + 15));
         // Where LOD 0 hands over to LOD 1, in metres: 0 shows LOD 1 up close.

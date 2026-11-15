@@ -8,6 +8,7 @@
 // ---------------------------------------------------------------------------
 
 #include "engine/render/shaders/shadow.hlsli"
+#include "engine/render/shaders/scene_out.hlsli"
 
 struct Vertex {
     float3 pos;
@@ -144,22 +145,22 @@ float3 apply_surface_texture(float3 albedo, float3 p, float3 n) {
     return albedo * shade;
 }
 
-float4 ps_main(VSOut i) : SV_Target {
+SceneOut ps_main(VSOut i) {
     if (i.fade.x > 0.5f) {
         const float t = dither_threshold(i.clip.xy);
         if (i.fade.x < 1.5f) clip(i.fade.y - t);   // fading in
         else                 clip(t - i.fade.y);   // fading out
     }
-    if (wire > 0.5f) return float4(1.0f, 0.25f, 0.65f, 1.0f);
+    if (wire > 0.5f) return scene_flat(float3(1.0f, 0.25f, 0.65f));
     // Debug views. The first attempt at "where is the curtain visible" tested
     // the interpolated normal's length, which a sharp CREASE also shortens --
     // it counted the terrain's ridge lines as seams and sent a whole
     // investigation the wrong way. The skirt flag is exact; the crease view
     // is the normal-length test, but only where the flag is zero.
     if (mesh_debug > 0.5f && mesh_debug < 1.5f && i.skirt > 0.001f)
-        return float4(1.0f, 0.0f, 1.0f, 1.0f);
+        return scene_flat(float3(1.0f, 0.0f, 1.0f));
     if (mesh_debug > 1.5f && i.skirt <= 0.001f && length(i.nrm) < 0.9f)
-        return float4(0.0f, 1.0f, 1.0f, 1.0f);
+        return scene_flat(float3(0.0f, 1.0f, 1.0f));
     const float3 n = normalize(i.nrm);
     const float3 sun = normalize(float3(0.45f, 0.78f, 0.35f));
     const float  lam = saturate(dot(n, sun));
@@ -171,11 +172,9 @@ float4 ps_main(VSOut i) : SV_Target {
 
     // Sun shadow: from the terrain itself and from the trees (shadow.hlsli).
     const float sh = lam > 0.0f ? shadow_factor(i.world, n) : 1.0f;
-    float3 col = rock * (0.22f + 0.78f * lam * sh) + float3(0.10f, 0.13f, 0.18f) * sky;
-
-    const float dist = length(i.world - cam_pos);
-    const float fog = saturate(dist / far_plane);
-    col = lerp(col, float3(0.40f, 0.50f, 0.66f), fog * fog);
-
-    return float4(col, 1.0f);
+    // Direct and ambient apart (scene_out.hlsli): the post chain shades
+    // each with its own occlusion.
+    return scene_out(rock * (0.78f * lam * sh),
+                     rock * 0.22f + float3(0.10f, 0.13f, 0.18f) * sky,
+                     i.world, cam_pos, far_plane);
 }

@@ -199,7 +199,25 @@ float4 debug_view(VSOut i, float3 n, float foam) {
     return float4(saturate(ww_total_amplitude_lod(sea_state, i.minwl) * 0.25f).xxx, 1.0f);
 }
 
-float4 ps_main(VSOut i) : SV_Target {
+float4 water_colour(VSOut i);
+
+// Two targets now (scene_out.hlsli). The sea's colour goes to the direct
+// target, blended as before; in the ambient target it only TAKES AWAY what
+// is under it (the PSO blends ZERO / INV_SRC_ALPHA there), so the seabed's
+// ambient occlusion does not show through the water.
+struct WaterOut {
+    float4 direct  : SV_Target0;
+    float4 ambient : SV_Target1;
+};
+WaterOut ps_main(VSOut i) {
+    const float4 c = water_colour(i);
+    WaterOut o;
+    o.direct = c;
+    o.ambient = float4(0.0f, 0.0f, 0.0f, c.a);
+    return o;
+}
+
+float4 water_colour(VSOut i) {
     // Inland. The terrain in front of this already won the depth test almost
     // everywhere, but the shoreline is where the two surfaces meet at a
     // grazing angle and a vertex can land a little the wrong side of it.

@@ -18,6 +18,7 @@
 #include "engine/field/real_field.hlsl"
 #include "engine/render/shaders/shadow.hlsli"
 #include "engine/render/shaders/leaf.hlsli"
+#include "engine/render/shaders/scene_out.hlsli"
 
 cbuffer FoliageFrame : register(b0) {
     row_major float4x4 view_proj;
@@ -404,21 +405,20 @@ FolOut vs_blade(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     return o;
 }
 
-float3 shade_foliage(float3 albedo, float3 n, float ao, float3 world, float3 toward_eye) {
+SceneOut shade_foliage(float3 albedo, float3 n, float ao, float3 world, float3 toward_eye,
+                       float contact = 0.0f, float ssao = 0.4f) {
     const float3 sun = normalize(float3(0.45f, 0.78f, 0.35f));
     const float sh = shadow_factor(world, float3(0.0f, 1.0f, 0.0f));
     const float lam = saturate((dot(n, sun) + 0.5f) / 1.5f);
     const float back = saturate(dot(-toward_eye, sun));
     const float through = 0.6f * back * back * back * sh;
     const float sky = saturate(n.y * 0.5f + 0.5f);
-    float3 col = albedo * ((0.32f + 0.85f * lam * sh) * ao + through) +
-                 float3(0.10f, 0.13f, 0.18f) * (0.5f + 0.5f * sky) * ao;
-    const float dist = length(world - cam_pos);
-    const float fog = saturate(dist / far_plane);
-    return lerp(col, float3(0.40f, 0.50f, 0.66f), fog * fog);
+    return scene_out(albedo * (0.85f * lam * sh * ao + through),
+                     albedo * 0.32f * ao + float3(0.10f, 0.13f, 0.18f) * (0.5f + 0.5f * sky) * ao,
+                     world, cam_pos, far_plane, contact, ssao);
 }
 
-float4 ps_blade(FolOut i, bool front : SV_IsFrontFace) : SV_Target {
+SceneOut ps_blade(FolOut i, bool front : SV_IsFrontFace) {
     const float d = length(i.world - cam_pos);
     if (dither(i.clip.xy) >= blade_fade(d)) discard;
     float3 n = normalize(i.nrm);
@@ -435,8 +435,10 @@ float4 ps_blade(FolOut i, bool front : SV_IsFrontFace) : SV_Target {
         albedo = hc == 0u ? float3(0.85f, 0.82f, 0.75f) : hc == 1u ? float3(0.85f, 0.70f, 0.15f)
                : hc == 2u ? float3(0.55f, 0.35f, 0.70f) : float3(0.80f, 0.30f, 0.30f);
     }
-    if (debug > 0.5f) return float4(0.9f, 0.9f, 0.1f, 1.0f);
-    return float4(shade_foliage(albedo, n, ao, i.world, normalize(cam_pos - i.world)), 1.0f);
+    if (debug > 0.5f) return scene_flat(float3(0.9f, 0.9f, 0.1f));
+    // Blades take a little: the base of a sward darkening where it meets a
+    // trunk or a stone reads; blade-on-blade does not.
+    return shade_foliage(albedo, n, ao, i.world, normalize(cam_pos - i.world), 0.3f * (1.0f - i.uv.y));
 }
 
 // Two crossed quads, verts 0..7.
@@ -464,7 +466,7 @@ FolOut vs_card(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     return o;
 }
 
-float4 ps_card(FolOut i) : SV_Target {
+SceneOut ps_card(FolOut i) {
     const float d = length(i.world - cam_pos);
     const float dz = dither(i.clip.xy);
     if (dz < blade_fade(d)) discard;
@@ -485,8 +487,8 @@ float4 ps_card(FolOut i) : SV_Target {
     const float dryness = saturate(i.dry) * smoothstep(0.1f, 0.9f, i.uv.y + 0.3f * i.dry);
     const float3 albedo = lerp(i.col, i.dcol, dryness);
     const float ao = lerp(0.4f, 1.0f, i.uv.y);
-    if (debug > 0.5f) return float4(0.1f, 0.6f, 0.9f, 1.0f);
-    return float4(shade_foliage(albedo, normalize(i.nrm), ao, i.world, normalize(cam_pos - i.world)), 1.0f);
+    if (debug > 0.5f) return scene_flat(float3(0.1f, 0.6f, 0.9f));
+    return shade_foliage(albedo, normalize(i.nrm), ao, i.world, normalize(cam_pos - i.world));
 }
 
 // A bush: 14 leaf cards round the inside of a squat ellipsoid, verts 0..55.
@@ -524,13 +526,13 @@ FolOut vs_bush(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     return o;
 }
 
-float4 ps_bush(FolOut i) : SV_Target {
+SceneOut ps_bush(FolOut i) {
     const float blur = length(fwidth(i.uv));
     const float a = leaf_coverage(i.uv, 1.0f, funit(i.seed), blur, 0.0f);
     const float thr = lerp(0.5f, dither(i.clip.xy), saturate(blur * 6.0f));
     if (a < thr) discard;
     const float3 albedo = lerp(i.col, i.dcol, i.dry) * (0.85f + 0.3f * funit(fhash(i.seed, 9u)));
     const float ao = lerp(0.45f, 1.0f, saturate(i.nrm.y));
-    if (debug > 0.5f) return float4(0.9f, 0.2f, 0.9f, 1.0f);
-    return float4(shade_foliage(albedo, normalize(i.nrm), ao, i.world, normalize(cam_pos - i.world)), 1.0f);
+    if (debug > 0.5f) return scene_flat(float3(0.9f, 0.2f, 0.9f));
+    return shade_foliage(albedo, normalize(i.nrm), ao, i.world, normalize(cam_pos - i.world));
 }

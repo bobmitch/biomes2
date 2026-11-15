@@ -205,6 +205,14 @@ public:
     // Sun shadows, three cascades. On by default; --no-shadows and L for A/B.
     void set_shadows(bool on) { shadows_on_ = on; }
     bool shadows() const { return shadows_on_; }
+    // The post chain (post.hlsl). All on by default; Y, O and J in the window.
+    void set_taa(bool on) { taa_on_ = on; hist_valid_ = false; }
+    bool taa() const { return taa_on_; }
+    void set_ao(bool on) { ao_on_ = on; }
+    bool ao() const { return ao_on_; }
+    void set_contact(bool on) { contact_on_ = on; }
+    bool contact() const { return contact_on_; }
+    void set_post_debug(float d) { post_debug_ = d; }
     bool trees_on() const { return trees_on_; }
     void set_tree_extras(const std::vector<TreeGpuInstance>& extra) {
         tree_extras_ = extra;
@@ -321,6 +329,28 @@ private:
     void*                        shadow_cb_cpu_[kFrameCount] = {};
     ComPtr<ID3D12PipelineState>  mesh_shadow_pso_;
     bool shadows_on_ = true;
+
+    // --- the post chain ---
+    bool create_post_targets(std::string& error);
+    bool create_post_pipelines(std::string& error);
+    void record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer);
+    ComPtr<ID3D12Resource> hdr_direct_, hdr_ambient_, scene_, ao_, history_[2];
+    ComPtr<ID3D12DescriptorHeap> post_rtv_heap_;
+    ComPtr<ID3D12RootSignature> post_root_;
+    ComPtr<ID3D12PipelineState> ao_pso_, composite_pso_, taa_pso_, final_pso_;
+    ComPtr<ID3D12Resource> post_cb_[kFrameCount];
+    void* post_cb_cpu_[kFrameCount] = {};
+    float view_proj_[16] = {};      // this frame, jittered
+    float view_proj_nj_[16] = {};   // this frame, unjittered
+    float prev_vp_[16] = {};        // last frame, unjittered
+    float prev_cam_[3] = {0, 0, 0};
+    float cur_cam_[3] = {0, 0, 0};
+    float jitter_[2] = {0, 0};
+    UINT  hist_cur_ = 0;
+    bool  hist_valid_ = false;
+    unsigned long long post_frame_ = 0;
+    bool  taa_on_ = true, ao_on_ = true, contact_on_ = true;
+    float post_debug_ = 0.0f;
     TreeField        tree_field_;
     TreeRenderer     trees_;
     TreeDrawSettings tree_settings_;

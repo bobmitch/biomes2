@@ -60,8 +60,11 @@ the streaming A/B switches `--no-lod-align`,
 `--no-lod-hold`, `--no-prioritise`, `--adaptive-budget` and
 `--lod-fade <frames>`, and the tree switches `--tree-distance <m>`,
 `--tree-debug 1|2|3|4` (tint by level; only LOD 0 / LOD 1 / impostors),
-`--tree-lod0 <m>`, `--no-trees`, `--no-shadows`, `--no-foliage` and
-`--foliage-debug 1`. `--walk` takes `--uncapped` to time frames at ground
+`--tree-lod0 <m>`, `--no-trees`, `--no-shadows`, `--no-foliage`,
+`--foliage-debug 1`, and the post chain's `--no-taa`, `--no-ao`,
+`--no-contact`, `--no-post` and `--post-debug 1|2` (AO alone, contact
+shadows alone). `--sea-shot` only PLACES the camera: pair it with `--shot`,
+or it falls through to the window loop with no window and never exits. `--walk` takes `--uncapped` to time frames at ground
 level, where the grass is. It is a GUI subsystem binary, so a shell does not wait
 on it: run it with `Start-Process -Wait` or the file you read will be the
 last run's.
@@ -497,6 +500,37 @@ temp registers (X4505). One call site per field function, each in a
 `[loop]`, the probes as one loop with a little state machine.
 
 Not handled: grass does not know about dig edits, and floats over a dug hole.
+
+### The frame: HDR targets and the post chain
+
+Scene shaders write TWO R16G16B16A16F targets through `scene_out.hlsli`: the
+sun's direct light, and everything else (sky, bounce, fog). Then
+`post.hlsl`: horizon-based AO at half resolution from depth; a composite of
+direct x screen-space contact shadow (a 0.5 m march towards the sun through
+depth) + ambient x AO; TAA (Halton 2,3 jitter over 8 frames, reprojection by
+depth with the unjittered previous matrix, YCoCg variance clipping, 1:9
+blend); then a light contrast-adaptive sharpen and a tonemap into the back
+buffer. Y / O / J toggle TAA, AO and contact shadows. A still renders 16
+frames so TAA converges. Cost: ~0.3 ms a frame at ground level, 0.09 of it
+the effects.
+
+- **The tonemap is the identity below 0.8.** The sky's clear colour comes
+  out bit for bit (102, 128, 168), so the crack detector -- sky colour below
+  the horizon is a hole -- still means what it says. A filmic curve would
+  have broken that instrument silently. Grade only above 0.8, or move the
+  detector to a pre-tonemap buffer first.
+- **Occlusion is per surface, in the targets' alpha.** Contact shadows over
+  foliage turned every crown nearly black: leaf cards shadow each other
+  everywhere inside the march, and the cascades already shadow them at their
+  own scale. The direct target's alpha says how much contact shadow a surface
+  takes (ground and bark 1, grass 0.3 at the root to 0 at the tip, leaves 0);
+  the ambient target's alpha does the same for AO (leaves 0.6, grass 0.4),
+  because dense grass occludes itself in depth everywhere. Measured on a
+  meadow still: AO and contact shadows darken the bottom half by ~9.5%
+  together; at full strength it was 13.5% and read as mud.
+- The sea writes its colour to the direct target as before and only REMOVES
+  ambient under it (ZERO / INV_SRC_ALPHA on target 1), so seabed AO does not
+  show through it.
 
 ### Shadows
 

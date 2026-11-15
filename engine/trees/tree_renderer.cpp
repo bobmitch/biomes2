@@ -289,8 +289,11 @@ bool TreeRenderer::create_pipelines(std::string& error) {
     }
 
     // --- graphics ---
+    // Scene pipelines draw into the renderer's two HDR targets
+    // (scene_out.hlsli); the bake draws into its own 8-bit atlas pair.
     auto make_pso = [&](const char* vs_e, const char* ps_e, UINT rts,
-                        ComPtr<ID3D12PipelineState>& out, bool shadow = false) -> bool {
+                        ComPtr<ID3D12PipelineState>& out, bool shadow = false,
+                        DXGI_FORMAT fmt = DXGI_FORMAT_R16G16B16A16_FLOAT) -> bool {
         ComPtr<ID3DBlob> vs, ps;
         if (!compile_shader(kTreeShader, vs_e, "vs_5_1", vs, error)) return false;
         if (!compile_shader(kTreeShader, ps_e, "ps_5_1", ps, error)) return false;
@@ -313,7 +316,7 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         pd.SampleMask = UINT_MAX;
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pd.NumRenderTargets = rts;
-        for (UINT i = 0; i < rts; ++i) pd.RTVFormats[i] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        for (UINT i = 0; i < rts; ++i) pd.RTVFormats[i] = fmt;
         pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
         pd.SampleDesc.Count = 1;
         if (shadow) {
@@ -324,9 +327,9 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (trees)", hr); return false; }
         return true;
     };
-    if (!make_pso("vs_mesh", "ps_mesh", 1, mesh_pso_)) return false;
-    if (!make_pso("vs_impostor", "ps_impostor", 1, imp_pso_)) return false;
-    if (!make_pso("vs_bake", "ps_bake", 2, bake_pso_)) return false;
+    if (!make_pso("vs_mesh", "ps_mesh", 2, mesh_pso_)) return false;
+    if (!make_pso("vs_impostor", "ps_impostor", 2, imp_pso_)) return false;
+    if (!make_pso("vs_bake", "ps_bake", 2, bake_pso_, false, DXGI_FORMAT_R8G8B8A8_UNORM)) return false;
     if (!make_pso("vs_mesh", "ps_mesh_shadow", 0, mesh_shadow_pso_, true)) return false;
     if (!make_pso("vs_impostor", "ps_impostor_shadow", 0, imp_shadow_pso_, true)) return false;
     return true;

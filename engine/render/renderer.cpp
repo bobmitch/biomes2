@@ -63,6 +63,61 @@ struct ShadowConstants {
 };
 static_assert(sizeof(ShadowConstants) == 256, "ShadowConstants must match shadow.hlsli");
 
+// The scene is drawn into two HDR targets -- direct sunlight and everything
+// else -- which the post chain combines (scene_out.hlsli, post.hlsl).
+const DXGI_FORMAT kSceneFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+// Matches cbuffer PostConstants in post.hlsl: 288 bytes.
+struct PostConstants {
+    float inv_view_proj[16];
+    float view_proj[16];
+    float prev_view_proj[16];
+    float cam_pos[3];  float time;
+    float sun_dir[3];  float near_plane;
+    float far_plane;   float sharpen;
+    float inv_size[2];
+    float jitter_ndc[2];
+    UINT  width, height;
+    UINT  hist_cur, flags;
+    UINT  frame;       float ao_radius;
+    float contact_len; float debug;
+    float pad[2];
+};
+static_assert(sizeof(PostConstants) == 288, "PostConstants must match post.hlsl");
+
+// 4x4 inverse (row-major), by cofactors.
+bool invert4(const float m[16], float out[16]) {
+    float inv[16];
+    inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+    inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+    inv[8] = m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+    inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+    inv[5] = m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+    inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+    inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+    inv[2] = m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+    inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+    inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+    inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+    inv[7] = m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+    inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+    const double det = double(m[0]) * inv[0] + double(m[1]) * inv[4] + double(m[2]) * inv[8] + double(m[3]) * inv[12];
+    if (det == 0.0) return false;
+    for (int i = 0; i < 16; ++i) out[i] = float(inv[i] / det);
+    return true;
+}
+
+// Halton (2, 3), the usual TAA sequence: eight sub-pixel offsets that fill
+// the pixel evenly before repeating.
+float halton(int i, int b) {
+    float f = 1.0f, r = 0.0f;
+    while (i > 0) { f /= float(b); r += f * float(i % b); i /= b; }
+    return r;
+}
+
 // Cascade far edges, metres from the camera. The last one is just past the
 // default tree draw distance; beyond it the shadow fades out under the fog.
 const float kCascadeSplit[4] = {0.2f, 35.0f, 140.0f, 520.0f};
@@ -291,7 +346,8 @@ bool Renderer::create_depth(std::string& error) {
     rd.Height = height_;
     rd.DepthOrArraySize = 1;
     rd.MipLevels = 1;
-    rd.Format = DXGI_FORMAT_D32_FLOAT;
+    // Typeless, so the post chain can read it as R32_FLOAT.
+    rd.Format = DXGI_FORMAT_R32_TYPELESS;
     rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
 
@@ -387,14 +443,22 @@ bool Renderer::create_water_pipeline(std::string& error) {
     rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
     rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    // The ambient target: the sea only removes what is under it there, so
+    // the seabed's occlusion does not show through (water.hlsl).
+    pd.BlendState.IndependentBlendEnable = TRUE;
+    D3D12_RENDER_TARGET_BLEND_DESC& rt1 = pd.BlendState.RenderTarget[1];
+    rt1 = rt;
+    rt1.SrcBlend = D3D12_BLEND_ZERO;
+    rt1.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
 
     pd.DepthStencilState.DepthEnable = TRUE;
     pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
     pd.SampleMask = UINT_MAX;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.NumRenderTargets = 2;
+    pd.RTVFormats[0] = kSceneFormat;
+    pd.RTVFormats[1] = kSceneFormat;
     pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     pd.SampleDesc.Count = 1;
 
@@ -593,8 +657,9 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
     pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
     pd.SampleMask = UINT_MAX;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.NumRenderTargets = 2;
+    pd.RTVFormats[0] = kSceneFormat;
+    pd.RTVFormats[1] = kSceneFormat;
     pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     pd.SampleDesc.Count = 1;
 
@@ -620,6 +685,7 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
     pd.PS.BytecodeLength = 0;
     pd.NumRenderTargets = 0;
     pd.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+    pd.RTVFormats[1] = DXGI_FORMAT_UNKNOWN;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.RasterizerState.SlopeScaledDepthBias = 2.0f;
@@ -677,7 +743,8 @@ bool Renderer::create_shadow_resources(std::string& error) {
     }
 
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 3;
+    // [0] shadow, [1..2] impostor atlases, [3..9] post SRVs, [10..13] post UAVs.
+    hd.NumDescriptors = 16;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srv_heap_));
     if (FAILED(hr)) { error = hr_text("shared srv heap", hr); return false; }
@@ -872,6 +939,7 @@ bool Renderer::reload_shaders(std::string& error) {
     if (!mesher_.reload_shaders(device_.Get(), error)) return false;
     if (!create_mesh_pipeline(error)) return false;
     if (!create_water_pipeline(error)) return false;
+    if (!create_post_pipelines(error)) return false;
     // Everything resident was built by the old kernel, so start again.
     streamer_.init();
     return true;
@@ -904,6 +972,8 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
 
     if (!create_depth(error)) return false;
     if (!create_shadow_resources(error)) return false;
+    if (!create_post_targets(error)) return false;
+    if (!create_post_pipelines(error)) return false;
 
     UINT64 tsfreq = 0;
     queue_->GetTimestampFrequency(&tsfreq);
@@ -1047,6 +1117,302 @@ void Renderer::resize(UINT width, UINT height) {
     std::string ignored;
     create_rtvs(ignored);
     create_depth(ignored);
+    create_post_targets(ignored);
+    hist_valid_ = false;
+}
+
+
+// --- the post chain ------------------------------------------------------------
+
+bool Renderer::create_post_targets(std::string& error) {
+    if (!post_rtv_heap_) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = 2;
+        if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&post_rtv_heap_)))) {
+            error = "post rtv heap";
+            return false;
+        }
+    }
+    const UINT w = width_ ? width_ : 1, h = height_ ? height_ : 1;
+    auto tex = [&](ComPtr<ID3D12Resource>& out, UINT tw, UINT th, DXGI_FORMAT fmt,
+                   D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state, const float* clear) -> bool {
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = tw;
+        rd.Height = th;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = fmt;
+        rd.SampleDesc.Count = 1;
+        rd.Flags = flags;
+        D3D12_CLEAR_VALUE cv = {};
+        cv.Format = fmt;
+        if (clear) for (int k = 0; k < 4; ++k) cv.Color[k] = clear[k];
+        out.Reset();
+        return SUCCEEDED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state,
+                                                          clear ? &cv : nullptr, IID_PPV_ARGS(&out)));
+    };
+    const float zero[4] = {0, 0, 0, 1};
+    const float sky[4] = {0.40f, 0.50f, 0.66f, 1.0f};
+    const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (!tex(hdr_direct_, w, h, kSceneFormat, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+             D3D12_RESOURCE_STATE_RENDER_TARGET, zero) ||
+        !tex(hdr_ambient_, w, h, kSceneFormat, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+             D3D12_RESOURCE_STATE_RENDER_TARGET, sky) ||
+        !tex(scene_, w, h, kSceneFormat, uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr) ||
+        !tex(ao_, (w + 1) / 2, (h + 1) / 2, DXGI_FORMAT_R8_UNORM, uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr) ||
+        !tex(history_[0], w, h, kSceneFormat, uav, read, nullptr) ||
+        !tex(history_[1], w, h, kSceneFormat, uav, read, nullptr)) {
+        error = "post targets";
+        return false;
+    }
+    const UINT rinc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_CPU_DESCRIPTOR_HANDLE r = post_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    device_->CreateRenderTargetView(hdr_direct_.Get(), nullptr, r);
+    r.ptr += rinc;
+    device_->CreateRenderTargetView(hdr_ambient_.Get(), nullptr, r);
+
+    const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto slot = [&](UINT i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE c = srv_heap_->GetCPUDescriptorHandleForHeapStart();
+        c.ptr += SIZE_T(i) * inc;
+        return c;
+    };
+    auto srv = [&](ID3D12Resource* res, DXGI_FORMAT fmt, UINT i) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = fmt;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        device_->CreateShaderResourceView(res, &sd, slot(i));
+    };
+    auto uavd = [&](ID3D12Resource* res, DXGI_FORMAT fmt, UINT i) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = fmt;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        device_->CreateUnorderedAccessView(res, nullptr, &ud, slot(i));
+    };
+    srv(depth_.Get(), DXGI_FORMAT_R32_FLOAT, 3);
+    srv(hdr_direct_.Get(), kSceneFormat, 4);
+    srv(hdr_ambient_.Get(), kSceneFormat, 5);
+    srv(ao_.Get(), DXGI_FORMAT_R8_UNORM, 6);
+    srv(scene_.Get(), kSceneFormat, 7);
+    srv(history_[0].Get(), kSceneFormat, 8);
+    srv(history_[1].Get(), kSceneFormat, 9);
+    uavd(ao_.Get(), DXGI_FORMAT_R8_UNORM, 10);
+    uavd(scene_.Get(), kSceneFormat, 11);
+    uavd(history_[0].Get(), kSceneFormat, 12);
+    uavd(history_[1].Get(), kSceneFormat, 13);
+    hist_valid_ = false;
+    return true;
+}
+
+bool Renderer::create_post_pipelines(std::string& error) {
+    if (!post_root_) {
+        D3D12_DESCRIPTOR_RANGE sr = {};
+        sr.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr.NumDescriptors = 7;
+        D3D12_DESCRIPTOR_RANGE ur = {};
+        ur.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ur.NumDescriptors = 4;
+        D3D12_ROOT_PARAMETER p[3] = {};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[1].DescriptorTable.NumDescriptorRanges = 1;
+        p[1].DescriptorTable.pDescriptorRanges = &sr;
+        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[2].DescriptorTable.NumDescriptorRanges = 1;
+        p[2].DescriptorTable.pDescriptorRanges = &ur;
+        for (int k = 0; k < 3; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_STATIC_SAMPLER_DESC ss[2] = {};
+        ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        ss[1].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        for (int k = 0; k < 2; ++k) {
+            ss[k].AddressU = ss[k].AddressV = ss[k].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            ss[k].MaxLOD = D3D12_FLOAT32_MAX;
+            ss[k].ShaderRegister = k;
+            ss[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        }
+        D3D12_ROOT_SIGNATURE_DESC rsd = {};
+        rsd.NumParameters = 3;
+        rsd.pParameters = p;
+        rsd.NumStaticSamplers = 2;
+        rsd.pStaticSamplers = ss;
+        ComPtr<ID3DBlob> sig, err;
+        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+        if (FAILED(hr)) { error = "post root signature"; return false; }
+        hr = device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&post_root_));
+        if (FAILED(hr)) { error = hr_text("CreateRootSignature (post)", hr); return false; }
+        for (UINT f = 0; f < kFrameCount; ++f) {
+            D3D12_HEAP_PROPERTIES up = {};
+            up.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC bd = {};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = 512;
+            bd.Height = 1;
+            bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            hr = device_->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                  nullptr, IID_PPV_ARGS(&post_cb_[f]));
+            if (FAILED(hr)) { error = hr_text("post cb", hr); return false; }
+            post_cb_[f]->Map(0, nullptr, &post_cb_cpu_[f]);
+        }
+    }
+    const char* kPost = "engine/render/shaders/post.hlsl";
+    const char* cs_e[3] = {"cs_ao", "cs_composite", "cs_taa"};
+    ComPtr<ID3D12PipelineState>* cs_o[3] = {&ao_pso_, &composite_pso_, &taa_pso_};
+    for (int k = 0; k < 3; ++k) {
+        ComPtr<ID3DBlob> cs;
+        if (!compile_shader(kPost, cs_e[k], "cs_5_1", cs, error)) return false;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cd = {};
+        cd.pRootSignature = post_root_.Get();
+        cd.CS.pShaderBytecode = cs->GetBufferPointer();
+        cd.CS.BytecodeLength = cs->GetBufferSize();
+        if (FAILED(device_->CreateComputePipelineState(&cd, IID_PPV_ARGS(cs_o[k]->GetAddressOf())))) {
+            error = "post compute pso";
+            return false;
+        }
+    }
+    ComPtr<ID3DBlob> vs, ps;
+    if (!compile_shader(kPost, "vs_full", "vs_5_1", vs, error)) return false;
+    if (!compile_shader(kPost, "ps_final", "ps_5_1", ps, error)) return false;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = post_root_.Get();
+    pd.VS.pShaderBytecode = vs->GetBufferPointer();
+    pd.VS.BytecodeLength = vs->GetBufferSize();
+    pd.PS.pShaderBytecode = ps->GetBufferPointer();
+    pd.PS.BytecodeLength = ps->GetBufferSize();
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    if (FAILED(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&final_pso_)))) {
+        error = "post final pso";
+        return false;
+    }
+    return true;
+}
+
+void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
+    const bool wire = mode_ == Mode::Wireframe;
+    // TAA only reprojects static surfaces by depth; a camera that jumped
+    // (Tab, a teleport, the first frame) starts the history over.
+    const float jx = cur_cam_[0] - prev_cam_[0], jy = cur_cam_[1] - prev_cam_[1], jz = cur_cam_[2] - prev_cam_[2];
+    if (jx * jx + jy * jy + jz * jz > 400.0f) hist_valid_ = false;
+
+    PostConstants pc = {};
+    invert4(view_proj_, pc.inv_view_proj);
+    std::memcpy(pc.view_proj, view_proj_, sizeof pc.view_proj);
+    std::memcpy(pc.prev_view_proj, prev_vp_, sizeof pc.prev_view_proj);
+    for (int k = 0; k < 3; ++k) pc.cam_pos[k] = cur_cam_[k];
+    pc.sun_dir[0] = 0.45f; pc.sun_dir[1] = 0.78f; pc.sun_dir[2] = 0.35f;
+    pc.near_plane = kNearPlane;
+    pc.far_plane = kFarPlane;
+    pc.sharpen = taa_on_ && !wire ? 0.5f : 0.0f;
+    pc.inv_size[0] = 1.0f / float(width_);
+    pc.inv_size[1] = 1.0f / float(height_);
+    pc.jitter_ndc[0] = jitter_[0];
+    pc.jitter_ndc[1] = jitter_[1];
+    pc.width = width_;
+    pc.height = height_;
+    pc.hist_cur = hist_cur_;
+    pc.flags = (taa_on_ && !wire ? 1u : 0u) | (ao_on_ && !wire ? 2u : 0u) |
+               (contact_on_ && !wire ? 4u : 0u) | (hist_valid_ ? 8u : 0u);
+    pc.frame = static_cast<UINT>(post_frame_);
+    pc.ao_radius = 1.2f;
+    pc.contact_len = 0.5f;
+    pc.debug = post_debug_;
+    std::memcpy(post_cb_cpu_[frame_], &pc, sizeof pc);
+
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+        D3D12_RESOURCE_BARRIER rb = {};
+        rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        rb.Transition.pResource = r;
+        rb.Transition.StateBefore = a;
+        rb.Transition.StateAfter = b;
+        rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd_->ResourceBarrier(1, &rb);
+    };
+    auto uavb = [&](ID3D12Resource* r) {
+        D3D12_RESOURCE_BARRIER rb = {};
+        rb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        rb.UAV.pResource = r;
+        cmd_->ResourceBarrier(1, &rb);
+    };
+    tr(depth_.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, read);
+    tr(hdr_direct_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
+    tr(hdr_ambient_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
+
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
+    cmd_->SetDescriptorHeaps(1, heaps);
+    const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_GPU_DESCRIPTOR_HANDLE srvs = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+    srvs.ptr += UINT64(3) * inc;
+    D3D12_GPU_DESCRIPTOR_HANDLE uavs = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+    uavs.ptr += UINT64(10) * inc;
+    cmd_->SetComputeRootSignature(post_root_.Get());
+    cmd_->SetComputeRootConstantBufferView(0, post_cb_[frame_]->GetGPUVirtualAddress());
+    cmd_->SetComputeRootDescriptorTable(1, srvs);
+    cmd_->SetComputeRootDescriptorTable(2, uavs);
+
+    // AO at half resolution.
+    cmd_->SetPipelineState(ao_pso_.Get());
+    cmd_->Dispatch(((width_ + 1) / 2 + 7) / 8, ((height_ + 1) / 2 + 7) / 8, 1);
+    tr(ao_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+    // Direct x contact + ambient x AO.
+    cmd_->SetPipelineState(composite_pso_.Get());
+    cmd_->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
+    tr(scene_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+    // TAA into this frame's history.
+    ID3D12Resource* cur = history_[hist_cur_].Get();
+    tr(cur, read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    cmd_->SetPipelineState(taa_pso_.Get());
+    cmd_->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
+    uavb(cur);
+    tr(cur, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+
+    // Sharpen and tonemap into the back buffer.
+    D3D12_VIEWPORT vp = {};
+    vp.Width = float(width_);
+    vp.Height = float(height_);
+    vp.MaxDepth = 1.0f;
+    D3D12_RECT sc = {0, 0, LONG(width_), LONG(height_)};
+    cmd_->RSSetViewports(1, &vp);
+    cmd_->RSSetScissorRects(1, &sc);
+    cmd_->OMSetRenderTargets(1, &backbuffer, FALSE, nullptr);
+    cmd_->SetGraphicsRootSignature(post_root_.Get());
+    cmd_->SetGraphicsRootConstantBufferView(0, post_cb_[frame_]->GetGPUVirtualAddress());
+    cmd_->SetGraphicsRootDescriptorTable(1, srvs);
+    cmd_->SetGraphicsRootDescriptorTable(2, uavs);
+    cmd_->SetPipelineState(final_pso_.Get());
+    cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmd_->DrawInstanced(3, 1, 0, 0);
+
+    // Back to where the next frame starts.
+    tr(ao_.Get(), read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    tr(scene_.Get(), read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    tr(depth_.Get(), read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    tr(hdr_direct_.Get(), read, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    tr(hdr_ambient_.Get(), read, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    hist_valid_ = taa_on_ && !wire;
+    hist_cur_ ^= 1u;
+    std::memcpy(prev_vp_, view_proj_nj_, sizeof prev_vp_);
+    for (int k = 0; k < 3; ++k) prev_cam_[k] = cur_cam_[k];
+    ++post_frame_;
 }
 
 void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HANDLE rtv) {
@@ -1062,13 +1428,35 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     cmd_->RSSetViewports(1, &vp);
     cmd_->RSSetScissorRects(1, &scissor);
 
+    // The scene goes into the two HDR targets; the back buffer only receives
+    // the post chain's result (record_post).
     const D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
-    cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    D3D12_CPU_DESCRIPTOR_HANDLE hdr[2];
+    hdr[0] = post_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    hdr[1] = hdr[0];
+    hdr[1].ptr += device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    cmd_->OMSetRenderTargets(2, hdr, FALSE, &dsv);
     cmd_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
     cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     MeshConstants mc = {};
     build_view_proj(view, mc.view_proj);
+    // TAA's sub-pixel jitter: Halton (2, 3) over 8 frames, as an NDC offset
+    // added to clip x and y in proportion to w. The unjittered matrix is what
+    // the next frame reprojects with.
+    std::memcpy(view_proj_nj_, mc.view_proj, sizeof view_proj_nj_);
+    jitter_[0] = jitter_[1] = 0.0f;
+    if (taa_on_ && mode_ != Mode::Wireframe) {
+        const int ji = int(post_frame_ % 8) + 1;
+        jitter_[0] = (halton(ji, 2) - 0.5f) * 2.0f / float(width_);
+        jitter_[1] = (halton(ji, 3) - 0.5f) * 2.0f / float(height_);
+        for (int r = 0; r < 4; ++r) {
+            mc.view_proj[r * 4 + 0] += jitter_[0] * mc.view_proj[r * 4 + 3];
+            mc.view_proj[r * 4 + 1] += jitter_[1] * mc.view_proj[r * 4 + 3];
+        }
+    }
+    std::memcpy(view_proj_, mc.view_proj, sizeof view_proj_);
+    for (int k = 0; k < 3; ++k) cur_cam_[k] = view.cam_pos[k];
     mc.cam_pos[0] = view.cam_pos[0];
     mc.cam_pos[1] = view.cam_pos[1];
     mc.cam_pos[2] = view.cam_pos[2];
@@ -1081,9 +1469,11 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
 
     {
         // The mesh does not cover the screen, so the sky is cleared rather
-        // than drawn.
+        // than drawn: into the ambient target, with no direct light.
         const float sky[4] = {0.40f, 0.50f, 0.66f, 1.0f};
-        cmd_->ClearRenderTargetView(rtv, sky, 0, nullptr);
+        const float none[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        cmd_->ClearRenderTargetView(hdr[0], none, 0, nullptr);
+        cmd_->ClearRenderTargetView(hdr[1], sky, 0, nullptr);
     }
 
     {
@@ -1201,6 +1591,8 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         cmd_->IASetIndexBuffer(&water_ibv_);
         cmd_->DrawIndexedInstanced(water_index_count_, 1, 0, 0, 0);
     }
+
+    record_post(rtv);
 }
 
 // Record the copy of this frame's newly meshed chunks into this frame's
@@ -1667,6 +2059,33 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
                                                   D3D12_RESOURCE_STATE_COPY_DEST,
                                                   nullptr, IID_PPV_ARGS(&readback));
     if (FAILED(hr)) { error = hr_text("CreateCommittedResource (readback)", hr); return false; }
+
+    // TAA needs frames to converge: a still renders sixteen with the same
+    // camera and the jitter walking, and captures the last.
+    if (taa_on_ && mode_ != Mode::Wireframe) {
+        hist_valid_ = false;
+        for (int warm = 0; warm < 16; ++warm) {
+            allocators_[frame_]->Reset();
+            cmd_->Reset(allocators_[frame_].Get(), nullptr);
+            D3D12_RESOURCE_BARRIER wb = {};
+            wb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            wb.Transition.pResource = targets_[frame_].Get();
+            wb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            wb.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+            wb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            cmd_->ResourceBarrier(1, &wb);
+            D3D12_CPU_DESCRIPTOR_HANDLE wrtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+            wrtv.ptr += static_cast<SIZE_T>(frame_) * rtv_stride_;
+            record_scene(view, wrtv);
+            wb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            wb.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+            cmd_->ResourceBarrier(1, &wb);
+            cmd_->Close();
+            ID3D12CommandList* wl[] = {cmd_.Get()};
+            queue_->ExecuteCommandLists(1, wl);
+            wait_for_gpu();
+        }
+    }
 
     allocators_[frame_]->Reset();
     cmd_->Reset(allocators_[frame_].Get(), nullptr);

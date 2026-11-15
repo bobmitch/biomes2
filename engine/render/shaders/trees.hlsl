@@ -88,6 +88,7 @@ SamplerState                   g_linear    : register(s0);
 static const float3 kSky = float3(0.40f, 0.50f, 0.66f);
 
 #include "engine/render/shaders/leaf.hlsli"
+#include "engine/render/shaders/scene_out.hlsli"
 
 float3 qrot(float4 q, float3 v) {
     const float3 t = 2.0f * cross(q.xyz, v);
@@ -120,10 +121,10 @@ float3 bark_albedo(float3 base, float2 uv, float footprint) {
 
 // `sh` is the sun's visibility from shadow.hlsli: it scales the direct and
 // the transmitted light, never the sky.
-float3 shade(float3 albedo, float3 n, float ao, float3 world, bool foliage, float sh) {
+SceneOut shade(float3 albedo, float3 n, float ao, float3 world, bool foliage, float sh) {
     const float3 sun = normalize(float3(0.45f, 0.78f, 0.35f));
     const float sky = saturate(n.y * 0.5f + 0.5f);
-    float3 col;
+    float3 dir, amb;
     if (foliage) {
         // A crown is lit THROUGH as much as on: wrapped diffuse, light that
         // leaks through the leaves when the sun is behind them, and skylight
@@ -134,19 +135,17 @@ float3 shade(float3 albedo, float3 n, float ao, float3 world, bool foliage, floa
         const float3 v = normalize(cam_pos - world);
         const float back = saturate(dot(-v, sun));
         const float through = 0.45f * back * back * back * sh;
-        col = albedo * ((0.34f + 0.66f * lam * sh) * (0.45f + 0.55f * ao) + through) +
-              float3(0.10f, 0.13f, 0.18f) * (0.5f + 0.5f * sky) * ao;
+        dir = albedo * (0.66f * lam * sh * (0.45f + 0.55f * ao) + through);
+        amb = albedo * 0.34f * (0.45f + 0.55f * ao) + float3(0.10f, 0.13f, 0.18f) * (0.5f + 0.5f * sky) * ao;
     } else {
         // Bark gets more fill than open ground: under a crown, light that
         // bounced off leaves and the floor reaches the shaded side, and with
         // the ground's 0.22 every trunk's shadow side read as black.
         const float lam = saturate(dot(n, sun));
-        col = albedo * (0.36f * ao + 0.70f * lam * sh * (0.35f + 0.65f * ao)) +
-              float3(0.12f, 0.15f, 0.19f) * (0.4f + 0.6f * sky) * ao;
+        dir = albedo * (0.70f * lam * sh * (0.35f + 0.65f * ao));
+        amb = albedo * 0.36f * ao + float3(0.12f, 0.15f, 0.19f) * (0.4f + 0.6f * sky) * ao;
     }
-    const float dist = length(world - cam_pos);
-    const float fog = saturate(dist / far_plane);
-    return lerp(col, kSky, fog * fog);
+    return scene_out(dir, amb, world, cam_pos, far_plane, foliage ? 0.0f : 1.0f, foliage ? 0.6f : 1.0f);
 }
 
 // --- mesh pass ----------------------------------------------------------------
@@ -232,7 +231,7 @@ MeshOut vs_mesh(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     return o;
 }
 
-float4 ps_mesh(MeshOut i, bool front : SV_IsFrontFace) : SV_Target {
+SceneOut ps_mesh(MeshOut i, bool front : SV_IsFrontFace) {
     if (!keep_pixel(i.clip.xy, i.packed)) discard;
     // The cut: a log keeps the trunk above it, a stump below it.
     if (i.mode == 1u && i.kind < 0.5f) clip(i.local_y - cut_height + 0.002f);
@@ -268,9 +267,9 @@ float4 ps_mesh(MeshOut i, bool front : SV_IsFrontFace) : SV_Target {
     }
     if (debug > 0.5f && debug < 1.5f) {
         // 1: which level drew it -- LOD 0 red, LOD 1 green (packed bit 29).
-        return float4(((i.packed >> 29) & 1u) != 0u ? float3(0.2f, 0.8f, 0.2f) : float3(0.9f, 0.2f, 0.2f), 1.0f);
+        return scene_flat(((i.packed >> 29) & 1u) != 0u ? float3(0.2f, 0.8f, 0.2f) : float3(0.9f, 0.2f, 0.2f));
     }
-    return float4(shade(albedo, n, ao, i.world, foliage, shadow_factor(i.world, n)), 1.0f);
+    return shade(albedo, n, ao, i.world, foliage, shadow_factor(i.world, n));
 }
 
 // The mesh as a shadow caster: the same cut, the same leaf coverage, no
@@ -405,21 +404,21 @@ bool impostor_fetch(ImpOut i, float3 rd, out float4 acc_a, out float4 acc_n) {
     return acc_a.a / wsum >= 0.45f;
 }
 
-float4 ps_impostor(ImpOut i) : SV_Target {
+SceneOut ps_impostor(ImpOut i) {
     if (!keep_pixel(i.clip.xy, i.packed)) discard;
     float4 acc_a, acc_n;
     if (!impostor_fetch(i, normalize(i.world - cam_pos), acc_a, acc_n)) discard;
     const float3 albedo = (acc_a.rgb / max(acc_a.a, 1e-4f)) * (0.9f + 0.2f * i.tint);
     const float3 nl = normalize(acc_n.rgb / max(acc_n.a, 1e-4f) * 2.0f - 1.0f);
     const float3 nw = to_world(nl, i.yaw);
-    if (debug > 0.5f && debug < 1.5f) return float4(0.2f, 0.3f, 0.95f, 1.0f);
+    if (debug > 0.5f && debug < 1.5f) return scene_flat(float3(0.2f, 0.3f, 0.95f));
     // The card runs through the middle of the crown, so a shadow lookup on it
     // would find the tree's own front half and darken every distant tree.
     // Look from just outside its bound on the sun's side instead: hills and
     // other trees still shade it, its own crown does not.
     const float3 sun = normalize(float3(0.45f, 0.78f, 0.35f));
     const float sh = shadow_factor(i.world + sun * i.bound, sun);
-    return float4(shade(albedo, nw, 1.0f, i.world, true, sh), 1.0f);
+    return shade(albedo, nw, 1.0f, i.world, true, sh);
 }
 
 // An impostor casting: its card already faces the sun (the shadow pass hands
