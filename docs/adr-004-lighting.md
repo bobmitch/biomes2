@@ -353,6 +353,41 @@ the day it does not.
   and light shafts through the haze (L4's froxels). The sea is still the
   weakest surface.
 
+## L6, step 1 — crown volumes and a traced sky, 2026-11-15
+
+The first piece of L6 is the shade under a canopy, because it is the one
+thing the no-GI fallback gets most wrong: the ambient target lit a woodland
+floor as if it stood in a field.
+
+- **Crown volumes.** One procedural BLAS -- a unit AABB, a sphere
+  intersected in `gi_transmittance` -- instanced per standing tree as an
+  ellipsoid from where its crown starts to its top, 0.9 of the leaves'
+  reach across, carrying the species' `leaf_density` from archetypes.json
+  (m^2 of leaf per m^3; extinction G x LAD with Ross's G = 0.5). Mask 0x4:
+  the key-light shadow never sees them, so the alpha-tested cards keep
+  every sunfleck; only diffuse rays take Beer-Lambert through a crown.
+  They enter the TLAS only while something traces them.
+- **`gi_transmittance`**: 0 at any opaque hit (terrain, a trunk), else
+  exp(-sum sigma x chord), cards culled. An opaque hit anywhere ends it, so
+  traversal order does not matter.
+- **The consumer** (`--rt-sky`, Shift+R): one cosine-weighted ray a pixel a
+  frame in `rt_shadow.hlsl`, an R2 sequence rotated per pixel, 80 m long,
+  integrated by TAA. The composite multiplies the AMBIENT target by it. A
+  ray heading down stands for the ground's bounce and does not see terrain;
+  a ray from a leaf or trunk skips the crown it starts inside -- charging a
+  leaf for the whole crown behind it drew every crown dark from outside.
+- **Measured** (`--rt-report`, the sky lines): mean sky visibility in the
+  wood 0.90 with terrain and trunks, 0.50 with crowns; spawn 0.93 / 0.59;
+  the bare hillside 0.86 either way. At fixed exposure (`--ev100 13`) the
+  shaded half of the woodland floor goes from luma 82.6 to 58.5; trunks
+  alone take it to 80.6. Sunlit ground does not move.
+- **Cost:** +0.5 ms for terrain and trunks, +1.0 ms more for the crowns in
+  a dense wood (1.40 -> 2.95 ms for the whole trace); 0.2 ms on the
+  hillside. Full resolution; half resolution or the probes are the fix.
+- **Not done:** the ambient target also holds local light, which the sky
+  visibility dims too (a torch under a tree) until DDGI separates them;
+  the no-RT tier's canopy-cover map; the probes themselves.
+
 ## L5 — done, 2026-11-15
 
 - **The scene:** a BLAS per drawn LOD 0-3 chunk, straight from the mesh

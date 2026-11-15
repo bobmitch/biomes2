@@ -45,6 +45,7 @@ struct TreeLook {
     float trunk = 0.025f;         // base radius as a fraction of height
     float leaf_size = 1.0f;       // card edge, metres
     int   limbs = 6;
+    float leaf_density = 0.5f;    // leaf area density in the crown, m^2/m^3: the RT crown volume's extinction
     float nominal_height = 15.0f; // metres the mesh is built at
 };
 

@@ -23,7 +23,8 @@ void uav_all(ID3D12GraphicsCommandList* cmd) {
 }
 }  // namespace
 
-// Matches TreeRtInfo in gi_trace.hlsli.
+// Matches TreeRtInfo in gi_trace.hlsli. bark[3] is the crown volume's
+// extinction, 1/m.
 struct TreeRtInfo {
     UINT vbase, ibase_bark, ibase_leaf, narrow;   // narrow: weeping leaves, as the raster's leaf_kind
     float bark[4], leaf[4];
@@ -173,11 +174,29 @@ bool RtScene::build_trees(ID3D12GraphicsCommandList4* cl, const std::vector<Tree
         const size_t species = m / kTreeVariants;
         if (species < looks.size()) {
             ti.narrow = looks[species].form == TreeForm::Weeping ? 1u : 0u;
+            // Beer-Lambert through a crown of randomly oriented leaves: the
+            // extinction is G * leaf area density, with G = 0.5 for a
+            // spherical leaf-angle distribution (Ross).
+            ti.bark[3] = 0.5f * looks[species].leaf_density;
             for (int k = 0; k < 3; ++k) {
                 ti.bark[k] = srgb_lin(looks[species].bark[k]);
                 ti.leaf[k] = srgb_lin(looks[species].leaf[k]);
             }
         }
+    }
+    // Each model's crown as an ellipsoid: from where the crown starts to the
+    // top, as wide as the leaves reach. A tree with no leaves has none.
+    crowns_by_model_.assign(models.size(), Crown());
+    for (size_t m = 0; m < models.size(); ++m) {
+        const size_t species = m / kTreeVariants;
+        Crown& c = crowns_by_model_[m];
+        c.cy = c.rh = c.rv = 0.0f;
+        if (species >= looks.size() || looks[species].leaf_density <= 0.0f) continue;
+        const TreeModel& tm = models[m];
+        c.rv = 0.5f * (tm.top - tm.crown_base);
+        c.cy = tm.crown_base + c.rv;
+        c.rh = 0.9f * tm.radius;
+        if (c.rv < 0.25f || c.rh < 0.25f) c.rh = c.rv = 0.0f;
     }
     if (pos.empty() || idx.empty()) return false;
     auto upload = [&](const void* src, UINT64 bytes, ComPtr<ID3D12Resource>& out) -> bool {
@@ -194,7 +213,39 @@ bool RtScene::build_trees(ID3D12GraphicsCommandList4* cl, const std::vector<Tree
 
     // One BLAS per model, each with its own scratch: forty-odd, once.
     tree_blas_.assign(models.size(), ComPtr<ID3D12Resource>());
-    std::vector<ComPtr<ID3D12Resource> > scratch(models.size());
+    std::vector<ComPtr<ID3D12Resource> > scratch(models.size() + 1);
+    // The crowns' one BLAS: a unit AABB; gi_trace intersects the sphere in it.
+    // OPAQUE, so a ray that culls non-opaque geometry -- the sky ray, which
+    // takes crowns as a volume and so skips the cards -- still meets it.
+    {
+        const D3D12_RAYTRACING_AABB box = {-1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f};
+        if (!upload(&box, sizeof box, crown_aabb_)) return false;
+        D3D12_RAYTRACING_GEOMETRY_DESC g = {};
+        g.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS;
+        g.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+        g.AABBs.AABBCount = 1;
+        g.AABBs.AABBs.StartAddress = crown_aabb_->GetGPUVirtualAddress();
+        g.AABBs.AABBs.StrideInBytes = sizeof(D3D12_RAYTRACING_AABB);
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in = {};
+        in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+        in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+        in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        in.NumDescs = 1;
+        in.pGeometryDescs = &g;
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pi = {};
+        dev_->GetRaytracingAccelerationStructurePrebuildInfo(&in, &pi);
+        ComPtr<ID3D12Resource>& cs = scratch[models.size()];
+        if (!make_buffer(pi.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+                         D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true, crown_blas_) ||
+            !make_buffer(pi.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                         true, cs)) return false;
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bd = {};
+        bd.Inputs = in;
+        bd.DestAccelerationStructureData = crown_blas_->GetGPUVirtualAddress();
+        bd.ScratchAccelerationStructureData = cs->GetGPUVirtualAddress();
+        cl->BuildRaytracingAccelerationStructure(&bd, 0, nullptr);
+        stats_.blas_bytes += pi.ResultDataMaxSizeInBytes;
+    }
     for (size_t m = 0; m < models.size(); ++m) {
         const Range& r = ranges[m];
         D3D12_RAYTRACING_GEOMETRY_DESC g[2] = {};
@@ -388,13 +439,15 @@ void RtScene::record(ID3D12GraphicsCommandList* cmd, UINT frame,
         std::memset(&d, 0, sizeof d);
         d.Transform[0][0] = d.Transform[1][1] = d.Transform[2][2] = 1.0f;
         d.InstanceID = slot;
-        d.InstanceMask = 0x1;
+        d.InstanceMask = kMaskTerrain;
         d.AccelerationStructure = sb.blas->GetGPUVirtualAddress();
         ++stats_.instances_terrain;
     }
     stats_.instances_trees = 0;
+    stats_.instances_crowns = 0;
     const float r2 = tree_range * tree_range;
-    for (size_t i = 0; !(debug_ & 4u) && i < trees.size() && n < max_instances_ && stats_.instances_trees < kMaxTreeInstances; ++i) {
+    for (size_t i = 0; !(debug_ & 4u) && i < trees.size() && n < max_instances_ &&
+                       stats_.instances_trees + stats_.instances_crowns < kMaxTreeInstances; ++i) {
         const TreeGpuInstance& t = trees[i];
         if (t.mode != 0 || t.model >= tree_blas_.size() || !tree_blas_[t.model]) continue;
         const float dx = t.pos[0] - cam[0], dz = t.pos[2] - cam[2];
@@ -411,9 +464,26 @@ void RtScene::record(ID3D12GraphicsCommandList* cmd, UINT frame,
             d.Transform[r][3] = t.pos[r];
         }
         d.InstanceID = kTreeFlag | t.model;
-        d.InstanceMask = 0x2;
+        d.InstanceMask = kMaskTrees;
         d.AccelerationStructure = tree_blas_[t.model]->GetGPUVirtualAddress();
         ++stats_.instances_trees;
+        // Its crown: the unit sphere scaled to the ellipsoid, then placed as
+        // the tree is. Counts against the same cap as the trees.
+        if (!crowns_ || !crown_blas_ || t.model >= crowns_by_model_.size() || n >= max_instances_ ||
+            stats_.instances_trees + stats_.instances_crowns >= kMaxTreeInstances) continue;
+        const Crown& c = crowns_by_model_[t.model];
+        if (c.rh <= 0.0f) continue;
+        D3D12_RAYTRACING_INSTANCE_DESC& e = inst[n++];
+        std::memset(&e, 0, sizeof e);
+        const float rad[3] = {c.rh, c.rv, c.rh};
+        for (int r = 0; r < 3; ++r) {
+            for (int k = 0; k < 3; ++k) e.Transform[r][k] = R[r][k] * s * rad[k];
+            e.Transform[r][3] = t.pos[r] + R[r][1] * s * c.cy;
+        }
+        e.InstanceID = kCrownFlag | t.model;
+        e.InstanceMask = kMaskCrowns;
+        e.AccelerationStructure = crown_blas_->GetGPUVirtualAddress();
+        ++stats_.instances_crowns;
     }
     // Slots nobody has drawn for a while give their BLAS back.
     for (UINT s = 0; s < kSlots; ++s) {

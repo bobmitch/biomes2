@@ -39,14 +39,19 @@ StructuredBuffer<float4>     g_rt_tree_attr : register(t37);   // per vertex: u,
 
 static const uint  kRtSlotIndices = 36864;     // chunk_mesher.h kSlotIndices
 static const uint  kRtTreeFlag = 0x800000u;    // rt_scene.h
-static const uint  kRtMaskTerrain = 0x1u, kRtMaskTrees = 0x2u;
+static const uint  kRtCrownFlag = 0x400000u;   // rt_scene.h: a crown volume, kRtCrownFlag | model
+static const uint  kRtMaskTerrain = 0x1u, kRtMaskTrees = 0x2u, kRtMaskCrowns = 0x4u;
+// What the surface rays see: terrain and the trees' own geometry. Crowns are
+// a volume for diffuse rays only (gi_transmittance) -- a shadow ray through
+// one would blur every sunfleck the alpha-tested cards make.
+static const uint  kRtMaskSurfaces = 0x3u;
 // Whether a ray meeting a leaf card at these barycentrics meets a leaf: the
 // raster's own pattern (leaf.hlsli) at the card's interpolated uv, tested at
 // 0.5 as a sharp card is. A first version passed 55% of the light through
 // every card instead; a low sun crossed so many that a wood's floor lost
 // every trunk shadow under a uniform dimness.
 bool rt_leaf_solid(uint inst, uint prim, float2 b) {
-    const TreeRtInfo ti = g_rt_tree_info[inst & 0x7FFFFFu];
+    const TreeRtInfo ti = g_rt_tree_info[inst & 0x3FFFFFu];
     const uint ib = ti.ibase_leaf + 3u * prim;
     const float4 a0 = g_rt_tree_attr[ti.vbase + g_rt_tree_idx[ib + 0u]];
     const float4 a1 = g_rt_tree_attr[ti.vbase + g_rt_tree_idx[ib + 1u]];
@@ -72,7 +77,46 @@ float gi_occluded_masked(GiRay r, uint mask) {
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0f : 1.0f;
 }
 
-float gi_occluded(GiRay r) { return gi_occluded_masked(r, 0xFFu); }
+float gi_occluded(GiRay r) { return gi_occluded_masked(r, kRtMaskSurfaces); }
+
+// The light that gets through along r for a DIFFUSE ray (ADR-004 L6): 0 at
+// any opaque hit -- terrain, a trunk -- and Beer-Lambert through every crown
+// volume it crosses, exp(-sum sigma * chord). Leaf cards are culled: the
+// crowns stand for them, and a smooth volume is what keeps a few rays a
+// pixel from being noise. Order does not matter -- an opaque hit anywhere
+// zeroes the lot -- so the first one ends the search.
+//
+// `own_crown` false skips any crown the ray STARTS inside: a leaf at the edge
+// of its crown sees open sky over the outward half, and charging it the
+// whole crown behind it drew every crown dark from outside. The ground under
+// a low crown keeps it.
+float gi_transmittance_masked(GiRay r, uint mask, bool own_crown) {
+    RayQuery<RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+    RayDesc rd;
+    rd.Origin = r.origin; rd.TMin = r.tmin; rd.Direction = r.dir; rd.TMax = r.tmax;
+    q.TraceRayInline(g_tlas, RAY_FLAG_NONE, mask, rd);
+    float tau = 0.0f;
+    while (q.Proceed()) {
+        if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
+        // The instance maps the unit sphere onto the crown, and the object-
+        // space ray keeps the world ray's parameter, so these t are metres.
+        const float3 o = q.CandidateObjectRayOrigin();
+        const float3 d = q.CandidateObjectRayDirection();
+        const float a = dot(d, d), b = dot(o, d), c = dot(o, o) - 1.0f;
+        const float disc = b * b - a * c;
+        if (disc <= 0.0f || (!own_crown && c < 0.0f)) continue;
+        const float s = sqrt(disc);
+        const float t0 = max((-b - s) / a, q.RayTMin());
+        const float t1 = min((-b + s) / a, q.CommittedRayT());
+        if (t1 <= t0) continue;
+        tau += g_rt_tree_info[q.CandidateInstanceID() & 0x3FFFFFu].bark.w * (t1 - t0);
+        if (tau > 8.0f) q.Abort();   // nothing left to see
+    }
+    if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) return 0.0f;
+    return exp(-tau);
+}
+
+float gi_transmittance(GiRay r) { return gi_transmittance_masked(r, kRtMaskSurfaces | kRtMaskCrowns, true); }
 
 float4 rt_unpack_material(uint m) {
     const float4 q = float4(m & 0xFFu, (m >> 8) & 0xFFu, (m >> 16) & 0xFFu, m >> 24) / 255.0f;
@@ -102,7 +146,7 @@ GiHit gi_trace_masked(GiRay r, uint mask) {
     const float2 b = q.CommittedTriangleBarycentrics();
     const float3 w = float3(1.0f - b.x - b.y, b.x, b.y);
     if ((inst & kRtTreeFlag) != 0u) {
-        const TreeRtInfo ti = g_rt_tree_info[inst & 0x7FFFFFu];
+        const TreeRtInfo ti = g_rt_tree_info[inst & 0x3FFFFFu];
         const uint geom = q.CommittedGeometryIndex();
         const uint ib = (geom == 0u ? ti.ibase_bark : ti.ibase_leaf) + 3u * prim;
         const float3 p0 = g_rt_tree_pos[ti.vbase + g_rt_tree_idx[ib + 0u]];
@@ -128,7 +172,7 @@ GiHit gi_trace_masked(GiRay r, uint mask) {
     return h;
 }
 
-GiHit gi_trace(GiRay r) { return gi_trace_masked(r, 0xFFu); }
+GiHit gi_trace(GiRay r) { return gi_trace_masked(r, kRtMaskSurfaces); }
 
 // The terrain along r, and the point to start a shadow ray from there:
 // Hanika's shadow-terminator fix ("Hacking the Shadow Terminator", Ray

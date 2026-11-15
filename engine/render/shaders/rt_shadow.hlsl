@@ -7,6 +7,9 @@
 //     the composite uses in place of the cascades under --rt-shadows;
 //   - where both apply, the cascades' answer at the same point, and which of
 //     four ways the two agree -- lit/lit, shadow/shadow, or one only;
+//   - under --rt-sky (ADR-004 L6), a few cosine-weighted rays through
+//     gi_transmittance: how much of the sky the pixel sees past terrain,
+//     trunks and the crown volumes -- what the composite scales ambient by;
 //   - a primary ray, terrain only, through gi_trace, against the depth
 //     buffer's distance: whether the TLAS is the terrain that was drawn
 //     (agree / RT nearer / RT farther or missed), and the angle between
@@ -21,15 +24,25 @@ cbuffer RtConstants : register(b0) {
     float3 cam_pos;  uint width;
     float3 key_dir;  uint height;
     float  near_plane; float far_plane; float csm_reach; uint frame;
-    uint   checks;     float light_radius; float2 pad1;   // checks: the instruments; light_radius: the disk, radians
+    uint   checks;     float light_radius;                // checks: the instruments; light_radius: the disk, radians
+    uint   sky_rays;   uint sky_mask;                     // L6: rays a pixel a frame (0 = off), and what they see
+    float  sky_range;  float3 pad1;
 };
 
 Texture2D<float>          g_depth : register(t0);
-RWTexture2D<unorm float>  u_vis   : register(u0);
+RWTexture2D<unorm float2> u_vis   : register(u0);   // x the key light's visibility, y the sky's
 // [0] both lit [1] both shadowed [2] RT shadowed only [3] cascades shadowed only
 // [4] primary agree [5] RT nearer [6] RT farther or missed [7] normal error, centi-degrees, summed
 // over [8] near, non-grazing agreeing pixels
+// [9] sky visibility x 1000, summed over [10] surface pixels inside csm_reach;
+// [11] and [12] the same inside 60 m
 RWStructuredBuffer<uint>  u_stats : register(u1);
+
+uint pcg_hash(uint v) {
+    const uint s = v * 747796405u + 2891336453u;
+    const uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
 
 float3 world_at(float2 uv, float z) {
     const float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
@@ -57,7 +70,7 @@ void cs_rt_shadow(uint3 id : SV_DispatchThreadID) {
     if (id.x >= width || id.y >= height) return;
     const int2 p = int2(id.xy);
     const float z = g_depth[p];
-    if (z >= 1.0f) { u_vis[p] = 1.0f; return; }
+    if (z >= 1.0f) { u_vis[p] = float2(1.0f, 1.0f); return; }
     const float2 uv = (float2(p) + 0.5f) / float2(width, height);
     const float3 P = world_at(uv, z);
     const float3 n = normal_from_depth(p, P);
@@ -106,9 +119,45 @@ void cs_rt_shadow(uint3 id : SV_DispatchThreadID) {
         nl = n;
     }
     const float vis = dot(nl, key_dir) > -0.05f ? gi_occluded(sr) : 0.0f;
-    u_vis[p] = vis;
+
+    // The sky (L6): cosine-weighted about the shading normal, an R2 sequence
+    // rotated per pixel and advanced per frame so TAA integrates a different
+    // set of directions each frame. A ray heading DOWN stands for the ground's
+    // bounce, which the ambient model already gives a lower hemisphere: it
+    // sees trunks and crowns but not the terrain, or every wall and trunk
+    // would lose half its light in an open field.
+    float sky = 1.0f;
+    if (sky_rays > 0u) {
+        const float3 o = on_terrain ? lifted + ns * (0.02f + 0.0002f * d) : P + n * (0.05f + 0.0005f * d);
+        const float3 b1 = normalize(abs(nl.y) < 0.99f ? cross(nl, float3(0.0f, 1.0f, 0.0f)) : cross(nl, float3(1.0f, 0.0f, 0.0f)));
+        const float3 b2 = cross(nl, b1);
+        const uint hp = pcg_hash(uint(p.x) + pcg_hash(uint(p.y)));
+        const float2 rot = float2(float(hp & 0xFFFFu), float(hp >> 16)) / 65536.0f;
+        float acc = 0.0f;
+        for (uint k = 0u; k < sky_rays; ++k) {
+            const float i = float((frame % 1024u) * sky_rays + k);
+            const float2 u = frac(rot + i * float2(0.7548776662f, 0.5698402910f));
+            const float rr = sqrt(u.x), ph = 6.2831853f * u.y;
+            GiRay kr;
+            kr.origin = o;
+            kr.tmin = 0.0f;
+            kr.dir = normalize(b1 * (rr * cos(ph)) + b2 * (rr * sin(ph)) + nl * sqrt(max(0.0f, 1.0f - u.x)));
+            kr.tmax = sky_range;
+            acc += gi_transmittance_masked(kr, kr.dir.y < 0.0f ? (sky_mask & ~kRtMaskTerrain) : sky_mask, on_terrain);
+        }
+        sky = acc / float(sky_rays);
+    }
+    u_vis[p] = float2(vis, sky);
 
     if (checks == 0u) return;
+    if (d < csm_reach) {
+        InterlockedAdd(u_stats[9], uint(sky * 1000.0f + 0.5f));
+        InterlockedAdd(u_stats[10], 1u);
+        if (d < 60.0f) {
+            InterlockedAdd(u_stats[11], uint(sky * 1000.0f + 0.5f));
+            InterlockedAdd(u_stats[12], 1u);
+        }
+    }
     if (dot(n, key_dir) > 0.1f && d < csm_reach) {
         const bool rt = vis > 0.5f;
         const bool csm = cascade_visibility(P, n) > 0.5f;

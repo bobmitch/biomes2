@@ -55,7 +55,7 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--band-report`, `--sea-report`, `--swim`, `--blend-report`, `--tab-test`,
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
 references), `--rt-report` (ADR-004 L5: the ray-tracing scene at three
-views), `--lights-report` (ADR-004 L3: local lights at night, six
+views, and L6's sky visibility with and without crowns), `--lights-report` (ADR-004 L3: local lights at night, six
 configurations timed) and `--fell` (with `--fell-save` / `--fell-verify`).
 Every mode takes `--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
@@ -774,6 +774,28 @@ albedo), SM 6.5, compiled with DXC. `rt_shadow.hlsl` is the pass.
   render under `--rt-shadows` -- the mist reads them -- so this is an A/B,
   not a replacement yet. Memory: 94-270 MB of terrain BLAS, two 94 MB TLAS
   sized for 67k instances, 103 MB scratch.
+
+### Canopy shade: crown volumes and a traced sky (ADR-004 L6, step 1)
+
+`--rt-sky` (Shift+R) scales the AMBIENT target by a traced sky visibility:
+one cosine-weighted ray a pixel a frame through `gi_transmittance`
+(`gi_trace.hlsli`), which is 0 at any opaque hit and Beer-Lambert through
+the CROWN VOLUMES -- one procedural unit-sphere BLAS, instanced per standing
+tree as an ellipsoid round its crown (mask 0x4, InstanceID `0x400000 |
+model`), with the species' `leaf_density` from archetypes.json as the leaf
+area density (extinction 0.5 x LAD). `--no-crowns` keeps terrain and trunks
+only, for A/B; `--rt-sky-rays <n>` traces more.
+
+- **Crowns are for diffuse rays only.** The key-light shadow (`gi_occluded`,
+  mask 0x3) never sees them, so the alpha-tested cards keep every sunfleck.
+- **A ray skips the crown it starts inside** unless it starts on terrain:
+  charging a leaf for the whole crown behind it drew every crown dark from
+  outside. A ray heading down stands for the ground's bounce and does not
+  see terrain, or every trunk in an open field would lose half its light.
+- `--rt-report` prints the sky visibility with and without crowns and the
+  cost: wood 0.90 -> 0.50, spawn 0.93 -> 0.59, +1.5 ms in a dense wood at
+  full resolution. The ambient target also holds LOCAL light, which this
+  dims too until DDGI separates them.
 
 - **Cracks are counted in the engine, as UNDRAWN pixels** (ADR-004 L0):
   below the horizon, far depth, and both HDR scene targets still at their

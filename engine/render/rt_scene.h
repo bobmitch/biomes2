@@ -14,6 +14,11 @@
 //            caps opaque, leaves and needles NON-opaque -- a shadow ray
 //            passing a card keeps a share of its light, so a crown is a
 //            transmittance, as the ADR asks, without proxy hulls.
+//   crowns   (ADR-004 L6) one shared procedural BLAS, a unit-sphere AABB,
+//            instanced per standing tree as an ellipsoid round its crown
+//            with the species' leaf area density: a volume the sky rays
+//            take Beer-Lambert through, smooth where the cards are binary.
+//            Mask kMaskCrowns, so the key-light shadow never sees them.
 //   TLAS     rebuilt every frame from the drawn chunks and the standing
 //            trees within range. InstanceID is the slot for terrain, and
 //            kTreeFlag | model for a tree, which is how gi_trace finds a
@@ -42,6 +47,8 @@ public:
     static const UINT kBuildsPerFrame = 32;
     static const UINT kMaxTreeInstances = 65536;
     static const UINT kTreeFlag = 0x800000u;
+    static const UINT kCrownFlag = 0x400000u;   // InstanceID of a crown: kCrownFlag | model
+    static const UINT kMaskTerrain = 0x1u, kMaskTrees = 0x2u, kMaskCrowns = 0x4u;
     static const int  kMaxLod = 3;
 
     bool init(ID3D12Device* device, std::string& error);
@@ -55,6 +62,9 @@ public:
     void note_meshed(const std::vector<Streamer::MeshedChunk>& meshed, bool landed = false);
     // Bisection switches (BIOMES_RT_DBG): 2 no terrain BLAS, 4 no trees in the TLAS.
     unsigned debug_ = 0;
+    // Crown volumes in the TLAS (L6). Off unless something traces them: they
+    // double the tree instances.
+    bool crowns_ = false;
 
     // Builds what is due and the TLAS, on `cmd`, after the frame's meshing
     // and before anything traces. The pool's vertices and indices must be in
@@ -74,7 +84,7 @@ public:
         UINT terrain_blas = 0, tree_blas = 0;
         UINT64 blas_bytes = 0, tlas_bytes = 0, scratch_bytes = 0;
         UINT built_this_frame = 0, pending = 0;
-        UINT instances_terrain = 0, instances_trees = 0;
+        UINT instances_terrain = 0, instances_trees = 0, instances_crowns = 0;
         UINT drawn_without_blas = 0;     // drawn LOD 0-3 chunks not (yet) in the TLAS
         // Where queued chunks went, since start: the queue's own accounts.
         UINT64 noted = 0, dropped_remeshed = 0, dropped_moved = 0, empty = 0, built_total = 0;
@@ -112,6 +122,11 @@ private:
     // Trees: positions (float3), indices, and per-model info for gi_trace.
     ComPtr<ID3D12Resource> tree_pos_, tree_idx_, tree_info_, tree_attr_;
     std::vector<ComPtr<ID3D12Resource> > tree_blas_;
+    // Crowns: the unit AABB, its BLAS, and per model the ellipsoid in model
+    // space (centre height, horizontal and vertical radii); radius 0 = none.
+    ComPtr<ID3D12Resource> crown_aabb_, crown_blas_;
+    struct Crown { float cy, rh, rv; };
+    std::vector<Crown> crowns_by_model_;
     Stats stats_;
 };
 

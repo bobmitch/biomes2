@@ -50,7 +50,7 @@ cbuffer PostConstants : register(b0) {
     float3 sun_disk;     float pad4;         // disk radiance seen from the camera, nits
     float3 moon_disk;    float pad5;
     float3 cam_fwd;      float fog_on;       // the mist (L4): fog.hlsl's integrated volume
-    float  fog_near;     float fog_log_ratio; float rt_shadows; float pad6;   // rt_shadows: L5's traced key-light visibility
+    float  fog_near;     float fog_log_ratio; float rt_shadows; float rt_sky;   // L5's traced key-light visibility, L6's traced sky
 };
 
 Texture2D<float>  g_depth   : register(t0);
@@ -63,7 +63,7 @@ Texture2D<float4> g_hist1   : register(t6);
 Texture2D<float4> g_skyview : register(t7);   // atmosphere.hlsl: the sky round the camera
 Texture3D<float4> g_ap      : register(t8);   // atmosphere.hlsl: in-scatter (rgb), transmittance (a)
 Texture3D<float4> g_fog     : register(t9);   // fog.hlsl: in-scatter (rgb), transmittance (a), to each slice's far side
-Texture2D<float>  g_rtvis   : register(t10);  // rt_shadow.hlsl: the key light's visibility, traced
+Texture2D<float2> g_rtvis   : register(t10);  // rt_shadow.hlsl: x the key light's visibility, y the sky's, traced
 
 RWTexture2D<float>  u_ao    : register(u0);
 RWTexture2D<float4> u_scene : register(u1);
@@ -285,8 +285,13 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
                    ? lerp(1.0f, contact_shadow(p, z, P), 0.7f * saturate(cmask)) : 1.0f;   // never fully black: sky light still reaches a crease
     // Under --rt-shadows the surfaces wrote their direct light unshadowed
     // (shadow.hlsli) and the traced visibility takes the cascades' place.
-    const float rtv = rt_shadows > 0.5f ? g_rtvis[p] : 1.0f;
-    float3 c = dir * (cs * rtv) + amb * ao;
+    const float rtv = rt_shadows > 0.5f ? g_rtvis[p].x : 1.0f;
+    // Under --rt-sky (L6) the ambient takes the traced sky visibility --
+    // terrain, trunks and the crowns' volumes -- which is the shade under a
+    // canopy. It scales all of the ambient target, so a local light under a
+    // tree is dimmed with the sky until DDGI separates them.
+    const float skv = rt_sky > 0.5f ? g_rtvis[p].y : 1.0f;
+    float3 c = dir * (cs * rtv) + amb * (ao * skv);
     // The atmosphere between the eye and the surface.
     const float4 ap = aerial(uv, length(P - cam_pos));
     c = c * ap.a + ap.rgb;

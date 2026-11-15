@@ -272,7 +272,12 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // The mist (ADR-004 L4), for A/B.
             if (wp == 'N') { g_renderer.set_fog(!g_renderer.fog()); return 0; }
             // Ray-traced key-light shadows in place of the cascades (L5).
-            if (wp == 'R') { g_renderer.set_rt_shadows(!g_renderer.rt_shadows()); return 0; }
+            // Shift+R: the traced sky visibility, canopy shade (L6).
+            if (wp == 'R') {
+                if (GetKeyState(VK_SHIFT) & 0x8000) g_renderer.set_rt_sky(!g_renderer.rt_sky());
+                else g_renderer.set_rt_shadows(!g_renderer.rt_shadows());
+                return 0;
+            }
             if (wp == 'H') { g_time_lapse = !g_time_lapse; return 0; }
             if (wp == VK_OEM_COMMA || wp == VK_OEM_PERIOD) {
                 g_renderer.set_ev_comp(g_renderer.ev_comp() + (wp == VK_OEM_PERIOD ? 0.5f : -0.5f));
@@ -734,6 +739,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (c2.find("--no-fog") != std::string::npos) g_renderer.set_fog(false);
         // The ray-tracing scene (ADR-004 L5).
         if (c2.find("--rt-shadows") != std::string::npos) g_renderer.set_rt_shadows(true);
+        if (c2.find("--rt-sky") != std::string::npos) g_renderer.set_rt_sky(true);
+        {
+            const size_t k = c2.find("--rt-sky-rays ");
+            if (k != std::string::npos) g_renderer.set_rt_sky_rays(std::atoi(c2.c_str() + k + 14));
+        }
+        if (c2.find("--no-crowns") != std::string::npos)
+            g_renderer.set_rt_sky_mask(engine::RtScene::kMaskTerrain | engine::RtScene::kMaskTrees);
         if (c2.find("--rt-report") != std::string::npos) { g_renderer.set_rt_active(true); g_renderer.set_rt_checks(true); }
         const size_t fdn = c2.find("--fog-density");
         if (fdn != std::string::npos) g_renderer.set_fog_density(float(std::atof(c2.c_str() + fdn + 13)));
@@ -1070,10 +1082,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 std::fprintf(f, "gpu: atmosphere %.3f ms, mist inject %.3f ms, mist integrate %.3f ms, "
                                 "post chain in all %.3f ms (smoothed over the still's frames)\n",
                              pt.atmosphere, pt.mist_inject, pt.mist_integrate, pt.post_total);
-                if (g_renderer.rt_shadows()) {
+                if (g_renderer.rt_shadows() || g_renderer.rt_sky()) {
                     const engine::Renderer::RtStats& rs = g_renderer.rt_stats();
-                    std::fprintf(f, "gpu: ray tracing -- BLAS + TLAS build %.3f ms, shadow trace %.3f ms\n",
-                                 rs.build_ms, rs.trace_ms);
+                    std::fprintf(f, "gpu: ray tracing -- BLAS + TLAS build %.3f ms, trace (key light%s) %.3f ms\n",
+                                 rs.build_ms, g_renderer.rt_sky() ? " + sky" : "", rs.trace_ms);
                 }
                 const engine::Renderer::SkyCheck& sk = g_renderer.last_sky_check();
                 if (sk.valid)
@@ -2264,8 +2276,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(f, "  BLAS: %u terrain, %u tree models; %.1f MB, TLAS %.1f MB (two), scratch %.1f MB\n",
                          rs.terrain_blas, rs.tree_blas, rs.blas_bytes / 1048576.0, rs.tlas_bytes / 1048576.0,
                          rs.scratch_bytes / 1048576.0);
-            std::fprintf(f, "  TLAS: %u chunk instances, %u trees; %u drawn LOD 0-3 chunks without a BLAS; %u pending\n",
-                         rs.instances_terrain, rs.instances_trees, rs.drawn_without_blas, rs.pending);
+            std::fprintf(f, "  TLAS: %u chunk instances, %u trees, %u crowns; %u drawn LOD 0-3 chunks without a BLAS; %u pending\n",
+                         rs.instances_terrain, rs.instances_trees, rs.instances_crowns, rs.drawn_without_blas, rs.pending);
             std::fprintf(f, "  GPU: BLAS + TLAS build %.3f ms a frame (steady), shadow trace and checks %.3f ms\n",
                          st.build_ms, st.trace_ms);
             if (prim > 0)
@@ -2278,6 +2290,32 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                 "(lit %.2f%%, shadowed %.2f%%); RT shadowed only %.2f%%, cascades shadowed only %.2f%%\n\n",
                              cmp, 100.0 * (st.lit_lit + st.shadow_shadow) / cmp, 100.0 * st.lit_lit / cmp,
                              100.0 * st.shadow_shadow / cmp, 100.0 * st.rt_only / cmp, 100.0 * st.csm_only / cmp);
+
+            // The sky (L6): mean visibility over the surface pixels, with the
+            // crowns, with terrain and trunks only, and the trace's cost each
+            // way -- off is the L5 trace alone. One ray a pixel a frame.
+            struct SkyCfg { const char* name; bool on; unsigned mask; };
+            const SkyCfg cfgs[] = {
+                {"off (key light only)", false, 0x7u},
+                {"terrain + trunks", true, 0x3u},
+                {"terrain + trunks + crowns", true, 0x7u},
+            };
+            for (const SkyCfg& c : cfgs) {
+                g_renderer.set_rt_sky_mask(c.mask);
+                g_renderer.set_rt_sky(c.on);
+                for (int i = 0; i < 240; ++i) frame();
+                const engine::Renderer::RtStats& s2 = g_renderer.rt_stats();
+                const engine::RtScene::Stats& r2 = g_renderer.rt_scene_stats();
+                if (c.on)
+                    std::fprintf(f, "  sky %-26s visibility %.3f inside 468 m (%u px), %.3f inside 60 m (%u px); "
+                                    "trace %.3f ms, build %.3f ms, %u crowns\n",
+                                 c.name, s2.sky_mean, s2.sky_pixels, s2.sky_near_mean, s2.sky_near_pixels,
+                                 s2.trace_ms, s2.build_ms, r2.instances_crowns);
+                else
+                    std::fprintf(f, "  sky %-26s trace %.3f ms, build %.3f ms\n", c.name, s2.trace_ms, s2.build_ms);
+            }
+            g_renderer.set_rt_sky(false);
+            std::fprintf(f, "\n");
         }
         std::fclose(f);
         g_renderer.shutdown();

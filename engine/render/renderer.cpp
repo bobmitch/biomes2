@@ -170,7 +170,7 @@ struct PostConstants {
     float sun_disk[3];     float pad4;
     float moon_disk[3];    float pad5;
     float cam_fwd[3];      float fog_on;
-    float fog_near;        float fog_log_ratio; float rt_shadows; float pad6;
+    float fog_near;        float fog_log_ratio; float rt_shadows; float rt_sky;
 };
 static_assert(sizeof(PostConstants) == 416, "PostConstants must match post.hlsl");
 
@@ -193,9 +193,11 @@ struct RtConstants {
     float cam_pos[3];  UINT width;
     float key_dir[3];  UINT height;
     float near_plane;  float far_plane; float csm_reach; UINT frame;
-    UINT  checks;      float light_radius; float pad1[2];
+    UINT  checks;      float light_radius;
+    UINT  sky_rays;    UINT sky_mask;
+    float sky_range;   float pad1[3];
 };
-static_assert(sizeof(RtConstants) == 128, "RtConstants must match rt_shadow.hlsl");
+static_assert(sizeof(RtConstants) == 144, "RtConstants must match rt_shadow.hlsl");
 // The mist's froxels: 160 x 90 x 128, log-spaced from 0.5 m to 6 km.
 const UINT  kFogX = 160, kFogY = 90, kFogZ = 128;
 const float kFogNear = 0.5f, kFogFar = 6000.0f;
@@ -1092,6 +1094,17 @@ void Renderer::set_rt_shadows(bool on) {
     if (on) set_rt_active(true);
 }
 
+void Renderer::set_rt_sky(bool on) {
+    rt_sky_ = on;
+    rt_.crowns_ = on && (rt_sky_mask_ & RtScene::kMaskCrowns) != 0u;
+    if (on) set_rt_active(true);
+}
+
+void Renderer::set_rt_sky_mask(unsigned mask) {
+    rt_sky_mask_ = mask;
+    rt_.crowns_ = rt_sky_ && (mask & RtScene::kMaskCrowns) != 0u;
+}
+
 void Renderer::set_rt_active(bool on) {
     if (on && !rt_active_) rt_seed_ = true;
     rt_active_ = on;
@@ -1115,7 +1128,7 @@ bool Renderer::create_rt(std::string& error) {
     rd.Height = height_;
     rd.DepthOrArraySize = 1;
     rd.MipLevels = 1;
-    rd.Format = DXGI_FORMAT_R8_UNORM;
+    rd.Format = DXGI_FORMAT_R8G8_UNORM;   // x the key light, y the sky (L6)
     rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     HRESULT hr = device_->CreateCommittedResource(&dh, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -1153,7 +1166,7 @@ bool Renderer::create_rt(std::string& error) {
     D3D12_CPU_DESCRIPTOR_HANDLE c = srv_heap_->GetCPUDescriptorHandleForHeapStart();
     {
         D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
-        sd.Format = DXGI_FORMAT_R8_UNORM;
+        sd.Format = DXGI_FORMAT_R8G8_UNORM;
         sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         sd.Texture2D.MipLevels = 1;
@@ -1161,7 +1174,7 @@ bool Renderer::create_rt(std::string& error) {
         h.ptr += SIZE_T(36) * inc;
         device_->CreateShaderResourceView(rt_vis_.Get(), &sd, h);
         D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
-        ud.Format = DXGI_FORMAT_R8_UNORM;
+        ud.Format = DXGI_FORMAT_R8G8_UNORM;
         ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         h = c;
         h.ptr += SIZE_T(37) * inc;
@@ -1260,6 +1273,10 @@ void Renderer::record_rt_trace() {
             rt_stats_.primary_nearer = s[5];
             rt_stats_.primary_farther = s[6];
             rt_stats_.normal_err_deg = s[8] ? float(double(s[7]) / 100.0 / double(s[8])) : 0.0f;
+            rt_stats_.sky_mean = s[10] ? float(double(s[9]) / 1000.0 / double(s[10])) : 0.0f;
+            rt_stats_.sky_near_mean = s[12] ? float(double(s[11]) / 1000.0 / double(s[12])) : 0.0f;
+            rt_stats_.sky_pixels = s[10];
+            rt_stats_.sky_near_pixels = s[12];
             D3D12_RANGE nr = {0, 0};
             rt_stats_rb_[frame_]->Unmap(0, &nr);
         }
@@ -1297,6 +1314,9 @@ void Renderer::record_rt_trace() {
     rc.checks = rt_checks_ ? 1u : 0u;
     // The sun's angular radius, or the moon's: 0.2667 and 0.259 degrees.
     rc.light_radius = (sky_frame_.key_is_moon ? 0.259f : 0.2667f) * 0.0174533f;
+    rc.sky_rays = rt_sky_ ? UINT(rt_sky_rays_) : 0u;
+    rc.sky_mask = rt_sky_mask_;
+    rc.sky_range = 80.0f;
     std::memcpy(rt_cb_cpu_[frame_], &rc, sizeof rc);
 
     tr(mesher_.indices(), ib, ib | nps);
@@ -2854,6 +2874,7 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     pc.fog_near = kFogNear;
     pc.fog_log_ratio = std::log(kFogFar / kFogNear);
     pc.rt_shadows = (rt_shadows_ && rt_ok_ && !wire) ? 1.0f : 0.0f;
+    pc.rt_sky = (rt_sky_ && rt_ok_ && !wire) ? 1.0f : 0.0f;
     pc.near_plane = kNearPlane;
     pc.far_plane = kFarPlane;
     pc.sharpen = taa_on_ && !wire ? 0.5f : 0.0f;

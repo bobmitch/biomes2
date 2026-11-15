@@ -278,11 +278,21 @@ public:
     bool rt_shadows() const { return rt_shadows_; }
     void set_rt_active(bool on);   // the scene and the trace, without replacing the cascades
     void set_rt_checks(bool on) { rt_checks_ = on; }   // the CSM and normal instruments (--rt-report)
+    // L6: the ambient scaled by a traced sky visibility -- terrain, trunks and
+    // the crown volumes (--rt-sky, Shift+R). The mask picks what the rays see
+    // (RtScene::kMask*), for A/B; the crowns enter the TLAS only when it
+    // includes them.
+    void set_rt_sky(bool on);
+    bool rt_sky() const { return rt_sky_; }
+    void set_rt_sky_mask(unsigned mask);
+    void set_rt_sky_rays(int n) { rt_sky_rays_ = n < 1 ? 1 : (n > 16 ? 16 : n); }
     const RtScene::Stats& rt_scene_stats() const { return rt_.stats(); }
     struct RtStats {
         uint32_t lit_lit = 0, shadow_shadow = 0, rt_only = 0, csm_only = 0;
         uint32_t primary_agree = 0, primary_nearer = 0, primary_farther = 0;
         float normal_err_deg = 0.0f;
+        float sky_mean = 0.0f, sky_near_mean = 0.0f;   // L6: traced sky visibility, inside the cascades' reach / 60 m
+        uint32_t sky_pixels = 0, sky_near_pixels = 0;
         float build_ms = 0.0f, trace_ms = 0.0f;   // GPU, smoothed
     };
     const RtStats& rt_stats() const { return rt_stats_; }
@@ -470,6 +480,9 @@ private:
     void record_rt_trace();
     RtScene rt_;
     bool rt_ok_ = false, rt_shadows_ = false, rt_active_ = false, rt_seed_ = false, rt_checks_ = false;
+    bool rt_sky_ = false;
+    unsigned rt_sky_mask_ = RtScene::kMaskTerrain | RtScene::kMaskTrees | RtScene::kMaskCrowns;
+    int rt_sky_rays_ = 1;
     RtStats rt_stats_;
     ComPtr<ID3D12RootSignature> rt_root_;
     ComPtr<ID3D12PipelineState> rt_pso_, rt_clear_pso_;
