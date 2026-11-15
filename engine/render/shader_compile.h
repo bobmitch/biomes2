@@ -13,6 +13,7 @@
 #include <windows.h>
 #include <d3dcommon.h>
 #include <d3dcompiler.h>
+#include <dxcapi.h>
 #include <wrl/client.h>
 
 #include <cstdio>
@@ -141,6 +142,50 @@ inline bool read_whole_file(const char* path, std::string& out) {
     return true;
 }
 
+// DXC, for Shader Model 6 targets (ADR-004 L0): inline ray queries, wave
+// intrinsics, everything FXC's SM 5.1 cannot express. Loaded at run time from
+// beside engine.exe, where the build copies dxcompiler.dll and dxil.dll out
+// of the Windows SDK; dxil.dll is what SIGNS the DXIL, and D3D12 rejects an
+// unsigned shader, so the pair travels together. Absent, SM 6 compiles fail
+// with a message and everything on SM 5.1 runs as before.
+struct Dxc {
+    ComPtr<IDxcCompiler3> compiler;
+    ComPtr<IDxcUtils>     utils;
+    unsigned long long    version = 0;   // major << 32 | minor, for the cache hash
+    std::string           why;           // why it is not available
+    bool ok() const { return compiler != nullptr; }
+};
+inline Dxc& dxc() {
+    static Dxc d;
+    static bool tried = false;
+    if (tried) return d;
+    tried = true;
+    HMODULE m = LoadLibraryA("dxcompiler.dll");
+    if (!m) { d.why = "dxcompiler.dll not found beside engine.exe or on PATH"; return d; }
+    typedef HRESULT(__stdcall * CreateFn)(REFCLSID, REFIID, LPVOID*);
+    CreateFn create = reinterpret_cast<CreateFn>(GetProcAddress(m, "DxcCreateInstance"));
+    if (!create) { d.why = "dxcompiler.dll has no DxcCreateInstance"; return d; }
+    if (FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(&d.compiler))) ||
+        FAILED(create(CLSID_DxcUtils, IID_PPV_ARGS(&d.utils)))) {
+        d.compiler.Reset();
+        d.why = "DxcCreateInstance failed";
+        return d;
+    }
+    ComPtr<IDxcVersionInfo> vi;
+    if (SUCCEEDED(d.compiler.As(&vi))) {
+        UINT32 major = 0, minor = 0;
+        vi->GetVersion(&major, &minor);
+        d.version = (static_cast<unsigned long long>(major) << 32) | minor;
+    }
+    return d;
+}
+
+// Shader Model 6 targets look like "cs_6_5"; FXC's like "cs_5_1".
+inline bool is_sm6(const char* target) {
+    const char* u = std::strchr(target, '_');
+    return u && u[1] == '6';
+}
+
 inline bool compile_shader(const char* path, const char* entry, const char* target,
                            ComPtr<ID3DBlob>& out, std::string& error) {
     RootInclude inc;
@@ -175,8 +220,15 @@ inline bool compile_shader(const char* path, const char* entry, const char* targ
     h = fnv1a64(entry, std::strlen(entry), h);
     h = fnv1a64(target, std::strlen(target), h);
     h = fnv1a64(&flags, sizeof(flags), h);
-    const UINT compiler = D3D_COMPILER_VERSION;
-    h = fnv1a64(&compiler, sizeof(compiler), h);
+    const bool sm6 = is_sm6(target);
+    if (sm6) {
+        // A DXC blob is keyed by DXC's own version, never FXC's.
+        h = fnv1a64("dxc", 3, h);
+        h = fnv1a64(&dxc().version, sizeof(dxc().version), h);
+    } else {
+        const UINT compiler = D3D_COMPILER_VERSION;
+        h = fnv1a64(&compiler, sizeof(compiler), h);
+    }
     char cache_path[96];
     std::snprintf(cache_path, sizeof(cache_path), "build/shader_cache/%016llx.cso", h);
 
@@ -192,8 +244,58 @@ inline bool compile_shader(const char* path, const char* entry, const char* targ
     }
 
     errors.Reset();
-    hr = D3DCompile(pre->GetBufferPointer(), pre->GetBufferSize(), path, nullptr, nullptr,
-                    entry, target, flags, 0, &out, &errors);
+    if (sm6) {
+        // The same preprocessed text FXC would have compiled: one include
+        // resolver for both compilers, and the hash covers what DXC sees.
+        Dxc& d = dxc();
+        if (!d.ok()) {
+            error = std::string("compiling ") + path + " " + entry + " (" + target + "): " + d.why;
+            startup_log().push_back(std::make_pair(std::string("FAILED  ") + path + " " + entry,
+                                                   startup_now_ms() - t0));
+            return false;
+        }
+        std::wstring wentry(entry, entry + std::strlen(entry));
+        std::wstring wtarget(target, target + std::strlen(target));
+        std::wstring wpath(path, path + std::strlen(path));
+        std::vector<LPCWSTR> args;
+        args.push_back(wpath.c_str());
+        args.push_back(L"-E"); args.push_back(wentry.c_str());
+        args.push_back(L"-T"); args.push_back(wtarget.c_str());
+#ifdef _DEBUG
+        args.push_back(L"-Od"); args.push_back(L"-Zi");
+#else
+        args.push_back(L"-O3");
+#endif
+        DxcBuffer src_buf;
+        src_buf.Ptr = pre->GetBufferPointer();
+        src_buf.Size = pre->GetBufferSize();
+        src_buf.Encoding = DXC_CP_UTF8;
+        ComPtr<IDxcResult> res;
+        hr = d.compiler->Compile(&src_buf, args.data(), static_cast<UINT32>(args.size()), nullptr,
+                                 IID_PPV_ARGS(&res));
+        HRESULT status = hr;
+        if (SUCCEEDED(hr)) res->GetStatus(&status);
+        if (FAILED(status)) {
+            ComPtr<IDxcBlobUtf8> msg;
+            if (res) res->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&msg), nullptr);
+            error = std::string("compiling ") + path + " " + entry + " (" + target + ", DXC):\n" +
+                    (msg && msg->GetStringLength() ? msg->GetStringPointer() : "(no message)");
+            startup_log().push_back(std::make_pair(std::string("FAILED  ") + path + " " + entry,
+                                                   startup_now_ms() - t0));
+            return false;
+        }
+        ComPtr<IDxcBlob> obj;
+        res->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&obj), nullptr);
+        if (!obj || FAILED(D3DCreateBlob(obj->GetBufferSize(), &out))) {
+            error = std::string("compiling ") + path + " " + entry + ": DXC returned no object";
+            return false;
+        }
+        std::memcpy(out->GetBufferPointer(), obj->GetBufferPointer(), obj->GetBufferSize());
+        hr = S_OK;
+    } else {
+        hr = D3DCompile(pre->GetBufferPointer(), pre->GetBufferSize(), path, nullptr, nullptr,
+                        entry, target, flags, 0, &out, &errors);
+    }
     // FAILED, not "compile": a failed compile is never cached, so logging it
     // as a compile made the next run's recompile look like a cache miss.
     startup_log().push_back(std::make_pair(std::string(FAILED(hr) ? "FAILED  " : "compile ") +

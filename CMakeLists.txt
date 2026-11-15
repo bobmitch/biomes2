@@ -154,7 +154,8 @@ if(BIOMES2_ENGINE)
     engine/trees/tree_field.cpp
     engine/trees/tree_renderer.cpp
     engine/trees/felling.cpp
-    engine/foliage/foliage_renderer.cpp)
+    engine/foliage/foliage_renderer.cpp
+    engine/render/rt_check.cpp)
   target_include_directories(engine PRIVATE ${PROJECT_SOURCE_DIR})
   # M1: the engine links the generator now. Track B was built against the
   # trivial field precisely so a pipeline bug could never be confused with a
@@ -162,5 +163,42 @@ if(BIOMES2_ENGINE)
   target_link_libraries(engine PRIVATE d3d12 dxgi d3dcompiler Jolt worldgen)
   if(MSVC)
     target_compile_options(engine PRIVATE /W3 /D_CRT_SECURE_NO_WARNINGS)
+  endif()
+
+  # DXC for Shader Model 6 (ADR-004 L0): the Windows SDK's dxcompiler.dll
+  # and dxil.dll, copied beside engine.exe after every build. dxil.dll signs
+  # the DXIL; D3D12 refuses an unsigned shader, so the two go together. The
+  # newest SDK that has both wins. Missing is a WARNING, not an error -- the
+  # SM 5.1 engine runs without them and only SM 6 shaders fail, by name, as a
+  # missing Jolt only skips the engine (CLAUDE.md on the CI outage).
+  set(BIOMES2_DXC_DIR "")
+  if(DEFINED ENV{WindowsSdkBinPath} AND DEFINED ENV{WindowsSdkVersion})
+    string(REGEX REPLACE "[\\\\/]$" "" _sdkver "$ENV{WindowsSdkVersion}")
+    set(_cand "$ENV{WindowsSdkBinPath}/${_sdkver}/x64")
+    if(EXISTS "${_cand}/dxcompiler.dll" AND EXISTS "${_cand}/dxil.dll")
+      set(BIOMES2_DXC_DIR "${_cand}")
+    endif()
+  endif()
+  if(NOT BIOMES2_DXC_DIR)
+    file(GLOB _dxcs "C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64/dxcompiler.dll")
+    list(SORT _dxcs)
+    list(REVERSE _dxcs)
+    foreach(_d ${_dxcs})
+      get_filename_component(_dir "${_d}" DIRECTORY)
+      if(EXISTS "${_dir}/dxil.dll")
+        set(BIOMES2_DXC_DIR "${_dir}")
+        break()
+      endif()
+    endforeach()
+  endif()
+  if(BIOMES2_DXC_DIR)
+    message(STATUS "engine: DXC from ${BIOMES2_DXC_DIR}")
+    add_custom_command(TARGET engine POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${BIOMES2_DXC_DIR}/dxcompiler.dll" "${BIOMES2_DXC_DIR}/dxil.dll"
+              "$<TARGET_FILE_DIR:engine>")
+  else()
+    message(WARNING "engine: no dxcompiler.dll + dxil.dll in any Windows SDK; "
+                    "Shader Model 6 shaders (ray tracing) will not compile.")
   endif()
 endif()

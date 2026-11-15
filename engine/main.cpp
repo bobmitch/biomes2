@@ -559,7 +559,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                              hl.find("--normal-check") != std::string::npos ||
                              hl.find("--blend-report") != std::string::npos;
     const bool fell_mode = hl.find("--fell") != std::string::npos;
-    const bool headless = report_mode || fell_mode || !shot_path.empty() || flight_seconds > 0.0 ||
+    const bool rt_check_mode = hl.find("--check-rt") != std::string::npos;
+    const bool headless = report_mode || fell_mode || rt_check_mode || !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
                           dig_seconds > 0.0 || mode_dig_save || mode_dig_verify ||
@@ -612,6 +613,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 1;
     }
     g_felling.init(&g_renderer, &g_physics);
+    if (rt_check_mode) {
+        // ADR-004 L0: does hardware ray tracing work end to end here?
+        std::remove("build/rt_check.txt");
+        const bool ok = engine::run_rt_check(g_renderer.device(), g_renderer.queue(), g_renderer.caps(),
+                                             "build/rt_check.txt");
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return ok ? 0 : 1;
+    }
     if (start_overlay) g_renderer.set_mode(engine::Mode::Wireframe);
     g_renderer.set_sea_state(sea_state);
     g_renderer.set_water_debug(water_debug);
@@ -931,6 +941,19 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                          st.resident, st.pending, st.free_slots);
             std::fprintf(f, "vertices %u\nindices %u\ntriangles %u\nslots overflowed %u\n",
                          st.vertices, st.indices, st.indices / 3, st.overflowed);
+            {
+                const engine::Renderer::CrackCount& cc = g_renderer.last_cracks();
+                std::fprintf(f, "cracks below the horizon: %zu undrawn (far depth, scene targets clear) -- "
+                                "%zu by final sky colour, %zu of them both; far depth alone %zu; "
+                                "of %zu pixels below it\n", cc.undrawn, cc.by_colour, cc.undrawn_and_colour,
+                             cc.by_depth, cc.below_horizon);
+                if (!cc.where.empty()) {
+                    std::fprintf(f, "undrawn pixels (x y):");
+                    for (size_t q = 0; q < cc.where.size(); ++q)
+                        std::fprintf(f, " %d %d", cc.where[q].first, cc.where[q].second);
+                    std::fprintf(f, "\n");
+                }
+            }
             {
                 // What the ground cover drew in this still.
                 uint32_t fc[5] = {0, 0, 0, 0, 0};

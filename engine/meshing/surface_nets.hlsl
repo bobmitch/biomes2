@@ -337,8 +337,33 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
     // high 16. A slot holds 4608 vertices, well inside 16 bits.
     uint skirt_slot = 0xFFFFu;
     if (border) {
+        // Into the rock AND outward along the surface, across the chunk face.
+        // Straight down -normal alone, the curtain is edge-on to anyone
+        // looking at a wall face-on, and a steep wall crossed by a LOD border
+        // showed the ~1 m strip between the two meshes as a vertical slit of
+        // sky: the rough hillside's 49 "pinholes" were one such slit, viewed
+        // 15 degrees off the wall's normal. Leaning outward makes the curtain
+        // a flange tucked UNDER the neighbour's surface, so it covers the gap
+        // whatever the view. Where the surface faces straight out of the face
+        // there is no tangent to lean along, and -normal is all there is.
+        //
+        // The lean never climbs and is one voxel, not two. A full two-voxel
+        // lean along the raw tangent stood dark fins up on distant ridges: at
+        // a coarse LOD the field normal describes fine relief the mesh does
+        // not have, so its tangent can point steeply up, and 16 m along it at
+        // an 8 m voxel is a shard against the sky. The gap across a face is
+        // at most one COARSE voxel, and both sides lean, so one is enough.
+        // A/B on the hillside: undrawn 49 -> 0, visible curtain 2666 -> 3330
+        // pixels, and the frame otherwise differs only in distant slivers.
+        float3 outward = float3(0.0f, 0.0f, 0.0f);
+        if (id.x == 0u) outward.x = -1.0f; else if (id.x == kCells - 1u) outward.x = 1.0f;
+        if (id.z == 0u) outward.z = -1.0f; else if (id.z == kCells - 1u) outward.z = 1.0f;
+        float3 tang = outward - nrm * dot(outward, nrm);
+        tang.y = min(tang.y, 0.0f);
+        const float  tl = length(tang);
+        const float3 lean = tl > 0.05f ? tang / tl : float3(0.0f, 0.0f, 0.0f);
         Vertex s;
-        s.pos = world - nrm * (voxel * skirt);
+        s.pos = world + (lean * 0.5f - nrm) * (voxel * skirt);
         s.nrm = nrm * 0.5f;
         skirt_slot = local_slot + 1u;
         g_vertices[vbase + skirt_slot] = s;

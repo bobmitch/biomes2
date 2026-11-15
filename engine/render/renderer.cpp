@@ -949,6 +949,8 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     double t0 = startup_now_ms();
     if (!create_device(error, debug_layer)) return false;
     startup_log().push_back(std::make_pair(std::string("phase: device"), startup_now_ms() - t0));
+    caps_ = query_caps(device_.Get());
+    startup_log().push_back(std::make_pair(std::string("device: ") + describe(caps_), 0.0));
     if (!create_swapchain(hwnd, error)) return false;
     if (!create_rtvs(error)) return false;
 
@@ -2106,6 +2108,71 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     cmd_->ResourceBarrier(1, &b);
 
+    // The two HDR scene targets, for the "nothing drawn here" crack count.
+    ComPtr<ID3D12Resource> hdr_rb[2];
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT hfp = {};
+    {
+        const D3D12_RESOURCE_DESC hd = hdr_direct_->GetDesc();
+        UINT64 htotal = 0;
+        device_->GetCopyableFootprints(&hd, 0, 1, 0, &hfp, nullptr, nullptr, &htotal);
+        ID3D12Resource* src_t[2] = {hdr_direct_.Get(), hdr_ambient_.Get()};
+        for (int k = 0; k < 2; ++k) {
+            D3D12_RESOURCE_DESC hb = bd;
+            hb.Width = htotal;
+            hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &hb, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                  nullptr, IID_PPV_ARGS(&hdr_rb[k]));
+            if (FAILED(hr)) { error = hr_text("CreateCommittedResource (hdr readback)", hr); return false; }
+            D3D12_RESOURCE_BARRIER t = {};
+            t.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            t.Transition.pResource = src_t[k];
+            t.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            t.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            t.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            cmd_->ResourceBarrier(1, &t);
+            D3D12_TEXTURE_COPY_LOCATION hd2 = {}, hs = {};
+            hd2.pResource = hdr_rb[k].Get();
+            hd2.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            hd2.PlacedFootprint = hfp;
+            hs.pResource = src_t[k];
+            hs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            cmd_->CopyTextureRegion(&hd2, 0, 0, 0, &hs, nullptr);
+            t.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            t.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            cmd_->ResourceBarrier(1, &t);
+        }
+    }
+
+    // Depth too, for the depth-based crack count.
+    const D3D12_RESOURCE_DESC dd = depth_->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT dfp = {};
+    UINT64 dtotal = 0;
+    device_->GetCopyableFootprints(&dd, 0, 1, 0, &dfp, nullptr, nullptr, &dtotal);
+    ComPtr<ID3D12Resource> depth_rb;
+    {
+        D3D12_RESOURCE_DESC db = bd;
+        db.Width = dtotal;
+        hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &db, D3D12_RESOURCE_STATE_COPY_DEST,
+                                              nullptr, IID_PPV_ARGS(&depth_rb));
+        if (FAILED(hr)) { error = hr_text("CreateCommittedResource (depth readback)", hr); return false; }
+        D3D12_RESOURCE_BARRIER db2 = {};
+        db2.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        db2.Transition.pResource = depth_.Get();
+        db2.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        db2.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        db2.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        cmd_->ResourceBarrier(1, &db2);
+        D3D12_TEXTURE_COPY_LOCATION ddst = {}, dsrc = {};
+        ddst.pResource = depth_rb.Get();
+        ddst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        ddst.PlacedFootprint = dfp;
+        dsrc.pResource = depth_.Get();
+        dsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        cmd_->CopyTextureRegion(&ddst, 0, 0, 0, &dsrc, nullptr);
+        db2.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        db2.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        cmd_->ResourceBarrier(1, &db2);
+    }
+
     D3D12_TEXTURE_COPY_LOCATION dst = {};
     dst.pResource = readback.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -2145,6 +2212,67 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
     }
     D3D12_RANGE none = {0, 0};
     readback->Unmap(0, &none);
+
+    // Holes below the horizon, both ways. A pixel is below the horizon if
+    // its view ray points more than ~1 degree under it: rays nearer the
+    // horizon can pass over the rim of the world legitimately.
+    {
+        cracks_ = CrackCount();
+        const float* dbase = nullptr;
+        const unsigned char* hb0 = nullptr;
+        const unsigned char* hb1 = nullptr;
+        D3D12_RANGE drange = {0, static_cast<SIZE_T>(dtotal)};
+        hdr_rb[0]->Map(0, nullptr, reinterpret_cast<void**>(const_cast<unsigned char**>(&hb0)));
+        hdr_rb[1]->Map(0, nullptr, reinterpret_cast<void**>(const_cast<unsigned char**>(&hb1)));
+        // Half floats: the clear values, as the targets hold them.
+        auto half = [](unsigned short h) {
+            const unsigned e = (h >> 10) & 31u, m = h & 1023u;
+            const float s = (h & 0x8000u) ? -1.0f : 1.0f;
+            if (e == 0) return s * float(m) / 16777216.0f;
+            return s * std::ldexp(float(m | 1024u), int(e) - 25);
+        };
+        if (hb0 && hb1 &&
+            SUCCEEDED(depth_rb->Map(0, &drange, reinterpret_cast<void**>(const_cast<float**>(&dbase))))) {
+            for (UINT y = 0; y < height_; ++y) {
+                const float ny = 1.0f - (float(y) + 0.5f) / float(height_) * 2.0f;
+                const float* drow = reinterpret_cast<const float*>(
+                    reinterpret_cast<const unsigned char*>(dbase) + size_t(y) * dfp.Footprint.RowPitch);
+                const unsigned char* crow = &bgr[static_cast<size_t>(y) * width_ * 3];
+                const unsigned short* drow_h = reinterpret_cast<const unsigned short*>(hb0 + size_t(y) * hfp.Footprint.RowPitch);
+                const unsigned short* arow_h = reinterpret_cast<const unsigned short*>(hb1 + size_t(y) * hfp.Footprint.RowPitch);
+                for (UINT x = 0; x < width_; ++x) {
+                    const float nx = (float(x) + 0.5f) / float(width_) * 2.0f - 1.0f;
+                    float dir[3];
+                    for (int k = 0; k < 3; ++k) {
+                        dir[k] = view.cam_fwd[k] + view.cam_right[k] * nx * view.tan_half_fov * view.aspect +
+                                 view.cam_up[k] * ny * view.tan_half_fov;
+                    }
+                    const float dl = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+                    if (dir[1] / dl > -0.0175f) continue;
+                    ++cracks_.below_horizon;
+                    const bool c = crow[x * 3 + 0] == 168 && crow[x * 3 + 1] == 128 && crow[x * 3 + 2] == 102;
+                    const bool d = drow[x] >= 1.0f;
+                    cracks_.by_colour += c;
+                    cracks_.by_depth += d;
+                    cracks_.both += (c && d);
+                    // Nothing drawn: far depth, no direct light, ambient still the sky clear.
+                    const unsigned short* dp = drow_h + x * 4;
+                    const unsigned short* ap = arow_h + x * 4;
+                    const bool clear = d && dp[0] == 0 && dp[1] == 0 && dp[2] == 0 &&
+                                       std::fabs(half(ap[0]) - 0.40f) < 2e-3f &&
+                                       std::fabs(half(ap[1]) - 0.50f) < 2e-3f &&
+                                       std::fabs(half(ap[2]) - 0.66f) < 2e-3f;
+                    cracks_.undrawn += clear;
+                    if (clear && cracks_.where.size() < 200) cracks_.where.push_back(std::make_pair(int(x), int(y)));
+                    cracks_.undrawn_and_colour += (clear && c);
+                }
+            }
+            D3D12_RANGE dnone = {0, 0};
+            depth_rb->Unmap(0, &dnone);
+        }
+        if (hb0) hdr_rb[0]->Unmap(0, nullptr);
+        if (hb1) hdr_rb[1]->Unmap(0, nullptr);
+    }
 
     if (!write_bmp(path, static_cast<int>(width_), static_cast<int>(height_), bgr.data())) {
         error = std::string("could not write ") + path;

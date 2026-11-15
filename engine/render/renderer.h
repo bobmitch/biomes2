@@ -17,6 +17,7 @@
 #include "engine/trees/tree_field.h"
 #include "engine/trees/tree_renderer.h"
 #include "engine/foliage/foliage_renderer.h"
+#include "engine/render/rt_check.h"
 
 #include <unordered_map>
 #include <vector>
@@ -213,6 +214,27 @@ public:
     void set_contact(bool on) { contact_on_ = on; }
     bool contact() const { return contact_on_; }
     void set_post_debug(float d) { post_debug_ = d; }
+
+    // What the device can do (ADR-004): ray-tracing tier, shader model.
+    const DeviceCaps& caps() const { return caps_; }
+    ID3D12Device*       device() const { return device_.Get(); }
+    ID3D12CommandQueue* queue() const { return queue_.Get(); }
+
+    // Holes, counted by the last capture() two ways, below the horizon only:
+    // pixels that are exactly the sky's clear colour, and pixels whose depth
+    // is the far plane. The colour count is what the external crack detector
+    // has always done; the depth count is the one that survives a tonemap
+    // that changes the sky (ADR-004 L0). They must agree before it does.
+    // `undrawn` is the definition that survives a tonemap: far depth AND both
+    // HDR scene targets still at their clear values -- nothing, sea included,
+    // was drawn there. Far depth alone counts the sea beyond the clipmap,
+    // which writes no depth, as holes.
+    struct CrackCount {
+        size_t below_horizon = 0, by_colour = 0, by_depth = 0, both = 0;
+        size_t undrawn = 0, undrawn_and_colour = 0;
+        std::vector<std::pair<int, int> > where;   // the first undrawn pixels, for --pick
+    };
+    const CrackCount& last_cracks() const { return cracks_; }
     bool trees_on() const { return trees_on_; }
     void set_tree_extras(const std::vector<TreeGpuInstance>& extra) {
         tree_extras_ = extra;
@@ -350,6 +372,8 @@ private:
     bool  hist_valid_ = false;
     unsigned long long post_frame_ = 0;
     bool  taa_on_ = true, ao_on_ = true, contact_on_ = true;
+    DeviceCaps caps_;
+    CrackCount cracks_;
     float post_debug_ = 0.0f;
     TreeField        tree_field_;
     TreeRenderer     trees_;

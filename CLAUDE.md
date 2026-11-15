@@ -60,6 +60,7 @@ the streaming A/B switches `--no-lod-align`,
 `--no-lod-hold`, `--no-prioritise`, `--adaptive-budget` and
 `--lod-fade <frames>`, and the tree switches `--tree-distance <m>`,
 `--tree-debug 1|2|3|4` (tint by level; only LOD 0 / LOD 1 / impostors),
+`--check-rt` (ADR-004 L0: DXR end to end on one triangle),
 `--tree-lod0 <m>`, `--no-trees`, `--no-shadows`, `--no-foliage`,
 `--foliage-debug 1`, and the post chain's `--no-taa`, `--no-ao`,
 `--no-contact`, `--no-post` and `--post-debug 1|2` (AO alone, contact
@@ -219,7 +220,8 @@ last run's.
   of fake non-persistence in `--dig-verify`.
   **Now a real skirt, and surface vertices are never moved.** Same-LOD
   neighbours weld exactly at their shared row. Each border cell gets a second
-  vertex two voxels into the solid along −normal, and `cs_quads` hangs a
+  vertex two voxels into the solid along −normal and one voxel OUTWARD across
+  the chunk face along the surface (never upward), and `cs_quads` hangs a
   double-sided curtain from every mesh-border edge on an X/Z face
   (`border_side`). A skirt vertex's normal is stored at HALF length; shading
   normalises it, and `is_skirt_vertex` tests the length exactly. Do not
@@ -514,11 +516,25 @@ buffer. Y / O / J toggle TAA, AO and contact shadows. A still renders 16
 frames so TAA converges. Cost: ~0.3 ms a frame at ground level, 0.09 of it
 the effects.
 
-- **The tonemap is the identity below 0.8.** The sky's clear colour comes
-  out bit for bit (102, 128, 168), so the crack detector -- sky colour below
-  the horizon is a hole -- still means what it says. A filmic curve would
-  have broken that instrument silently. Grade only above 0.8, or move the
-  detector to a pre-tonemap buffer first.
+- **Cracks are counted in the engine, as UNDRAWN pixels** (ADR-004 L0):
+  below the horizon, far depth, and both HDR scene targets still at their
+  clear values -- read before TAA and the tonemap, so neither can hide a
+  hole. Every `--shot` writes the count to `<shot>.txt`. Trust it over the
+  old sky-colour test, which TAA had ALREADY blinded: on the rough hillside
+  it read 0 with post on against 49 real pinholes with post off. Far depth
+  alone is not a crack either -- the sea beyond the clipmap writes none.
+  The tonemap is still the identity below 0.8 (L1 replaces it); nothing
+  depends on that any more.
+- **A skirt straight down −normal is edge-on to a wall seen face-on.** The
+  rough hillside's ~50 "pinholes" (2420, 118, 3390) were one slit, 5 x 20
+  px: a steep wall crossed by a LOD 0 / LOD 1 border at z = 3456, viewed 15°
+  off its normal, so the curtain covered nothing and the ~1 m strip between
+  the two meshes showed sky. The shot report now lists the undrawn pixels;
+  `--pick` on them gave the wall, the border and the LODs in one run. The
+  skirt now also leans outward along the surface, as a flange under the
+  neighbour: undrawn 49 → 0. Leaning two voxels along the raw tangent stood
+  dark fins up on distant ridges (a coarse LOD's field normal describes
+  relief its mesh lacks), so the lean is one voxel and never climbs.
 - **Occlusion is per surface, in the targets' alpha.** Contact shadows over
   foliage turned every crown nearly black: leaf cards shadow each other
   everywhere inside the march, and the cascades already shadow them at their
