@@ -16,6 +16,7 @@
 #include "engine/field/world_gpu.h"
 #include "engine/trees/tree_field.h"
 #include "engine/trees/tree_renderer.h"
+#include "engine/foliage/foliage_renderer.h"
 
 #include <unordered_map>
 #include <vector>
@@ -192,6 +193,15 @@ public:
     const TreeRenderer&    trees() const { return trees_; }
     TreeDrawSettings&      tree_settings() { return tree_settings_; }
     void set_trees(bool on) { trees_on_ = on; }
+    // Ground cover: grass, flowers, bushes. --no-foliage and G for A/B.
+    void set_foliage(bool on) { foliage_on_ = on; }
+    bool foliage_on() const { return foliage_on_; }
+    FoliageSettings& foliage_settings() { return foliage_settings_; }
+    const FoliageRenderer& foliage() const { return foliage_; }
+    bool foliage_counts(uint32_t out[5], std::string& error) {
+        wait_for_gpu();
+        return foliage_.read_counts(queue_.Get(), out, error);
+    }
     // Sun shadows, three cascades. On by default; --no-shadows and L for A/B.
     void set_shadows(bool on) { shadows_on_ = on; }
     bool shadows() const { return shadows_on_; }
@@ -314,6 +324,9 @@ private:
     TreeField        tree_field_;
     TreeRenderer     trees_;
     TreeDrawSettings tree_settings_;
+    FoliageRenderer  foliage_;
+    FoliageSettings  foliage_settings_;
+    bool foliage_on_ = true;
     std::vector<TreeGpuInstance> tree_extras_;
     std::vector<TreeGpuInstance> tree_all_;
     std::unordered_map<uint32_t, float> tree_hits_;

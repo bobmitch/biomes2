@@ -24,6 +24,7 @@
 //   - =         tree draw distance, 100 to 2000 m in 50 m steps
 //   F6 / F9     save / load: dig edits and felled trees, under build/
 //   L           sun shadows on / off
+//   G           ground cover (grass, flowers, bushes) on / off
 // ---------------------------------------------------------------------------
 #include "engine/render/renderer.h"
 #include "engine/render/water_wave.h"
@@ -234,6 +235,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (wp == 'L') { g_renderer.set_shadows(!g_renderer.shadows()); return 0; }
+            if (wp == 'G') { g_renderer.set_foliage(!g_renderer.foliage_on()); return 0; }
             if (wp == VK_F6) { g_want_save = true; return 0; }
             if (wp == VK_F9) { g_want_load = true; return 0; }
             if (wp == VK_F5) {
@@ -632,6 +634,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (tg != std::string::npos) g_renderer.tree_settings().debug = float(std::atof(c2.c_str() + tg + 12));
         if (c2.find("--no-trees") != std::string::npos) g_renderer.set_trees(false);
         if (c2.find("--no-shadows") != std::string::npos) g_renderer.set_shadows(false);
+        if (c2.find("--no-foliage") != std::string::npos) g_renderer.set_foliage(false);
+        const size_t fd = c2.find("--foliage-debug");
+        if (fd != std::string::npos) g_renderer.foliage_settings().debug = float(std::atof(c2.c_str() + fd + 15));
         // Where LOD 0 hands over to LOD 1, in metres: 0 shows LOD 1 up close.
         const size_t tl = c2.find("--tree-lod0");
         if (tl != std::string::npos) g_renderer.tree_settings().lod0_dist = float(std::atof(c2.c_str() + tl + 11));
@@ -914,6 +919,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                          st.resident, st.pending, st.free_slots);
             std::fprintf(f, "vertices %u\nindices %u\ntriangles %u\nslots overflowed %u\n",
                          st.vertices, st.indices, st.indices / 3, st.overflowed);
+            {
+                // What the ground cover drew in this still.
+                uint32_t fc[5] = {0, 0, 0, 0, 0};
+                std::string ferr;
+                if (g_renderer.foliage_counts(fc, ferr)) {
+                    std::fprintf(f, "foliage: %u near blades, %u far blades, %u clump cards, %u bushes, "
+                                    "%u overflowed; %zu tiles resident\n",
+                                 fc[0], fc[1], fc[2], fc[3], fc[4], g_renderer.foliage().tiles_resident());
+                }
+            }
             std::fprintf(f, "field residual at %u vertices of slot 0: max %.4f m, mean %.4f m\n",
                          checked, mx, mn);
             std::fclose(f);
@@ -2641,7 +2656,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     }
 
     if (walk_seconds > 0.0) {
-        g_renderer.set_vsync(true);
+        // --uncapped measures frame cost at ground level, where the grass is:
+        // a flight passes too high for blades to be emitted at all.
+        const bool walk_uncapped = std::string(cmdline ? cmdline : "").find("--uncapped") != std::string::npos;
+        g_renderer.set_vsync(!walk_uncapped);
+        std::vector<double> walk_ms;
         g_walk = true;
         g_physics.place_character(0.0f, Spawn::above(0.0f, 0.0f), 0.0f);
         g_physics.character_position(g_feet);
@@ -2674,6 +2693,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             QueryPerformanceCounter(&now);
             const double total = double(now.QuadPart - wstart.QuadPart) / double(wfreq.QuadPart);
             const double dt = double(now.QuadPart - wprev.QuadPart) / double(wfreq.QuadPart);
+            walk_ms.push_back(dt * 1000.0);
             wprev = now;
             if (total >= walk_seconds) break;
 
@@ -2765,6 +2785,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const engine::FrameStats st = g_renderer.stats();
         if (FILE* f = std::fopen("build/walk.txt", "w")) {
             std::fprintf(f, "capsule walk over the generated world, %.1f s\n", walk_seconds);
+            if (walk_ms.size() > 60) {
+                std::vector<double> sm(walk_ms.begin() + 60, walk_ms.end());
+                std::sort(sm.begin(), sm.end());
+                double sum = 0.0;
+                for (size_t q = 0; q < sm.size(); ++q) sum += sm[q];
+                std::fprintf(f, "frame time (%s, after the first 60): mean %.2f ms, 99th %.2f ms\n",
+                             walk_uncapped ? "uncapped" : "vsync", sum / sm.size(),
+                             sm[size_t(sm.size() * 0.99)]);
+            }
             std::fprintf(f, "frames %llu, travelled %.0f m\n", frames, travelled);
             // Jolt cannot tell "in the air" from "that chunk has not arrived":
             // in both cases nothing is underneath. One number, not two labels

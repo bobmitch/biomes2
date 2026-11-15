@@ -43,6 +43,7 @@ of having them.
 | Generator gate | `build\validate.exe` | ALL CHECKS PASSED, 8 seeds at version 13 |
 | Trees | same | trees/ha forest 213, taiga 189, wetland 70, highland 36, meadows 31, badlands 13, ashlands 13, glacier 2, rift 1 (edges only); rank vs configured 1.00 (v12 on Windows: forest 230 -- river banks were not being kept clear) |
 | Tree cost | `engine --flight 10 [--no-trees]` | 0.76 vs 0.39 ms at spawn, 1.03 vs 0.47 ms with `--flight-from -704 60 -448` (densest forest); 1000 m draw distance 0.94 ms |
+| Ground cover | `engine --walk 15 --uncapped [--no-foliage]` | 1.83 vs 1.54 ms a frame walking through a meadow; a woodland-edge still draws ~24k near blades, 13k far, 13k cards, 219 bushes, 0 overflowed |
 | Shadows | `engine --flight 10 [--no-shadows]` | spawn 1.66 vs 0.78 ms; densest forest (`--flight-from -704 60 -448`) 2.66 vs 0.97 ms |
 | Felling | `engine --fell --fell-save`, then `--fell-verify` | walk stopped 0.55 m from the axis (bark + capsule 0.54), 9 of 9 swings, log tipped 72 degrees and rested in 9.3 s; reloaded 0.0000 m from rest, tree not standing |
 | Blend seams | same | 0 seeds over 5 cm; worst 0.014 m base, 0.036 m 3D, over 398,211 crossings (v8: steps up to 178 m) |

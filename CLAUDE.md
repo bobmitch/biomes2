@@ -13,6 +13,7 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `worldgen/data/` | `archetypes.json` — the biome table. All tuning lives here. |
 | `worldgen/golden/` | Pinned seed hashes. Changes must be deliberate. |
 | `engine/trees/` | Tree meshes (procedural, made here), the CPU tile streamer over layer 8, GPU culling and impostors, felling. |
+| `engine/foliage/` | Ground cover -- grass, flowers, bushes -- generated on the GPU each frame (`foliage.hlsl`). |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32). Debug tool, Windows only. |
 | `tools/shared/` | Presentation, shared by the harness and the viewer. |
@@ -59,7 +60,9 @@ the streaming A/B switches `--no-lod-align`,
 `--no-lod-hold`, `--no-prioritise`, `--adaptive-budget` and
 `--lod-fade <frames>`, and the tree switches `--tree-distance <m>`,
 `--tree-debug 1|2|3|4` (tint by level; only LOD 0 / LOD 1 / impostors),
-`--tree-lod0 <m>`, `--no-trees` and `--no-shadows`. It is a GUI subsystem binary, so a shell does not wait
+`--tree-lod0 <m>`, `--no-trees`, `--no-shadows`, `--no-foliage` and
+`--foliage-debug 1`. `--walk` takes `--uncapped` to time frames at ground
+level, where the grass is. It is a GUI subsystem binary, so a shell does not wait
 on it: run it with `Start-Process -Wait` or the file you read will be the
 last run's.
 
@@ -468,6 +471,32 @@ from the same mesh split at `kCutHeight`. F6/F9 save/load `build/edits.bin`
 and `build/trees.bin` (same field id). `--fell` walks into a trunk, fells
 it and watches the log; `--fell-save` then `--fell-verify` in a second
 process checks the log is where it rested and the tree does not stand.
+
+### Ground cover
+
+Grass blades, clump cards, bushes and flowers, per biome from the `ground`
+block in `archetypes.json` -- presentation only, never in the golden hash or
+a save, nothing collides. 16 m tiles of 1 m cells are baked on the GPU as
+they come into range (`cs_bake`: the real surface, bisected inside layer 6's
+overhang as trees are; slope; river and shore; the blended ground cover; a
+canopy factor from layer 8's patch noise, so a forest floor has less grass
+and more bushes) and cached in a 768-tile pool. Every frame `cs_emit` turns
+cached cells in the frustum into: blades (5 segments to 22 m, 2 beyond),
+full density inside 10 m and thinning as (10/d)^2 to 60 m with each blade
+widening by the square root so cover holds, the last blade of a cell
+shrinking rather than popping; crossed clump cards 48-150 m, dither-faded
+against the blades; leaf-card bushes; flowers on a few blade tips. A 6-8 m
+tuft noise varies height and density inside a patch. Same sun, shadows and
+fog as everything else. `G` toggles it. Cost: +0.3 ms a frame walking
+through a meadow (`--walk 15 --uncapped`, with and without `--no-foliage`);
+about 24k near blades, 13k far, 13k cards in a woodland-edge still.
+
+The bake kernel is the third time the inlining lesson has bitten: written
+longhand -- five heights and three density probes -- it exceeded FXC's 4096
+temp registers (X4505). One call site per field function, each in a
+`[loop]`, the probes as one loop with a little state machine.
+
+Not handled: grass does not know about dig edits, and floats over a dug hole.
 
 ### Shadows
 

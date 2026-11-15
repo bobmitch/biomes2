@@ -20,6 +20,7 @@
       {"name": "snag",   "form": "snag",      "height": [6.0, 14.0],  "altitude": [-100.0, 900.0], "shape": {"bark": [0.13, 0.12, 0.11], "leaf": [0.00, 0.00, 0.00], "crown_start": 0.45, "crown_radius": 0.15, "trunk": 0.024, "leaf_size": 0.00, "limbs": 4}}
     ]
   },
+  "_note_ground": "Ground cover -- grass, flowers, bushes -- drawn by the engine on the GPU from the seed. Presentation only: nothing here reaches the golden hash or a save, and a missing block means bare ground. grass is blade density at full patch (1 = the engine's maximum), cover the share of the biome inside a grass patch, dry how far the colour leans to dry_color, narrow 1 for reeds; flowers and bushes are chances per 1 m cell. Grass thins under a tree canopy by the same patch noise layer 8 plants trees with.",
   "sea_level": 0.0,
   "biomes": [
     {
@@ -29,6 +30,7 @@
       "base_elevation": 12.0, "amplitude": 18.0, "octaves": 4, "lacunarity": 2.0, "gain": 0.50, "ridge_blend": 0.05, "flatness": 1.60,
       "overhang_strength": 0.00, "cave_density": 0.00, "cave_depth_band": [8.0, 120.0],
       "material_id": 0, "water_level_offset": 0.0,
+      "ground": {"grass": 1.00, "cover": 0.85, "height": [0.25, 0.60], "color": [0.28, 0.44, 0.11], "dry_color": [0.58, 0.52, 0.26], "dry": 0.15, "narrow": 0, "flowers": 0.10, "bushes": 0.012},
       "trees": {"density": 0.30, "cover": 0.20, "species": {"oak": 3, "birch": 2, "maple": 1}}
     },
     {
@@ -38,6 +40,7 @@
       "base_elevation": 20.0, "amplitude": 38.0, "octaves": 5, "lacunarity": 2.0, "gain": 0.50, "ridge_blend": 0.20, "flatness": 1.25,
       "overhang_strength": 0.10, "cave_density": 0.00, "cave_depth_band": [10.0, 160.0],
       "material_id": 1, "water_level_offset": 0.0,
+      "ground": {"grass": 0.55, "cover": 0.70, "height": [0.15, 0.40], "color": [0.20, 0.35, 0.09], "dry_color": [0.45, 0.42, 0.20], "dry": 0.10, "narrow": 0, "flowers": 0.015, "bushes": 0.09},
       "trees": {"density": 0.55, "cover": 0.80, "species": {"oak": 3, "maple": 2.5, "beech": 2.5, "birch": 2, "pine": 0.6, "fir": 0.4}}
     },
     {
@@ -47,6 +50,7 @@
       "base_elevation": 3.0, "amplitude": 8.0, "octaves": 4, "lacunarity": 2.1, "gain": 0.45, "ridge_blend": 0.00, "flatness": 2.40,
       "overhang_strength": 0.00, "cave_density": 0.00, "cave_depth_band": [6.0, 60.0],
       "material_id": 2, "water_level_offset": 0.0,
+      "ground": {"grass": 0.95, "cover": 0.80, "height": [0.55, 1.15], "color": [0.30, 0.42, 0.15], "dry_color": [0.55, 0.50, 0.28], "dry": 0.25, "narrow": 1, "flowers": 0.02, "bushes": 0.03},
       "trees": {"density": 0.35, "cover": 0.45, "species": {"willow": 3, "alder": 3, "birch": 2}}
     },
     {
@@ -56,6 +60,7 @@
       "base_elevation": 90.0, "amplitude": 140.0, "octaves": 6, "lacunarity": 2.0, "gain": 0.52, "ridge_blend": 0.70, "flatness": 0.85,
       "overhang_strength": 0.35, "cave_density": 0.00, "cave_depth_band": [20.0, 260.0],
       "material_id": 3, "water_level_offset": 0.0,
+      "ground": {"grass": 0.65, "cover": 0.65, "height": [0.10, 0.30], "color": [0.34, 0.42, 0.16], "dry_color": [0.55, 0.48, 0.26], "dry": 0.45, "narrow": 0, "flowers": 0.04, "bushes": 0.05},
       "trees": {"density": 0.22, "cover": 0.40, "species": {"pine": 3, "fir": 2, "birch": 1}}
     },
     {
@@ -65,6 +70,7 @@
       "base_elevation": 45.0, "amplitude": 70.0, "octaves": 5, "lacunarity": 2.2, "gain": 0.48, "ridge_blend": 0.55, "flatness": 1.10,
       "overhang_strength": 0.45, "cave_density": 0.00, "cave_depth_band": [12.0, 180.0],
       "material_id": 4, "water_level_offset": 0.0,
+      "ground": {"grass": 0.18, "cover": 0.30, "height": [0.15, 0.35], "color": [0.42, 0.42, 0.20], "dry_color": [0.62, 0.54, 0.30], "dry": 0.80, "narrow": 0, "flowers": 0.0, "bushes": 0.02},
       "trees": {"density": 0.08, "cover": 0.25, "species": {"scrub": 3, "snag": 1}}
     },
     {
@@ -74,6 +80,7 @@
       "base_elevation": 55.0, "amplitude": 60.0, "octaves": 5, "lacunarity": 2.0, "gain": 0.50, "ridge_blend": 0.30, "flatness": 1.20,
       "overhang_strength": 0.15, "cave_density": 0.00, "cave_depth_band": [10.0, 150.0],
       "material_id": 5, "water_level_offset": 0.0,
+      "ground": {"grass": 0.35, "cover": 0.50, "height": [0.12, 0.30], "color": [0.24, 0.34, 0.14], "dry_color": [0.48, 0.44, 0.26], "dry": 0.30, "narrow": 0, "flowers": 0.01, "bushes": 0.08},
       "trees": {"density": 0.55, "cover": 0.75, "species": {"spruce": 4, "fir": 3, "pine": 1.5, "birch": 0.5}}
     },
     {
@@ -99,7 +106,8 @@
       "adjacency_forbid": ["meadows"], "allow_island": false,
       "base_elevation": 70.0, "amplitude": 165.0, "octaves": 6, "lacunarity": 2.1, "gain": 0.56, "ridge_blend": 0.90, "flatness": 0.75,
       "overhang_strength": 0.70, "cave_density": 0.00, "cave_depth_band": [25.0, 320.0],
-      "material_id": 8, "water_level_offset": 0.0
+      "material_id": 8, "water_level_offset": 0.0,
+      "ground": {"grass": 0.05, "cover": 0.20, "height": [0.10, 0.25], "color": [0.40, 0.40, 0.22], "dry_color": [0.58, 0.52, 0.32], "dry": 0.90, "narrow": 0, "flowers": 0.0, "bushes": 0.0}
     }
   ]
 }

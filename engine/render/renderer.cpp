@@ -959,6 +959,9 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         tree_field_.init(&world_, 3);
     }
     startup_log().push_back(std::make_pair(std::string("phase: tree models + impostor bake"), startup_now_ms() - t0));
+    t0 = startup_now_ms();
+    if (!foliage_.init(device_.Get(), &world_, "worldgen/data/archetypes.json", error)) return false;
+    startup_log().push_back(std::make_pair(std::string("phase: foliage pipelines"), startup_now_ms() - t0));
 
     ready_ = true;
     return true;
@@ -1124,6 +1127,24 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         ti.far_plane = kFarPlane;
         ti.shadow_cb = shadow_cb_[frame_]->GetGPUVirtualAddress();
         trees_.record(cmd_.Get(), frame_, ti, tree_settings_);
+    }
+
+    // Ground cover after the trees, before the sea.
+    if (foliage_on_ && foliage_.ready() && mode_ != Mode::Wireframe) {
+        FoliageFrameInputs fi = {};
+        std::memcpy(fi.view_proj, mc.view_proj, sizeof fi.view_proj);
+        for (int k = 0; k < 3; ++k) {
+            fi.cam_pos[k] = view.cam_pos[k];
+            fi.cam_right[k] = view.cam_right[k];
+            fi.cam_up[k] = view.cam_up[k];
+        }
+        fi.time = view.time;
+        fi.far_plane = kFarPlane;
+        fi.shadow_cb = shadow_cb_[frame_]->GetGPUVirtualAddress();
+        fi.shadow_table = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+        ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
+        cmd_->SetDescriptorHeaps(1, heaps);
+        foliage_.record(cmd_.Get(), frame_, fi, foliage_settings_);
     }
 
     // The sea goes last: it is transparent, so it has to blend over whatever
@@ -1474,6 +1495,11 @@ void Renderer::render(const ViewConstants& view) {
     patches_added_.clear();
     patches_removed_.clear();
     update_trees(view, false);
+    // Only when it will draw this frame: a tile handed a slot is baked by the
+    // same frame's record, and a frame that skipped it would leave the slot
+    // marked valid over cells nobody wrote.
+    if (foliage_on_ && mode_ != Mode::Wireframe)
+        foliage_.update(view.cam_pos[0], view.cam_pos[2], foliage_settings_, false);
     streamer_.update(view.cam_pos[0], view.cam_pos[1], view.cam_pos[2]);
     {
         const std::vector<ChunkKey>& gone = streamer_.retired_keys();
@@ -1615,6 +1641,8 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
     // A still of a finished world: no chunk mid-fade in a screenshot.
     streamer_.settle_fades();
     update_trees(view, true);
+    if (foliage_on_ && mode_ != Mode::Wireframe)
+        foliage_.update(view.cam_pos[0], view.cam_pos[2], foliage_settings_, true);
 
     const D3D12_RESOURCE_DESC rd = targets_[frame_]->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
