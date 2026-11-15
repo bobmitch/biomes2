@@ -576,6 +576,17 @@ public:
     // Which slot a chunk currently owns, if it is still resident. The mesh
     // readback needs this: by the time a copy lands the chunk may have been
     // retired and its slot handed to something else entirely.
+    // Every slot drawn this frame with its chunk -- resident with geometry,
+    // and held while its replacement fades in. What the ray-tracing scene
+    // instances (ADR-004 L5).
+    void drawn(std::vector<std::pair<ChunkKey, UINT> >& out) const {
+        out.clear();
+        for (std::unordered_map<ChunkKey, UINT, ChunkKeyHash>::const_iterator it = resident_.begin();
+             it != resident_.end(); ++it)
+            if (it->second != kNoSlot) out.push_back(std::make_pair(it->first, it->second));
+        for (size_t i = 0; i < held_.size(); ++i) out.push_back(std::make_pair(held_[i].key, held_[i].slot));
+    }
+
     bool slot_of(const ChunkKey& k, UINT& out) const {
         std::unordered_map<ChunkKey, UINT, ChunkKeyHash>::const_iterator it =
             resident_.find(k);

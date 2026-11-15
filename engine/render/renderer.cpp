@@ -170,7 +170,7 @@ struct PostConstants {
     float sun_disk[3];     float pad4;
     float moon_disk[3];    float pad5;
     float cam_fwd[3];      float fog_on;
-    float fog_near;        float fog_log_ratio; float pad6[2];
+    float fog_near;        float fog_log_ratio; float rt_shadows; float pad6;
 };
 static_assert(sizeof(PostConstants) == 416, "PostConstants must match post.hlsl");
 
@@ -187,6 +187,15 @@ struct FogConstants {
     float screen_w;     float screen_h;  float density_scale; float pad0;
 };
 static_assert(sizeof(FogConstants) == 192, "FogConstants must match fog.hlsl");
+// Matches cbuffer RtConstants in rt_shadow.hlsl.
+struct RtConstants {
+    float inv_view_proj[16];
+    float cam_pos[3];  UINT width;
+    float key_dir[3];  UINT height;
+    float near_plane;  float far_plane; float csm_reach; UINT frame;
+    UINT  checks;      float light_radius; float pad1[2];
+};
+static_assert(sizeof(RtConstants) == 128, "RtConstants must match rt_shadow.hlsl");
 // The mist's froxels: 160 x 90 x 128, log-spaced from 0.5 m to 6 km.
 const UINT  kFogX = 160, kFogY = 90, kFogZ = 128;
 const float kFogNear = 0.5f, kFogFar = 6000.0f;
@@ -995,6 +1004,7 @@ void Renderer::record_shadows(const ViewConstants& view) {
     sc.split[3] = on ? 1.0f : 0.0f;
     fill_light(sc.light);
     std::memcpy(sc.cluster, cluster_consts_, sizeof sc.cluster);
+    sc.cluster[2][3] = (rt_shadows_ && rt_ok_ && mode_ != Mode::Wireframe) ? 1.0f : 0.0f;
     if (on) {
         compute_cascades(view);
         for (UINT c = 0; c < kCascades; ++c) {
@@ -1070,6 +1080,272 @@ void Renderer::record_shadows(const ViewConstants& view) {
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     cmd_->ResourceBarrier(1, &b);
+}
+
+// ---------------------------------------------------------------------------
+// The ray-tracing scene (ADR-004 L5): rt_scene.h for the acceleration
+// structures, gi_trace.hlsli for the tracer, rt_shadow.hlsl for the trace.
+// ---------------------------------------------------------------------------
+
+void Renderer::set_rt_shadows(bool on) {
+    rt_shadows_ = on;
+    if (on) set_rt_active(true);
+}
+
+void Renderer::set_rt_active(bool on) {
+    if (on && !rt_active_) rt_seed_ = true;
+    rt_active_ = on;
+}
+
+bool Renderer::create_rt(std::string& error) {
+    rt_ok_ = false;
+    // Absent hardware or DXC is not an error: the engine runs on cascades.
+    if (caps_.raytracing < D3D12_RAYTRACING_TIER_1_1 || !dxc().ok()) return true;
+    std::string why;
+    if (const char* dbg = std::getenv("BIOMES_RT_DBG")) rt_.debug_ = unsigned(std::atoi(dbg));
+    if (!rt_.init(device_.Get(), why)) {
+        startup_log().push_back(std::make_pair(std::string("ray tracing off: ") + why, 0.0));
+        return true;
+    }
+    D3D12_HEAP_PROPERTIES dh = {};
+    dh.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = width_;
+    rd.Height = height_;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R8_UNORM;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    HRESULT hr = device_->CreateCommittedResource(&dh, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                  nullptr, IID_PPV_ARGS(&rt_vis_));
+    if (FAILED(hr)) { error = hr_text("rt visibility", hr); return false; }
+    auto buffer = [&](ComPtr<ID3D12Resource>& out, D3D12_HEAP_TYPE heap, UINT64 bytes, bool uav, D3D12_RESOURCE_STATES st) -> bool {
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = heap;
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = bytes;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+        return SUCCEEDED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, st, nullptr, IID_PPV_ARGS(&out)));
+    };
+    if (!buffer(rt_stats_buf_, D3D12_HEAP_TYPE_DEFAULT, 64, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) { error = "rt stats"; return false; }
+    for (UINT f = 0; f < kFrameCount; ++f) {
+        if (!buffer(rt_stats_rb_[f], D3D12_HEAP_TYPE_READBACK, 64, false, D3D12_RESOURCE_STATE_COPY_DEST) ||
+            !buffer(rt_cb_[f], D3D12_HEAP_TYPE_UPLOAD, 256, false, D3D12_RESOURCE_STATE_GENERIC_READ)) { error = "rt buffers"; return false; }
+        rt_cb_[f]->Map(0, nullptr, &rt_cb_cpu_[f]);
+    }
+    {
+        D3D12_QUERY_HEAP_DESC qd = {};
+        qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qd.Count = 4 * kFrameCount;
+        if (FAILED(device_->CreateQueryHeap(&qd, IID_PPV_ARGS(&rt_queries_)))) { error = "rt queries"; return false; }
+        if (!buffer(rt_query_rb_, D3D12_HEAP_TYPE_READBACK, 4 * kFrameCount * 8, false, D3D12_RESOURCE_STATE_COPY_DEST)) { error = "rt query readback"; return false; }
+    }
+    // [36] the visibility SRV (post t10), [37] its UAV.
+    const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE c = srv_heap_->GetCPUDescriptorHandleForHeapStart();
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = DXGI_FORMAT_R8_UNORM;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE h = c;
+        h.ptr += SIZE_T(36) * inc;
+        device_->CreateShaderResourceView(rt_vis_.Get(), &sd, h);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = DXGI_FORMAT_R8_UNORM;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        h = c;
+        h.ptr += SIZE_T(37) * inc;
+        device_->CreateUnorderedAccessView(rt_vis_.Get(), nullptr, &ud, h);
+    }
+    // Root signature: constants, the shadow constants, the TLAS, the sun's
+    // map, depth, the six geometry buffers gi_trace reads, the visibility
+    // UAV, the stats.
+    {
+        D3D12_DESCRIPTOR_RANGE r_shadow = {}, r_depth = {}, r_vis = {};
+        r_shadow.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r_shadow.NumDescriptors = 1; r_shadow.BaseShaderRegister = 8;
+        r_depth.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;  r_depth.NumDescriptors = 1;  r_depth.BaseShaderRegister = 0;
+        r_vis.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;    r_vis.NumDescriptors = 1;    r_vis.BaseShaderRegister = 0;
+        D3D12_ROOT_PARAMETER p[14] = {};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0;
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 2;
+        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[2].Descriptor.ShaderRegister = 30;
+        p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[3].DescriptorTable.NumDescriptorRanges = 1; p[3].DescriptorTable.pDescriptorRanges = &r_shadow;
+        p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[4].DescriptorTable.NumDescriptorRanges = 1; p[4].DescriptorTable.pDescriptorRanges = &r_depth;
+        for (int k = 0; k < 6; ++k) {
+            p[5 + k].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            p[5 + k].Descriptor.ShaderRegister = 31 + k;
+        }
+        p[11].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[11].DescriptorTable.NumDescriptorRanges = 1; p[11].DescriptorTable.pDescriptorRanges = &r_vis;
+        p[12].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; p[12].Descriptor.ShaderRegister = 1;
+        p[13].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[13].Descriptor.ShaderRegister = 37;   // tree uv, kind, seed
+        for (int k = 0; k < 14; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_STATIC_SAMPLER_DESC cmp = {};
+        cmp.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+        cmp.AddressU = cmp.AddressV = cmp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        cmp.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+        cmp.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        cmp.MaxLOD = D3D12_FLOAT32_MAX;
+        cmp.ShaderRegister = 1;
+        cmp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rsd = {};
+        rsd.NumParameters = 14;
+        rsd.pParameters = p;
+        rsd.NumStaticSamplers = 1;
+        rsd.pStaticSamplers = &cmp;
+        ComPtr<ID3DBlob> sig, err;
+        hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+        if (FAILED(hr)) {
+            error = std::string("rt root signature: ") + (err ? static_cast<const char*>(err->GetBufferPointer()) : "");
+            return false;
+        }
+        hr = device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&rt_root_));
+        if (FAILED(hr)) { error = hr_text("CreateRootSignature (rt)", hr); return false; }
+    }
+    const char* entries[2] = {"cs_rt_shadow", "cs_rt_clear"};
+    ComPtr<ID3D12PipelineState>* outs[2] = {&rt_pso_, &rt_clear_pso_};
+    for (int k = 0; k < 2; ++k) {
+        ComPtr<ID3DBlob> cs;
+        if (!compile_shader("engine/render/shaders/rt_shadow.hlsl", entries[k], "cs_6_5", cs, error)) return false;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cd = {};
+        cd.pRootSignature = rt_root_.Get();
+        cd.CS.pShaderBytecode = cs->GetBufferPointer();
+        cd.CS.BytecodeLength = cs->GetBufferSize();
+        if (FAILED(device_->CreateComputePipelineState(&cd, IID_PPV_ARGS(outs[k]->GetAddressOf())))) {
+            error = "rt compute pso";
+            return false;
+        }
+    }
+    rt_ok_ = true;
+    return true;
+}
+
+void Renderer::record_rt_trace() {
+    auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+        D3D12_RESOURCE_BARRIER rb = {};
+        rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        rb.Transition.pResource = r;
+        rb.Transition.StateBefore = a;
+        rb.Transition.StateAfter = b;
+        rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd_->ResourceBarrier(1, &rb);
+    };
+    const D3D12_RESOURCE_STATES nps = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES ps = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES ib = D3D12_RESOURCE_STATE_INDEX_BUFFER;
+    const UINT q = UINT(frame_) * 4;
+
+    // Last time this frame index ran: its stats and stamps have landed.
+    if (rt_stats_pending_[frame_]) {
+        UINT* s = nullptr;
+        D3D12_RANGE rr = {0, 64};
+        if (SUCCEEDED(rt_stats_rb_[frame_]->Map(0, &rr, reinterpret_cast<void**>(&s)))) {
+            rt_stats_.lit_lit = s[0];
+            rt_stats_.shadow_shadow = s[1];
+            rt_stats_.rt_only = s[2];
+            rt_stats_.csm_only = s[3];
+            rt_stats_.primary_agree = s[4];
+            rt_stats_.primary_nearer = s[5];
+            rt_stats_.primary_farther = s[6];
+            rt_stats_.normal_err_deg = s[8] ? float(double(s[7]) / 100.0 / double(s[8])) : 0.0f;
+            D3D12_RANGE nr = {0, 0};
+            rt_stats_rb_[frame_]->Unmap(0, &nr);
+        }
+        rt_stats_pending_[frame_] = false;
+    }
+    if (rt_query_pending_[frame_]) {
+        UINT64* t = nullptr;
+        D3D12_RANGE rr = {q * 8, (q + 4) * 8};
+        if (SUCCEEDED(rt_query_rb_->Map(0, &rr, reinterpret_cast<void**>(&t)))) {
+            UINT64 freq = 0;
+            queue_->GetTimestampFrequency(&freq);
+            const UINT64* s = t + q;
+            const double k = freq ? 1000.0 / double(freq) : 0.0;
+            auto ema = [](float& v, double x) { v = v == 0.0f ? float(x) : float(0.95 * v + 0.05 * x); };
+            ema(rt_stats_.build_ms, double(s[1] - s[0]) * k);
+            ema(rt_stats_.trace_ms, double(s[3] - s[2]) * k);
+            D3D12_RANGE nr = {0, 0};
+            rt_query_rb_->Unmap(0, &nr);
+        }
+        rt_query_pending_[frame_] = false;
+    }
+
+    RtConstants rc = {};
+    invert4(view_proj_, rc.inv_view_proj);
+    for (int k = 0; k < 3; ++k) {
+        rc.cam_pos[k] = cur_cam_[k];
+        rc.key_dir[k] = sky_frame_.key_dir[k];
+    }
+    rc.width = width_;
+    rc.height = height_;
+    rc.near_plane = kNearPlane;
+    rc.far_plane = kFarPlane;
+    rc.csm_reach = kCascadeSplit[kCascades] * 0.9f;
+    rc.frame = UINT(post_frame_);
+    rc.checks = rt_checks_ ? 1u : 0u;
+    // The sun's angular radius, or the moon's: 0.2667 and 0.259 degrees.
+    rc.light_radius = (sky_frame_.key_is_moon ? 0.259f : 0.2667f) * 0.0174533f;
+    std::memcpy(rt_cb_cpu_[frame_], &rc, sizeof rc);
+
+    tr(mesher_.indices(), ib, ib | nps);
+    tr(shadow_map_.Get(), ps, ps | nps);
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
+    cmd_->SetDescriptorHeaps(1, heaps);
+    const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto at = [&](UINT i) {
+        D3D12_GPU_DESCRIPTOR_HANDLE g = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+        g.ptr += UINT64(i) * inc;
+        return g;
+    };
+    const D3D12_GPU_VIRTUAL_ADDRESS any = mesher_.vertices()->GetGPUVirtualAddress();
+    cmd_->SetComputeRootSignature(rt_root_.Get());
+    cmd_->SetComputeRootConstantBufferView(0, rt_cb_[frame_]->GetGPUVirtualAddress());
+    cmd_->SetComputeRootConstantBufferView(1, shadow_cb_[frame_]->GetGPUVirtualAddress());
+    cmd_->SetComputeRootShaderResourceView(2, rt_.tlas());
+    cmd_->SetComputeRootDescriptorTable(3, at(0));
+    cmd_->SetComputeRootDescriptorTable(4, at(3));
+    cmd_->SetComputeRootShaderResourceView(5, mesher_.vertices()->GetGPUVirtualAddress());
+    cmd_->SetComputeRootShaderResourceView(6, mesher_.indices()->GetGPUVirtualAddress());
+    cmd_->SetComputeRootShaderResourceView(7, mesher_.vertex_materials()->GetGPUVirtualAddress());
+    cmd_->SetComputeRootShaderResourceView(8, rt_.tree_positions() ? rt_.tree_positions()->GetGPUVirtualAddress() : any);
+    cmd_->SetComputeRootShaderResourceView(9, rt_.tree_indices() ? rt_.tree_indices()->GetGPUVirtualAddress() : any);
+    cmd_->SetComputeRootShaderResourceView(10, rt_.tree_info() ? rt_.tree_info()->GetGPUVirtualAddress() : any);
+    cmd_->SetComputeRootDescriptorTable(11, at(37));
+    cmd_->SetComputeRootUnorderedAccessView(12, rt_stats_buf_->GetGPUVirtualAddress());
+    cmd_->SetComputeRootShaderResourceView(13, rt_.tree_attributes() ? rt_.tree_attributes()->GetGPUVirtualAddress() : any);
+    cmd_->SetPipelineState(rt_clear_pso_.Get());
+    cmd_->Dispatch(2, 1, 1);
+    {
+        D3D12_RESOURCE_BARRIER u = {};
+        u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        u.UAV.pResource = rt_stats_buf_.Get();
+        cmd_->ResourceBarrier(1, &u);
+    }
+    cmd_->EndQuery(rt_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q + 2);
+    cmd_->SetPipelineState(rt_pso_.Get());
+    cmd_->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
+    tr(rt_vis_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nps);
+    cmd_->EndQuery(rt_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q + 3);
+    cmd_->ResolveQueryData(rt_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q, 4, rt_query_rb_.Get(), UINT64(q) * 8);
+    rt_query_pending_[frame_] = true;
+    tr(rt_stats_buf_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmd_->CopyBufferRegion(rt_stats_rb_[frame_].Get(), 0, rt_stats_buf_.Get(), 0, 64);
+    tr(rt_stats_buf_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    rt_stats_pending_[frame_] = true;
+    tr(shadow_map_.Get(), ps | nps, ps);
+    tr(mesher_.indices(), ib | nps, ib);
 }
 
 // ---------------------------------------------------------------------------
@@ -2216,6 +2492,9 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     t0 = startup_now_ms();
     if (!create_fog(error)) return false;
     startup_log().push_back(std::make_pair(std::string("phase: mist map + volumes"), startup_now_ms() - t0));
+    t0 = startup_now_ms();
+    if (!create_rt(error)) return false;
+    startup_log().push_back(std::make_pair(std::string("phase: ray-tracing scene"), startup_now_ms() - t0));
 
     ready_ = true;
     return true;
@@ -2403,18 +2682,23 @@ bool Renderer::create_post_pipelines(std::string& error) {
         sr.NumDescriptors = 9;
         // t9, the mist's integrated volume, sits at heap [32]: 29 past the
         // table's start at [3].
-        D3D12_DESCRIPTOR_RANGE sr2[2] = {sr, {}};
+        D3D12_DESCRIPTOR_RANGE sr2[3] = {sr, {}, {}};
         sr2[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr2[1].NumDescriptors = 1;
         sr2[1].BaseShaderRegister = 9;
         sr2[1].OffsetInDescriptorsFromTableStart = 29;
+        // t10, L5's traced visibility, at heap [36].
+        sr2[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr2[2].NumDescriptors = 1;
+        sr2[2].BaseShaderRegister = 10;
+        sr2[2].OffsetInDescriptorsFromTableStart = 33;
         D3D12_DESCRIPTOR_RANGE ur = {};
         ur.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         ur.NumDescriptors = 4;
         D3D12_ROOT_PARAMETER p[5] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[1].DescriptorTable.NumDescriptorRanges = 2;
+        p[1].DescriptorTable.NumDescriptorRanges = 3;
         p[1].DescriptorTable.pDescriptorRanges = sr2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[2].DescriptorTable.NumDescriptorRanges = 1;
@@ -2569,6 +2853,7 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     pc.fog_on = (fog_on_ && !wire) ? 1.0f : 0.0f;
     pc.fog_near = kFogNear;
     pc.fog_log_ratio = std::log(kFogFar / kFogNear);
+    pc.rt_shadows = (rt_shadows_ && rt_ok_ && !wire) ? 1.0f : 0.0f;
     pc.near_plane = kNearPlane;
     pc.far_plane = kFarPlane;
     pc.sharpen = taa_on_ && !wire ? 0.5f : 0.0f;
@@ -2657,6 +2942,16 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     cmd_->SetComputeRootUnorderedAccessView(3, lumhist_->GetGPUVirtualAddress());
     cmd_->SetComputeRootUnorderedAccessView(4, expo_->GetGPUVirtualAddress());
 
+    // The traced key-light shadow and the RT instruments (L5).
+    if (rt_ok_ && rt_active_ && !(rt_.debug_ & 1u)) {
+        record_rt_trace();
+        cmd_->SetComputeRootSignature(post_root_.Get());
+        cmd_->SetComputeRootConstantBufferView(0, post_cb_[frame_]->GetGPUVirtualAddress());
+        cmd_->SetComputeRootDescriptorTable(1, srvs);
+        cmd_->SetComputeRootDescriptorTable(2, uavs);
+        cmd_->SetComputeRootUnorderedAccessView(3, lumhist_->GetGPUVirtualAddress());
+        cmd_->SetComputeRootUnorderedAccessView(4, expo_->GetGPUVirtualAddress());
+    }
     // AO at half resolution.
     cmd_->SetPipelineState(ao_pso_.Get());
     cmd_->Dispatch(((width_ + 1) / 2 + 7) / 8, ((height_ + 1) / 2 + 7) / 8, 1);
@@ -2704,6 +2999,7 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     cmd_->DrawInstanced(3, 1, 0, 0);
 
     // Back to where the next frame starts.
+    if (rt_ok_ && rt_active_ && !(rt_.debug_ & 1u)) tr(rt_vis_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     tr(sky_view_tex_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     tr(ap_tex_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     tr(ao_.Get(), read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -2728,6 +3024,30 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     // This frame's sun, moon and sky (ADR-004 L2), before anything uses them.
     update_sky(view.cam_pos[1]);
     for (int k = 0; k < 3; ++k) tree_settings_.sun_dir[k] = sky_frame_.key_dir[k];
+    // The ray-tracing scene (ADR-004 L5): due BLAS and this frame's TLAS.
+    if (rt_ok_ && rt_active_) {
+        if (rt_seed_) {
+            // Switched on with the world already meshed: everything drawn at
+            // LOD 0-3 is due, as if meshed two frames ago.
+            std::vector<std::pair<ChunkKey, UINT> > drawn;
+            streamer_.drawn(drawn);
+            std::vector<Streamer::MeshedChunk> seed;
+            for (size_t i = 0; i < drawn.size(); ++i) {
+                Streamer::MeshedChunk m;
+                m.key = drawn[i].first;
+                m.slot = drawn[i].second;
+                seed.push_back(m);
+            }
+            rt_.note_meshed(seed, true);
+            rt_seed_ = false;
+        }
+        rt_.note_meshed(streamer_.last_meshed());
+        const UINT q = UINT(frame_) * 4;
+        if (rt_queries_) cmd_->EndQuery(rt_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q + 0);
+        if (!(rt_.debug_ & 8u)) rt_.record(cmd_.Get(), UINT(frame_), streamer_, mesher_, trees_.models(), trees_.looks(),
+                   trees_.instance_list(), view.cam_pos, tree_settings_.max_dist);
+        if (rt_queries_) cmd_->EndQuery(rt_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q + 1);
+    }
     // Local lights (ADR-004 L3): their list, their clusters and their shadow
     // faces, before anything is shaded with them.
     record_lights(view);
@@ -3397,10 +3717,19 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
     } snap_guard(exposure_snap_);
 
     // TAA needs frames to converge: a still renders sixteen with the same
-    // camera and the jitter walking, and captures the last.
-    if (taa_on_ && mode_ != Mode::Wireframe) {
+    // camera and the jitter walking, and captures the last. The ray-tracing
+    // scene (L5) needs frames too, for its BLAS backlog: a still waits for
+    // it, up to 400 frames, before counting down the sixteen.
+    const bool taa_warm = taa_on_ && mode_ != Mode::Wireframe;
+    auto rt_behind = [&]() {
+        return rt_ok_ && rt_active_ && (rt_.stats().pending > 0 || rt_.stats().drawn_without_blas > 0);
+    };
+    if (taa_warm || rt_behind()) {
         hist_valid_ = false;
-        for (int warm = 0; warm < 16; ++warm) {
+        int rt_frames = 0;
+        for (int warm = 0; warm < 16 || (rt_behind() && rt_frames < 400); ++warm) {
+            if (rt_behind() && rt_frames < 400) { ++rt_frames; warm = 0; }
+            if (!taa_warm && !rt_behind()) break;
             allocators_[frame_]->Reset();
             cmd_->Reset(allocators_[frame_].Get(), nullptr);
             D3D12_RESOURCE_BARRIER wb = {};

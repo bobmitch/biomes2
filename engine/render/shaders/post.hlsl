@@ -50,7 +50,7 @@ cbuffer PostConstants : register(b0) {
     float3 sun_disk;     float pad4;         // disk radiance seen from the camera, nits
     float3 moon_disk;    float pad5;
     float3 cam_fwd;      float fog_on;       // the mist (L4): fog.hlsl's integrated volume
-    float  fog_near;     float fog_log_ratio; float2 pad6;
+    float  fog_near;     float fog_log_ratio; float rt_shadows; float pad6;   // rt_shadows: L5's traced key-light visibility
 };
 
 Texture2D<float>  g_depth   : register(t0);
@@ -63,6 +63,7 @@ Texture2D<float4> g_hist1   : register(t6);
 Texture2D<float4> g_skyview : register(t7);   // atmosphere.hlsl: the sky round the camera
 Texture3D<float4> g_ap      : register(t8);   // atmosphere.hlsl: in-scatter (rgb), transmittance (a)
 Texture3D<float4> g_fog     : register(t9);   // fog.hlsl: in-scatter (rgb), transmittance (a), to each slice's far side
+Texture2D<float>  g_rtvis   : register(t10);  // rt_shadow.hlsl: the key light's visibility, traced
 
 RWTexture2D<float>  u_ao    : register(u0);
 RWTexture2D<float4> u_scene : register(u1);
@@ -282,7 +283,10 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     const float cmask = g_direct[p].a;
     const float cs = ((flags & 4u) != 0u && cmask > 0.01f && dot(dir, dir) > 1e-6f)
                    ? lerp(1.0f, contact_shadow(p, z, P), 0.7f * saturate(cmask)) : 1.0f;   // never fully black: sky light still reaches a crease
-    float3 c = dir * cs + amb * ao;
+    // Under --rt-shadows the surfaces wrote their direct light unshadowed
+    // (shadow.hlsli) and the traced visibility takes the cascades' place.
+    const float rtv = rt_shadows > 0.5f ? g_rtvis[p] : 1.0f;
+    float3 c = dir * (cs * rtv) + amb * ao;
     // The atmosphere between the eye and the surface.
     const float4 ap = aerial(uv, length(P - cam_pos));
     c = c * ap.a + ap.rgb;

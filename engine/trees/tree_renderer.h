@@ -104,6 +104,11 @@ public:
     size_t atlas_bytes() const { return atlas_bytes_; }
     double bake_ms() const { return bake_ms_; }
     size_t instances() const { return cpu_instances_.size(); }
+    // For the ray-tracing scene (ADR-004 L5): the models' CPU meshes, the
+    // species' looks, and this frame's instances.
+    const std::vector<TreeModel>& models() const { return models_; }
+    const std::vector<TreeLook>& looks() const { return looks_; }
+    const std::vector<TreeGpuInstance>& instance_list() const { return cpu_instances_; }
 
     // Synchronous readback of last frame's per-draw counts and overflows.
     // Report modes only: it waits on the GPU.

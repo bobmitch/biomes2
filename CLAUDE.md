@@ -54,7 +54,8 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
 `--band-report`, `--sea-report`, `--swim`, `--blend-report`, `--tab-test`,
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
-references), `--lights-report` (ADR-004 L3: local lights at night, six
+references), `--rt-report` (ADR-004 L5: the ray-tracing scene at three
+views), `--lights-report` (ADR-004 L3: local lights at night, six
 configurations timed) and `--fell` (with `--fell-save` / `--fell-verify`).
 Every mode takes `--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
@@ -717,6 +718,62 @@ atmosphere's aerial perspective, and its far end over the sky.
 - **The exploration layer is not built**: mist that lifts where you have
   been, or weather that rolls in. The hook is `FogMap` -- one density
   function, read in one place -- and ADR-004's L4 section lists the options.
+
+### The ray-tracing scene (ADR-004 L5)
+
+DXR 1.1 inline RayQuery, off until asked for: `--rt-shadows` (`R` in the
+window) traces the key light's shadow in place of the cascades;
+`--rt-report` measures. `engine/render/rt_scene.{h,cpp}` keeps a BLAS per
+drawn chunk at LOD 0-3 (+-512 m, the cascades' reach) -- pointing at the
+whole vertex pool and the slot's own index range, because the pool's
+indices are absolute -- and one per tree model from its LOD 1 mesh (bark
+opaque, leaf cards non-opaque); the TLAS is rebuilt every frame from the
+drawn chunks and the standing trees in range. `gi_trace.hlsli` is the
+ADR's tracer interface: `gi_occluded` and `gi_trace` (hit, normal,
+albedo), SM 6.5, compiled with DXC. `rt_shadow.hlsl` is the pass.
+
+- **DXR 1.1 has no indirect build**, so a chunk's index count must reach the
+  CPU before its BLAS: read back three of RtScene's OWN ticks after it is
+  meshed (a still's warm-up records frames without advancing the renderer's
+  frame index), at most 32 builds a frame. **Three, not two**: a chunk is
+  noted before the tick its frame takes, and "two on" read the slot's old
+  zero before that frame's counter copy landed -- 834 of 858 chunks at spawn
+  were judged empty for good.
+- **Chunks are queued by looking, not by being told.** Headless modes fill
+  residency in a loop that meshes without recording a scene, so an event
+  queue never heard of those chunks. The TLAS pass walks every drawn slot
+  and queues any whose BLAS (or empty verdict) is not for its current key.
+- **A GPU hang reads back as zeros everywhere.** The first run's counts,
+  stats and timers were all 0 and looked like a queue bug;
+  `GetDeviceRemovedReason` said `DXGI_ERROR_DEVICE_HUNG`. The cause was the
+  tree builds' scratch going into the deferred-release list stamped 0 for
+  "not seen yet" -- which the release loop, running first, read as ancient,
+  freeing it while the build ran. Bisected with `BIOMES_RT_DBG` (1 no
+  trace, 2 no terrain BLAS, 4 no trees in the TLAS, 8 no scene at all, 16
+  no tree BLAS). `--rt-report` now says whether the device is alive.
+- **Leaf cards are alpha-tested in the ray query** with the raster's own
+  `leaf_coverage` at the card's uv (per-vertex uv, kind and seed uploaded
+  beside the positions). A flat 55% transmission per card was tried first:
+  a dawn sun crosses so many cards that the wood's floor lost every trunk
+  shadow under a uniform dimness.
+- **Terrain shadow rays start from Hanika's lifted point** ("Hacking the
+  Shadow Terminator"): the pixel's own triangle comes from a terrain-only
+  primary ray, and the start is lifted onto the curve its vertex normals
+  imply. Smooth normals over facets up to 8 m wide streaked every grazing
+  slope with self-shadow before it.
+- **Penumbra**: each shadow ray aims at a different point on the sun's (or
+  moon's) disk per pixel and frame, and TAA integrates the true penumbra.
+- **`--rt-report`** at three views: primary rays meet the drawn terrain
+  within 1% of the depth buffer on 93% of the badlands hillside (the rest
+  is trees, water and LOD 4+), nearer only 0.5%; `gi_trace`'s normals within
+  2.5-3.2 degrees of the depth buffer's near the camera; shadow agreement
+  with the cascades 94% on the hillside, 76-79% in woodland, where the
+  traced canopy is the leaf pattern and the cascades' is coarser.
+- **Cost**: BLAS + TLAS 0.18-0.23 ms steady; the shadow ray 0.29 ms on bare
+  ground to 1.4 ms through a forest (alpha-tested leaves). The cascades still
+  render under `--rt-shadows` -- the mist reads them -- so this is an A/B,
+  not a replacement yet. Memory: 94-270 MB of terrain BLAS, two 94 MB TLAS
+  sized for 67k instances, 103 MB scratch.
 
 - **Cracks are counted in the engine, as UNDRAWN pixels** (ADR-004 L0):
   below the horizon, far depth, and both HDR scene targets still at their

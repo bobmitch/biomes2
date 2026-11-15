@@ -36,9 +36,10 @@ cbuffer ShadowConstants : register(b2) {
 Texture2DArray<float>  g_shadow     : register(t8);
 SamplerComparisonState g_shadow_cmp : register(s1);
 
-// 1 lit, 0 in shadow. `n` is the surface normal used for the offset; pass the
-// geometric one where there is one, a crown's for foliage.
-float shadow_factor(float3 world, float3 n) {
+// 1 lit, 0 in shadow, by the cascades. `n` is the surface normal used for
+// the offset; pass the geometric one where there is one, a crown's for
+// foliage.
+float cascade_visibility(float3 world, float3 n) {
     if (shadow_split.w < 0.5f) return 1.0f;
     const float d = length(world - shadow_cam);
     if (d >= shadow_split.z) return 1.0f;
@@ -61,6 +62,14 @@ float shadow_factor(float3 world, float3 n) {
     // Fade over the last 10% of the last cascade.
     const float fade = saturate((shadow_split.z - d) / (0.1f * shadow_split.z));
     return lerp(1.0f, s, fade);
+}
+
+// What a surface shader multiplies its key light by. Under --rt-shadows
+// (ADR-004 L5, l_cam_fwd.w set) it is 1: the surface writes unshadowed
+// direct light and the composite multiplies in the ray-traced visibility.
+float shadow_factor(float3 world, float3 n) {
+    if (l_cam_fwd.w > 0.5f) return 1.0f;
+    return cascade_visibility(world, n);
 }
 
 #endif

@@ -271,6 +271,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == 'C') { g_renderer.clear_lights(); return 0; }
             // The mist (ADR-004 L4), for A/B.
             if (wp == 'N') { g_renderer.set_fog(!g_renderer.fog()); return 0; }
+            // Ray-traced key-light shadows in place of the cascades (L5).
+            if (wp == 'R') { g_renderer.set_rt_shadows(!g_renderer.rt_shadows()); return 0; }
             if (wp == 'H') { g_time_lapse = !g_time_lapse; return 0; }
             if (wp == VK_OEM_COMMA || wp == VK_OEM_PERIOD) {
                 g_renderer.set_ev_comp(g_renderer.ev_comp() + (wp == VK_OEM_PERIOD ? 0.5f : -0.5f));
@@ -628,8 +630,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                              hl.find("--blend-report") != std::string::npos;
     const bool fell_mode = hl.find("--fell") != std::string::npos;
     const bool lights_mode = hl.find("--lights-report") != std::string::npos;
+    const bool rt_report_mode = hl.find("--rt-report") != std::string::npos;
     const bool rt_check_mode = hl.find("--check-rt") != std::string::npos;
-    const bool headless = report_mode || fell_mode || lights_mode || rt_check_mode || !shot_path.empty() || flight_seconds > 0.0 ||
+    const bool headless = report_mode || fell_mode || lights_mode || rt_report_mode || rt_check_mode || !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
                           dig_seconds > 0.0 || mode_dig_save || mode_dig_verify ||
@@ -729,6 +732,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (c2.find("--no-light-shadows") != std::string::npos) g_renderer.set_light_shadows(false);
         // The mist (ADR-004 L4): off, or thicker or thinner than authored.
         if (c2.find("--no-fog") != std::string::npos) g_renderer.set_fog(false);
+        // The ray-tracing scene (ADR-004 L5).
+        if (c2.find("--rt-shadows") != std::string::npos) g_renderer.set_rt_shadows(true);
+        if (c2.find("--rt-report") != std::string::npos) { g_renderer.set_rt_active(true); g_renderer.set_rt_checks(true); }
         const size_t fdn = c2.find("--fog-density");
         if (fdn != std::string::npos) g_renderer.set_fog_density(float(std::atof(c2.c_str() + fdn + 13)));
         // Time of day (ADR-004 L2), hours: --time 6.5 is half past six.
@@ -1064,6 +1070,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 std::fprintf(f, "gpu: atmosphere %.3f ms, mist inject %.3f ms, mist integrate %.3f ms, "
                                 "post chain in all %.3f ms (smoothed over the still's frames)\n",
                              pt.atmosphere, pt.mist_inject, pt.mist_integrate, pt.post_total);
+                if (g_renderer.rt_shadows()) {
+                    const engine::Renderer::RtStats& rs = g_renderer.rt_stats();
+                    std::fprintf(f, "gpu: ray tracing -- BLAS + TLAS build %.3f ms, shadow trace %.3f ms\n",
+                                 rs.build_ms, rs.trace_ms);
+                }
                 const engine::Renderer::SkyCheck& sk = g_renderer.last_sky_check();
                 if (sk.valid)
                     std::fprintf(f, "sky table GPU vs CPU: %d texels, mean %.3f%%, worst %.3f%% at (%.0f, %.0f)\n",
@@ -2178,6 +2189,97 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                          g_mesh_max_verts, g_mesh_max_idx);
             std::fclose(f);
         }
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return 0;
+    }
+
+    if (rt_report_mode) {
+        // --rt-report (ADR-004 L5): the ray-tracing scene, measured at three
+        // views once its BLAS backlog has drained -- what it holds and costs,
+        // whether its terrain is the terrain that was drawn (a primary ray
+        // against the depth buffer), and how its key-light shadow agrees with
+        // the cascades'.
+        g_renderer.set_vsync(false);
+        const engine::WorldGpu& wg = g_renderer.world();
+        std::remove("build/rt_report.txt");
+        FILE* f = std::fopen("build/rt_report.txt", "w");
+        if (!f) return 1;
+        if (!g_renderer.rt_available()) {
+            std::fprintf(f, "ray tracing unavailable on this device (needs DXR 1.1 and DXC)\n");
+            std::fclose(f);
+            g_renderer.shutdown();
+            g_physics.shutdown();
+            return 0;
+        }
+        float clock = 0.0f;
+        auto frame = [&]() -> bool {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
+            if (w < 1.0f || h < 1.0f) return false;
+            clock += 1.0f / 60.0f;
+            engine::ViewConstants v = {};
+            fill_view(g_camera, w, h, clock, v);
+            g_renderer.render(v);
+            return true;
+        };
+        struct View { const char* name; float x, y, z, yaw, pitch, hours; bool ground; };
+        const View views[] = {
+            {"a wood at dawn, facing the sun", -30.0f, 0.0f, -60.0f, 4.71f, 0.05f, 7.0f, true},
+            {"spawn at 14:00", 10.0f, 46.0f, -70.0f, 0.15f, -0.42f, 14.0f, false},
+            {"the rough hillside at 17:00", 2420.0f, 118.0f, 3390.0f, 0.6f, -0.25f, 17.0f, false},
+        };
+        std::fprintf(f, "rt report (ADR-004 L5): DXR 1.1 inline RayQuery, BLAS per LOD 0-3 chunk and per tree model\n\n");
+        for (const View& vw : views) {
+            g_camera.x = vw.x; g_camera.z = vw.z;
+            g_camera.y = vw.ground ? wg.height(vw.x, vw.z) + 1.7f : vw.y;
+            g_camera.yaw = vw.yaw; g_camera.pitch = vw.pitch;
+            g_renderer.set_time_of_day(vw.hours);
+            int fill = 0;
+            unsigned max_built = 0;
+            for (; fill < 1500; ++fill) {
+                if (!frame()) break;
+                const engine::RtScene::Stats& rs = g_renderer.rt_scene_stats();
+                if (rs.built_this_frame > max_built) max_built = rs.built_this_frame;
+                if (fill > 60 && g_renderer.stats().pending == 0 && g_renderer.tree_field().settled() &&
+                    rs.pending == 0 && rs.drawn_without_blas == 0) break;
+            }
+            for (int i = 0; i < 120; ++i) frame();
+            const engine::RtScene::Stats& rs = g_renderer.rt_scene_stats();
+            const engine::Renderer::RtStats& st = g_renderer.rt_stats();
+            const double cmp = double(st.lit_lit) + st.shadow_shadow + st.rt_only + st.csm_only;
+            const double prim = double(st.primary_agree) + st.primary_nearer + st.primary_farther;
+            std::fprintf(f, "%s -- (%.0f, %.1f, %.0f)\n", vw.name, g_camera.x, g_camera.y, g_camera.z);
+            std::fprintf(f, "  settled in %d frames, at most %u BLAS built in one\n", fill, max_built);
+            // A hung GPU reads back as zeros everywhere -- counts, stats, timers
+            // -- which first looked like a BLAS queue bug. Say so up front.
+            std::fprintf(f, "  device: %s\n", g_renderer.device()->GetDeviceRemovedReason() == S_OK
+                                                  ? "alive" : "REMOVED -- every number below is void");
+            std::fprintf(f, "  queue so far: %llu noted, %llu built, %llu empty, %llu dropped as remeshed, %llu as moved\n",
+                         (unsigned long long)rs.noted, (unsigned long long)rs.built_total, (unsigned long long)rs.empty,
+                         (unsigned long long)rs.dropped_remeshed, (unsigned long long)rs.dropped_moved);
+            std::fprintf(f, "  BLAS: %u terrain, %u tree models; %.1f MB, TLAS %.1f MB (two), scratch %.1f MB\n",
+                         rs.terrain_blas, rs.tree_blas, rs.blas_bytes / 1048576.0, rs.tlas_bytes / 1048576.0,
+                         rs.scratch_bytes / 1048576.0);
+            std::fprintf(f, "  TLAS: %u chunk instances, %u trees; %u drawn LOD 0-3 chunks without a BLAS; %u pending\n",
+                         rs.instances_terrain, rs.instances_trees, rs.drawn_without_blas, rs.pending);
+            std::fprintf(f, "  GPU: BLAS + TLAS build %.3f ms a frame (steady), shadow trace and checks %.3f ms\n",
+                         st.build_ms, st.trace_ms);
+            if (prim > 0)
+                std::fprintf(f, "  primary ray vs depth (terrain): agree %.2f%%, RT nearer %.3f%%, RT farther or missed %.2f%%; "
+                                "normal error %.2f deg where they agree within 40 m\n",
+                             100.0 * st.primary_agree / prim, 100.0 * st.primary_nearer / prim,
+                             100.0 * st.primary_farther / prim, st.normal_err_deg);
+            if (cmp > 0)
+                std::fprintf(f, "  key-light shadow vs cascades (%.0f lit-facing pixels inside 468 m): agree %.2f%% "
+                                "(lit %.2f%%, shadowed %.2f%%); RT shadowed only %.2f%%, cascades shadowed only %.2f%%\n\n",
+                             cmp, 100.0 * (st.lit_lit + st.shadow_shadow) / cmp, 100.0 * st.lit_lit / cmp,
+                             100.0 * st.shadow_shadow / cmp, 100.0 * st.rt_only / cmp, 100.0 * st.csm_only / cmp);
+        }
+        std::fclose(f);
         g_renderer.shutdown();
         g_physics.shutdown();
         return 0;

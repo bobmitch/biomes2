@@ -245,7 +245,7 @@ Each one is measured with an instrument, not judged only by eye.
 | **L2** ✅ | Hillaire atmosphere, aerial perspective, time of day (`--time`, a key) | `--sky-report`: sun and sky radiance against reference values |
 | **L3** ✅ | Clustered local lights, shadow atlas, a torch you can carry | `--lights-report`: lights per cluster, shadow budget, ms |
 | **L4** ✅ | Froxel volumetric fog: sun, local lights, height and local media | A/B stills; ms |
-| **L5** | RT scene: BLAS per chunk and per tree model, TLAS; `gi_trace` / `gi_occluded` on DXR; ray-traced sun shadow A/B against the cascades | `--rt-report`: BLAS count and memory, build ms, agreement with the CSM |
+| **L5** ✅ | RT scene: BLAS per chunk and per tree model, TLAS; `gi_trace` / `gi_occluded` on DXR; ray-traced sun shadow A/B against the cascades | `--rt-report`: BLAS count and memory, build ms, agreement with the CSM |
 | **L6** | DDGI cascades, relocation, classification, visibility, behind `gi_diffuse` / `gi_sky_visibility`; every surface shader switched to the interface | `--gi-report`; **`--leak-test`**: dig a sealed chamber, measure its luminance with no light inside (must be ~0), then light a torch in it (must fill it) |
 | **L6b** | The SDF tracer: a second `gi_trace` from the density field, A/B against DXR on the same probes | per-ray agreement with DXR; `--leak-test` on both |
 | **L7** | SSR and specular, RT water reflections at Ultra | A/B stills |
@@ -352,6 +352,33 @@ the day it does not.
 - **Not done:** stars, moon phases, night-vision tone (Purkinje), clouds,
   and light shafts through the haze (L4's froxels). The sea is still the
   weakest surface.
+
+## L5 — done, 2026-11-15
+
+- **The scene:** a BLAS per drawn LOD 0-3 chunk, straight from the mesh
+  pool (indices are absolute, so the BLAS points at the pool and the slot's
+  index range: no copy), built three ticks after meshing from the read-back
+  index count, 32 a frame; a BLAS per tree model from LOD 1, bark opaque and
+  leaves non-opaque; a TLAS of drawn chunks and standing trees rebuilt every
+  frame. 0.2 ms a frame steady.
+- **The tracer:** `gi_trace` (hit, distance, normal, albedo) and
+  `gi_occluded` in `gi_trace.hlsli`, the interface every later ray goes
+  through. Leaf cards are alpha-tested against the raster's own leaf
+  pattern -- the ADR's "crowns as a transmittance" was tried as a flat 55%
+  a card and blanketed a wood's floor at low sun; the proxy-hull idea stays
+  open for probe rays in L6, where per-ray cost matters more than shape.
+- **The A/B:** `--rt-shadows` replaces the cascades' visibility with a traced
+  one, from Hanika's terminator-safe origin on terrain, towards a jittered
+  point on the light's disk so TAA integrates a real penumbra.
+- **The instrument:** `--rt-report` -- BLAS and TLAS counts and memory, build
+  and trace ms, primary-ray agreement with the depth buffer (93% on bare
+  terrain, 0.5% nearer: the TLAS is the drawn terrain), `gi_trace`'s
+  normals against the depth buffer's (2.5-3.2 degrees near), and agreement
+  with the cascades (94% on bare terrain; 76-79% under trees).
+- **Not done:** the cascades still render under RT (the mist reads them);
+  logs and stumps are not in the TLAS; terrain past LOD 3 is not; no
+  compaction, so terrain BLAS memory is 94-270 MB; the TLAS is sized for
+  67k instances at 94 MB a copy.
 
 ## L4 — done, 2026-11-15
 

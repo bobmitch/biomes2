@@ -21,6 +21,7 @@
 #include "engine/render/sky.h"
 #include "engine/render/local_lights.h"
 #include "engine/render/fog.h"
+#include "engine/render/rt_scene.h"
 
 #include <unordered_map>
 #include <vector>
@@ -268,6 +269,24 @@ public:
     // Frame-time A/B cannot resolve passes this small on a noisy machine.
     struct PostTimes { float atmosphere = 0, mist_inject = 0, mist_integrate = 0, post_total = 0; };
     const PostTimes& post_times() const { return post_times_; }
+
+    // The ray-tracing scene (ADR-004 L5). Off until asked for: --rt-shadows
+    // (R in the window) traces the key light's shadow in place of the
+    // cascades; the RT instruments run whenever it is on.
+    bool rt_available() const { return rt_ok_; }
+    void set_rt_shadows(bool on);
+    bool rt_shadows() const { return rt_shadows_; }
+    void set_rt_active(bool on);   // the scene and the trace, without replacing the cascades
+    void set_rt_checks(bool on) { rt_checks_ = on; }   // the CSM and normal instruments (--rt-report)
+    const RtScene::Stats& rt_scene_stats() const { return rt_.stats(); }
+    struct RtStats {
+        uint32_t lit_lit = 0, shadow_shadow = 0, rt_only = 0, csm_only = 0;
+        uint32_t primary_agree = 0, primary_nearer = 0, primary_farther = 0;
+        float normal_err_deg = 0.0f;
+        float build_ms = 0.0f, trace_ms = 0.0f;   // GPU, smoothed
+    };
+    const RtStats& rt_stats() const { return rt_stats_; }
+
     // What the meter saw in the last capture(): the histogram and the
     // exposure it chose. bins[k] covers log2 nits kLumLogMin + k * step.
     struct ExposureReport {
@@ -446,6 +465,20 @@ private:
     bool create_fog(std::string& error);
     bool create_fog_pipelines(std::string& error);
     void record_fog();
+    // The ray-tracing scene (ADR-004 L5).
+    bool create_rt(std::string& error);
+    void record_rt_trace();
+    RtScene rt_;
+    bool rt_ok_ = false, rt_shadows_ = false, rt_active_ = false, rt_seed_ = false, rt_checks_ = false;
+    RtStats rt_stats_;
+    ComPtr<ID3D12RootSignature> rt_root_;
+    ComPtr<ID3D12PipelineState> rt_pso_, rt_clear_pso_;
+    ComPtr<ID3D12Resource> rt_vis_, rt_stats_buf_, rt_stats_rb_[kFrameCount], rt_cb_[kFrameCount];
+    void* rt_cb_cpu_[kFrameCount] = {};
+    bool  rt_stats_pending_[kFrameCount] = {};
+    ComPtr<ID3D12QueryHeap> rt_queries_;
+    ComPtr<ID3D12Resource>  rt_query_rb_;
+    bool  rt_query_pending_[kFrameCount] = {};
     FogMap fog_map_;
     PostTimes post_times_;
     ComPtr<ID3D12QueryHeap> post_queries_;
