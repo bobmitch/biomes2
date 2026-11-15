@@ -586,7 +586,18 @@ static SeedResult eval_seed(uint64_t world_seed,
                 const int ci = static_cast<int>(std::floor(w.pts[i].first / cell));
                 const int cj = static_cast<int>(std::floor(w.pts[i].second / cell));
                 ts.clear();
-                trees_in_cells(w, wp, table, ci - 8, cj - 8, ci + 8, cj + 8, ts);
+                // trees_in_cells, unrolled to keep each cell's reject reason:
+                // same order (rows of j, then i), so the same trees in the
+                // same sequence. The reasons go in the tile report.
+                int why_count[TREE_REJECT_COUNT] = {0};
+                for (int jj = cj - 8; jj < cj + 8; ++jj) {
+                    for (int ii = ci - 8; ii < ci + 8; ++ii) {
+                        TreeInstance t1;
+                        int why = 0;
+                        if (tree_at_cell(w, wp, table, ii, jj, t1, &why)) ts.push_back(t1);
+                        ++why_count[why];
+                    }
+                }
                 h = fnv1a(h, static_cast<uint64_t>(ts.size()));
                 lh[3] = fnv1a(lh[3], static_cast<uint64_t>(ts.size()));
                 for (size_t m = 0; m < ts.size(); ++m) {
@@ -624,10 +635,13 @@ static SeedResult eval_seed(uint64_t world_seed,
                         th = fnv1a(th, (uint64_t(bz) << 32) | bh);
                         th = fnv1a(th, (uint64_t(ts[m].species) << 16) | ts[m].variant);
                     }
-                    char line[128];
-                    std::snprintf(line, sizeof line, "      tile %2d at cell (%d, %d): %3zu trees, %016llx\n",
-                                  tiles, ci, cj, ts.size(), static_cast<unsigned long long>(th));
+                    char line[256];
+                    int at = std::snprintf(line, sizeof line, "      tile %2d at cell (%d, %d): %3zu trees, %016llx, by outcome",
+                                           tiles, ci, cj, ts.size(), static_cast<unsigned long long>(th));
+                    for (int r = 0; r < TREE_REJECT_COUNT && at < 240; ++r)
+                        at += std::snprintf(line + at, sizeof line - at, " %d", why_count[r]);
                     out.tile_dump += line;
+                    out.tile_dump += "\n";
                 }
             }
         }
