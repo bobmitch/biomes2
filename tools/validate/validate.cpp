@@ -625,8 +625,7 @@ static SeedResult eval_seed(uint64_t world_seed,
                         th = fnv1a(th, (uint64_t(ts[m].species) << 16) | ts[m].variant);
                     }
                     char line[128];
-                    std::snprintf(line, sizeof line, "      tile %2d at cell (%d, %d): %3zu trees, %016llx
-",
+                    std::snprintf(line, sizeof line, "      tile %2d at cell (%d, %d): %3zu trees, %016llx\n",
                                   tiles, ci, cj, ts.size(), static_cast<unsigned long long>(th));
                     out.tile_dump += line;
                 }
@@ -1201,8 +1200,7 @@ static void golden_hashes(const WorldParams& wp, const ArchetypeTable& table,
                 const SeedResult r = eval_seed(static_cast<uint64_t>(i), gw, table, ap);
                 hashes[i] = r.hash;
                 for (int k = 0; k < 4; ++k) g_layer_hash[i][k] = r.layer_hash[k];
-                if (i == 0) g_seed0_trees = r.tree_dump + "    seed 0's tiles:
-" + r.tile_dump;
+                if (i == 0) g_seed0_trees = r.tree_dump + "    seed 0's tiles:\n" + r.tile_dump;
             }
         }));
     }
