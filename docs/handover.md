@@ -46,6 +46,7 @@ of having them.
 | Ground cover | `engine --walk 15 --uncapped [--no-foliage]` | 1.83 vs 1.54 ms a frame walking through a meadow; a woodland-edge still draws ~24k near blades, 13k far, 13k cards, 219 bushes, 0 overflowed |
 | Cracks | `engine --shot ... ` then `<shot>.txt` | default view 0 undrawn; rough hillside `--cam 2420 118 3390 0.6 -0.25` 0 (was 49: a skirt edge-on to a wall, fixed by leaning it outward); 1400 m vista ~73,800 (the void past the world's rim) |
 | Ray tracing | `engine --check-rt` | DXR 1.1, SM 6.5, DXC 1.6; 64 rays, 0 disagreements with the CPU |
+| Local lights (L3) | `engine --lights-report` | night, ground: none 2.33 ms; torch carried walking 2.51; 64 campfires 2.98 / 3.55 shadowed; 255 campfires 4.42, 46.5 per lit cluster, 0 overflowed |
 | Sky (L2) | `engine --sky-report` (CPU only) | vs IES clear sky, sun 20 deg up and over: direct x1.02-1.07, diffuse x1.04-1.11; evaluate() 0.18 ms |
 | Sky GPU vs CPU (L2) | `engine --shot ... [--time h]` then `<shot>.txt` | 192 texels: noon mean 0.04% worst 0.12%; sunset worst 0.52%; night worst 0.23% |
 | Exposure (L1) | `engine --shot ...` then `<shot>.txt` | EV100 spawn 13.7, rough hillside 14.9, `--altitude 1400` 15.1, `--sea-shot` 15.4; histogram printed per stop |

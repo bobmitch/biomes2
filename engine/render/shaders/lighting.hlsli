@@ -135,11 +135,14 @@ Surface make_surface(float3 albedo_linear, float roughness, float3 n, float3 v) 
 }
 
 // Radiance from the sun's direct beam, times `shadow` (the sun's visibility).
-float3 sun_light(Surface s, float shadow) {
-    const float nl = dot(s.n, kSunDir);
+// Radiance from a light arriving along `l` with illuminance `E` (lux, on a
+// surface facing it), times `shadow`: the sun's, and since L3 each local
+// light's (local_lights.hlsli).
+float3 direct_light(Surface s, float3 l, float3 E, float shadow) {
+    const float nl = dot(s.n, l);
     if (nl <= 0.0f || shadow <= 0.0f) return 0.0f;
     const float nv = max(dot(s.n, s.v), 1e-4f);
-    const float3 h = normalize(kSunDir + s.v);
+    const float3 h = normalize(l + s.v);
     const float nh = saturate(dot(s.n, h));
     const float vh = saturate(dot(s.v, h));
     const float a = max(s.roughness * s.roughness, 0.002f);
@@ -147,7 +150,11 @@ float3 sun_light(Surface s, float shadow) {
     const float3 F = f_schlick(f0, vh);
     const float3 spec = d_ggx(nh, a) * v_smith_ggx(nv, nl, a) * F;
     const float3 diff = (1.0f - F) * s.albedo * (1.0f - s.metal) / kPi;
-    return (diff + spec) * kSunLux * (nl * shadow);
+    return (diff + spec) * E * (nl * shadow);
+}
+
+float3 sun_light(Surface s, float shadow) {
+    return direct_light(s, kSunDir, kSunLux, shadow);
 }
 
 // Radiance from everything else: the GI interface's diffuse and specular.
@@ -164,14 +171,18 @@ float3 ambient_light(Surface s, float3 world) {
 // a crown of many cards does (a crown is a volume, not a surface); `through`
 // is the share of the light the leaf passes on, peaked towards the sun so a
 // back-lit crown glows; `transmit` its colour (a leaf passes green).
-float3 leaf_sun_light(float3 albedo, float3 n, float3 v, float wrap, float through, float shadow) {
-    const float lam = saturate((dot(n, kSunDir) + wrap) / (1.0f + wrap));
-    const float back = saturate(dot(-v, kSunDir));
+float3 leaf_light(float3 albedo, float3 n, float3 v, float3 l, float3 E, float wrap, float through, float shadow) {
+    const float lam = saturate((dot(n, l) + wrap) / (1.0f + wrap));
+    const float back = saturate(dot(-v, l));
     const float3 diff = albedo / kPi * lam;
     // Forward scattering through the leaf, in the leaf's own colour, which
     // is roughly what a leaf's transmittance is.
     const float3 trans = albedo / kPi * (through * back * back * back);
-    return (diff + trans) * kSunLux * shadow;
+    return (diff + trans) * E * shadow;
+}
+
+float3 leaf_sun_light(float3 albedo, float3 n, float3 v, float wrap, float through, float shadow) {
+    return leaf_light(albedo, n, v, kSunDir, kSunLux, wrap, through, shadow);
 }
 
 #endif

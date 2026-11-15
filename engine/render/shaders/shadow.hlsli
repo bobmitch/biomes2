@@ -27,6 +27,10 @@ cbuffer ShadowConstants : register(b2) {
     float4 l_sky_zenith;
     float4 l_sky_horizon_sun;  // the horizon under the key light, and opposite it
     float4 l_sky_horizon_away;
+    // Local lights' froxel clusters (ADR-004 L3, local_lights.hlsli).
+    float4 l_cluster;          // tiles x, tiles y, slices, lights this frame
+    float4 l_cluster2;         // near, slices / ln(far / near), screen width, screen height
+    float4 l_cam_fwd;          // the camera's forward, for a pixel's view depth
 };
 
 Texture2DArray<float>  g_shadow     : register(t8);

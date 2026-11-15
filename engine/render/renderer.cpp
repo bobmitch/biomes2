@@ -5,6 +5,7 @@
 #include "engine/render/atmosphere.h"
 
 #include <d3dcompiler.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -64,8 +65,82 @@ struct ShadowConstants {
     float cam[3];
     float res;
     float light[7][4];     // the frame's light (ADR-004 L2): Renderer::fill_light
+    float cluster[3][4];   // local lights' clusters (ADR-004 L3): Renderer::record_lights
 };
-static_assert(sizeof(ShadowConstants) == 368, "ShadowConstants must match shadow.hlsli");
+static_assert(sizeof(ShadowConstants) == 416, "ShadowConstants must match shadow.hlsli");
+
+// Matches cbuffer ClusterConstants in lights.hlsl.
+struct ClusterConstants {
+    float cam_pos[3];   UINT  light_count;
+    float cam_right[3]; float tan_half_fov;
+    float cam_up[3];    float aspect;
+    float cam_fwd[3];   float near_z;
+    float log_scale;    float far_z; UINT pad0, pad1;
+};
+static_assert(sizeof(ClusterConstants) == 80, "ClusterConstants must match lights.hlsl");
+
+// Row-vector matrices, as everything here: clip = p * M.
+void mat_mul4(const float a[16], const float b[16], float out[16]) {
+    float r[16];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
+            r[i * 4 + j] = a[i * 4 + 0] * b[0 * 4 + j] + a[i * 4 + 1] * b[1 * 4 + j] +
+                           a[i * 4 + 2] * b[2 * 4 + j] + a[i * 4 + 3] * b[3 * 4 + j];
+    std::memcpy(out, r, sizeof r);
+}
+
+// Frustum planes of a view-projection, dot(n, p) + d >= 0 inside, as the
+// tree cull reads them (and as compute_cascades builds them).
+void planes_of(const float m[16], float planes[6][4]) {
+    float col[4][4];
+    for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) col[c][r] = m[r * 4 + c];
+    for (int k = 0; k < 4; ++k) {
+        planes[0][k] = col[3][k] + col[0][k];
+        planes[1][k] = col[3][k] - col[0][k];
+        planes[2][k] = col[3][k] + col[1][k];
+        planes[3][k] = col[3][k] - col[1][k];
+        planes[4][k] = col[2][k];
+        planes[5][k] = col[3][k] - col[2][k];
+    }
+    for (int p = 0; p < 6; ++p) {
+        const float l = std::sqrt(planes[p][0] * planes[p][0] + planes[p][1] * planes[p][1] + planes[p][2] * planes[p][2]);
+        if (l > 0.0f) for (int k = 0; k < 4; ++k) planes[p][k] /= l;
+    }
+}
+
+// One shadow face of a local light: looking along `fwd` from `pos`, with a
+// field of view a little over 90 degrees so a cube's faces overlap enough
+// for PCF and the normal offset at their edges.
+void light_face(const float pos[3], const float fwd[3], const float up_hint[3], float fov_deg, float range,
+                float out_vp[16], float right[3], float up[3]) {
+    float u[3] = {up_hint[0], up_hint[1], up_hint[2]};
+    float r[3] = {u[1] * fwd[2] - u[2] * fwd[1], u[2] * fwd[0] - u[0] * fwd[2], u[0] * fwd[1] - u[1] * fwd[0]};
+    float rl = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+    if (rl < 1e-4f) { u[0] = 1.0f; u[1] = 0.0f; u[2] = 0.0f;
+        r[0] = u[1] * fwd[2] - u[2] * fwd[1]; r[1] = u[2] * fwd[0] - u[0] * fwd[2]; r[2] = u[0] * fwd[1] - u[1] * fwd[0];
+        rl = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]); }
+    for (int k = 0; k < 3; ++k) r[k] /= rl;
+    // up = fwd x right, so (right, up, fwd) is a basis.
+    u[0] = fwd[1] * r[2] - fwd[2] * r[1];
+    u[1] = fwd[2] * r[0] - fwd[0] * r[2];
+    u[2] = fwd[0] * r[1] - fwd[1] * r[0];
+    float v[16] = {};
+    for (int i = 0; i < 3; ++i) { v[i * 4 + 0] = r[i]; v[i * 4 + 1] = u[i]; v[i * 4 + 2] = fwd[i]; }
+    v[12] = -(r[0] * pos[0] + r[1] * pos[1] + r[2] * pos[2]);
+    v[13] = -(u[0] * pos[0] + u[1] * pos[1] + u[2] * pos[2]);
+    v[14] = -(fwd[0] * pos[0] + fwd[1] * pos[1] + fwd[2] * pos[2]);
+    v[15] = 1.0f;
+    const float n = 0.05f, f = range > 0.2f ? range : 0.2f;
+    const float s = 1.0f / std::tan(0.5f * fov_deg * 3.14159265f / 180.0f);
+    float p[16] = {};
+    p[0] = s;
+    p[5] = s;
+    p[10] = f / (f - n);
+    p[11] = 1.0f;
+    p[14] = -n * f / (f - n);
+    mat_mul4(v, p, out_vp);
+    for (int k = 0; k < 3; ++k) { right[k] = r[k]; up[k] = u[k]; }
+}
 
 // The scene is drawn into two HDR targets -- direct sunlight and everything
 // else -- which the post chain combines (scene_out.hlsli, post.hlsl).
@@ -604,14 +679,20 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         params[3].Descriptor.ShaderRegister = 2;
-        D3D12_DESCRIPTOR_RANGE sr = {};
-        sr.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        sr.NumDescriptors = 1;
-        sr.BaseShaderRegister = 8;
+        // The shadow table: the sun's map at heap [0], and since ADR-004 L3
+        // the local lights' buffers and atlas at [24..28] (t20..t24).
+        D3D12_DESCRIPTOR_RANGE sr[2] = {};
+        sr[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[0].NumDescriptors = 1;
+        sr[0].BaseShaderRegister = 8;
+        sr[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[1].NumDescriptors = 5;
+        sr[1].BaseShaderRegister = 20;
+        sr[1].OffsetInDescriptorsFromTableStart = 24;
         params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        params[4].DescriptorTable.NumDescriptorRanges = 1;
-        params[4].DescriptorTable.pDescriptorRanges = &sr;
+        params[4].DescriptorTable.NumDescriptorRanges = 2;
+        params[4].DescriptorTable.pDescriptorRanges = sr;
         // Each vertex's surface material (ADR-004 L1), parallel to t0.
         params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -772,8 +853,11 @@ bool Renderer::create_shadow_resources(std::string& error) {
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     // [0] shadow, [1..2] impostor atlases, [3..11] post SRVs (the last two the
     // sky-view table and the aerial-perspective volume), [12..15] post UAVs,
-    // [16..17] the atmosphere's static tables, [18..19] its per-frame UAVs.
-    hd.NumDescriptors = 24;
+    // [16..17] the atmosphere's static tables, [18..19] its per-frame UAVs,
+    // [24..28] the local lights (L3): lights, cluster counts and items, the
+    // shadow atlas and its faces -- reached by every lit pipeline through a
+    // second range of the table that starts at the sun's map, [0].
+    hd.NumDescriptors = 32;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srv_heap_));
     if (FAILED(hr)) { error = hr_text("shared srv heap", hr); return false; }
@@ -889,6 +973,7 @@ void Renderer::record_shadows(const ViewConstants& view) {
     const bool on = shadows_on_ && mode_ != Mode::Wireframe;
     sc.split[3] = on ? 1.0f : 0.0f;
     fill_light(sc.light);
+    std::memcpy(sc.cluster, cluster_consts_, sizeof sc.cluster);
     if (on) {
         compute_cascades(view);
         for (UINT c = 0; c < kCascades; ++c) {
@@ -964,6 +1049,461 @@ void Renderer::record_shadows(const ViewConstants& view) {
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     cmd_->ResourceBarrier(1, &b);
+}
+
+// ---------------------------------------------------------------------------
+// Local lights (ADR-004 L3): local_lights.h for the model, lights.hlsl for
+// the clusters, local_lights.hlsli for the shading.
+// ---------------------------------------------------------------------------
+
+bool Renderer::create_lights(std::string& error) {
+    D3D12_HEAP_PROPERTIES dh = {};
+    dh.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_HEAP_PROPERTIES uh = {};
+    uh.Type = D3D12_HEAP_TYPE_UPLOAD;
+    auto buffer = [&](ComPtr<ID3D12Resource>& out, D3D12_HEAP_PROPERTIES& hp, UINT64 bytes, bool uav,
+                      D3D12_RESOURCE_STATES state, const char* what) -> bool {
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = bytes;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+        const HRESULT hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, state, nullptr, IID_PPV_ARGS(&out));
+        if (FAILED(hr)) { error = hr_text(what, hr); return false; }
+        return true;
+    };
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (!buffer(lights_gpu_, dh, UINT64(kMaxLights) * sizeof(LocalLightGpu), false, read, "light list")) return false;
+    if (!buffer(faces_gpu_, dh, UINT64(kMaxShadowLights) * 6 * sizeof(LightFaceGpu), false, read, "light faces")) return false;
+    // Root UAVs: ALLOW_UNORDERED_ACCESS is not optional (CLAUDE.md).
+    if (!buffer(cluster_n_, dh, UINT64(kClusterCount) * 4, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "cluster counts")) return false;
+    if (!buffer(cluster_ix_, dh, UINT64(kClusterCount) * kClusterMaxItems * 4, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "cluster items")) return false;
+    if (!buffer(cluster_stats_, dh, 16, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "cluster stats")) return false;
+    cluster_readable_ = false;
+    D3D12_HEAP_PROPERTIES rh = {};
+    rh.Type = D3D12_HEAP_TYPE_READBACK;
+    for (UINT f = 0; f < kFrameCount; ++f) {
+        if (!buffer(lights_up_[f], uh, UINT64(kMaxLights) * sizeof(LocalLightGpu), false, D3D12_RESOURCE_STATE_GENERIC_READ, "light upload")) return false;
+        if (!buffer(faces_up_[f], uh, UINT64(kMaxShadowLights) * 6 * sizeof(LightFaceGpu), false, D3D12_RESOURCE_STATE_GENERIC_READ, "face upload")) return false;
+        if (!buffer(cluster_cb_[f], uh, 256, false, D3D12_RESOURCE_STATE_GENERIC_READ, "cluster cb")) return false;
+        if (!buffer(stats_rb_[f], rh, 16, false, D3D12_RESOURCE_STATE_COPY_DEST, "cluster stats readback")) return false;
+        lights_up_[f]->Map(0, nullptr, &lights_up_cpu_[f]);
+        faces_up_[f]->Map(0, nullptr, &faces_up_cpu_[f]);
+        cluster_cb_[f]->Map(0, nullptr, &cluster_cb_cpu_[f]);
+        stats_pending_[f] = false;
+    }
+
+    // The shadow atlas: 4096^2 of depth, 64 tiles of 512^2.
+    {
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = kLightAtlas;
+        rd.Height = kLightAtlas;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_R32_TYPELESS;
+        rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        D3D12_CLEAR_VALUE cv = {};
+        cv.Format = DXGI_FORMAT_D32_FLOAT;
+        cv.DepthStencil.Depth = 1.0f;
+        HRESULT hr = device_->CreateCommittedResource(&dh, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                      &cv, IID_PPV_ARGS(&light_atlas_));
+        if (FAILED(hr)) { error = hr_text("light shadow atlas", hr); return false; }
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        hd.NumDescriptors = 1;
+        hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&light_dsv_heap_));
+        if (FAILED(hr)) { error = hr_text("light atlas dsv heap", hr); return false; }
+        D3D12_DEPTH_STENCIL_VIEW_DESC dv = {};
+        dv.Format = DXGI_FORMAT_D32_FLOAT;
+        dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        device_->CreateDepthStencilView(light_atlas_.Get(), &dv, light_dsv_heap_->GetCPUDescriptorHandleForHeapStart());
+    }
+
+    // Descriptors [24..28]: t20 lights, t21 counts, t22 items, t23 atlas, t24 faces.
+    const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto slot = [&](UINT i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE c = srv_heap_->GetCPUDescriptorHandleForHeapStart();
+        c.ptr += SIZE_T(i) * inc;
+        return c;
+    };
+    auto sbuf = [&](ID3D12Resource* r, UINT n, UINT stride, UINT i) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = DXGI_FORMAT_UNKNOWN;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Buffer.NumElements = n;
+        sd.Buffer.StructureByteStride = stride;
+        device_->CreateShaderResourceView(r, &sd, slot(i));
+    };
+    sbuf(lights_gpu_.Get(), kMaxLights, sizeof(LocalLightGpu), 24);
+    sbuf(cluster_n_.Get(), kClusterCount, 4, 25);
+    sbuf(cluster_ix_.Get(), kClusterCount * kClusterMaxItems, 4, 26);
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = DXGI_FORMAT_R32_FLOAT;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        device_->CreateShaderResourceView(light_atlas_.Get(), &sd, slot(27));
+    }
+    sbuf(faces_gpu_.Get(), kMaxShadowLights * 6, sizeof(LightFaceGpu), 28);
+
+    // The cluster pass: constants, the light list, three UAVs.
+    {
+        D3D12_ROOT_PARAMETER p[5] = {};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        for (int k = 0; k < 3; ++k) {
+            p[2 + k].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            p[2 + k].Descriptor.ShaderRegister = k;
+        }
+        for (int k = 0; k < 5; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rsd = {};
+        rsd.NumParameters = 5;
+        rsd.pParameters = p;
+        ComPtr<ID3DBlob> sig, err;
+        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+        if (FAILED(hr)) { error = "cluster root signature"; return false; }
+        hr = device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&cluster_root_));
+        if (FAILED(hr)) { error = hr_text("CreateRootSignature (clusters)", hr); return false; }
+    }
+    for (UINT i = 0; i < kMaxShadowLights; ++i) shadow_slots_[i] = ShadowSlot();
+    return create_lights_pipelines(error);
+}
+
+bool Renderer::create_lights_pipelines(std::string& error) {
+    const char* entries[2] = {"cs_cluster", "cs_cluster_clear"};
+    ComPtr<ID3D12PipelineState>* outs[2] = {&cluster_pso_, &cluster_clear_pso_};
+    for (int k = 0; k < 2; ++k) {
+        ComPtr<ID3DBlob> cs;
+        if (!compile_shader("engine/render/shaders/lights.hlsl", entries[k], "cs_5_1", cs, error)) return false;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cd = {};
+        cd.pRootSignature = cluster_root_.Get();
+        cd.CS.pShaderBytecode = cs->GetBufferPointer();
+        cd.CS.BytecodeLength = cs->GetBufferSize();
+        if (FAILED(device_->CreateComputePipelineState(&cd, IID_PPV_ARGS(outs[k]->GetAddressOf())))) {
+            error = "cluster compute pso";
+            return false;
+        }
+    }
+    return true;
+}
+
+namespace {
+// A flame's flicker: three incommensurate sines, about +-20% at worst. A
+// light with flicker 0 is steady.
+float flame(float t, uint32_t seed, float amount) {
+    const float s = float(seed % 997u) * 0.37f;
+    return 1.0f + amount * (0.10f * std::sin(t * 8.3f + s) + 0.06f * std::sin(t * 13.7f + s * 1.7f) +
+                            0.04f * std::sin(t * 23.1f + s * 2.3f));
+}
+}  // namespace
+
+void Renderer::record_lights(const ViewConstants& view) {
+    // The stats this frame index last wrote have landed: the frame's fence
+    // was waited for before its allocator came back.
+    if (stats_pending_[frame_]) {
+        void* p = nullptr;
+        D3D12_RANGE rr = {0, 16};
+        if (SUCCEEDED(stats_rb_[frame_]->Map(0, &rr, &p))) {
+            const UINT* s = static_cast<const UINT*>(p);
+            light_stats_.overflowed = s[0];
+            light_stats_.max_in_cluster = s[1];
+            light_stats_.clusters_lit = s[2];
+            light_stats_.cluster_items = s[3];
+            D3D12_RANGE nr = {0, 0};
+            stats_rb_[frame_]->Unmap(0, &nr);
+        }
+        stats_pending_[frame_] = false;
+    }
+
+    // --- this frame's lights: the torch at the camera, then the placed ones
+    struct Active { LocalLight l; float importance; };
+    std::vector<Active> act;
+    act.reserve(lights_.size() + 1);
+    const float* cam = view.cam_pos;
+    if (torch_on_) {
+        Active a;
+        a.l = make_torch();
+        a.l.id = 0;
+        // In the right hand, a little low and ahead of the eye. The flame
+        // wanders a centimetre or two, which the shadows follow: they are
+        // redrawn every frame for a light that moves anyway.
+        const float t = view.time;
+        for (int k = 0; k < 3; ++k)
+            a.l.pos[k] = cam[k] + view.cam_right[k] * 0.35f - view.cam_up[k] * 0.30f + view.cam_fwd[k] * 0.45f;
+        a.l.pos[0] += 0.012f * std::sin(t * 9.1f);
+        a.l.pos[1] += 0.015f * std::sin(t * 11.3f + 1.0f);
+        a.l.pos[2] += 0.012f * std::sin(t * 7.7f + 2.0f);
+        a.importance = 1e30f;   // the light in your hand is always the one that matters
+        act.push_back(a);
+    }
+    for (size_t i = 0; i < lights_.size(); ++i) {
+        Active a;
+        a.l = lights_[i];
+        const float dx = a.l.pos[0] - cam[0], dy = a.l.pos[1] - cam[1], dz = a.l.pos[2] - cam[2];
+        a.importance = a.l.lumens / (std::max)(dx * dx + dy * dy + dz * dz, 1.0f);
+        act.push_back(a);
+    }
+    std::stable_sort(act.begin(), act.end(), [](const Active& x, const Active& y) { return x.importance > y.importance; });
+    if (act.size() > kMaxLights) act.resize(kMaxLights);
+
+    // --- shadows: the most important shadowed lights keep or take a slot
+    light_stats_.lights = UINT(act.size());
+    light_stats_.shadowed = 0;
+    light_stats_.faces_drawn = 0;
+    light_stats_.chunk_draws = 0;
+    bool wanted[kMaxShadowLights] = {};
+    std::vector<int> slot_of(act.size(), -1);
+    if (light_shadows_on_) {
+        std::vector<size_t> pick;
+        for (size_t i = 0; i < act.size() && pick.size() < kMaxShadowLights; ++i)
+            if (act[i].l.shadow) pick.push_back(i);
+        // Keep the slots of lights still picked: their faces are cached there.
+        for (size_t q = 0; q < pick.size(); ++q)
+            for (UINT s = 0; s < kMaxShadowLights; ++s)
+                if (shadow_slots_[s].light == act[pick[q]].l.id) { slot_of[pick[q]] = int(s); wanted[s] = true; }
+        for (size_t q = 0; q < pick.size(); ++q) {
+            if (slot_of[pick[q]] >= 0) continue;
+            for (UINT s = 0; s < kMaxShadowLights; ++s) {
+                if (wanted[s]) continue;
+                shadow_slots_[s] = ShadowSlot();
+                shadow_slots_[s].light = act[pick[q]].l.id;
+                slot_of[pick[q]] = int(s);
+                wanted[s] = true;
+                break;
+            }
+        }
+    }
+    for (UINT s = 0; s < kMaxShadowLights; ++s) if (!wanted[s]) shadow_slots_[s] = ShadowSlot();
+
+    // Which slots draw their faces this frame: never drawn or moved first
+    // (most important first, as `act` is sorted), then the stalest -- a
+    // static light's faces are redrawn every few seconds so a dug hole or a
+    // felled tree reaches its shadow -- within twelve faces.
+    std::vector<size_t> redraw;
+    {
+        UINT budget = kMaxFacesPerFrame;
+        std::vector<size_t> stale;
+        for (size_t i = 0; i < act.size(); ++i) {
+            if (slot_of[i] < 0) continue;
+            ShadowSlot& sl = shadow_slots_[slot_of[i]];
+            const float dx = act[i].l.pos[0] - sl.pos[0], dy = act[i].l.pos[1] - sl.pos[1], dz = act[i].l.pos[2] - sl.pos[2];
+            const bool moved = dx * dx + dy * dy + dz * dz > 1e-4f;
+            const int faces = act[i].l.type == 1 ? 1 : 6;
+            if (!sl.ready || moved) {
+                if (UINT(faces) <= budget) { redraw.push_back(i); budget -= faces; }
+            } else if (post_frame_ - sl.drawn > 240) {
+                stale.push_back(i);
+            }
+        }
+        std::sort(stale.begin(), stale.end(), [&](size_t x, size_t y) {
+            return shadow_slots_[slot_of[x]].drawn < shadow_slots_[slot_of[y]].drawn;
+        });
+        for (size_t q = 0; q < stale.size(); ++q) {
+            const int faces = act[stale[q]].l.type == 1 ? 1 : 6;
+            if (UINT(faces) <= budget) { redraw.push_back(stale[q]); budget -= faces; }
+        }
+    }
+
+    // --- the faces' matrices, for what is redrawn
+    static const float kAxis[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    static const float kUp[6][3] = {{0, 1, 0}, {0, 1, 0}, {0, 0, 1}, {0, 0, -1}, {0, 1, 0}, {0, 1, 0}};
+    struct FaceDraw { UINT tile; float vp[16]; float right[3], up[3]; float pos[3]; float range; };
+    std::vector<FaceDraw> draws;
+    for (size_t q = 0; q < redraw.size(); ++q) {
+        const LocalLight& L = act[redraw[q]].l;
+        const int s = slot_of[redraw[q]];
+        const int faces = L.type == 1 ? 1 : 6;
+        for (int fc = 0; fc < faces; ++fc) {
+            FaceDraw d;
+            d.tile = UINT(s) * 6 + UINT(fc);
+            const float* fwd = L.type == 1 ? L.spot_dir : kAxis[fc];
+            const float* uph = L.type == 1 ? kUp[0] : kUp[fc];
+            const float fov = L.type == 1 ? (std::min)(2.0f * L.spot_outer_deg + 10.0f, 150.0f) : 95.0f;
+            light_face(L.pos, fwd, uph, fov, L.range, d.vp, d.right, d.up);
+            for (int k = 0; k < 3; ++k) d.pos[k] = L.pos[k];
+            d.range = L.range;
+            LightFaceGpu& g = faces_cpu_[d.tile];
+            std::memcpy(g.view_proj, d.vp, sizeof g.view_proj);
+            const float sz = float(kLightTile) / float(kLightAtlas);
+            g.rect[0] = float(d.tile % (kLightAtlas / kLightTile)) * sz;
+            g.rect[1] = float(d.tile / (kLightAtlas / kLightTile)) * sz;
+            g.rect[2] = sz;
+            g.rect[3] = 1.0f / float(kLightAtlas);
+            draws.push_back(d);
+        }
+        ShadowSlot& sl = shadow_slots_[s];
+        sl.ready = true;
+        for (int k = 0; k < 3; ++k) sl.pos[k] = L.pos[k];
+        sl.drawn = post_frame_;
+        sl.faces = faces;
+    }
+
+    // --- the GPU records
+    LocalLightGpu* gl = static_cast<LocalLightGpu*>(lights_up_cpu_[frame_]);
+    for (size_t i = 0; i < act.size(); ++i) {
+        const LocalLight& L = act[i].l;
+        LocalLightGpu g = {};
+        const float cd = L.lumens / (4.0f * 3.14159265f) * flame(view.time, L.id * 2654435761u + 17u, L.flicker);
+        for (int k = 0; k < 3; ++k) {
+            g.pos[k] = L.pos[k];
+            g.intensity[k] = L.color[k] * cd;
+            g.spot_dir[k] = L.spot_dir[k];
+        }
+        g.range = L.range;
+        g.type = float(L.type);
+        g.cos_outer = std::cos(L.spot_outer_deg * 3.14159265f / 180.0f);
+        g.cos_inner = std::cos(L.spot_inner_deg * 3.14159265f / 180.0f);
+        g.shadow = (slot_of[i] >= 0 && shadow_slots_[slot_of[i]].ready) ? slot_of[i] * 6 : -1;
+        if (g.shadow >= 0) ++light_stats_.shadowed;
+        gl[i] = g;
+    }
+    std::memcpy(faces_up_cpu_[frame_], faces_cpu_, sizeof faces_cpu_);
+
+    // --- the clusters' constants, for the cluster pass and every lit shader
+    const float lscale = float(kClusterZ) / std::log(kClusterFar / kClusterNear);
+    ClusterConstants cc = {};
+    for (int k = 0; k < 3; ++k) {
+        cc.cam_pos[k] = cam[k];
+        cc.cam_right[k] = view.cam_right[k];
+        cc.cam_up[k] = view.cam_up[k];
+        cc.cam_fwd[k] = view.cam_fwd[k];
+    }
+    cc.light_count = UINT(act.size());
+    cc.tan_half_fov = view.tan_half_fov;
+    cc.aspect = view.aspect;
+    cc.near_z = kClusterNear;
+    cc.far_z = kClusterFar;
+    cc.log_scale = lscale;
+    std::memcpy(cluster_cb_cpu_[frame_], &cc, sizeof cc);
+    cluster_consts_[0][0] = float(kClusterX); cluster_consts_[0][1] = float(kClusterY);
+    cluster_consts_[0][2] = float(kClusterZ); cluster_consts_[0][3] = float(act.size());
+    cluster_consts_[1][0] = kClusterNear;     cluster_consts_[1][1] = lscale;
+    cluster_consts_[1][2] = float(width_);    cluster_consts_[1][3] = float(height_);
+    for (int k = 0; k < 3; ++k) cluster_consts_[2][k] = view.cam_fwd[k];
+    cluster_consts_[2][3] = 0.0f;
+
+    // --- copies, the cluster pass, its stats
+    auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+        D3D12_RESOURCE_BARRIER rb = {};
+        rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        rb.Transition.pResource = r;
+        rb.Transition.StateBefore = a;
+        rb.Transition.StateAfter = b;
+        rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd_->ResourceBarrier(1, &rb);
+    };
+    auto uavb = [&](ID3D12Resource* r) {
+        D3D12_RESOURCE_BARRIER rb = {};
+        rb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        rb.UAV.pResource = r;
+        cmd_->ResourceBarrier(1, &rb);
+    };
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    tr(lights_gpu_.Get(), read, D3D12_RESOURCE_STATE_COPY_DEST);
+    tr(faces_gpu_.Get(), read, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!act.empty())
+        cmd_->CopyBufferRegion(lights_gpu_.Get(), 0, lights_up_[frame_].Get(), 0, UINT64(act.size()) * sizeof(LocalLightGpu));
+    cmd_->CopyBufferRegion(faces_gpu_.Get(), 0, faces_up_[frame_].Get(), 0, sizeof faces_cpu_);
+    tr(lights_gpu_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, read);
+    tr(faces_gpu_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, read);
+    if (cluster_readable_) {
+        tr(cluster_n_.Get(), read, ua);
+        tr(cluster_ix_.Get(), read, ua);
+    }
+    cmd_->SetComputeRootSignature(cluster_root_.Get());
+    cmd_->SetComputeRootConstantBufferView(0, cluster_cb_[frame_]->GetGPUVirtualAddress());
+    cmd_->SetComputeRootShaderResourceView(1, lights_gpu_->GetGPUVirtualAddress());
+    cmd_->SetComputeRootUnorderedAccessView(2, cluster_n_->GetGPUVirtualAddress());
+    cmd_->SetComputeRootUnorderedAccessView(3, cluster_ix_->GetGPUVirtualAddress());
+    cmd_->SetComputeRootUnorderedAccessView(4, cluster_stats_->GetGPUVirtualAddress());
+    cmd_->SetPipelineState(cluster_clear_pso_.Get());
+    cmd_->Dispatch(1, 1, 1);
+    uavb(cluster_stats_.Get());
+    cmd_->SetPipelineState(cluster_pso_.Get());
+    cmd_->Dispatch((kClusterCount + 63) / 64, 1, 1);
+    uavb(cluster_stats_.Get());
+    tr(cluster_n_.Get(), ua, read);
+    tr(cluster_ix_.Get(), ua, read);
+    cluster_readable_ = true;
+    tr(cluster_stats_.Get(), ua, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmd_->CopyBufferRegion(stats_rb_[frame_].Get(), 0, cluster_stats_.Get(), 0, 16);
+    tr(cluster_stats_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, ua);
+    stats_pending_[frame_] = true;
+
+    if (draws.empty()) return;
+
+    // --- the shadow faces: the chunks in each light's reach, and the trees
+    tr(light_atlas_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    const D3D12_CPU_DESCRIPTOR_HANDLE dsv = light_dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+    cmd_->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+    D3D12_INDEX_BUFFER_VIEW ibv = {};
+    ibv.BufferLocation = mesher_.indices()->GetGPUVirtualAddress();
+    ibv.SizeInBytes = kSlots * kSlotIndices * 4;
+    ibv.Format = DXGI_FORMAT_R32_UINT;
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
+    std::vector<UINT> slots;
+    for (size_t q = 0; q < draws.size(); ++q) {
+        const FaceDraw& d = draws[q];
+        const UINT per_row = kLightAtlas / kLightTile;
+        const LONG x0 = LONG((d.tile % per_row) * kLightTile), y0 = LONG((d.tile / per_row) * kLightTile);
+        D3D12_RECT rc = {x0, y0, x0 + LONG(kLightTile), y0 + LONG(kLightTile)};
+        D3D12_VIEWPORT vp = {};
+        vp.TopLeftX = float(x0);
+        vp.TopLeftY = float(y0);
+        vp.Width = float(kLightTile);
+        vp.Height = float(kLightTile);
+        vp.MaxDepth = 1.0f;
+        cmd_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 1, &rc);
+        cmd_->RSSetViewports(1, &vp);
+        cmd_->RSSetScissorRects(1, &rc);
+        cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        MeshConstants mc = {};
+        std::memcpy(mc.view_proj, d.vp, sizeof mc.view_proj);
+        mc.slot_vertices = static_cast<float>(kSlotVertices);
+        cmd_->SetDescriptorHeaps(1, heaps);
+        cmd_->SetPipelineState(mesh_shadow_pso_.Get());
+        cmd_->SetGraphicsRootSignature(mesh_root_.Get());
+        cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
+        cmd_->SetGraphicsRootShaderResourceView(1, mesher_.vertices()->GetGPUVirtualAddress());
+        cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
+        cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress());
+        cmd_->SetGraphicsRootConstantBufferView(3, shadow_cb_[frame_]->GetGPUVirtualAddress());
+        cmd_->SetGraphicsRootDescriptorTable(4, srv_heap_->GetGPUDescriptorHandleForHeapStart());
+        cmd_->IASetIndexBuffer(&ibv);
+        streamer_.slots_near(d.pos, d.range, slots);
+        for (size_t k = 0; k < slots.size(); ++k)
+            cmd_->ExecuteIndirect(cmd_sig_.Get(), 1, mesher_.draw_args(),
+                                  UINT64(slots[k]) * sizeof(D3D12_DRAW_INDEXED_ARGUMENTS), nullptr, 0);
+        light_stats_.chunk_draws += UINT(slots.size());
+        if (trees_on_ && trees_.ready()) {
+            TreeShadowInputs si = {};
+            std::memcpy(si.view_proj, d.vp, sizeof si.view_proj);
+            planes_of(d.vp, si.planes);
+            for (int k = 0; k < 3; ++k) {
+                si.cam_pos[k] = cam[k];
+                si.light_right[k] = d.right[k];
+                si.light_up[k] = d.up[k];
+            }
+            si.time = view.time;
+            si.far_plane = kFarPlane;
+            trees_.record_light_shadow(cmd_.Get(), frame_, UINT(q), si, tree_settings_);
+            // The tree pass sets its own targets' state; put ours back.
+            cmd_->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+        }
+        ++light_stats_.faces_drawn;
+    }
+    tr(light_atlas_.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,6 +1772,7 @@ bool Renderer::reload_shaders(std::string& error) {
     if (!create_water_pipeline(error)) return false;
     if (!create_post_pipelines(error)) return false;
     if (!create_atmosphere_pipelines(error)) return false;
+    if (!create_lights_pipelines(error)) return false;
     // Everything resident was built by the old kernel, so start again.
     streamer_.init();
     return true;
@@ -1267,6 +1808,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     if (!create_depth(error)) return false;
     if (!create_shadow_resources(error)) return false;
     if (!create_atmosphere(error)) return false;
+    if (!create_lights(error)) return false;
     if (!create_post_targets(error)) return false;
     if (!create_post_pipelines(error)) return false;
 
@@ -1792,6 +2334,9 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     // This frame's sun, moon and sky (ADR-004 L2), before anything uses them.
     update_sky(view.cam_pos[1]);
     for (int k = 0; k < 3; ++k) tree_settings_.sun_dir[k] = sky_frame_.key_dir[k];
+    // Local lights (ADR-004 L3): their list, their clusters and their shadow
+    // faces, before anything is shaded with them.
+    record_lights(view);
     // The sun's view first: the shadow map has to be finished before anything
     // that samples it is drawn.
     record_shadows(view);

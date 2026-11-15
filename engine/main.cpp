@@ -248,10 +248,27 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == 'U') { g_renderer.set_tonemap((g_renderer.tonemap() + 2u) % 3u); return 0; }
             // Time of day (ADR-004 L2): Page Up / Page Down step half an hour,
             // H runs the clock at an hour every ten seconds.
+            // Shift for five minutes at a time.
             if (wp == VK_PRIOR || wp == VK_NEXT) {
-                g_renderer.set_time_of_day(g_renderer.time_of_day() + (wp == VK_PRIOR ? 0.5f : -0.5f));
+                const float step = (GetKeyState(VK_SHIFT) & 0x8000) ? 5.0f / 60.0f : 0.5f;
+                g_renderer.set_time_of_day(g_renderer.time_of_day() + (wp == VK_PRIOR ? step : -step));
                 return 0;
             }
+            // Local lights (ADR-004 L3): F carries a torch; V drops a campfire
+            // on the ground four metres ahead; C clears the campfires.
+            if (wp == 'F') { g_renderer.set_carried_torch(!g_renderer.carried_torch()); return 0; }
+            if (wp == 'V') {
+                float f[3], r[3], u[3];
+                g_camera.basis(f, r, u);
+                const float hl = std::sqrt(f[0] * f[0] + f[2] * f[2]);
+                engine::LocalLight l = engine::make_campfire();
+                l.pos[0] = g_camera.x + (hl > 1e-3f ? f[0] / hl : 0.0f) * 4.0f;
+                l.pos[2] = g_camera.z + (hl > 1e-3f ? f[2] / hl : 1.0f) * 4.0f;
+                l.pos[1] = g_renderer.world().height(l.pos[0], l.pos[2]) + 0.5f;
+                g_renderer.add_light(l);
+                return 0;
+            }
+            if (wp == 'C') { g_renderer.clear_lights(); return 0; }
             if (wp == 'H') { g_time_lapse = !g_time_lapse; return 0; }
             if (wp == VK_OEM_COMMA || wp == VK_OEM_PERIOD) {
                 g_renderer.set_ev_comp(g_renderer.ev_comp() + (wp == VK_OEM_PERIOD ? 0.5f : -0.5f));
@@ -275,6 +292,28 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+// --lights <n>, and --lights-report: n campfires on the ground round the
+// camera, from a fixed sequence so a still is repeatable. 64 go within 60 m
+// and the disc grows with the count, so density stays that of a large camp:
+// 255 crammed into the same disc overflowed every cluster, which measured a
+// test mistake rather than the engine.
+void scatter_lights(int n) {
+    const float rmax = 60.0f * std::sqrt((std::max)(float(n), 64.0f) / 64.0f);
+    const engine::WorldGpu& wg = g_renderer.world();
+    uint32_t h = 0x9e3779b9u;
+    for (int i = 0; i < n; ++i) {
+        h = h * 1664525u + 1013904223u;
+        const float a = float(h >> 8) / 16777216.0f * 6.2831853f;
+        h = h * 1664525u + 1013904223u;
+        const float r = 8.0f + float(h >> 8) / 16777216.0f * (rmax - 8.0f);
+        engine::LocalLight l = engine::make_campfire();
+        l.pos[0] = g_camera.x + r * std::cos(a);
+        l.pos[2] = g_camera.z + r * std::sin(a);
+        l.pos[1] = wg.height(l.pos[0], l.pos[2]) + 0.5f;
+        g_renderer.add_light(l);
+    }
 }
 
 void fill_view(const engine::Camera& cam, float w, float h, float t,
@@ -586,8 +625,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                              hl.find("--normal-check") != std::string::npos ||
                              hl.find("--blend-report") != std::string::npos;
     const bool fell_mode = hl.find("--fell") != std::string::npos;
+    const bool lights_mode = hl.find("--lights-report") != std::string::npos;
     const bool rt_check_mode = hl.find("--check-rt") != std::string::npos;
-    const bool headless = report_mode || fell_mode || rt_check_mode || !shot_path.empty() || flight_seconds > 0.0 ||
+    const bool headless = report_mode || fell_mode || lights_mode || rt_check_mode || !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
                           dig_seconds > 0.0 || mode_dig_save || mode_dig_verify ||
@@ -682,6 +722,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (c2.find("--no-post") != std::string::npos) {
             g_renderer.set_taa(false); g_renderer.set_ao(false); g_renderer.set_contact(false);
         }
+        // Local lights (ADR-004 L3): carry a torch; local shadows off for A/B.
+        if (c2.find("--torch") != std::string::npos) g_renderer.set_carried_torch(true);
+        if (c2.find("--no-light-shadows") != std::string::npos) g_renderer.set_light_shadows(false);
         // Time of day (ADR-004 L2), hours: --time 6.5 is half past six.
         const size_t tod = c2.find("--time");
         if (tod != std::string::npos) g_renderer.set_time_of_day(float(std::atof(c2.c_str() + tod + 6)));
@@ -773,6 +816,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (have_cam) {
             g_camera.x = cam_arg[0]; g_camera.y = cam_arg[1]; g_camera.z = cam_arg[2];
             g_camera.yaw = cam_arg[3]; g_camera.pitch = cam_arg[4];
+        }
+        {
+            const std::string cl = cmdline ? cmdline : "";
+            // --ground: the camera's x and z, at eye height on the ground.
+            if (cl.find("--ground") != std::string::npos)
+                g_camera.y = g_renderer.world().height(g_camera.x, g_camera.z) + 1.7f;
+            const size_t ln = cl.find("--lights ");
+            if (ln != std::string::npos) scatter_lights(std::atoi(cl.c_str() + ln + 9));
         }
         engine::ViewConstants v = {};
         fill_view(g_camera, 1280.0f, 720.0f, 0.0f, v);
@@ -2117,6 +2168,105 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                          g_mesh_max_verts, g_mesh_max_idx);
             std::fclose(f);
         }
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return 0;
+    }
+
+    if (lights_mode) {
+        // --lights-report (ADR-004 L3): local lights at night, at ground
+        // level, measured -- the frame with none, with the torch, with 64
+        // campfires with and without their shadows, and with 255 -- and what
+        // the clusters and the shadow budget did.
+        const std::string cl = cmdline ? cmdline : "";
+        if (cl.find("--time") == std::string::npos) g_renderer.set_time_of_day(23.0f);
+        g_renderer.set_vsync(false);
+        const engine::WorldGpu& wg = g_renderer.world();
+        g_camera.x = 0.0f; g_camera.z = 0.0f;
+        g_camera.y = wg.height(0.0f, 0.0f) + 1.7f;
+        g_camera.yaw = 0.15f; g_camera.pitch = -0.12f;
+        std::remove("build/lights_report.txt");
+        // A running clock: flames flicker and the carried torch wanders, so
+        // its shadow is redrawn every frame as it is in play. A frozen clock
+        // cached it and reported its shadows as free.
+        float clock = 0.0f;
+        auto frame = [&]() -> bool {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
+            if (w < 1.0f || h < 1.0f) return false;
+            clock += 1.0f / 60.0f;
+            engine::ViewConstants v = {};
+            fill_view(g_camera, w, h, clock, v);
+            g_renderer.render(v);
+            return true;
+        };
+        for (int i = 0; i < 900; ++i) {
+            if (!frame()) break;
+            if (i > 60 && g_renderer.stats().pending == 0 && g_renderer.tree_field().settled()) break;
+        }
+        FILE* f = std::fopen("build/lights_report.txt", "w");
+        if (!f) return 1;
+        const engine::SkyFrame& sf = g_renderer.sky_frame();
+        std::fprintf(f, "lights report (ADR-004 L3): %02d:%02d, key light the %s; camera at ground level, (0, %.1f, 0)\n\n",
+                     int(sf.hours), int((sf.hours - float(int(sf.hours))) * 60.0f), sf.key_is_moon ? "moon" : "sun", g_camera.y);
+        // `walk`: the camera walks at 3 m/s, so the carried torch moves every
+        // frame and all six of its faces are redrawn every frame -- a torch
+        // held still is redrawn only once it has wandered a centimetre.
+        struct Config { const char* name; bool torch; int lights; bool shadows; bool walk; };
+        const Config configs[] = {
+            {"no local lights", false, 0, true, false},
+            {"the torch, held still", true, 0, true, false},
+            {"the torch, walking at 3 m/s", true, 0, true, true},
+            {"torch + 64 campfires, no local shadows", true, 64, false, false},
+            {"torch + 64 campfires", true, 64, true, false},
+            {"torch + 255 campfires", true, 255, true, false},
+        };
+        const float home_x = g_camera.x;
+        LARGE_INTEGER qf, q0, q1;
+        QueryPerformanceFrequency(&qf);
+        for (const Config& c : configs) {
+            // Home first: the campfires are scattered round the camera, and a
+            // walking config leaves it 20 m away.
+            g_camera.x = home_x;
+            g_camera.y = wg.height(g_camera.x, g_camera.z) + 1.7f;
+            g_renderer.clear_lights();
+            g_renderer.set_carried_torch(c.torch);
+            g_renderer.set_light_shadows(c.shadows);
+            scatter_lights(c.lights);
+            for (int i = 0; i < 90; ++i) frame();
+            std::vector<double> ms;
+            unsigned faces = 0, draws = 0;
+            for (int i = 0; i < 400; ++i) {
+                if (c.walk) {
+                    g_camera.x += 0.05f;
+                    g_camera.y = wg.height(g_camera.x, g_camera.z) + 1.7f;
+                }
+                QueryPerformanceCounter(&q0);
+                if (!frame()) break;
+                QueryPerformanceCounter(&q1);
+                ms.push_back(1000.0 * double(q1.QuadPart - q0.QuadPart) / double(qf.QuadPart));
+                faces += g_renderer.light_stats().faces_drawn;
+                draws += g_renderer.light_stats().chunk_draws;
+            }
+            std::sort(ms.begin(), ms.end());
+            double mean = 0.0;
+            for (double x : ms) mean += x;
+            mean = ms.empty() ? 0.0 : mean / double(ms.size());
+            const double p99 = ms.empty() ? 0.0 : ms[size_t(double(ms.size() - 1) * 0.99)];
+            const engine::Renderer::LightStats& ls = g_renderer.light_stats();
+            std::fprintf(f, "%-40s frame mean %.2f ms, 99th %.2f ms\n", c.name, mean, p99);
+            std::fprintf(f, "    lights %u, with a shadow ready %u; shadow faces redrawn %.1f a frame (%.0f chunk draws)\n",
+                         ls.lights, ls.shadowed, ms.empty() ? 0.0 : double(faces) / ms.size(),
+                         ms.empty() ? 0.0 : double(draws) / ms.size());
+            std::fprintf(f, "    clusters: %u of %u lit, %u lights listed in all (%.1f per lit cluster), most in one %u, overflowed %u\n",
+                         ls.clusters_lit, engine::kClusterCount, ls.cluster_items,
+                         ls.clusters_lit ? double(ls.cluster_items) / ls.clusters_lit : 0.0,
+                         ls.max_in_cluster, ls.overflowed);
+        }
+        std::fclose(f);
         g_renderer.shutdown();
         g_physics.shutdown();
         return 0;

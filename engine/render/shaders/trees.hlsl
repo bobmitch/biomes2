@@ -89,6 +89,7 @@ static const float3 kSky = float3(0.40f, 0.50f, 0.66f);
 
 #include "engine/render/shaders/leaf.hlsli"
 #include "engine/render/shaders/scene_out.hlsli"
+#include "engine/render/shaders/local_lights.hlsli"
 
 float3 qrot(float4 q, float3 v) {
     const float3 t = 2.0f * cross(q.xyz, v);
@@ -127,7 +128,7 @@ float3 bark_albedo(float3 base, float2 uv, float footprint) {
 // the extra fill on both is a STAND-IN for light the no-GI ambient cannot
 // know about -- bounce between leaves and off the floor under a crown --
 // which DDGI (L6) computes and these multipliers should then be removed for.
-SceneOut shade(float3 albedo_srgb, float3 n, float ao, float3 world, bool foliage, float sh) {
+SceneOut shade(float3 albedo_srgb, float3 n, float ao, float3 world, bool foliage, float sh, float4 clip) {
     const float3 albedo = srgb_to_linear(albedo_srgb);
     const float3 v = normalize(cam_pos - world);
     float3 dir, amb;
@@ -138,14 +139,15 @@ SceneOut shade(float3 albedo_srgb, float3 n, float ao, float3 world, bool foliag
         // the underside of every crown went black -- shards of black card
         // against the sky, which is what the first close-up showed.
         dir = leaf_sun_light(albedo, n, v, 0.6f, 0.7f, sh) * (0.85f * (0.45f + 0.55f * ao));
-        amb = albedo / kPi * gi_diffuse(world, n, v) * (1.3f * (0.45f + 0.55f * ao));
+        amb = albedo / kPi * gi_diffuse(world, n, v) * (1.3f * (0.45f + 0.55f * ao)) +
+              local_lights_leaf(albedo, n, v, 0.6f, 0.7f, world, clip) * (0.85f * (0.45f + 0.55f * ao));
     } else {
         // Bark gets more fill than open ground: under a crown, light that
         // bounced off leaves and the floor reaches the shaded side, and with
         // the ground's fill every trunk's shadow side read as black.
         const Surface s = make_surface(albedo, 0.85f, n, v);
         dir = sun_light(s, sh) * (0.9f * (0.35f + 0.65f * ao));
-        amb = ambient_light(s, world) * (1.3f * ao);
+        amb = ambient_light(s, world) * (1.3f * ao) + local_lights(s, world, clip) * (0.35f + 0.65f * ao);
     }
     return scene_out(dir, amb, world, cam_pos, far_plane, foliage ? 0.0f : 1.0f, foliage ? 0.6f : 1.0f);
 }
@@ -271,7 +273,7 @@ SceneOut ps_mesh(MeshOut i, bool front : SV_IsFrontFace) {
         // 1: which level drew it -- LOD 0 red, LOD 1 green (packed bit 29).
         return scene_flat(((i.packed >> 29) & 1u) != 0u ? float3(0.2f, 0.8f, 0.2f) : float3(0.9f, 0.2f, 0.2f));
     }
-    return shade(albedo, n, ao, i.world, foliage, shadow_factor(i.world, n));
+    return shade(albedo, n, ao, i.world, foliage, shadow_factor(i.world, n), i.clip);
 }
 
 // The mesh as a shadow caster: the same cut, the same leaf coverage, no
@@ -419,7 +421,7 @@ SceneOut ps_impostor(ImpOut i) {
     // Look from just outside its bound on the sun's side instead: hills and
     // other trees still shade it, its own crown does not.
     const float sh = shadow_factor(i.world + kSunDir * i.bound, kSunDir);
-    return shade(albedo, nw, 1.0f, i.world, true, sh);
+    return shade(albedo, nw, 1.0f, i.world, true, sh, i.clip);
 }
 
 // An impostor casting: its card already faces the sun (the shadow pass hands

@@ -82,6 +82,13 @@ public:
     // viewport must already be bound.
     void record_shadow(ID3D12GraphicsCommandList* cmd, UINT frame, UINT cascade,
                        const TreeShadowInputs& in, const TreeDrawSettings& s);
+    // One face of a local light's shadow (ADR-004 L3): culled against the
+    // face, levelled like the sun's first cascade (full detail, real
+    // leaves). `face` is the frame's face counter, 0 .. kMaxLightFaces - 1,
+    // each with its own constants.
+    static const UINT kMaxLightFaces = 12;
+    void record_light_shadow(ID3D12GraphicsCommandList* cmd, UINT frame, UINT face,
+                             const TreeShadowInputs& in, const TreeDrawSettings& s);
 
     // What the models are, for physics and felling.
     const TreeModel& model(uint32_t species, uint32_t variant) const {

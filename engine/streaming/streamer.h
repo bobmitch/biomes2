@@ -596,6 +596,29 @@ public:
     }
     size_t free_slot_count() const { return free_slots_.size(); }
 
+    // Every slot holding geometry whose chunk comes within `r` of `c`: what a
+    // local light's shadow faces draw (ADR-004 L3), rather than the whole
+    // resident world six times over. Held chunks too -- they are still drawn.
+    void slots_near(const float c[3], float r, std::vector<UINT>& out) const {
+        out.clear();
+        auto test = [&](const ChunkKey& k, UINT slot) {
+            const float S = lod_chunk_size(k.lod);
+            const float pad = lod_voxel(k.lod) * 3.0f;   // the ghost cell and the skirt
+            const float lo[3] = {float(k.x) * S - pad, float(k.y) * S - pad, float(k.z) * S - pad};
+            const float hi[3] = {float(k.x + 1) * S + pad, float(k.y + 1) * S + pad, float(k.z + 1) * S + pad};
+            float d2 = 0.0f;
+            for (int a = 0; a < 3; ++a) {
+                const float v = c[a] < lo[a] ? lo[a] - c[a] : (c[a] > hi[a] ? c[a] - hi[a] : 0.0f);
+                d2 += v * v;
+            }
+            if (d2 <= r * r) out.push_back(slot);
+        };
+        for (std::unordered_map<ChunkKey, UINT, ChunkKeyHash>::const_iterator it = resident_.begin();
+             it != resident_.end(); ++it)
+            if (it->second != kNoSlot) test(it->first, it->second);
+        for (size_t i = 0; i < held_.size(); ++i) test(held_[i].key, held_[i].slot);
+    }
+
 private:
     struct Held   { ChunkKey key; UINT slot; int fade_start; };   // -1: waiting
     struct FadeIn { ChunkKey key; UINT slot; int start; };        // -1: waiting

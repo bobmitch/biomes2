@@ -19,6 +19,7 @@
 #include "engine/render/shaders/shadow.hlsli"
 #include "engine/render/shaders/leaf.hlsli"
 #include "engine/render/shaders/scene_out.hlsli"
+#include "engine/render/shaders/local_lights.hlsli"
 
 cbuffer FoliageFrame : register(b0) {
     row_major float4x4 view_proj;
@@ -409,12 +410,13 @@ FolOut vs_blade(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
 // and transmitted sun of lighting.hlsli, and the GI interface's diffuse with
 // a little extra fill standing in for light scattered between blades, which
 // the no-GI ambient cannot see (trees.hlsl's shade says the same).
-SceneOut shade_foliage(float3 albedo_srgb, float3 n, float ao, float3 world, float3 toward_eye,
+SceneOut shade_foliage(float4 clip, float3 albedo_srgb, float3 n, float ao, float3 world, float3 toward_eye,
                        float contact = 0.0f, float ssao = 0.4f) {
     const float3 albedo = srgb_to_linear(albedo_srgb);
     const float sh = shadow_factor(world, float3(0.0f, 1.0f, 0.0f));
     return scene_out(leaf_sun_light(albedo, n, toward_eye, 0.5f, 0.7f, sh) * (1.09f * ao),
-                     albedo / kPi * gi_diffuse(world, n, toward_eye) * (1.3f * ao),
+                     albedo / kPi * gi_diffuse(world, n, toward_eye) * (1.3f * ao) +
+                     local_lights_leaf(albedo, n, toward_eye, 0.5f, 0.7f, world, clip) * ao,
                      world, cam_pos, far_plane, contact, ssao);
 }
 
@@ -438,7 +440,7 @@ SceneOut ps_blade(FolOut i, bool front : SV_IsFrontFace) {
     if (debug > 0.5f) return scene_flat(float3(0.9f, 0.9f, 0.1f));
     // Blades take a little: the base of a sward darkening where it meets a
     // trunk or a stone reads; blade-on-blade does not.
-    return shade_foliage(albedo, n, ao, i.world, normalize(cam_pos - i.world), 0.3f * (1.0f - i.uv.y));
+    return shade_foliage(i.clip, albedo, n, ao, i.world, normalize(cam_pos - i.world), 0.3f * (1.0f - i.uv.y));
 }
 
 // Two crossed quads, verts 0..7.
@@ -488,7 +490,7 @@ SceneOut ps_card(FolOut i) {
     const float3 albedo = lerp(i.col, i.dcol, dryness);
     const float ao = lerp(0.4f, 1.0f, i.uv.y);
     if (debug > 0.5f) return scene_flat(float3(0.1f, 0.6f, 0.9f));
-    return shade_foliage(albedo, normalize(i.nrm), ao, i.world, normalize(cam_pos - i.world));
+    return shade_foliage(i.clip, albedo, normalize(i.nrm), ao, i.world, normalize(cam_pos - i.world));
 }
 
 // A bush: 14 leaf cards round the inside of a squat ellipsoid, verts 0..55.
@@ -534,5 +536,5 @@ SceneOut ps_bush(FolOut i) {
     const float3 albedo = lerp(i.col, i.dcol, i.dry) * (0.85f + 0.3f * funit(fhash(i.seed, 9u)));
     const float ao = lerp(0.45f, 1.0f, saturate(i.nrm.y));
     if (debug > 0.5f) return scene_flat(float3(0.9f, 0.2f, 0.9f));
-    return shade_foliage(albedo, normalize(i.nrm), ao, i.world, normalize(cam_pos - i.world));
+    return shade_foliage(i.clip, albedo, normalize(i.nrm), ao, i.world, normalize(cam_pos - i.world));
 }

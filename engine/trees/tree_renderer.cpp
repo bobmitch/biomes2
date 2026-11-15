@@ -51,7 +51,8 @@ struct TreeFrame {
 static_assert(sizeof(TreeFrame) == 320, "TreeFrame must match the HLSL cbuffer");
 const UINT kCbStride = 512;
 // Per frame in flight: the camera's constants, then one per shadow cascade.
-const UINT kCbPerFrame = 4;
+// The main pass, three sun cascades, and up to twelve local-light faces.
+const UINT kCbPerFrame = 4 + TreeRenderer::kMaxLightFaces;
 
 struct ModelInfoGpu {
     float radius, top, bound, slice;
@@ -181,10 +182,16 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         range.NumDescriptors = 2;
         range.BaseShaderRegister = 5;
-        D3D12_DESCRIPTOR_RANGE srange = {};
-        srange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        srange.NumDescriptors = 1;
-        srange.BaseShaderRegister = 8;
+        // The shadow table: the sun's map at heap [0], and since ADR-004 L3
+        // the local lights' buffers and atlas at [24..28] (t20..t24).
+        D3D12_DESCRIPTOR_RANGE srange[2] = {};
+        srange[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srange[0].NumDescriptors = 1;
+        srange[0].BaseShaderRegister = 8;
+        srange[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srange[1].NumDescriptors = 5;
+        srange[1].BaseShaderRegister = 20;
+        srange[1].OffsetInDescriptorsFromTableStart = 24;
         D3D12_ROOT_PARAMETER p[10] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         p[0].Constants.ShaderRegister = 1;
@@ -201,8 +208,8 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         p[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[8].Descriptor.ShaderRegister = 2;
         p[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[9].DescriptorTable.NumDescriptorRanges = 1;
-        p[9].DescriptorTable.pDescriptorRanges = &srange;
+        p[9].DescriptorTable.NumDescriptorRanges = 2;
+        p[9].DescriptorTable.pDescriptorRanges = srange;
         for (int k = 0; k < 10; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_STATIC_SAMPLER_DESC ssa[2] = {};
@@ -835,6 +842,25 @@ void TreeRenderer::record_shadow(ID3D12GraphicsCommandList* cmd, UINT frame, UIN
     // 1 + the cascade: the cull and the caster shaders both read it.
     tf.shadow_pass = 1.0f + float(cascade);
     cull_and_draw(cmd, frame, 1 + cascade, &tf, true, 0);
+}
+
+void TreeRenderer::record_light_shadow(ID3D12GraphicsCommandList* cmd, UINT frame, UINT face,
+                                       const TreeShadowInputs& in, const TreeDrawSettings& s) {
+    if (!ready_ || face >= kMaxLightFaces) return;
+    TreeFrame tf = {};
+    std::memcpy(tf.view_proj, in.view_proj, sizeof tf.view_proj);
+    std::memcpy(tf.frustum, in.planes, sizeof tf.frustum);
+    for (int k = 0; k < 3; ++k) {
+        tf.cam_pos[k] = in.cam_pos[k];
+        tf.cam_right[k] = in.light_right[k];
+        tf.cam_up[k] = in.light_up[k];
+    }
+    tf.time = in.time;
+    tf.far_plane = in.far_plane;
+    fill_common(tf, static_cast<UINT>(cpu_instances_.size()), static_cast<UINT>(models_.size()),
+                quad_first_, quad_base_, s);
+    tf.shadow_pass = 1.0f;   // the first cascade's floor: full detail, real leaves
+    cull_and_draw(cmd, frame, 4 + face, &tf, true, 0);
 }
 
 void TreeRenderer::cull_and_draw(ID3D12GraphicsCommandList* cmd, UINT frame, UINT cb_index,

@@ -243,7 +243,7 @@ Each one is measured with an instrument, not judged only by eye.
 | **L0** ✅ | DXC alongside FXC; check the device's DXR tier at init; crack detection moved from colour to depth | `--check-rt`; crack counts identical before and after |
 | **L1** ✅ | Units, auto-exposure, tonemap, PBR materials, biome terrain materials | a histogram report; A/B stills |
 | **L2** ✅ | Hillaire atmosphere, aerial perspective, time of day (`--time`, a key) | `--sky-report`: sun and sky radiance against reference values |
-| **L3** | Clustered local lights, shadow atlas, a torch you can carry | `--lights-report`: lights per cluster, shadow budget, ms |
+| **L3** ✅ | Clustered local lights, shadow atlas, a torch you can carry | `--lights-report`: lights per cluster, shadow budget, ms |
 | **L4** | Froxel volumetric fog: sun, local lights, height and local media | A/B stills; ms |
 | **L5** | RT scene: BLAS per chunk and per tree model, TLAS; `gi_trace` / `gi_occluded` on DXR; ray-traced sun shadow A/B against the cascades | `--rt-report`: BLAS count and memory, build ms, agreement with the CSM |
 | **L6** | DDGI cascades, relocation, classification, visibility, behind `gi_diffuse` / `gi_sky_visibility`; every surface shader switched to the interface | `--gi-report`; **`--leak-test`**: dig a sealed chamber, measure its luminance with no light inside (must be ~0), then light a torch in it (must fill it) |
@@ -352,6 +352,30 @@ the day it does not.
 - **Not done:** stars, moon phases, night-vision tone (Purkinje), clouds,
   and light shafts through the haze (L4's froxels). The sea is still the
   weakest surface.
+
+## L3 — done, 2026-11-15
+
+- **Lights:** point and spot in lumens, inverse square windowed to zero at
+  a range, flicker; up to 256 a frame, sorted by importance with the carried
+  torch first. A torch is 200 lm and invisible beside the sun, as it should
+  be; at night it is the scene.
+- **Clusters:** 16 x 9 x 24 froxels, log slices 0.5-400 m, up to 128 lights
+  each, built in compute every frame. Terrain, trees and grass walk their
+  pixel's cluster through the same BRDF as the sun. The buffers reach every
+  lit pipeline as a second range of the table each already binds for the
+  sun's shadow map: no root parameter changed.
+- **Shadows:** a 4096^2 atlas, a cube of 512^2 faces per point light, eight
+  slots by importance with sticky assignment so faces stay cached, at most
+  twelve faces redrawn a frame (new or moved first, static lights refreshed
+  every 240 frames). Each face draws only the chunks in the light's range,
+  and the trees through their own cull with real leaves.
+- **The instrument:** `--lights-report`, at night at ground level -- none
+  2.33 ms, the torch carried at walking pace 2.51 (six faces a frame), 64
+  campfires 2.98 / 3.55 shadowed, 255 at 4.42 with 46.5 lights per lit
+  cluster and none overflowed.
+- **Not done:** local light on the sea; a visible torch and flames (the
+  light exists, its source does not); spot lights placed by anything; light
+  separated from GTAO; ray-traced shadows for small lights (needs L5).
 
 ## Risks
 

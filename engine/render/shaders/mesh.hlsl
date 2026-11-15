@@ -9,6 +9,7 @@
 
 #include "engine/render/shaders/shadow.hlsli"
 #include "engine/render/shaders/scene_out.hlsli"
+#include "engine/render/shaders/local_lights.hlsli"
 
 struct Vertex {
     float3 pos;
@@ -191,5 +192,6 @@ SceneOut ps_main(VSOut i) {
     const Surface s = make_surface(albedo, mat.a, n, v);
     // Direct and ambient apart (scene_out.hlsli): the post chain shades
     // each with its own occlusion.
-    return scene_out(sun_light(s, sh), ambient_light(s, i.world), i.world, cam_pos, far_plane);
+    return scene_out(sun_light(s, sh), ambient_light(s, i.world) + local_lights(s, i.world, i.clip),
+                     i.world, cam_pos, far_plane);
 }

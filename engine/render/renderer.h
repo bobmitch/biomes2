@@ -19,6 +19,7 @@
 #include "engine/foliage/foliage_renderer.h"
 #include "engine/render/rt_check.h"
 #include "engine/render/sky.h"
+#include "engine/render/local_lights.h"
 
 #include <unordered_map>
 #include <vector>
@@ -230,6 +231,30 @@ public:
     void  set_time_of_day(float hours);
     float time_of_day() const { return time_hours_; }
     const SkyFrame& sky_frame() const { return sky_frame_; }
+
+    // Local lights (ADR-004 L3). A torch carried at the camera; lights
+    // placed in the world (returns the light's id); their shadows, on by
+    // default, off for A/B.
+    void set_carried_torch(bool on) { torch_on_ = on; }
+    bool carried_torch() const { return torch_on_; }
+    uint32_t add_light(const LocalLight& l) {
+        lights_.push_back(l);
+        lights_.back().id = next_light_id_++;
+        return lights_.back().id;
+    }
+    void clear_lights() { lights_.clear(); }
+    size_t light_count() const { return lights_.size() + (torch_on_ ? 1 : 0); }
+    void set_light_shadows(bool on) { light_shadows_on_ = on; }
+    bool light_shadows() const { return light_shadows_on_; }
+    struct LightStats {
+        uint32_t lights = 0;          // sent to the GPU this frame
+        uint32_t shadowed = 0;        // with a shadow ready
+        uint32_t faces_drawn = 0;     // shadow faces redrawn this frame
+        uint32_t chunk_draws = 0;     // terrain chunk draws in those faces
+        // From the cluster pass, read back a couple of frames late.
+        uint32_t overflowed = 0, max_in_cluster = 0, clusters_lit = 0, cluster_items = 0;
+    };
+    const LightStats& light_stats() const { return light_stats_; }
     // What the meter saw in the last capture(): the histogram and the
     // exposure it chose. bins[k] covers log2 nits kLumLogMin + k * step.
     struct ExposureReport {
@@ -404,6 +429,35 @@ private:
     SkyFrame sky_frame_;
     float    time_hours_ = 14.0f;
     float    sky_hours_ = -1.0f, sky_cam_y_ = -1.0e9f;   // what sky_frame_ was evaluated for
+    // Local lights (ADR-004 L3).
+    bool create_lights(std::string& error);
+    bool create_lights_pipelines(std::string& error);
+    void record_lights(const ViewConstants& view);
+    struct ShadowSlot {
+        uint32_t light = 0xFFFFFFFFu;     // light id; 0 is the carried torch
+        bool     ready = false;
+        float    pos[3] = {0, 0, 0};
+        unsigned long long drawn = 0;     // post_frame_ when its faces were drawn
+        int      faces = 6;
+    };
+    std::vector<LocalLight> lights_;
+    uint32_t next_light_id_ = 1;
+    bool     torch_on_ = false, light_shadows_on_ = true;
+    ShadowSlot shadow_slots_[kMaxShadowLights];
+    LightFaceGpu faces_cpu_[kMaxShadowLights * 6] = {};
+    float    cluster_consts_[3][4] = {};
+    LightStats light_stats_;
+    bool     cluster_readable_ = false;
+    ComPtr<ID3D12Resource> lights_gpu_, faces_gpu_, cluster_n_, cluster_ix_, cluster_stats_, light_atlas_;
+    ComPtr<ID3D12Resource> lights_up_[kFrameCount], faces_up_[kFrameCount], cluster_cb_[kFrameCount];
+    ComPtr<ID3D12Resource> stats_rb_[kFrameCount];
+    void* lights_up_cpu_[kFrameCount] = {};
+    void* faces_up_cpu_[kFrameCount] = {};
+    void* cluster_cb_cpu_[kFrameCount] = {};
+    bool  stats_pending_[kFrameCount] = {};
+    ComPtr<ID3D12DescriptorHeap> light_dsv_heap_;
+    ComPtr<ID3D12RootSignature> cluster_root_;
+    ComPtr<ID3D12PipelineState> cluster_pso_, cluster_clear_pso_;
     ComPtr<ID3D12RootSignature> atm_root_;
     ComPtr<ID3D12PipelineState> sky_view_pso_, aerial_pso_;
     ComPtr<ID3D12Resource> trans_tex_, ms_tex_, sky_view_tex_, ap_tex_;

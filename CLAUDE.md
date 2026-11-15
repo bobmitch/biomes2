@@ -54,8 +54,12 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
 `--band-report`, `--sea-report`, `--swim`, `--blend-report`, `--tab-test`,
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
-references) and `--fell` (with `--fell-save` / `--fell-verify`). Every mode
-takes `--time <hours>` (ADR-004 L2: 14 by default, which is the pre-L2 sun). `--flight` also takes `--settle`, `--holes` and
+references), `--lights-report` (ADR-004 L3: local lights at night, six
+configurations timed) and `--fell` (with `--fell-save` / `--fell-verify`).
+Every mode takes `--time <hours>` (ADR-004 L2: 14 by default, which is the
+pre-L2 sun), `--torch` (carry one) and `--no-light-shadows`; `--shot` also
+takes `--lights <n>` (campfires round the camera) and `--ground` (the
+`--cam` x and z at eye height on the ground). `--flight` also takes `--settle`, `--holes` and
 `--flight-speed <m/s>` and `--flight-from x y z`; `--shot` takes
 `--slot-report`; every mode takes `--mesh-debug 1|2` (curtain, creases) and
 the streaming A/B switches `--no-lod-align`,
@@ -614,8 +618,9 @@ by its depth. Scene shaders no longer fog.
   target still clears to a constant -- now a marker, `kSkyClear` -- and the
   composite reads what fraction of it a blended sea left as the share of sky
   to show. Crack counts identical before and after on every view.
-- **Time:** `--time <h>`; Page Up / Page Down step half an hour; `H` runs an
-  hour every ten seconds; the title shows the clock. Latitude 40 N,
+- **Time:** `--time <h>`; Page Up / Page Down step half an hour, with Shift
+  five minutes; `H` runs an hour every ten seconds; the title shows the
+  clock. Latitude 40 N,
   declination +15: sunrise 05:08, sunset 18:52. World +x is west and +z
   south, which puts 14:00's sun on the fixed pre-L2 sun to under a degree.
 - **Night is a full moon opposite the sun**, 0.19 lux on the ground,
@@ -624,6 +629,48 @@ by its depth. Scene shaders no longer fog.
   shift yet.
 - Cost: walking 2.08 -> 2.10 ms; flying 2.05 -> 1.99 ms (the scene shaders
   lost their fog).
+
+### Local lights (ADR-004 L3)
+
+Torches, fires, later magic: `engine/render/local_lights.h`. Point or spot,
+in lumens (a torch 200 lm, a campfire 1500), inverse square windowed to zero
+at the range, flickering. Each frame `Renderer::record_lights` sorts them by
+importance (lumens over distance squared; the carried torch always first),
+uploads up to 256, and `lights.hlsl` bins them into 16 x 9 x 24 froxel
+clusters (log slices 0.5-400 m, up to 128 a cluster). Terrain, trees and
+grass walk their pixel's cluster in `local_lights.hlsli` through the same
+BRDF as the sun (`direct_light`, `leaf_light` in `lighting.hlsli`).
+
+- **The buffers reach every lit pipeline without a new root parameter.**
+  They sit at heap slots [24..28] (t20..t24), and the table each pipeline
+  already binds for the sun's shadow map at [0] carries a SECOND RANGE with
+  `OffsetInDescriptorsFromTableStart = 24`. The cluster parameters ride in
+  the shadow constants. The sea is not lit by them (its pipeline has no
+  such table) -- yet.
+- **Shadows: a 4096^2 atlas of 512^2 tiles**, a cube of six for a point
+  light. The eight most important shadowed lights hold slots and keep
+  them while they stay in the eight, so their faces stay cached; at most
+  twelve faces are redrawn a frame -- never drawn or moved first, then a
+  static light's faces every 240 frames so a dug hole or a felled tree
+  reaches its shadow. A face draws only the chunks within the light's range
+  (`Streamer::slots_near`, one ExecuteIndirect a slot) and the trees through
+  their own cull (`TreeRenderer::record_light_shadow`, the first cascade's
+  floor: real leaves).
+- **`--lights-report` is the instrument** -- at night, at ground level,
+  frame mean over 400 frames: none 2.33 ms; torch held still 2.40; **torch
+  carried at walking pace 2.51** (all six faces redrawn every frame, 72 chunk
+  draws); 64 campfires 2.98 unshadowed, 3.55 with eight shadowed; 255
+  campfires 4.42, 46.5 lights per lit cluster, none overflowed. Two things
+  it caught in itself: a frozen clock cached the torch's shadow and called
+  it free, and 255 campfires in the 64-campfire disc overflowed every
+  cluster; the report now runs a clock and keeps density constant.
+- **Local light goes into the AMBIENT target**, so GTAO darkens it in
+  creases -- not quite right for a point light, cheap and honest until the
+  composite has a third target. The torch has no visible model yet.
+- Daytime with no lights: a uniform early-out skips every cluster read;
+  walking 2.10 (L2) -> 2.18 ms. Spot lights are implemented, with a
+  one-face shadow, but nothing places one yet.
+- Keys: `F` carries a torch, `V` drops a campfire 4 m ahead, `C` clears them.
 
 - **Cracks are counted in the engine, as UNDRAWN pixels** (ADR-004 L0):
   below the horizon, far depth, and both HDR scene targets still at their
