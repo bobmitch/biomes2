@@ -80,6 +80,30 @@ public:
                         const unsigned* idx, unsigned nidx);
 
     void remove_chunk(const ChunkKey& key);
+
+    // Props: trees. A handle is the body's index-and-sequence number, stable
+    // for the body's life.
+    //
+    // A static capsule between two world points: a standing trunk, a stump.
+    uint32_t add_static_capsule(const float a[3], const float b[3], float radius);
+    // A felled tree: a dense trunk capsule from y0 to y1 on the local axis
+    // and a light sphere for the crown, posed at (pos, rot), already turning
+    // at `spin` rad/s. Wood at 650 kg/m^3; the crown at 6, because a crown is
+    // mostly air and a solid one would weigh as much as the trunk ten times.
+    // `asleep` adds it without waking it, for a log loaded from a save.
+    uint32_t add_log(const float pos[3], const float rot[4], float trunk_r, float y0, float y1,
+                     float crown_y, float crown_r, const float spin[3], bool asleep);
+    void     remove_body(uint32_t handle);
+    // Where a body is: its shape origin and rotation. `active` false once
+    // Jolt has put it to sleep, which is what "came to rest" means.
+    bool     body_pose(uint32_t handle, float pos[3], float rot[4], bool& active) const;
+    size_t   prop_count() const { return props_.size(); }
+    // Any ray: metres to the first body, -1 for none; `prop` 1 if that body
+    // is a prop (a trunk, a stump, a log) rather than terrain.
+    float    probe_ray(const float from[3], const float dir[3], float len, int& prop) const;
+    // The character's active contacts: how many, and how many are props.
+    void     character_contacts(int& total, int& props) const;
+
     size_t body_count() const { return bodies_.size(); }
     size_t mesh_body_count() const { return mesh_bodies_; }
 
@@ -152,6 +176,8 @@ private:
     std::unique_ptr<Impl> impl_;
 
     std::unordered_map<ChunkKey, JPH::BodyID, ChunkKeyHash> bodies_;
+    std::unordered_map<uint32_t, JPH::BodyID> props_;
+    size_t dynamic_props_ = 0;
     std::unordered_map<JPH::uint32, int> body_lod_;
     std::unordered_map<JPH::uint32, int> body_is_mesh_;
     size_t mesh_bodies_ = 0;

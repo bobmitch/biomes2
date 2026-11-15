@@ -7,6 +7,8 @@
 // the image is a meshing difference and not a lighting one.
 // ---------------------------------------------------------------------------
 
+#include "engine/render/shaders/shadow.hlsli"
+
 struct Vertex {
     float3 pos;
     float3 nrm;
@@ -167,7 +169,9 @@ float4 ps_main(VSOut i) : SV_Target {
     rock = lerp(rock, float3(0.34f, 0.46f, 0.28f), saturate(n.y * n.y));
     rock = apply_surface_texture(rock, i.world, n);
 
-    float3 col = rock * (0.22f + 0.78f * lam) + float3(0.10f, 0.13f, 0.18f) * sky;
+    // Sun shadow: from the terrain itself and from the trees (shadow.hlsli).
+    const float sh = lam > 0.0f ? shadow_factor(i.world, n) : 1.0f;
+    float3 col = rock * (0.22f + 0.78f * lam * sh) + float3(0.10f, 0.13f, 0.18f) * sky;
 
     const float dist = length(i.world - cam_pos);
     const float fog = saturate(dist / far_plane);

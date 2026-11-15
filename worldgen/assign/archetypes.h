@@ -37,11 +37,41 @@ struct BiomeArchetype {
     // --- surface ---
     uint32_t material_id        = 0u;
     float    water_level_offset = 0.0f;
+
+    // --- trees (layer 8) ---
+    // Chance a candidate cell holds a tree inside a patch, and the share of
+    // the biome's area that is patch rather than clearing. Both 0 when the
+    // biome has no trees block.
+    float    tree_density = 0.0f;
+    float    tree_cover   = 0.0f;
+    // Relative weight per species, indexed like TreeTable::species.
+    std::vector<float> tree_species;
+};
+
+// One tree species. `form` and everything the engine reads under "shape" are
+// presentation; placement reads only the height and altitude ranges.
+struct TreeSpecies {
+    std::string name;              // diagnostics, and the key biomes refer to it by
+    std::string form;              // which mesh generator draws it; worldgen ignores it
+    float height_min = 10.0f, height_max = 20.0f;   // metres
+    float alt_lo = -1.0e9f, alt_hi = 1.0e9f;        // metres above sea level
+};
+
+struct TreeTable {
+    float cell          = 4.0f;     // candidate spacing, metres
+    float patch_freq    = 0.0045f;  // cycles per metre of the patch/clearing noise
+    float patch_edge    = 0.10f;    // noise units over which a patch edge thins out
+    float max_slope     = 0.80f;    // rise over run; steeper ground holds no tree
+    float shore         = 0.8f;     // metres above sea level a trunk needs
+    float altitude_ramp = 60.0f;    // metres of fade inside each end of a species' band
+    int   blend_sharpen = 4;        // biome blend weights to this power for trees
+    std::vector<TreeSpecies> species;
 };
 
 struct ArchetypeTable {
     std::vector<BiomeArchetype> biomes;
     float sea_level = 0.0f;
+    TreeTable trees;
 
     size_t size() const { return biomes.size(); }
     const BiomeArchetype& operator[](size_t i) const { return biomes[i]; }

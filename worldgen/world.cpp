@@ -257,6 +257,201 @@ float terrain_density(const SeedWorld& w, const WorldParams& wp,
     return d;
 }
 
+int biome_mix(const SeedWorld& w, const WorldParams& wp, float x, float z,
+              int* biome, float* weight) {
+    const float wx = x + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wx);
+    const float wz = z + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wz);
+    int   idx[4];
+    float dist[4];
+    float d5 = 3.4e38f;
+    const int found = w.lookup.nearest4(w.pts, wx, wz, idx, dist, &d5);
+    float wsum = 0.0f, wall = 0.0f;
+    float wt[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int   bb[4] = {-1, -1, -1, -1};
+    for (int k = 0; k < found; ++k) {
+        const float wk = blend_weight(dist[k], dist[0], d5, wp.blend_width);
+        wall = wall + wk;
+        const int b = w.biome[idx[k]];
+        if (b < 0 || wk <= 0.0f) continue;
+        bb[k] = b;
+        wt[k] = wk;
+        wsum = wsum + wk;
+    }
+    const float div = blend_divisor(wsum, wall);
+    int n = 0;
+    for (int k = 0; k < found; ++k) {
+        if (bb[k] < 0) continue;
+        biome[n] = bb[k];
+        weight[n] = div > 0.0f ? wt[k] / div : 0.0f;
+        ++n;
+    }
+    return n;
+}
+
+// --- layer 8: trees -----------------------------------------------------------
+// Cheapest test first. Most candidate cells are in a clearing or a treeless
+// biome and are rejected on the blend and the patch noise alone; the height,
+// slope and surface checks only run for the cells that survive those.
+bool tree_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
+                  int i, int j, TreeInstance& out, int* reason) {
+#define TREE_NO(r) do { if (reason) *reason = (r); return false; } while (0)
+    const TreeTable& tt = table.trees;
+    const size_t ns = tt.species.size();
+    if (ns == 0) TREE_NO(TREE_NO_LAND);
+
+    const float u_x = tree_unit(tree_hash(i, j, w.s_trees, 0u));
+    const float u_z = tree_unit(tree_hash(i, j, w.s_trees, 1u));
+    // Jitter inside the middle 80% of the cell: trunks never closer than a
+    // fifth of a cell (0.8 m at 4 m), so two never stand in one another.
+    const float x = (static_cast<float>(i) + 0.1f + 0.8f * u_x) * tt.cell;
+    const float z = (static_cast<float>(j) + 0.1f + 0.8f * u_z) * tt.cell;
+    if (x * x + z * z > wp.radius * wp.radius) TREE_NO(TREE_OUTSIDE);
+
+    int   bio[4];
+    float bw[4];
+    const int nb = biome_mix(w, wp, x, z, bio, bw);
+    if (nb == 0) TREE_NO(TREE_NO_LAND);
+    // Sharpen the blend for trees. Heights need the full 500 m blend; trees
+    // do not, and with it a forest neighbour still carried enough weight at
+    // the CENTRE of a rift cell to grow 14 trees a hectare there. Each weight
+    // to an integer power, renormalised: still continuous at a border, where
+    // equal weights stay equal, but a biome's trees keep to its own ground.
+    // Kept to the land share: a coastal fade stays a coastal fade.
+    {
+        float land = 0.0f, sharp = 0.0f;
+        float sw[4];
+        for (int k = 0; k < nb; ++k) {
+            land = land + bw[k];
+            float p = 1.0f;
+            for (int e = 0; e < tt.blend_sharpen; ++e) p = p * bw[k];
+            sw[k] = p;
+            sharp = sharp + p;
+        }
+        if (sharp > 0.0f) {
+            for (int k = 0; k < nb; ++k) bw[k] = sw[k] / sharp * land;
+        }
+    }
+
+    // Density and cover blend across a border like every other biome property.
+    // The patch is evaluated per biome and mixed, rather than with mixed cover,
+    // so each biome's own patches carry on to its edge instead of reshaping.
+    float density = 0.0f;
+    for (int k = 0; k < nb; ++k) {
+        const BiomeArchetype& a = table[bio[k]];
+        if (a.tree_density <= 0.0f) continue;
+        const float patch = tree_patch(x, z, tt.patch_freq, a.tree_cover, tt.patch_edge, w.s_tree_patch);
+        density = density + bw[k] * a.tree_density * patch;
+    }
+    if (density <= 0.0f) TREE_NO(TREE_CLEARING);
+    const float u_keep = tree_unit(tree_hash(i, j, w.s_trees, 2u));
+    if (u_keep >= density) TREE_NO(TREE_ROLL);
+
+    // The ground. Shore, slope and river first: they need only heights.
+    const float r = std::sqrt(x * x + z * z) / wp.radius;
+    const float h = terrain_height(w, wp, table, x, z, r);
+    if (h < table.sea_level + tt.shore) TREE_NO(TREE_SHORE);
+    const float e = 0.5f * tt.cell;
+    const float hx = terrain_height(w, wp, table, x + e, z, r) - terrain_height(w, wp, table, x - e, z, r);
+    const float hz = terrain_height(w, wp, table, x, z + e, r) - terrain_height(w, wp, table, x, z - e, r);
+    const float slope2 = (hx * hx + hz * hz) / (4.0f * e * e);
+    if (slope2 > tt.max_slope * tt.max_slope) TREE_NO(TREE_SLOPE);
+    float rw = 0.0f, rd = 0.0f;
+    if (nearest_river(w, wp, x, z, rw, rd) < rw + 1.0f) TREE_NO(TREE_RIVER);
+
+    // Which species: biome weight times altitude fit. The fit is what moves
+    // a forest from oak to fir uphill, and what makes the treeline.
+    float total = 0.0f;
+    float fit_of[64];
+    float wsp[64];
+    const size_t nsp = ns < 64 ? ns : 64;
+    for (size_t s = 0; s < nsp; ++s) {
+        float ws = 0.0f;
+        for (int k = 0; k < nb; ++k) {
+            const BiomeArchetype& a = table[bio[k]];
+            if (a.tree_density <= 0.0f) continue;
+            ws = ws + bw[k] * a.tree_species[s];
+        }
+        const TreeSpecies& sp = tt.species[s];
+        fit_of[s] = tree_altitude_fit(h - table.sea_level, sp.alt_lo, sp.alt_hi, tt.altitude_ramp);
+        wsp[s] = ws * fit_of[s];
+        total = total + wsp[s];
+    }
+    if (total <= 0.0f) TREE_NO(TREE_ALTITUDE);
+    // The fit also thins: where every candidate species fits badly the cell
+    // is usually rejected, so a treeline fades rather than stopping at a wall.
+    float best_fit = 0.0f;
+    for (size_t s = 0; s < nsp; ++s) {
+        if (wsp[s] > 0.0f && fit_of[s] > best_fit) best_fit = fit_of[s];
+    }
+    if (tree_unit(tree_hash(i, j, w.s_trees, 3u)) >= best_fit) TREE_NO(TREE_FIT_ROLL);
+
+    const float u_sp = tree_unit(tree_hash(i, j, w.s_trees, 4u)) * total;
+    size_t pick = nsp;
+    float acc = 0.0f;
+    for (size_t s = 0; s < nsp; ++s) {
+        if (wsp[s] <= 0.0f) continue;
+        acc = acc + wsp[s];
+        pick = s;
+        if (u_sp < acc) break;
+    }
+    if (pick >= nsp) TREE_NO(TREE_ALTITUDE);
+
+    // Stand the trunk on the REAL surface. Layer 6's overhang term moves the
+    // ground off the 2.5D height by up to strength * overhang_scale, a few
+    // metres in a forest. Testing for air and rock 0.75 m either side of h
+    // rejected 80% of forest candidates that had passed everything else
+    // (validate --tree-reasons). So bracket the crossing within that
+    // displacement, walking down from above it in 1 m steps, and bisect.
+    float ov = 0.0f;
+    for (int k = 0; k < nb; ++k) ov = ov + bw[k] * table[bio[k]].overhang_strength;
+    ov = ov * wp.overhang_scale + 1.0f;
+    float y_air = h + ov;
+    if (terrain_density(w, wp, table, x, y_air, z) > 0.0f) TREE_NO(TREE_SURFACE);
+    float y_rock = y_air;
+    bool found = false;
+    while (y_rock > h - ov) {
+        y_rock = y_rock - 1.0f;
+        if (terrain_density(w, wp, table, x, y_rock, z) > 0.0f) { found = true; break; }
+        y_air = y_rock;
+    }
+    if (!found) TREE_NO(TREE_SURFACE);
+    for (int it = 0; it < 8; ++it) {
+        const float ym = 0.5f * (y_air + y_rock);
+        if (terrain_density(w, wp, table, x, ym, z) > 0.0f) y_rock = ym; else y_air = ym;
+    }
+    const float ground = y_rock;
+    // No roof: a tree under an overhang would grow through it.
+    if (terrain_density(w, wp, table, x, ground + 3.0f, z) > 0.0f) TREE_NO(TREE_SURFACE);
+    if (terrain_density(w, wp, table, x, ground + 8.0f, z) > 0.0f) TREE_NO(TREE_SURFACE);
+
+    const TreeSpecies& sp = tt.species[pick];
+    const float u_h = tree_unit(tree_hash(i, j, w.s_trees, 5u));
+    // Stunted towards the ends of its band: 55% of full size at the edge.
+    const float stunt = 0.55f + 0.45f * fit_of[pick];
+    out.x = x;
+    out.y = ground;
+    out.z = z;
+    out.height = (sp.height_min + (sp.height_max - sp.height_min) * u_h) * stunt;
+    out.yaw01 = tree_unit(tree_hash(i, j, w.s_trees, 6u));
+    out.lean01 = tree_unit(tree_hash(i, j, w.s_trees, 7u));
+    out.id = tree_id(i, j);
+    out.species = static_cast<uint16_t>(pick);
+    out.variant = static_cast<uint16_t>(tree_hash(i, j, w.s_trees, 8u) & 0xFFu);
+    if (reason) *reason = TREE_KEPT;
+    return true;
+#undef TREE_NO
+}
+
+void trees_in_cells(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
+                    int i0, int j0, int i1, int j1, std::vector<TreeInstance>& out) {
+    TreeInstance t;
+    for (int j = j0; j < j1; ++j) {
+        for (int i = i0; i < i1; ++i) {
+            if (tree_at_cell(w, wp, table, i, j, t)) out.push_back(t);
+        }
+    }
+}
+
 // Signed distance to the nearest shaft wall, through the XZ bin grid. Shafts
 // are near-vertical, so binning them in the plane the way the rivers are
 // leaves very few candidates per sample.
@@ -632,6 +827,8 @@ SeedWorld build_world(uint64_t world_seed,
     w.s_overhang = feature_seed(world_seed, FEATURE_OVERHANG);
     w.s_cave = feature_seed(world_seed, FEATURE_CAVE);
     w.s_entrance = feature_seed(world_seed, FEATURE_ENTRANCE);
+    w.s_trees = feature_seed(world_seed, FEATURE_TREES);
+    w.s_tree_patch = feature_seed(world_seed, FEATURE_TREE_PATCH);
     const uint32_t s_cont = w.s_cont, s_dang = w.s_dang, s_wx = w.s_wx, s_wz = w.s_wz;
     const uint32_t s_cell = feature_seed(world_seed, FEATURE_CELLS);
 

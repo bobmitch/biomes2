@@ -7,7 +7,8 @@ play; that file is the law.
 
 Written 2026-11-13, at `generator_version` 8. The numbers were updated at
 version 9 (the continuous cell blend), version 10 (rounded ridged
-crests) and version 11 (caves off), with older values kept where they moved.
+crests), version 11 (caves off) and version 12 (trees), with older values
+kept where they moved.
 
 ## Where it stands
 
@@ -38,7 +39,11 @@ of having them.
 
 | Check | Command | Value |
 | --- | --- | --- |
-| Generator gate | `build\validate.exe` | ALL CHECKS PASSED, 8 seeds at version 11 |
+| Generator gate | `build\validate.exe` | ALL CHECKS PASSED, 8 seeds at version 12 |
+| Trees | same | trees/ha forest 230, taiga 200, wetland 80, highland 37, meadows 34, badlands 13, ashlands 14, glacier 2, rift 1 (edges only); rank vs configured 1.00 |
+| Tree cost | `engine --flight 10 [--no-trees]` | 0.76 vs 0.39 ms at spawn, 1.03 vs 0.47 ms with `--flight-from -704 60 -448` (densest forest); 1000 m draw distance 0.94 ms |
+| Shadows | `engine --flight 10 [--no-shadows]` | spawn 1.66 vs 0.78 ms; densest forest (`--flight-from -704 60 -448`) 2.66 vs 0.97 ms |
+| Felling | `engine --fell --fell-save`, then `--fell-verify` | walk stopped 0.55 m from the axis (bark + capsule 0.54), 9 of 9 swings, log tipped 72 degrees and rested in 9.3 s; reloaded 0.0000 m from rest, tree not standing |
 | Blend seams | same | 0 seeds over 5 cm; worst 0.014 m base, 0.036 m 3D, over 398,211 crossings (v8: steps up to 178 m) |
 | Land / islandness | same | 35.2% mean, 7.2 landmasses/seed, spawn mass 73.9% |
 | Volumetrics | same | caves off: 0.00% cave air, 2.3% of land columns overhang (v10 with caves: 1.72% and 10.6% -- most of what the overhang metric counted was cave air near the surface) |
@@ -115,6 +120,31 @@ Pool 768 × 4608 → 1536 × 6144. On a 60 m/s rough-terrain flight the old pool
 never settled and had 1654 starved frames and 384 early retires; the new
 one settled in 3 s with none. `--slot-report` and the flight's starved-frame
 count are the instruments.
+
+### 1d. Trees -- what is not done
+
+Placement, drawing, the slider and felling are in, measured above. Open, in
+the order I would take it:
+
+- **Shadows are in** (three cascades, terrain and trees; CLAUDE.md has the
+  design). What is left: they end at 520 m, so a mountain's shadow on a far
+  valley is not drawn; the sea neither casts nor receives; and the far
+  cascade could be refreshed every other frame if 1.7 ms over forest ever
+  matters.
+- **A rare long frame in the 60 m/s vsync flight**: worst 48-79 ms over
+  three runs, with or without shadows, while the 99th percentile stays at
+  22.5 ms. It was 24 ms in the first tree measurement, so something in the
+  tree path hitches occasionally -- a tile batch landing, the instance
+  rebuild, the 1 MB re-upload. Unmeasured; start with timing `update_trees`.
+- **Occlusion culling.** Culling is frustum and distance only. A Hi-Z pass
+  from the terrain depth would drop trees behind hills; it has not been
+  needed at ~1 ms a frame.
+- **Close-up art for conifers and pines.** Broadleaves read well at every
+  distance. Pine tufts up close are blades, not needles, and fir sprays
+  could be denser.
+- **Logs into materials.** A log is a rigid body with a stable id and a pose
+  in the save; splitting it is the hook the user asked for, not built.
+- view.exe and the contact sheet do not draw trees.
 
 ### 2. Cap MeshShape at the fine LOD levels
 

@@ -95,6 +95,41 @@ ArchetypeTable load_archetypes(const std::string& path) {
     ArchetypeTable t;
     t.sea_level = root.has("sea_level") ? static_cast<float>(root.number("sea_level")) : 0.0f;
 
+    // Layer 8's species table, before the biomes: a biome refers to species by
+    // name, and an unknown name is a typo that would silently plant nothing.
+    if (root.has("trees")) {
+        const jsonlite::Value& tr = root.obj.at("trees");
+        TreeTable& tt = t.trees;
+        tt.cell          = static_cast<float>(tr.number("cell"));
+        tt.patch_freq    = static_cast<float>(tr.number("patch_freq"));
+        tt.patch_edge    = static_cast<float>(tr.number("patch_edge"));
+        tt.max_slope     = static_cast<float>(tr.number("max_slope"));
+        tt.shore         = static_cast<float>(tr.number("shore"));
+        tt.altitude_ramp = static_cast<float>(tr.number("altitude_ramp"));
+        tt.blend_sharpen = static_cast<int>(tr.number("blend_sharpen"));
+        if (tt.blend_sharpen < 1 || tt.blend_sharpen > 16)
+            throw std::runtime_error("archetypes: trees.blend_sharpen must be 1..16");
+        const jsonlite::Array& sp = tr.array("species");
+        for (size_t i = 0; i < sp.size(); ++i) {
+            TreeSpecies s;
+            s.name = sp[i].string("name");
+            s.form = sp[i].string("form");
+            const jsonlite::Array& hh = sp[i].array("height");
+            const jsonlite::Array& aa = sp[i].array("altitude");
+            if (hh.size() != 2 || aa.size() != 2)
+                throw std::runtime_error("archetypes: tree " + s.name + " needs 2-entry height and altitude");
+            s.height_min = static_cast<float>(hh[0].num);
+            s.height_max = static_cast<float>(hh[1].num);
+            s.alt_lo = static_cast<float>(aa[0].num);
+            s.alt_hi = static_cast<float>(aa[1].num);
+            if (!(s.height_min > 0.0f && s.height_min <= s.height_max && s.alt_lo < s.alt_hi))
+                throw std::runtime_error("archetypes: tree " + s.name + " has an empty height or altitude range");
+            tt.species.push_back(s);
+        }
+        if (!(tt.cell > 0.0f && tt.altitude_ramp > 0.0f))
+            throw std::runtime_error("archetypes: trees.cell and trees.altitude_ramp must be positive");
+    }
+
     const jsonlite::Array& list = root.array("biomes");
     t.biomes.reserve(list.size());
 
@@ -132,6 +167,27 @@ ArchetypeTable load_archetypes(const std::string& path) {
 
         b.material_id        = static_cast<uint32_t>(e.number("material_id"));
         b.water_level_offset = static_cast<float>(e.number("water_level_offset"));
+
+        b.tree_species.assign(t.trees.species.size(), 0.0f);
+        if (e.has("trees")) {
+            const jsonlite::Value& tb = e.obj.at("trees");
+            b.tree_density = static_cast<float>(tb.number("density"));
+            b.tree_cover   = static_cast<float>(tb.number("cover"));
+            if (b.tree_density < 0.0f || b.tree_density > 1.0f || b.tree_cover < 0.0f || b.tree_cover > 1.0f)
+                throw std::runtime_error("archetypes: " + b.name + " trees density and cover must be in [0, 1]");
+            const jsonlite::Value& ws = tb.obj.at("species");
+            for (jsonlite::Object::const_iterator it = ws.obj.begin(); it != ws.obj.end(); ++it) {
+                size_t k = t.trees.species.size();
+                for (size_t m = 0; m < t.trees.species.size(); ++m) {
+                    if (t.trees.species[m].name == it->first) { k = m; break; }
+                }
+                if (k == t.trees.species.size())
+                    throw std::runtime_error("archetypes: " + b.name + " plants unknown tree " + it->first);
+                if (it->second.num < 0.0)
+                    throw std::runtime_error("archetypes: " + b.name + " has a negative weight for " + it->first);
+                b.tree_species[k] = static_cast<float>(it->second.num);
+            }
+        }
 
         t.biomes.push_back(b);
     }

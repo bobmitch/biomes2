@@ -14,7 +14,10 @@
 #include "engine/svdag/brick_store.h"
 #include "engine/svdag/brick_pager.h"
 #include "engine/field/world_gpu.h"
+#include "engine/trees/tree_field.h"
+#include "engine/trees/tree_renderer.h"
 
+#include <unordered_map>
 #include <vector>
 
 #include <windows.h>
@@ -181,6 +184,29 @@ public:
     // The edit overlay. Digging goes through here, and the renderer takes care
     // of uploading what changed and re-meshing what it touched.
     BrickStore& edits() { return edits_; }
+
+    // Trees. The field is the authority on which trees stand (CPU, layer 8);
+    // the caller adds what has been felled as extra instances -- logs and
+    // stumps, posed by physics -- every frame they move.
+    TreeField&             tree_field() { return tree_field_; }
+    const TreeRenderer&    trees() const { return trees_; }
+    TreeDrawSettings&      tree_settings() { return tree_settings_; }
+    void set_trees(bool on) { trees_on_ = on; }
+    // Sun shadows, three cascades. On by default; --no-shadows and L for A/B.
+    void set_shadows(bool on) { shadows_on_ = on; }
+    bool shadows() const { return shadows_on_; }
+    bool trees_on() const { return trees_on_; }
+    void set_tree_extras(const std::vector<TreeGpuInstance>& extra) {
+        tree_extras_ = extra;
+        tree_dirty_ = true;
+    }
+    // A chop: the tree shakes for half a second from `time`.
+    void tree_hit(uint32_t id, float time) { tree_hits_[id] = time; tree_dirty_ = true; }
+    // Per-draw visible counts from the last frame, for reports. Waits.
+    bool tree_counts(std::vector<uint32_t>& per_draw, uint32_t& overflow, std::string& error) {
+        wait_for_gpu();
+        return trees_.read_counts(queue_.Get(), per_draw, overflow, error);
+    }
     bool dig(float x, float y, float z, float radius, float strength,
              unsigned char material);
 
@@ -259,6 +285,41 @@ private:
     D3D12_INDEX_BUFFER_VIEW     water_ibv_ = {};
     UINT                        water_index_count_ = 0;
     bool create_water_pipeline(std::string& error);
+    // Advance the tree field and rebuild the instance list if anything moved.
+    void update_trees(const ViewConstants& view, bool settle);
+
+    // --- sun shadows ---
+    static const UINT kShadowRes = 2048;
+    static const UINT kCascades = 3;
+    struct Cascade {
+        float vp[16];
+        float planes[6][4];
+        float right[3], up[3];
+        float texel, depth_range;
+    };
+    bool create_shadow_resources(std::string& error);
+    void compute_cascades(const ViewConstants& view);
+    void record_shadows(const ViewConstants& view);
+    Cascade cascades_[kCascades];
+    ComPtr<ID3D12Resource>       shadow_map_;
+    ComPtr<ID3D12DescriptorHeap> shadow_dsv_heap_;
+    // The one shader-visible heap: [0] the shadow map, [1..2] the tree
+    // impostor atlases. One heap, because only one can be bound at a time
+    // and the terrain and the trees both sample the shadow.
+    ComPtr<ID3D12DescriptorHeap> srv_heap_;
+    ComPtr<ID3D12Resource>       shadow_cb_[kFrameCount];
+    void*                        shadow_cb_cpu_[kFrameCount] = {};
+    ComPtr<ID3D12PipelineState>  mesh_shadow_pso_;
+    bool shadows_on_ = true;
+    TreeField        tree_field_;
+    TreeRenderer     trees_;
+    TreeDrawSettings tree_settings_;
+    std::vector<TreeGpuInstance> tree_extras_;
+    std::vector<TreeGpuInstance> tree_all_;
+    std::unordered_map<uint32_t, float> tree_hits_;
+    unsigned long long tree_field_seen_ = 0;
+    bool tree_dirty_ = true;
+    bool trees_on_ = true;
     ComPtr<ID3D12CommandSignature> cmd_sig_;
 
     WorldGpu    world_;

@@ -12,6 +12,7 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `worldgen/assign/` | Quota assignment (layer 3). Portable C++, no host deps. |
 | `worldgen/data/` | `archetypes.json` — the biome table. All tuning lives here. |
 | `worldgen/golden/` | Pinned seed hashes. Changes must be deliberate. |
+| `engine/trees/` | Tree meshes (procedural, made here), the CPU tile streamer over layer 8, GPU culling and impostors, felling. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32). Debug tool, Windows only. |
 | `tools/shared/` | Presentation, shared by the harness and the viewer. |
@@ -50,13 +51,15 @@ one frame at a fixed camera and writes a BMP without opening a window.
 The engine's headless modes all write a text file under `build/` and exit:
 `--shot`, `--flight <s>`, `--walk <s>`, `--overhang`, `--dig`, `--dig-save`,
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
-`--band-report`, `--sea-report`, `--swim`, `--blend-report` and
-`--tab-test`. `--flight` also takes `--settle`, `--holes` and
+`--band-report`, `--sea-report`, `--swim`, `--blend-report`, `--tab-test`
+and `--fell` (with `--fell-save` / `--fell-verify`). `--flight` also takes `--settle`, `--holes` and
 `--flight-speed <m/s>` and `--flight-from x y z`; `--shot` takes
 `--slot-report`; every mode takes `--mesh-debug 1|2` (curtain, creases) and
 the streaming A/B switches `--no-lod-align`,
 `--no-lod-hold`, `--no-prioritise`, `--adaptive-budget` and
-`--lod-fade <frames>`. It is a GUI subsystem binary, so a shell does not wait
+`--lod-fade <frames>`, and the tree switches `--tree-distance <m>`,
+`--tree-debug 1|2|3|4` (tint by level; only LOD 0 / LOD 1 / impostors),
+`--tree-lod0 <m>`, `--no-trees` and `--no-shadows`. It is a GUI subsystem binary, so a shell does not wait
 on it: run it with `Start-Process -Wait` or the file you read will be the
 last run's.
 
@@ -144,6 +147,20 @@ last run's.
   and walk mode strafed along (+cos, -sin), so both were mirrored, while fly
   mode's A/D, which use `basis()`, were right. Take sideways directions from
   `basis()`, never from a hand-written sin/cos pair.
+- **`SV_VertexID` does NOT include `BaseVertexLocation` on this driver.**
+  Every tree model was drawn with its own base vertex and every one read
+  model 0's vertices through its own indices. LOD 0 trunks lined up by
+  accident -- every species emits a 10-sided trunk first -- so trees looked
+  plausible and crowns merely "sparse"; LOD 1 trunks twisted, caps joined to
+  tube vertices drew lines to the middle of the screen, and every impostor
+  was baked from an oak. The terrain never met it: its indices were always
+  absolute. Make indices absolute and pass base vertex 0, so the answer
+  does not depend on the driver. `--tree-debug 2|3|4` isolated it to one
+  level in one run.
+- **Never read back from an upload heap.** It is write-combined, uncached
+  memory. The impostor mip chain averaged each level by reading the one
+  above out of the upload buffer it had just written: a 20 s startup for
+  work that takes 180 ms in ordinary memory.
 - **A dual-compile header's OUT parameters must be spelled per language.**
   `T out[1]` decays to a pointer in C++ and works; in HLSL an array parameter
   is passed BY VALUE and the write never reaches the caller. The wave normal
@@ -397,12 +414,83 @@ triplanar, in `mesh.hlsl`, antialiased with `fwidth` and faded where a pixel
 covers the pattern. It costs ~0.1 ms of a 0.3 ms uncapped frame. `M` toggles
 wireframe. The window title shows both.
 
+### Trees
+
+**Placement is layer 8, in `worldgen/`, under the golden hash (v12).** One
+candidate per 4 m cell; the cell's hash decides the jitter, the keep test,
+species, height, yaw and mesh variant, so a tree is a pure function of its
+cell and `tree_id(i, j)` is its save identity -- nothing is stored. Per biome,
+`archetypes.json` gives `trees.density` (chance a cell in a patch holds a
+tree) and `trees.cover` (share of the biome that is patch, the rest clearing,
+from a 3-octave fBm thresholded at its MEASURED quantile -- `validate
+--tree-quantiles` printed the table `tree_cover_threshold` bakes; the guessed
+table was 4 points of cover out). Species weights are relative; each species
+has an altitude band, and its upper end is what moves broadleaf to conifer
+uphill and makes the treeline. A tree stands on the REAL surface, bisected
+inside layer 6's overhang displacement: testing for air and rock 0.75 m
+either side of the 2.5D height rejected 80% of forest candidates. For trees
+the biome blend weights are raised to the 4th power (`blend_sharpen`) so a
+forest's trees do not reach into the next cell over.
+
+**Placement is authoritative on the CPU.** The engine streams 64 m tiles
+round the camera on three worker threads (`TreeField`); the GPU only culls and
+draws. A GPU evaluation of the keep test could land an ULP the other side of
+its threshold (invariant 8), which is a tree you can see and not chop.
+
+**Drawing** (`TreeRenderer`): CPU-generated meshes, two levels per species x 4
+variants, in metres at the species' nominal height; a compute pass culls
+against the frustum and the draw distance, picks LOD 0 (< 45 m), LOD 1 (< 170
+m) or an octahedral impostor, with a dithered cross-fade at each boundary and
+a dithered fade over the last 12% of the distance, and appends to per-draw
+lists for two ExecuteIndirect calls. Impostors are baked at startup from 8x8
+hemi-octahedral views, premultiplied, mip-chained on the CPU (~180 ms).
+Trees use the terrain's sun, sky term and fog. The draw-distance slider is
+`-`/`=` (100-2000 m, default 500); terrain is unaffected. Cost, uncapped:
+~0.4 ms a frame at spawn, ~0.6 ms over the densest forest.
+
+**Felling** (`TreeFelling`): trunks within 40 m of the player are static
+capsules; a click swings from the eye; 2 + one per 6 cm of diameter fells it.
+The tree's id is marked felled, a stump (static) and a log (Jolt rigid body:
+a 650 kg/m^3 trunk capsule and a 6 kg/m^3 crown sphere) replace it, both drawn
+from the same mesh split at `kCutHeight`. F6/F9 save/load `build/edits.bin`
+and `build/trees.bin` (same field id). `--fell` walks into a trunk, fells
+it and watches the log; `--fell-save` then `--fell-verify` in a second
+process checks the log is where it rested and the tree does not stand.
+
+### Shadows
+
+Sun shadows, three cascades of 2048^2 out to 35, 140 and 520 m, cast by the
+terrain and the trees and received by both through one function,
+`shadow_factor` in `engine/render/shaders/shadow.hlsli`. Each cascade is an
+orthographic view down the sun fitted to a sphere round its slice of the
+view frustum -- a radius that depends only on the splits and the lens, so it
+never changes size -- with its centre snapped to whole texels, so edges do
+not crawl as the camera moves. 3x3 PCF, a normal offset of 1.5 texels and
+0.12 m of constant bias; past 520 m the shadow fades out under the fog.
+`L` in the window, `--no-shadows` for A/B.
+
+The terrain casts with the depth-only draw of every resident chunk (~0.2
+ms). Trees re-run their GPU cull per cascade, levelled by the CAMERA's
+distance so a shadow matches its tree, with a floor per cascade: the first
+keeps LOD 0 and the real leaf pattern (dappled light), the second never
+goes finer than LOD 1 and tests cards at their average coverage, the third
+is impostors only, each fetching one baked view's alpha along the sun. At
+full detail in every cascade with four blended views per impostor pixel,
+shadows cost 3.1 ms over the densest forest; with the floors, 1.7 ms. An
+impostor RECEIVES its shadow from a point just outside its bound on the sun
+side: its card runs through its own crown and would otherwise sit in its own
+shadow. The sea neither casts nor receives.
+
+The renderer owns the one shader-visible descriptor heap -- [0] the shadow
+map, [1..2] the impostor atlases -- because only one can be bound at a
+time and terrain and trees both sample the shadow.
+
 ## Testing
 
 `tools/validate` runs 200 seeds and exits non-zero on any failure. It asserts
 presence, quota, radial ordering, land fraction, adjacency, edge taper, home
 landmass, boat connectivity, spawn, slope budget, river sanity, LOD agreement, blend seams,
-cave entrances, throughput and the golden hashes, and emits a 64-seed contact
+trees, cave entrances, throughput and the golden hashes, and emits a 64-seed contact
 sheet — look at it. Automated checks cannot tell you whether a world is
 interesting.
 
@@ -446,6 +534,18 @@ gates it: a shaft must end in cave air) and `column_band` drops its 64 m cave
 padding (1129 → 736 chunks wanted). The `cave entrances` check asserts ZERO
 shafts while caves are off. What follows about layer 7 describes the code,
 which is intact, and applies again when the densities come back.
+
+**Trees are pinned by their instances**, like layer 7: a 64 m tile at each of
+the first 24 land cells, every tree's id, species, variant and quantised
+placement. The `trees` check compares what each biome GREW against what it
+was configured for (density x cover): rank agreement at least 0.8, treeless
+biomes under 5% of the densest, and no treed biome bare on more than 2% of
+seeds. It credits each candidate to the dominant biome at ITS OWN position --
+crediting by the sampled cell's site put 14 trees a hectare in rift, which
+plants none, because the biome lookup is domain-warped by up to 1.3 km.
+`validate --tree-reasons` tabulates where candidates go per biome (clearing,
+roll, shore, slope, river, altitude, surface); `--tree-sites <seed>` names
+the nearest tree of each species and the densest stand, for a `--cam`.
 
 **The golden hash cannot see everything, and layer 7 proved it.** The hash
 samples a 1024² grid — one density sample per 156 m — and a world has ~24

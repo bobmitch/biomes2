@@ -19,12 +19,18 @@
 //   T           surface texture: flat, detail (default), 1 m/10 m grid, both
 //   F5          reload every shader and remesh
 //   F2          write a capture to build/shot.bmp
+//   click       (once captured) chop the tree in front of you; enough
+//               swings fell it, and the log falls under physics
+//   - =         tree draw distance, 100 to 2000 m in 50 m steps
+//   F6 / F9     save / load: dig edits and felled trees, under build/
+//   L           sun shadows on / off
 // ---------------------------------------------------------------------------
 #include "engine/render/renderer.h"
 #include "engine/render/water_wave.h"
 #include "engine/render/shader_compile.h"
 #include "engine/camera.h"
 #include "engine/physics/physics_world.h"
+#include "engine/trees/felling.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -39,7 +45,11 @@ namespace {
 engine::Renderer  g_renderer;
 engine::Camera    g_camera;
 engine::PhysicsWorld g_physics;
+engine::TreeFelling  g_felling;
 bool  g_walk = false;
+bool  g_want_chop = false;
+bool  g_want_save = false, g_want_load = false;
+char  g_tree_msg[96] = "";
 // The capsule's feet, read back from Jolt each frame. Kept here so the camera
 // and the raymarch's capsule agree with what physics actually did, rather than
 // with what was asked for.
@@ -164,7 +174,10 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp != SIZE_MINIMIZED) g_renderer.resize(LOWORD(lp), HIWORD(lp));
             return 0;
         case WM_LBUTTONDOWN:
-            set_capture(hwnd, true);
+            // The first click captures the mouse; once captured, a click is
+            // a swing of the axe.
+            if (g_captured) g_want_chop = true;
+            else set_capture(hwnd, true);
             return 0;
         case WM_KEYDOWN:
             if (wp == VK_ESCAPE) {
@@ -212,6 +225,17 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (wp == VK_F2) { g_want_shot = true; return 0; }
+            if (wp == VK_OEM_MINUS || wp == VK_OEM_PLUS) {
+                // The tree draw-distance slider. Terrain is unaffected: it
+                // reaches the horizon under the same haze either way.
+                float d = g_renderer.tree_settings().max_dist + (wp == VK_OEM_PLUS ? 50.0f : -50.0f);
+                d = d < 100.0f ? 100.0f : (d > 2000.0f ? 2000.0f : d);
+                g_renderer.tree_settings().max_dist = d;
+                return 0;
+            }
+            if (wp == 'L') { g_renderer.set_shadows(!g_renderer.shadows()); return 0; }
+            if (wp == VK_F6) { g_want_save = true; return 0; }
+            if (wp == VK_F9) { g_want_load = true; return 0; }
             if (wp == VK_F5) {
                 std::string err;
                 if (!g_renderer.reload_shaders(err)) {
@@ -528,7 +552,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                              hl.find("--probe-field") != std::string::npos ||
                              hl.find("--normal-check") != std::string::npos ||
                              hl.find("--blend-report") != std::string::npos;
-    const bool headless = report_mode || !shot_path.empty() || flight_seconds > 0.0 ||
+    const bool fell_mode = hl.find("--fell") != std::string::npos;
+    const bool headless = report_mode || fell_mode || !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
                           dig_seconds > 0.0 || mode_dig_save || mode_dig_verify ||
@@ -580,6 +605,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         }
         return 1;
     }
+    g_felling.init(&g_renderer, &g_physics);
     if (start_overlay) g_renderer.set_mode(engine::Mode::Wireframe);
     g_renderer.set_sea_state(sea_state);
     g_renderer.set_water_debug(water_debug);
@@ -594,6 +620,21 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const size_t tx = c2.find("--texture");
         if (tx != std::string::npos) g_renderer.set_texture_mode(float(std::atof(c2.c_str() + tx + 9)));
         if (c2.find("--adaptive-budget") != std::string::npos) g_renderer.set_adaptive_budget(true);
+        // Trees: --tree-distance <m> is the draw-distance slider's starting
+        // value; --tree-debug 1 tints by level, 2/3/4 draw only LOD 0, LOD 1
+        // or impostors; --no-trees for an A/B against bare ground.
+        const size_t td = c2.find("--tree-distance");
+        if (td != std::string::npos) {
+            const float d = float(std::atof(c2.c_str() + td + 15));
+            if (d > 10.0f) g_renderer.tree_settings().max_dist = d;
+        }
+        const size_t tg = c2.find("--tree-debug");
+        if (tg != std::string::npos) g_renderer.tree_settings().debug = float(std::atof(c2.c_str() + tg + 12));
+        if (c2.find("--no-trees") != std::string::npos) g_renderer.set_trees(false);
+        if (c2.find("--no-shadows") != std::string::npos) g_renderer.set_shadows(false);
+        // Where LOD 0 hands over to LOD 1, in metres: 0 shows LOD 1 up close.
+        const size_t tl = c2.find("--tree-lod0");
+        if (tl != std::string::npos) g_renderer.tree_settings().lod0_dist = float(std::atof(c2.c_str() + tl + 11));
     }
     if (lod_fade >= 0) g_renderer.set_lod_fade_frames(lod_fade);
     g_physics.set_column_height([](float x, float z) {
@@ -1941,6 +1982,299 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (fell_mode) {
+        // --fell: the whole life of one tree, measured. Picks a real tree
+        // near spawn, stands the character 1.6 m off its trunk, and:
+        //   1. walks INTO the trunk for 1.5 s -- the capsule must stop at
+        //      the bark, which is the trunk collider working;
+        //   2. swings at it until it falls, counting swings;
+        //   3. watches the log for 12 s: how far it tipped, whether it came
+        //      to rest, and whether any part of it sank into the ground.
+        // --fell-save then writes the felled tree out; --fell-verify, in a
+        // SEPARATE process, loads it and checks the log is where it rested,
+        // the tree no longer stands, and the stump does.
+        const std::string cl = cmdline ? cmdline : "";
+        const bool do_save = cl.find("--fell-save") != std::string::npos;
+        const bool do_verify = cl.find("--fell-verify") != std::string::npos;
+        const engine::WorldGpu& wg = g_renderer.world();
+        g_renderer.set_vsync(true);
+        g_walk = true;
+        std::remove("build/fell.txt");
+
+        LARGE_INTEGER tf, t0, tp;
+        QueryPerformanceFrequency(&tf);
+        // Every frame hands its terrain to physics -- the gotcha CLAUDE.md
+        // names, met again: the first version's settle frames rendered
+        // without syncing, threw away every chunk that landed, and the
+        // character fell through the world beneath the trunk it was meant to
+        // walk into. Its contact list was empty, ground included.
+        auto frame = [&](float tt) -> bool {
+            sync_physics_terrain();
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
+            if (w < 1.0f || h < 1.0f) return false;
+            engine::ViewConstants v = {};
+            fill_view(g_camera, w, h, tt, v);
+            g_renderer.render(v);
+            return true;
+        };
+
+        // Let the tree field fill round spawn before choosing.
+        g_camera.x = 0.0f; g_camera.z = 0.0f;
+        g_camera.y = wg.height(0.0f, 0.0f) + 2.0f;
+        for (int i = 0; i < 600 && !g_renderer.tree_field().settled(); ++i) { frame(0.0f); Sleep(5); }
+        for (int i = 0; i < 5; ++i) frame(0.0f);
+
+        FILE* f = std::fopen("build/fell.txt", "w");
+        if (!f) return 1;
+        int verdict_fail = 0;
+
+        if (do_verify) {
+            std::string err;
+            bool mismatch = false;
+            float want[7] = {0, 0, 0, 0, 0, 0, 1};
+            uint32_t want_id = 0;
+            if (FILE* pf = std::fopen("build/fell_pose.txt", "r")) {
+                std::fscanf(pf, "%u %f %f %f %f %f %f %f", &want_id, &want[0], &want[1], &want[2],
+                            &want[3], &want[4], &want[5], &want[6]);
+                std::fclose(pf);
+            }
+            const bool ok = g_felling.load("build/trees.bin", wg.field_id(), err, mismatch);
+            for (int i = 0; i < 5; ++i) { g_felling.update(g_camera.x, g_camera.z); frame(0.0f); }
+            float pos[3], rot[4];
+            bool active = false;
+            const bool have = g_felling.log_pose(want_id, pos, rot, active);
+            bool standing = false;
+            const std::vector<worldgen::TreeInstance>& st = g_renderer.tree_field().standing();
+            for (size_t i = 0; i < st.size(); ++i) if (st[i].id == want_id) standing = true;
+            const float dx = pos[0] - want[0], dy = pos[1] - want[1], dz = pos[2] - want[2];
+            const float dpos = std::sqrt(dx * dx + dy * dy + dz * dz);
+            const float qd = std::fabs(rot[0] * want[3] + rot[1] * want[4] + rot[2] * want[5] + rot[3] * want[6]);
+            std::fprintf(f, "a SEPARATE process: loaded build/trees.bin (%s)\n", ok ? "ok" : err.c_str());
+            std::fprintf(f, "tree %08x: log %s, %.4f m from where it rested, rotation agreement %.5f\n",
+                         want_id, have ? "present" : "MISSING", dpos, qd);
+            std::fprintf(f, "the tree is standing again: %s\n", standing ? "YES -- FAIL" : "no");
+            std::fprintf(f, "felled trees loaded: %zu\n", g_felling.felled());
+            const bool pass = ok && have && !standing && dpos < 0.01f && qd > 0.9999f;
+            std::fprintf(f, "\n%s\n", pass ? "SURVIVED the restart" : "FAILED");
+            std::fclose(f);
+            g_renderer.shutdown();
+            g_physics.shutdown();
+            return pass ? 0 : 1;
+        }
+
+        // A tree: nearest to spawn with a trunk worth felling and a clear
+        // place to stand beside it.
+        const std::vector<worldgen::TreeInstance> st = g_renderer.tree_field().standing();
+        const worldgen::TreeInstance* pick = nullptr;
+        float stand_x = 0.0f, stand_z = 0.0f, best = 1e30f;
+        for (size_t i = 0; i < st.size(); ++i) {
+            float base[3], height, tr;
+            int hits;
+            if (!g_felling.tree_info(st[i].id, base, height, tr, hits)) continue;
+            if (tr < 0.12f || height < 8.0f) continue;
+            const float d = st[i].x * st[i].x + st[i].z * st[i].z;
+            if (d >= best) continue;
+            for (int k = 0; k < 8; ++k) {
+                const float a = 0.785398f * k;
+                const float sx = st[i].x + std::cos(a) * (tr + 1.6f), sz = st[i].z + std::sin(a) * (tr + 1.6f);
+                bool clear = std::fabs(wg.height(sx, sz) - st[i].y) < 0.8f;
+                for (size_t j = 0; j < st.size() && clear; ++j) {
+                    if (j == i) continue;
+                    const float ex = st[j].x - sx, ez = st[j].z - sz;
+                    if (ex * ex + ez * ez < 2.5f * 2.5f) clear = false;
+                }
+                if (!clear) continue;
+                best = d; pick = &st[i]; stand_x = sx; stand_z = sz;
+                break;
+            }
+        }
+        if (!pick) {
+            std::fprintf(f, "VOID RUN: no fellable tree with room to stand near spawn (%zu standing)\n", st.size());
+            std::fclose(f);
+            return 1;
+        }
+        const worldgen::TreeInstance tree = *pick;
+        float base[3], height, trunk_r;
+        int need = 0;
+        g_felling.tree_info(tree.id, base, height, trunk_r, need);
+        std::fprintf(f, "tree %08x, species %u, %.1f m tall, trunk radius %.2f m, at (%.1f, %.1f, %.1f)\n",
+                     tree.id, unsigned(tree.species), height, trunk_r, base[0], base[1], base[2]);
+
+        g_physics.place_character(stand_x, wg.height(stand_x, stand_z) + 0.3f, stand_z);
+        g_physics.character_position(g_feet);
+        // Face the trunk.
+        g_camera.yaw = std::atan2(tree.x - stand_x, tree.z - stand_z);
+        g_camera.pitch = -0.1f;
+
+        // What physics has between the character and the trunk, before any
+        // walking: a ray from the standing point at knee and chest height.
+        for (int i = 0; i < 3; ++i) { g_felling.update(g_feet[0], g_feet[2]); frame(0.0f); }
+        for (int k = 0; k < 2; ++k) {
+            const float hy = k == 0 ? 0.5f : 1.3f;
+            const float from[3] = {stand_x, wg.height(stand_x, stand_z) + hy, stand_z};
+            float d[3] = {tree.x - from[0], 0.0f, tree.z - from[2]};
+            const float dl = std::sqrt(d[0] * d[0] + d[2] * d[2]);
+            d[0] /= dl; d[2] /= dl;
+            int prop = 0;
+            const float hit = g_physics.probe_ray(from, d, 4.0f, prop);
+            std::fprintf(f, "probe at %.1f m: %s at %.2f m (trunk axis %.2f m away, bark at %.2f)\n", hy,
+                         hit < 0.0f ? "NOTHING" : (prop ? "a prop" : "terrain"), hit, dl, dl - trunk_r);
+        }
+
+        QueryPerformanceCounter(&t0);
+        tp = t0;
+        float min_axis = 1e9f;
+        int max_prop_contacts = 0, max_contacts = 0;
+        unsigned long long grounded_frames = 0;
+        bool grounded_at_walk = false;
+        int swings = 0;
+        bool felled = false;
+        double felled_at = -1.0;
+        float max_tilt = 0.0f, mid_sink = 0.0f;
+        bool rested = false;
+        double rested_at = -1.0;
+        unsigned long long frames = 0;
+        size_t colliders_seen = 0;
+        double next_swing = 4.5;
+        for (;;) {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            const double total = double(now.QuadPart - t0.QuadPart) / double(tf.QuadPart);
+            double dt = double(now.QuadPart - tp.QuadPart) / double(tf.QuadPart);
+            tp = now;
+            if (dt > 0.1) dt = 0.1;
+            if (total >= 19.0 || (felled && total - felled_at > 12.0)) break;
+
+            g_felling.update(g_feet[0], g_feet[2]);
+            if (g_felling.colliders() > colliders_seen) colliders_seen = g_felling.colliders();
+            float vx = 0.0f, vz = 0.0f;
+            if (total >= 2.45 && total < 2.5) grounded_at_walk = g_physics.character_grounded();
+            if (total >= 2.5 && total < 4.0) {
+                // Into the trunk at walking pace.
+                const float ex = tree.x - g_feet[0], ez = tree.z - g_feet[2];
+                const float el = std::sqrt(ex * ex + ez * ez);
+                if (el > 1e-3f) { vx = ex / el * 3.0f; vz = ez / el * 3.0f; }
+            }
+            sync_sea(float(total));
+            g_physics.update(float(dt), vx, vz, false, 0.0f);
+            if (g_physics.character_grounded()) ++grounded_frames;
+            g_physics.character_position(g_feet);
+            if (total >= 2.5 && total < 4.0) {
+                const float ex = tree.x - g_feet[0], ez = tree.z - g_feet[2];
+                const float ax = std::sqrt(ex * ex + ez * ez);
+                if (ax < min_axis) min_axis = ax;
+                int ct = 0, cp = 0;
+                g_physics.character_contacts(ct, cp);
+                if (cp > max_prop_contacts) max_prop_contacts = cp;
+                if (ct > max_contacts) max_contacts = ct;
+            }
+            g_camera.x = g_feet[0];
+            g_camera.y = g_feet[1] + kEyeAboveFeet;
+            g_camera.z = g_feet[2];
+
+            if (!felled && total >= next_swing && swings < 40) {
+                next_swing = total + 0.2;
+                const float eye[3] = {g_feet[0], g_feet[1] + kEyeAboveFeet, g_feet[2]};
+                float d[3] = {tree.x - eye[0], tree.y + 1.0f - eye[1], tree.z - eye[2]};
+                const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                for (int k = 0; k < 3; ++k) d[k] /= dl;
+                uint32_t id = 0;
+                const int r = g_felling.chop(eye, d, float(total), &id);
+                if (r > 0 && id == tree.id) ++swings;
+                if (r == 2 && id == tree.id) { felled = true; felled_at = total; }
+            }
+            if (felled) {
+                float pos[3], rot[4];
+                bool active = true;
+                if (g_felling.log_pose(tree.id, pos, rot, active)) {
+                    // The log's own up axis, and how far it is from vertical.
+                    const float up_y = 1.0f - 2.0f * (rot[0] * rot[0] + rot[2] * rot[2]);
+                    const float tilt = std::acos(std::fmax(-1.0f, std::fmin(1.0f, up_y))) * 57.29578f;
+                    if (tilt > max_tilt) max_tilt = tilt;
+                    // Midpoint of the trunk, against the ground under it.
+                    const float ux = 2.0f * (rot[0] * rot[1] - rot[3] * rot[2]);
+                    const float uz = 2.0f * (rot[1] * rot[2] + rot[3] * rot[0]);
+                    const float half = 0.35f * height;
+                    const float mx = pos[0] + ux * half, my = pos[1] + up_y * half, mz = pos[2] + uz * half;
+                    const float sink = wg.height(mx, mz) - (my + trunk_r * 0.0f);
+                    if (total - felled_at > 3.0 && sink > mid_sink) mid_sink = sink;
+                    if (!active && !rested) { rested = true; rested_at = total - felled_at; }
+                }
+            }
+            if (frame(float(total))) ++frames;
+        }
+
+        float pos[3] = {0, 0, 0}, rot[4] = {0, 0, 0, 1};
+        bool active = true;
+        g_felling.log_pose(tree.id, pos, rot, active);
+        bool standing = false;
+        {
+            const std::vector<worldgen::TreeInstance>& s2 = g_renderer.tree_field().standing();
+            for (size_t i = 0; i < s2.size(); ++i) if (s2[i].id == tree.id) standing = true;
+        }
+        const float stop_at = min_axis;
+        const float bark = trunk_r * 0.9f + 0.35f;
+        const bool blocked = stop_at > bark - 0.08f;
+        if (frames == 0) std::fprintf(f, "VOID RUN: no frames rendered.\n");
+        std::fprintf(f, "\n1. walking into the trunk: closest approach of the feet to its axis %.2f m,\n"
+                        "   bark plus capsule %.2f m: %s  (%zu trunk colliders round the player)\n",
+                     stop_at, bark, blocked ? "BLOCKED -- collision holds" : "WALKED THROUGH", colliders_seen);
+        std::fprintf(f, "   character contacts while walking: up to %d, of them props %d; standing when\n"
+                        "   the walk began: %s; frames on the ground %llu\n",
+                     max_contacts, max_prop_contacts, grounded_at_walk ? "yes" : "NO -- a void walk",
+                     grounded_frames);
+        std::fprintf(f, "2. swings to fell: %d of %d needed: %s\n", swings, need, felled ? "felled" : "NOT FELLED");
+        std::fprintf(f, "3. the log: tipped to %.0f degrees, %s%s, deepest a trunk midpoint went below the\n"
+                        "   ground %.2f m (negative: it lies on it)\n",
+                     max_tilt, rested ? "came to rest after " : "STILL MOVING after 12 s",
+                     rested ? "" : "", mid_sink);
+        if (rested) std::fprintf(f, "   rested %.1f s after the last swing\n", rested_at);
+        std::fprintf(f, "   still standing in the tree field: %s\n", standing ? "YES -- FAIL" : "no");
+        std::fprintf(f, "frames %llu, felled trees %zu, physics props %zu\n", frames, g_felling.felled(),
+                     g_physics.prop_count());
+        const bool pass = grounded_at_walk && blocked && felled && max_tilt > 60.0f && rested &&
+                          mid_sink < 0.6f && !standing;
+        if (!pass) verdict_fail = 1;
+
+        if (do_save) {
+            std::string err;
+            const bool ok = g_felling.save("build/trees.bin", wg.field_id(), err);
+            if (FILE* pf = std::fopen("build/fell_pose.txt", "w")) {
+                std::fprintf(pf, "%u %.6f %.6f %.6f %.7f %.7f %.7f %.7f\n", tree.id, pos[0], pos[1], pos[2],
+                             rot[0], rot[1], rot[2], rot[3]);
+                std::fclose(pf);
+            }
+            std::fprintf(f, "saved to build/trees.bin: %s\n", ok ? "ok" : err.c_str());
+        }
+
+        // A picture of it: from 10 m back, looking at the log's middle.
+        {
+            const float ux = 2.0f * (rot[0] * rot[1] - rot[3] * rot[2]);
+            const float uz = 2.0f * (rot[1] * rot[2] + rot[3] * rot[0]);
+            const float mx = pos[0] + ux * 0.4f * height, mz = pos[2] + uz * 0.4f * height;
+            engine::Camera c = g_camera;
+            c.x = mx - 9.0f; c.z = mz - 9.0f;
+            c.y = wg.height(c.x, c.z) + 3.5f;
+            c.yaw = std::atan2(mx - c.x, mz - c.z);
+            c.pitch = -0.22f;
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            engine::ViewConstants v = {};
+            fill_view(c, float(cr.right - cr.left), float(cr.bottom - cr.top), 20.0f, v);
+            std::string err;
+            g_renderer.capture(v, "build/fell.bmp", err);
+        }
+        std::fprintf(f, "\n%s\n", pass ? "PASS" : "FAIL");
+        std::fclose(f);
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return verdict_fail;
+    }
+
     if (std::string(cmdline ? cmdline : "").find("--tab-test") != std::string::npos) {
         // --tab-test: what pressing Tab does in the window. Fly for 4 s with
         // the window loop's physics step running as it does in fly mode,
@@ -2816,6 +3150,36 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (!g_walk) g_camera.update(static_cast<float>(dt));
         }
 
+        // Trees: colliders round the player, logs posed by physics; then any
+        // swing, save or load the window asked for this frame.
+        g_felling.update(g_walk ? g_feet[0] : g_camera.x, g_walk ? g_feet[2] : g_camera.z);
+        if (g_want_chop) {
+            g_want_chop = false;
+            float fwd[3], right[3], up[3];
+            g_camera.basis(fwd, right, up);
+            const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
+            uint32_t id = 0;
+            int hits = 0, need = 0;
+            const int r = g_felling.chop(eye, fwd, t, &id, &hits, &need);
+            if (r == 0) std::snprintf(g_tree_msg, sizeof g_tree_msg, "nothing in reach");
+            else if (r == 1) std::snprintf(g_tree_msg, sizeof g_tree_msg, "chop %d/%d", hits, need);
+            else std::snprintf(g_tree_msg, sizeof g_tree_msg, "TIMBER (%zu felled)", g_felling.felled());
+        }
+        if (g_want_save || g_want_load) {
+            std::string err;
+            bool ok = true, mismatch = false;
+            if (g_want_save) {
+                ok = g_renderer.save_edits("build/edits.bin", err) &&
+                     g_felling.save("build/trees.bin", g_renderer.world().field_id(), err);
+                std::snprintf(g_tree_msg, sizeof g_tree_msg, ok ? "saved" : "save FAILED");
+            } else {
+                ok = g_renderer.load_edits("build/edits.bin", err, mismatch);
+                const bool ok2 = g_felling.load("build/trees.bin", g_renderer.world().field_id(), err, mismatch);
+                std::snprintf(g_tree_msg, sizeof g_tree_msg, (ok || ok2) ? "loaded" : "nothing to load");
+            }
+            g_want_save = g_want_load = false;
+        }
+
         engine::ViewConstants view = {};
         fill_view(g_camera, w, h, t, view);
         g_renderer.render(view);
@@ -2832,15 +3196,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         ++fps_frames;
         if (fps_accum >= 0.5) {
             const engine::FrameStats st = g_renderer.stats();
-            char title[300];
+            char title[400];
             std::snprintf(title, sizeof(title),
-                          "biomes2 engine - %s [M] %s [T] - %.0f fps (worst %.1f ms) - "
+                          "biomes2 engine - %s [M] %s [T] - trees %.0f m [-=] %s - %.0f fps (worst %.1f ms) - "
                           "%zu chunks, %u tris - %u meshed/frame in %.3f ms - "
                           "%zu pending, %zu slots free%s%s",
                           g_renderer.mode() == engine::Mode::Mesh ? "shaded" : "wireframe",
                           g_renderer.texture_mode() < 0.5f ? "flat"
                           : g_renderer.texture_mode() < 1.5f ? "detail"
                           : g_renderer.texture_mode() < 2.5f ? "grid" : "detail+grid",
+                          g_renderer.tree_settings().max_dist, g_tree_msg,
                           fps_frames / fps_accum, worst_frame_ms,
                           st.resident, st.indices / 3,
                           st.meshed_this_frame, st.mesh_ms,

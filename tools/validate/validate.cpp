@@ -75,6 +75,11 @@ struct SeedResult {
     float entrance_reach = 0.0f;    // mean metres down to the cave it found
     int   river_segments = 0;
     int   river_paths_total = 0, river_paths_to_ocean = 0, river_ascending = 0;
+    // Layer 8, sampled: a 32 m square of candidate cells at every land cell's
+    // site, counted per biome.
+    std::vector<double> tree_count;   // per biome
+    std::vector<double> tree_area;    // m^2 sampled per biome
+    int   golden_trees = 0;           // trees that went into the hash
     uint64_t hash = 0;
     float mean_patch_cells = 0.0f;
     float mean_patch_km2 = 0.0f;
@@ -463,6 +468,37 @@ static SeedResult eval_seed(uint64_t world_seed,
         out.cave_fraction = sub > 0 ? static_cast<float>(air) / sub : 0.0f;
     }
 
+    // --- layer 8: trees, sampled per biome ---
+    // Each candidate cell is credited to the DOMINANT biome at its own
+    // position. Not to the biome of the site it was sampled around: the
+    // biome lookup is domain-warped by up to 1.3 km, so a cell's site in
+    // world space is usually in some other biome, and crediting by site put
+    // 14 trees a hectare in rift, which plants none.
+    {
+        out.tree_count.assign(nb, 0.0);
+        out.tree_area.assign(nb, 0.0);
+        const float cell = table.trees.cell;
+        for (int i = 0; i < n; ++i) {
+            if (biome[i] < 0) continue;
+            const int ci = static_cast<int>(std::floor(w.pts[i].first / cell));
+            const int cj = static_cast<int>(std::floor(w.pts[i].second / cell));
+            for (int jj = cj - 4; jj < cj + 4; ++jj) {
+                for (int ii = ci - 4; ii < ci + 4; ++ii) {
+                    const float cx = (ii + 0.5f) * cell, cz = (jj + 0.5f) * cell;
+                    int bb[4];
+                    float bw[4];
+                    const int m = biome_mix(w, wp, cx, cz, bb, bw);
+                    if (m == 0) continue;
+                    int dom = 0;
+                    for (int k = 1; k < m; ++k) if (bw[k] > bw[dom]) dom = k;
+                    TreeInstance t;
+                    if (tree_at_cell(w, wp, table, ii, jj, t)) out.tree_count[bb[dom]] += 1.0;
+                    out.tree_area[bb[dom]] += cell * cell;
+                }
+            }
+        }
+    }
+
     // --- determinism hash ---
     // Layers 0 and 1 on a fixed grid, plus the layer-3 assignment. Quantised,
     // because the point is to catch a changed generator, not float noise.
@@ -516,6 +552,37 @@ static SeedResult eval_seed(uint64_t world_seed,
             h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(e.ay * 64.0f)));
             h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(e.az * 64.0f)));
             h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(e.ra * 64.0f)));
+        }
+        // Layer 8 by its instances, like layer 7: a tree is a few metres
+        // across and the grid above samples every 156 m, so sampling would
+        // be blind to it. A 64 m tile at each of the first 24 land cells'
+        // sites, every tree's cell, species, variant and placement. A flipped
+        // keep test shows up as a tree appearing or vanishing, which moves
+        // the count and the sequence alike.
+        {
+            const float cell = table.trees.cell;
+            std::vector<TreeInstance> ts;
+            int tiles = 0;
+            for (int i = 0; i < n && tiles < 24; ++i) {
+                if (biome[i] < 0) continue;
+                ++tiles;
+                const int ci = static_cast<int>(std::floor(w.pts[i].first / cell));
+                const int cj = static_cast<int>(std::floor(w.pts[i].second / cell));
+                ts.clear();
+                trees_in_cells(w, wp, table, ci - 8, cj - 8, ci + 8, cj + 8, ts);
+                h = fnv1a(h, static_cast<uint64_t>(ts.size()));
+                for (size_t m = 0; m < ts.size(); ++m) {
+                    const TreeInstance& t = ts[m];
+                    h = fnv1a(h, static_cast<uint64_t>(t.id));
+                    h = fnv1a(h, (static_cast<uint64_t>(t.species) << 16) | t.variant);
+                    h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(t.x * 64.0f)));
+                    h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(t.y * 64.0f)));
+                    h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(t.z * 64.0f)));
+                    h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(t.height * 64.0f)));
+                    h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(t.yaw01 * 4096.0f)));
+                }
+                out.golden_trees += static_cast<int>(ts.size());
+            }
         }
         out.hash = h;
     }
@@ -599,6 +666,12 @@ struct Summary {
     int   entrance_mouths_sealed = 0, entrance_segs_pinched = 0;
     int   min_entrance_trunks = 1 << 30;
     float mean_entrance_trunks = 0.0f, mean_entrance_reach = 0.0f;
+    std::vector<double> tree_per_ha;  // per biome, mean over seeds that have it
+    std::vector<int>    tree_seeds;   // seeds each biome appeared in
+    int   tree_failures = 0;          // set after the loop; see the trees check
+    float tree_spearman = 0.0f;
+    int   tree_bare_seeds = 0;        // seeds where a treed biome grew nothing
+    float mean_golden_trees = 0.0f;
     float min_home_share = 2.0f;     // islandness: measured, not asserted
     float mean_home_share = 0.0f;
     float mean_landmasses = 0.0f;
@@ -681,6 +754,21 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
         if (r.river_segments == 0 || r.river_ascending > 0 ||
             r.river_paths_to_ocean != r.river_paths_total) ++sm.river_failures;
         sm.mean_river_segments += r.river_segments;
+        if (sm.tree_per_ha.empty()) {
+            sm.tree_per_ha.assign(table.size(), 0.0);
+            sm.tree_seeds.assign(table.size(), 0);
+        }
+        for (size_t b = 0; b < table.size() && b < r.tree_area.size(); ++b) {
+            if (r.tree_area[b] <= 0.0) continue;
+            const double per_ha = r.tree_count[b] / r.tree_area[b] * 10000.0;
+            sm.tree_per_ha[b] += per_ha;
+            ++sm.tree_seeds[b];
+            // A degeneracy guard: a biome that is configured with trees and
+            // sampled over a real area, growing none at all.
+            if (table[b].tree_density > 0.0f && table[b].tree_cover > 0.0f &&
+                r.tree_area[b] >= 20000.0 && r.tree_count[b] == 0.0) ++sm.tree_bare_seeds;
+        }
+        sm.mean_golden_trees += r.golden_trees;
         sm.min_home_share = std::min(sm.min_home_share, r.home_share);
         sm.mean_home_share += r.home_share;
         sm.mean_landmasses += r.landmasses;
@@ -715,6 +803,61 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
     sm.mean_patch_cells *= inv; sm.mean_patch_km2 *= inv;
     sm.mean_relaxed *= inv; sm.mean_overflow *= inv; sm.mean_candidates *= inv;
     sm.mean_river_segments *= inv;
+    sm.mean_golden_trees *= inv;
+    // Trees: what each biome actually grew, against what it was configured to
+    // grow (density x cover, the expected share of candidate cells). The
+    // configured ranking must survive into the world: altitude, slope, shore
+    // and river exclusions thin every biome differently, and a biome whose
+    // ground is mostly too steep would invert the order the table asks for.
+    {
+        double max_ha = 0.0;
+        for (size_t b = 0; b < sm.tree_per_ha.size(); ++b) {
+            if (sm.tree_seeds[b] > 0) sm.tree_per_ha[b] /= sm.tree_seeds[b];
+            if (sm.tree_per_ha[b] > max_ha) max_ha = sm.tree_per_ha[b];
+        }
+        int fails = 0;
+        std::vector<double> want, have;
+        for (size_t b = 0; b < sm.tree_per_ha.size(); ++b) {
+            const double cfg = table[b].tree_density * table[b].tree_cover;
+            if (cfg > 0.0 && sm.tree_per_ha[b] <= 0.0) ++fails;           // treed, grew none
+            if (cfg <= 0.0 && sm.tree_per_ha[b] > 0.05 * max_ha) ++fails; // bare, but wooded
+            want.push_back(cfg);
+            have.push_back(sm.tree_per_ha[b]);
+        }
+        // Spearman by ranks, ties averaged.
+        auto ranks = [](const std::vector<double>& v) {
+            std::vector<size_t> o(v.size());
+            for (size_t i = 0; i < o.size(); ++i) o[i] = i;
+            std::sort(o.begin(), o.end(), [&](size_t a, size_t b) { return v[a] < v[b]; });
+            std::vector<double> r(v.size(), 0.0);
+            for (size_t i = 0; i < o.size();) {
+                size_t j = i;
+                while (j + 1 < o.size() && v[o[j + 1]] == v[o[i]]) ++j;
+                for (size_t k = i; k <= j; ++k) r[o[k]] = 0.5 * (double(i) + double(j));
+                i = j + 1;
+            }
+            return r;
+        };
+        if (want.size() >= 3) {
+            const std::vector<double> ra = ranks(want), rb = ranks(have);
+            double ma = 0, mb = 0;
+            for (size_t i = 0; i < ra.size(); ++i) { ma += ra[i]; mb += rb[i]; }
+            ma /= ra.size(); mb /= rb.size();
+            double sab = 0, saa = 0, sbb = 0;
+            for (size_t i = 0; i < ra.size(); ++i) {
+                sab += (ra[i] - ma) * (rb[i] - mb);
+                saa += (ra[i] - ma) * (ra[i] - ma);
+                sbb += (rb[i] - mb) * (rb[i] - mb);
+            }
+            sm.tree_spearman = (saa > 0 && sbb > 0) ? float(sab / std::sqrt(saa * sbb)) : 0.0f;
+        }
+        if (sm.tree_spearman < 0.80f) ++fails;
+        // At most 2% of seeds may have a treed biome that grew nothing: a
+        // biome sampled at one or two cells high on a mountain can be bare
+        // for real.
+        if (sm.tree_bare_seeds > nseeds / 50) ++fails;
+        sm.tree_failures = fails;
+    }
     sm.mean_entrance_trunks *= inv; sm.mean_entrance_reach *= inv;
     sm.mean_cave_fraction *= inv; sm.mean_overhang_cols *= inv;
     sm.mean_home_share *= inv; sm.mean_landmasses *= inv;
@@ -1184,6 +1327,10 @@ int main(int argc, char** argv) {
     bool components = false;
     bool cave_access = false;
     bool entrances_probe = false;
+    bool tree_quantiles = false;
+    bool tree_reasons = false;
+    bool tree_sites = false;
+    uint64_t tree_sites_seed = 0;
     bool entrance_section = false;
     bool section = false;
     uint64_t section_seed = 0;
@@ -1222,6 +1369,12 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--components"))              components = true;
         else if (!std::strcmp(argv[i], "--cave-access"))             cave_access = true;
         else if (!std::strcmp(argv[i], "--entrances"))               entrances_probe = true;
+        else if (!std::strcmp(argv[i], "--tree-quantiles"))          tree_quantiles = true;
+        else if (!std::strcmp(argv[i], "--tree-reasons"))            tree_reasons = true;
+        else if (!std::strcmp(argv[i], "--tree-sites") && i + 1 < argc) {
+            tree_sites = true;
+            tree_sites_seed = std::strtoull(argv[++i], nullptr, 10);
+        }
         else if (!std::strcmp(argv[i], "--entrance-section") && i + 1 < argc) {
             entrance_section = true;
             section_seed = std::strtoull(argv[++i], nullptr, 10);
@@ -1356,6 +1509,138 @@ int main(int argc, char** argv) {
                     sum_count, mouth_sealed, mouth_shallow);
         std::printf("mean reach: a shaft finds cave air %.0f m below the surface\n",
                     sum_count > 0.0 ? sum_reach / sum_count : 0.0);
+        return 0;
+    }
+
+    if (tree_sites) {
+        // Where to point a camera: the nearest tree of every species to the
+        // origin, and the densest 32 m square within 2 km. Seed as the engine
+        // builds it (WorldGpu uses the raw seed, 0 by default).
+        const SeedWorld w = build_world(tree_sites_seed, wp, table, ap);
+        const float cell = table.trees.cell;
+        const size_t ns = table.trees.species.size();
+        std::vector<float> best_d(ns, 3.4e38f);
+        std::vector<TreeInstance> best_t(ns);
+        int dense_n = 0;
+        float dense_x = 0.0f, dense_z = 0.0f;
+        const int span = static_cast<int>(2000.0f / cell);
+        std::vector<TreeInstance> ts;
+        for (int tj = -span; tj < span; tj += 8) {
+            for (int ti = -span; ti < span; ti += 8) {
+                ts.clear();
+                trees_in_cells(w, wp, table, ti, tj, ti + 8, tj + 8, ts);
+                if (static_cast<int>(ts.size()) > dense_n) {
+                    dense_n = static_cast<int>(ts.size());
+                    dense_x = (ti + 4) * cell;
+                    dense_z = (tj + 4) * cell;
+                }
+                for (size_t k = 0; k < ts.size(); ++k) {
+                    const float d = std::sqrt(ts[k].x * ts[k].x + ts[k].z * ts[k].z);
+                    if (d < best_d[ts[k].species]) { best_d[ts[k].species] = d; best_t[ts[k].species] = ts[k]; }
+                }
+            }
+        }
+        std::printf("seed %llu: densest 32 m square within 2 km holds %d trees, centred (%.0f, %.0f)\n",
+                    static_cast<unsigned long long>(tree_sites_seed), dense_n, dense_x, dense_z);
+        for (size_t s = 0; s < ns; ++s) {
+            if (best_d[s] > 1e30f) { std::printf("  %-8s none within 2 km\n", table.trees.species[s].name.c_str()); continue; }
+            const TreeInstance& t = best_t[s];
+            std::printf("  %-8s at (%.1f, %.1f, %.1f), %.1f m tall, %.0f m from the origin\n",
+                        table.trees.species[s].name.c_str(), t.x, t.y, t.z, t.height, best_d[s]);
+        }
+        return 0;
+    }
+
+    if (tree_reasons) {
+        // Where layer 8's candidates go, per biome of the sampled cell's site:
+        // the same 32 m squares the trees check samples, over a few seeds.
+        const char* names[TREE_REJECT_COUNT] = {"kept", "outside", "no land", "clearing",
+            "roll", "shore", "slope", "river", "altitude", "fit roll", "surface"};
+        const size_t nb = table.size();
+        std::vector<std::vector<double> > hist(nb, std::vector<double>(TREE_REJECT_COUNT, 0.0));
+        std::vector<double> hsum(nb, 0.0), hn(nb, 0.0);
+        const int ns = std::min(nseeds, 12);
+        for (int s = 0; s < ns; ++s) {
+            const SeedWorld w = build_world(0x5EEDull * 1000003ull + static_cast<uint64_t>(s), wp, table, ap);
+            const float cell = table.trees.cell;
+            for (size_t c = 0; c < w.pts.size(); ++c) {
+                if (w.biome[c] < 0) continue;
+                const int ci = static_cast<int>(std::floor(w.pts[c].first / cell));
+                const int cj = static_cast<int>(std::floor(w.pts[c].second / cell));
+                for (int j = cj - 4; j < cj + 4; ++j) {
+                    for (int i = ci - 4; i < ci + 4; ++i) {
+                        // Credited to the dominant biome where the candidate
+                        // is: the lookup is warped, so the sampled site's own
+                        // biome is usually not the ground around it.
+                        const float cx = (i + 0.5f) * cell, cz = (j + 0.5f) * cell;
+                        int bb[4];
+                        float bw[4];
+                        const int m = biome_mix(w, wp, cx, cz, bb, bw);
+                        if (m == 0) continue;
+                        int dom = 0;
+                        for (int k = 1; k < m; ++k) if (bw[k] > bw[dom]) dom = k;
+                        const int b = bb[dom];
+                        TreeInstance t;
+                        int why = 0;
+                        tree_at_cell(w, wp, table, i, j, t, &why);
+                        hist[b][why] += 1.0;
+                        if (i == ci && j == cj) {
+                            hsum[b] += terrain_height(w, wp, table, cx, cz,
+                                                      std::sqrt(cx * cx + cz * cz) / wp.radius);
+                            hn[b] += 1.0;
+                        }
+                    }
+                }
+            }
+        }
+        std::printf("layer 8 candidates by outcome, %% of candidate cells, %d seeds\n%-10s %7s", ns, "biome", "mean h");
+        for (int r = 0; r < TREE_REJECT_COUNT; ++r) std::printf(" %8s", names[r]);
+        std::printf("\n");
+        for (size_t b = 0; b < nb; ++b) {
+            double tot = 0.0;
+            for (int r = 0; r < TREE_REJECT_COUNT; ++r) tot += hist[b][r];
+            if (tot <= 0.0) continue;
+            std::printf("%-10s %6.0fm", table[b].name.c_str(), hn[b] > 0 ? hsum[b] / hn[b] : 0.0);
+            for (int r = 0; r < TREE_REJECT_COUNT; ++r) std::printf(" %7.1f%%", 100.0 * hist[b][r] / tot);
+            std::printf("\n");
+        }
+        return 0;
+    }
+
+    if (tree_quantiles) {
+        // The patch noise's distribution, which tree_cover_threshold in
+        // field.h bakes. For cover c the threshold is the value the noise
+        // exceeds with probability c. Sampled at the patch frequency over the
+        // same seeds the gate uses, uniformly over the disc.
+        std::vector<float> v;
+        const int per = 20000;
+        v.reserve(static_cast<size_t>(nseeds) * per);
+        for (int s = 0; s < nseeds; ++s) {
+            const uint64_t seed = 0x5EEDull * 1000003ull + static_cast<uint64_t>(s);
+            const uint32_t sp = feature_seed(seed, FEATURE_TREE_PATCH);
+            Rng rng(seed ^ 0x7EEull);
+            for (int k = 0; k < per; ++k) {
+                const float x = (rng.uniform() * 2.0f - 1.0f) * wp.radius;
+                const float z = (rng.uniform() * 2.0f - 1.0f) * wp.radius;
+                v.push_back(fbm(x * table.trees.patch_freq, z * table.trees.patch_freq, 3, 2.0f, 0.5f, sp));
+            }
+        }
+        std::sort(v.begin(), v.end());
+        std::printf("patch noise over %d seeds x %d samples: min %.4f max %.4f\n",
+                    nseeds, per, v.front(), v.back());
+        std::printf("cover -> threshold (P(n > q) = cover)\n");
+        for (int c = 0; c <= 10; ++c) {
+            const double p = 1.0 - c / 10.0;
+            const size_t at = std::min(v.size() - 1, static_cast<size_t>(p * (v.size() - 1)));
+            std::printf("  q[%d] = %+.4f\n", c, v[at]);
+        }
+        std::printf("check with the baked table:\n");
+        for (int c = 1; c <= 9; ++c) {
+            const float thr = tree_cover_threshold(c / 10.0f);
+            const size_t above = v.end() - std::upper_bound(v.begin(), v.end(), thr);
+            std::printf("  cover %.1f -> threshold %+.4f -> measured %.3f\n",
+                        c / 10.0f, thr, double(above) / v.size());
+        }
         return 0;
     }
 
@@ -1737,7 +2022,7 @@ int main(int argc, char** argv) {
                                g.generator_version == kGeneratorVersion;
 
         std::printf("\nchecks over %d seeds\n", nseeds);
-        char d[128];
+        char d[512];
 
         std::snprintf(d, sizeof(d), "%d seeds missing a biome", s.presence_failures);
         line("presence", s.presence_failures == 0, d);
@@ -1797,6 +2082,19 @@ int main(int argc, char** argv) {
         std::snprintf(d, sizeof(d), "%.0f segments/seed, all descending and reaching the sea",
                       s.mean_river_segments);
         line("river sanity", s.river_failures == 0, d);
+        {
+            std::string per;
+            for (size_t b = 0; b < table.size() && b < s.tree_per_ha.size(); ++b) {
+                char one[64];
+                std::snprintf(one, sizeof(one), "%s%s %.0f", b ? ", " : "",
+                              table[b].name.c_str(), s.tree_per_ha[b]);
+                per += one;
+            }
+            std::snprintf(d, sizeof(d), "trees/ha %s; rank vs configured %.2f (min 0.80), "
+                          "%d bare seed-biomes, %.0f trees hashed/seed",
+                          per.c_str(), s.tree_spearman, s.tree_bare_seeds, s.mean_golden_trees);
+            line("trees", s.tree_failures == 0, d);
+        }
         if (caves_enabled(table)) {
             std::snprintf(d, sizeof(d), "%.1f shafts/seed (min %d, floor 8), reaching cave air "
                           "%.0f m down; %d mouths sealed, %d sampled segments still solid",
@@ -1838,7 +2136,7 @@ int main(int argc, char** argv) {
                          s.spawn_failures == 0 && s.slope_failures == 0 &&
                          land_mean_ok &&
                          s.river_failures == 0 && s.lod_failures == 0 &&
-                         s.seam_failures == 0 &&
+                         s.seam_failures == 0 && s.tree_failures == 0 &&
                          // It printed FAIL and never failed the run: the
                          // entrance check was missing from this conjunction.
                          s.entrance_failures == 0 &&

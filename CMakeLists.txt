@@ -149,7 +149,11 @@ if(BIOMES2_ENGINE)
     engine/physics/physics_world.cpp
     engine/svdag/brick_store.cpp
     engine/svdag/brick_pager.cpp
-    engine/field/world_gpu.cpp)
+    engine/field/world_gpu.cpp
+    engine/trees/tree_mesh.cpp
+    engine/trees/tree_field.cpp
+    engine/trees/tree_renderer.cpp
+    engine/trees/felling.cpp)
   target_include_directories(engine PRIVATE ${PROJECT_SOURCE_DIR})
   # M1: the engine links the generator now. Track B was built against the
   # trivial field precisely so a pipeline bug could never be confused with a

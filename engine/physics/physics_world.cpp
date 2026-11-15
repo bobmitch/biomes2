@@ -8,6 +8,8 @@
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
+#include <Jolt/Physics/Collision/Shape/SphereShape.h>
+#include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyInterface.h>
 #include <Jolt/Physics/Collision/RayCast.h>
@@ -132,6 +134,11 @@ void PhysicsWorld::shutdown() {
         bi.DestroyBody(it->second);
     }
     bodies_.clear();
+    for (std::unordered_map<uint32_t, JPH::BodyID>::iterator it = props_.begin(); it != props_.end(); ++it) {
+        bi.RemoveBody(it->second);
+        bi.DestroyBody(it->second);
+    }
+    props_.clear();
     impl_->character = nullptr;
     impl_.reset();
     // Factory and the registered types are process-wide and deliberately left
@@ -226,6 +233,88 @@ void PhysicsWorld::set_chunk_mesh(const ChunkKey& key, const float* verts,
     }
 }
 
+uint32_t PhysicsWorld::add_static_capsule(const float a[3], const float b[3], float radius) {
+    if (!impl_) return 0;
+    const JPH::Vec3 pa(a[0], a[1], a[2]), pb(b[0], b[1], b[2]);
+    JPH::Vec3 axis = pb - pa;
+    const float len = axis.Length();
+    if (len < 1e-3f) return 0;
+    axis /= len;
+    // Jolt's capsule runs along Y; turn Y onto the axis.
+    const JPH::Quat q = JPH::Quat::sFromTo(JPH::Vec3::sAxisY(), axis);
+    const float half = len > 2.0f * radius ? 0.5f * len - radius : 0.01f;
+    JPH::BodyCreationSettings bcs(new JPH::CapsuleShape(half, radius),
+                                  JPH::RVec3(0.5f * (pa + pb)), q,
+                                  JPH::EMotionType::Static, Layers::NON_MOVING);
+    const JPH::BodyID id = impl_->system.GetBodyInterface().CreateAndAddBody(
+        bcs, JPH::EActivation::DontActivate);
+    if (id.IsInvalid()) return 0;
+    const uint32_t h = id.GetIndexAndSequenceNumber();
+    props_[h] = id;
+    return h;
+}
+
+uint32_t PhysicsWorld::add_log(const float pos[3], const float rot[4], float trunk_r, float y0,
+                               float y1, float crown_y, float crown_r, const float spin[3],
+                               bool asleep) {
+    if (!impl_) return 0;
+    JPH::StaticCompoundShapeSettings cs;
+    {
+        const float len = y1 - y0;
+        const float half = len > 2.0f * trunk_r ? 0.5f * len - trunk_r : 0.01f;
+        JPH::CapsuleShapeSettings* trunk = new JPH::CapsuleShapeSettings(half, trunk_r);
+        trunk->SetDensity(650.0f);
+        cs.AddShape(JPH::Vec3(0.0f, 0.5f * (y0 + y1), 0.0f), JPH::Quat::sIdentity(), trunk);
+    }
+    if (crown_r > 0.05f) {
+        JPH::SphereShapeSettings* crown = new JPH::SphereShapeSettings(crown_r);
+        crown->SetDensity(6.0f);
+        cs.AddShape(JPH::Vec3(0.0f, crown_y, 0.0f), JPH::Quat::sIdentity(), crown);
+    }
+    JPH::ShapeSettings::ShapeResult r = cs.Create();
+    if (r.HasError()) return 0;
+    JPH::BodyCreationSettings bcs(r.Get(), JPH::RVec3(pos[0], pos[1], pos[2]),
+                                  JPH::Quat(rot[0], rot[1], rot[2], rot[3]).Normalized(),
+                                  JPH::EMotionType::Dynamic, Layers::MOVING);
+    bcs.mFriction = 0.8f;
+    bcs.mRestitution = 0.05f;
+    bcs.mLinearDamping = 0.1f;
+    bcs.mAngularDamping = 0.6f;    // a crown rolls on its sphere for ever at 0.35
+    bcs.mAngularVelocity = JPH::Vec3(spin[0], spin[1], spin[2]);
+    const JPH::BodyID id = impl_->system.GetBodyInterface().CreateAndAddBody(
+        bcs, asleep ? JPH::EActivation::DontActivate : JPH::EActivation::Activate);
+    if (id.IsInvalid()) return 0;
+    const uint32_t h = id.GetIndexAndSequenceNumber();
+    props_[h] = id;
+    ++dynamic_props_;
+    return h;
+}
+
+void PhysicsWorld::remove_body(uint32_t handle) {
+    if (!impl_) return;
+    std::unordered_map<uint32_t, JPH::BodyID>::iterator it = props_.find(handle);
+    if (it == props_.end()) return;
+    JPH::BodyInterface& bi = impl_->system.GetBodyInterface();
+    if (bi.GetMotionType(it->second) == JPH::EMotionType::Dynamic && dynamic_props_ > 0) --dynamic_props_;
+    bi.RemoveBody(it->second);
+    bi.DestroyBody(it->second);
+    props_.erase(it);
+}
+
+bool PhysicsWorld::body_pose(uint32_t handle, float pos[3], float rot[4], bool& active) const {
+    if (!impl_) return false;
+    std::unordered_map<uint32_t, JPH::BodyID>::const_iterator it = props_.find(handle);
+    if (it == props_.end()) return false;
+    const JPH::BodyInterface& bi = impl_->system.GetBodyInterface();
+    JPH::RVec3 p;
+    JPH::Quat q;
+    bi.GetPositionAndRotation(it->second, p, q);
+    pos[0] = float(p.GetX()); pos[1] = float(p.GetY()); pos[2] = float(p.GetZ());
+    rot[0] = q.GetX(); rot[1] = q.GetY(); rot[2] = q.GetZ(); rot[3] = q.GetW();
+    active = bi.IsActive(it->second);
+    return true;
+}
+
 void PhysicsWorld::remove_chunk(const ChunkKey& key) {
     if (!impl_) return;
     std::unordered_map<ChunkKey, JPH::BodyID, ChunkKeyHash>::iterator it = bodies_.find(key);
@@ -261,6 +350,29 @@ PhysicsWorld::UpProbe PhysicsWorld::probe_up(float x, float y, float z, float le
         }
     }
     return p;
+}
+
+float PhysicsWorld::probe_ray(const float from[3], const float dir[3], float len, int& prop) const {
+    prop = 0;
+    if (!impl_) return -1.0f;
+    const JPH::RRayCast ray(JPH::RVec3(from[0], from[1], from[2]),
+                            JPH::Vec3(dir[0], dir[1], dir[2]) * len);
+    JPH::RayCastSettings rs;
+    JPH::ClosestHitCollisionCollector<JPH::CastRayCollector> col;
+    impl_->system.GetNarrowPhaseQuery().CastRay(ray, rs, col);
+    if (!col.HadHit()) return -1.0f;
+    prop = props_.count(col.mHit.mBodyID.GetIndexAndSequenceNumber()) ? 1 : 0;
+    return col.mHit.mFraction * len;
+}
+
+void PhysicsWorld::character_contacts(int& total, int& props) const {
+    total = props = 0;
+    if (!impl_ || !impl_->character) return;
+    const JPH::CharacterVirtual::ContactList& cl = impl_->character->GetActiveContacts();
+    for (size_t i = 0; i < cl.size(); ++i) {
+        ++total;
+        if (props_.count(cl[i].mBodyB.GetIndexAndSequenceNumber())) ++props;
+    }
 }
 
 int PhysicsWorld::chunk_shape(const ChunkKey& k) const {
@@ -417,8 +529,9 @@ void PhysicsWorld::update(float dt, float vx, float vz, bool jump, float swim) {
                       {}, {}, impl_->temp);
 
     // The static bodies still need the broadphase kept current as chunks come
-    // and go, which is what this does with no dynamic bodies in the world.
-    impl_->system.Update(dt, 1, &impl_->temp, impl_->jobs.get());
+    // and go. A falling log is the one dynamic body; two collision steps at
+    // the 50 ms clamp keep a toppling trunk from tunnelling a heightfield.
+    impl_->system.Update(dt, dt > 0.02f ? 2 : 1, &impl_->temp, impl_->jobs.get());
 }
 
 void PhysicsWorld::character_position(float out[3]) const {

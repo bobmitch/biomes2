@@ -1,0 +1,595 @@
+// ---------------------------------------------------------------------------
+// Trees: the mesh pass (LOD 0 and 1), the octahedral impostor pass, and the
+// bake that makes the impostors.
+//
+// Everything is drawn through ExecuteIndirect from lists tree_cull.hlsl
+// fills, one draw per (model, level) plus one for every impostor. The
+// per-draw root constant says where that draw's visible list starts, because
+// SV_InstanceID does not include StartInstanceLocation.
+//
+// Lit the way mesh.hlsl lights the ground -- same sun, same sky term, same
+// fog -- so a tree and the terrain under it never disagree about the light.
+// Bark and leaves are procedural: no image files, as for the ground.
+// ---------------------------------------------------------------------------
+
+struct TreeVertex {
+    float3 pos;
+    float3 nrm;
+    float2 uv;
+    float  sway;
+    float  ao;
+    float  kind;   // 0 bark, 1 leaf, 2 needle, 3 cap up, 4 cap down
+    float  seed;
+};
+
+struct TreeInstance {
+    float3 pos;
+    float  scale;
+    float4 rot;
+    uint   model;
+    uint   mode;    // 0 standing, 1 felled log, 2 stump
+    float  hit_time;
+    uint   id;
+};
+
+struct ModelInfo {
+    float radius;     // metres at nominal, horizontal
+    float top;
+    float bound;      // impostor half-extent: the bake's ortho radius
+    float slice;      // impostor atlas slice
+    uint  first0, count0, base0;
+    uint  first1, count1, base1;
+    uint  species;
+    uint  pad;
+};
+
+struct SpeciesLook {
+    float3 bark;
+    float  leaf_kind;
+    float3 leaf;
+    float  pad;
+};
+
+cbuffer DrawOffset : register(b1) { uint g_list_offset; };
+
+cbuffer TreeFrame : register(b0) {
+    row_major float4x4 view_proj;
+    float3 cam_pos;    float time;
+    float3 sun_dir;    float max_dist;
+    float3 cam_right;  float lod0_dist;
+    float3 cam_up;     float lod1_dist;
+    float3 cam_fwd;    float far_plane;
+    float4 frustum[6];
+    uint   instance_count;
+    uint   model_count;
+    uint   frames;      // impostor frames per side
+    uint   quad_first;  // the impostor quad in the shared index buffer
+    uint   quad_base;
+    float  wind;
+    float  cut_height;
+    float  debug;
+    // The bake's view, set per frame of the atlas.
+    float3 bake_dir;   float bake_r;
+    float3 bake_right; float bake_centre_y;
+    float3 bake_up;    float shadow_pass;
+};
+
+#include "engine/render/shaders/shadow.hlsli"
+
+StructuredBuffer<TreeVertex>   g_verts     : register(t0);
+StructuredBuffer<TreeInstance> g_instances : register(t1);
+StructuredBuffer<uint>         g_visible   : register(t2);
+StructuredBuffer<ModelInfo>    g_models    : register(t3);
+StructuredBuffer<SpeciesLook>  g_looks     : register(t4);
+Texture2DArray<float4>         g_imp_albedo : register(t5);
+Texture2DArray<float4>         g_imp_normal : register(t6);
+SamplerState                   g_linear    : register(s0);
+
+static const float3 kSky = float3(0.40f, 0.50f, 0.66f);
+
+float3 qrot(float4 q, float3 v) {
+    const float3 t = 2.0f * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+// A dither in [0, 1): interleaved gradient noise. A LOD swap and the far
+// fade are screen-door fades on it; complementary sides of one threshold
+// draw every pixel exactly once, as mesh.hlsl does for terrain chunks.
+float dither(float2 px) {
+    return frac(52.9829189f * frac(dot(px, float2(0.06711056f, 0.00583715f))));
+}
+
+bool keep_pixel(float2 px, uint packed) {
+    const float w = float((packed >> 20) & 0xFFu) / 255.0f;
+    const uint side = (packed >> 28) & 1u;
+    const float d = dither(px);
+    return side == 0u ? d < w : d >= w;
+}
+
+// --- shading ----------------------------------------------------------------
+
+float hash11(float x) {
+    uint h = asuint(x) * 0x9E3779B1u;
+    h = (h ^ (h >> 15)) * 0x85EBCA77u;
+    return float((h ^ (h >> 13)) & 0xFFFFu) / 65535.0f;
+}
+
+float hash2(float2 c) {
+    const uint2 q = uint2(int2(floor(c)) + int2(0x4000, 0x4000));
+    uint h = q.x * 0x8da6b343u ^ q.y * 0xd8163841u;
+    h = (h ^ (h >> 13)) * 0xcb1ab31fu;
+    return float((h ^ (h >> 16)) & 0xFFFFu) / 65535.0f;
+}
+
+float vnoise(float2 p) {
+    const float2 c = floor(p);
+    const float2 f = p - c;
+    const float2 u = f * f * (3.0f - 2.0f * f);
+    return lerp(lerp(hash2(c), hash2(c + float2(1, 0)), u.x),
+                lerp(hash2(c + float2(0, 1)), hash2(c + float2(1, 1)), u.x), u.y);
+}
+
+// Bark: vertical fissures for dark bark; for pale bark (a birch's), dark
+// horizontal dashes instead. Chosen by the albedo's brightness, not by name.
+float3 bark_albedo(float3 base, float2 uv, float footprint) {
+    const float lum = dot(base, float3(0.3f, 0.5f, 0.2f));
+    const float fade = saturate(1.0f - footprint * 3.0f);
+    if (lum > 0.6f) {
+        const float dash = step(0.82f, vnoise(float2(uv.x * 3.0f, uv.y * 14.0f)));
+        const float blot = vnoise(uv * float2(1.5f, 0.6f));
+        return base * (1.0f - fade * (0.75f * dash + 0.25f * step(0.7f, blot)));
+    }
+    const float ridge = vnoise(float2(uv.x * 7.0f, uv.y * 0.9f));
+    const float fine = vnoise(uv * float2(18.0f, 4.0f));
+    return base * (1.0f + fade * (0.45f * (ridge - 0.5f) + 0.15f * (fine - 0.5f)));
+}
+
+// A card's leaf coverage in [0, 1], procedural. Broad leaves: a cluster of
+// pointed ellipses round a stalk. Needles: a twig with fine strokes off it.
+// `blur` widens every edge as the card shrinks on screen, so coverage tends
+// to the pattern's average instead of shimmering, and the dithered test then
+// keeps that fraction of pixels.
+// One layer of small leaves: the card is a grid of `cells` x `cells`, and
+// each cell holds one pointed leaf, jittered and turned by its own hash. Only
+// the pixel's own cell is tested, so the cost is one leaf per layer whatever
+// the count; leaves stay inside their cell, so nothing is cut off at an edge.
+// `narrow` stretches them (a willow's).
+float leaf_layer(float2 uv, float cells, float seed, float narrow) {
+    const float2 g = uv * cells;
+    const float2 c = floor(g);
+    const float2 f = g - c - 0.5f;
+    const float h0 = hash2(c + seed * 97.0f);
+    const float h1 = hash2(c.yx + seed * 53.0f + 17.0f);
+    const float h2 = hash2(c + seed * 31.0f + 41.0f);
+    if (h2 < 0.06f) return 0.0f;   // a few gaps, so a card is not a lattice
+    const float ang = h0 * 6.2831853f;
+    const float2 d = f - (float2(h1, h2) - 0.5f) * 0.18f;
+    const float2 r = float2(d.x * cos(ang) + d.y * sin(ang), -d.x * sin(ang) + d.y * cos(ang));
+    const float len = 0.47f;
+    const float wid = (narrow > 0.5f ? 0.10f : 0.25f) * (1.0f - 0.55f * saturate(r.x / len + 0.5f));
+    const float e = (r.x * r.x) / (len * len) + (r.y * r.y) / (wid * wid);
+    return saturate((1.0f - e) / 0.2f);
+}
+
+float leaf_coverage_sharp(float2 uv, float kind, float seed, float blur, float narrow);
+
+// What leaf_coverage converges to as the card shrinks: the pattern's own
+// average fill. The first version only widened the edges with `blur`, which
+// DIVIDED coverage towards zero, so every crown thinned out with distance.
+float leaf_coverage(float2 uv, float kind, float seed, float blur, float narrow) {
+    // A round card: a cluster of leaves, not a square of them.
+    const float rim = 1.0f - saturate((length(uv - 0.5f) - 0.40f) / 0.1f);
+    const float avg = kind < 1.5f ? 0.55f : 0.5f;
+    return rim * lerp(leaf_coverage_sharp(uv, kind, seed, blur, narrow), avg, saturate(blur * 5.0f - 0.25f));
+}
+
+float leaf_coverage_sharp(float2 uv, float kind, float seed, float blur, float narrow) {
+    if (kind < 1.5f) {
+        // Two layers half a cell apart: leaves overlap irregularly, which a
+        // single grid never does. 0.2 m leaves on a 1 m card at 7 cells.
+        const float a0 = leaf_layer(uv, 7.0f, seed, narrow);
+        const float a1 = leaf_layer(uv + 0.5f / 7.0f, 7.0f, seed + 0.37f, narrow);
+        return max(a0, a1);
+    }
+    const float twig = 1.0f - saturate(abs(uv.x - 0.5f) / max(0.02f + blur, 0.03f));
+    const float along = frac(uv.y * 9.0f + abs(uv.x - 0.5f) * 6.0f + seed * 3.0f);
+    const float stroke = 1.0f - saturate(abs(along - 0.5f) / max(0.18f + blur * 2.0f, 0.2f));
+    const float body = saturate(1.0f - abs(uv.x - 0.5f) * 2.1f) * saturate(1.0f - abs(uv.y - 0.5f) * 2.05f);
+    return max(twig, stroke * step(0.05f, body) * saturate(body * 4.0f));
+}
+
+// `sh` is the sun's visibility from shadow.hlsli: it scales the direct and
+// the transmitted light, never the sky.
+float3 shade(float3 albedo, float3 n, float ao, float3 world, bool foliage, float sh) {
+    const float3 sun = normalize(float3(0.45f, 0.78f, 0.35f));
+    const float sky = saturate(n.y * 0.5f + 0.5f);
+    float3 col;
+    if (foliage) {
+        // A crown is lit THROUGH as much as on: wrapped diffuse, light that
+        // leaks through the leaves when the sun is behind them, and skylight
+        // that reaches the underside. With the ground's plain Lambert term
+        // the underside of every crown went black -- shards of black card
+        // against the sky, which is what the first close-up showed.
+        const float lam = saturate((dot(n, sun) + 0.6f) / 1.6f);
+        const float3 v = normalize(cam_pos - world);
+        const float back = saturate(dot(-v, sun));
+        const float through = 0.45f * back * back * back * sh;
+        col = albedo * ((0.34f + 0.66f * lam * sh) * (0.45f + 0.55f * ao) + through) +
+              float3(0.10f, 0.13f, 0.18f) * (0.5f + 0.5f * sky) * ao;
+    } else {
+        // Bark gets more fill than open ground: under a crown, light that
+        // bounced off leaves and the floor reaches the shaded side, and with
+        // the ground's 0.22 every trunk's shadow side read as black.
+        const float lam = saturate(dot(n, sun));
+        col = albedo * (0.36f * ao + 0.70f * lam * sh * (0.35f + 0.65f * ao)) +
+              float3(0.12f, 0.15f, 0.19f) * (0.4f + 0.6f * sky) * ao;
+    }
+    const float dist = length(world - cam_pos);
+    const float fog = saturate(dist / far_plane);
+    return lerp(col, kSky, fog * fog);
+}
+
+// --- mesh pass ----------------------------------------------------------------
+
+struct MeshOut {
+    float4 clip  : SV_Position;
+    float3 world : TEXCOORD0;
+    float3 nrm   : TEXCOORD1;
+    float2 uv    : TEXCOORD2;
+    float  ao    : TEXCOORD3;
+    nointerpolation float kind : TEXCOORD4;
+    nointerpolation float seed : TEXCOORD5;
+    float  local_y : TEXCOORD6;
+    nointerpolation uint packed : TEXCOORD7;
+    nointerpolation uint mode : TEXCOORD8;
+    nointerpolation float3 bark : TEXCOORD9;
+    nointerpolation float3 leaf : TEXCOORD10;
+    nointerpolation float tint : TEXCOORD11;
+    nointerpolation float scale : TEXCOORD12;
+    nointerpolation float narrow : TEXCOORD13;
+};
+
+MeshOut degenerate() {
+    MeshOut o = (MeshOut)0;
+    o.clip = float4(0.0f, 0.0f, 0.0f, 1.0f);
+    return o;
+}
+
+MeshOut vs_mesh(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
+    const uint packed = g_visible[g_list_offset + iid];
+    const TreeInstance inst = g_instances[packed & 0xFFFFFu];
+    const TreeVertex v = g_verts[vid];
+    const ModelInfo mi = g_models[inst.model];
+    const SpeciesLook lk = g_looks[mi.species];
+
+    // Which parts of the mesh this instance draws. Whole cards and caps are
+    // dropped here, by collapsing every vertex to one point; the bark split
+    // at the cut is per pixel, below.
+    const bool cap_up = v.kind > 2.5f && v.kind < 3.5f;
+    const bool cap_dn = v.kind > 3.5f;
+    const bool foliage = v.kind > 0.5f && v.kind < 2.5f;
+    if (inst.mode == 0u && (cap_up || cap_dn)) return degenerate();
+    if (inst.mode == 1u && cap_up) return degenerate();
+    if (inst.mode == 2u && (cap_dn || foliage)) return degenerate();
+
+    float3 p = v.pos;
+    if (inst.mode == 0u) {
+        // Wind: the whole tree sways with height, cards flutter on top.
+        const float phase = float(inst.id & 1023u) * 0.37f;
+        const float h = saturate(p.y / max(mi.top, 1.0f));
+        const float3 wdir = normalize(float3(1.0f, 0.0f, 0.35f));
+        float sway = sin(time * 0.9f + phase) * 0.6f + sin(time * 2.1f + phase * 1.7f) * 0.25f;
+        float3 off = wdir * sway * (0.004f * mi.top) * h * h * wind;
+        if (foliage) {
+            off += float3(sin(time * 5.3f + v.seed * 40.0f), sin(time * 4.1f + v.seed * 23.0f) * 0.5f,
+                          cos(time * 4.7f + v.seed * 31.0f)) * (0.05f * v.sway * wind);
+        }
+        // A chop shakes the tree for half a second.
+        const float since = time - inst.hit_time;
+        if (since >= 0.0f && since < 0.6f) {
+            off += float3(1.0f, 0.0f, 0.6f) * sin(since * 55.0f) * (1.0f - since / 0.6f) * 0.03f * mi.top * h;
+        }
+        p += off / max(inst.scale, 0.05f);
+    }
+
+    const float3 world = inst.pos + qrot(inst.rot, p * inst.scale);
+    MeshOut o;
+    o.clip = mul(float4(world, 1.0f), view_proj);
+    o.world = world;
+    o.nrm = qrot(inst.rot, v.nrm);
+    o.uv = v.uv;
+    o.ao = v.ao;
+    o.kind = v.kind;
+    o.seed = v.seed;
+    o.local_y = v.pos.y;
+    o.packed = packed;
+    o.mode = inst.mode;
+    o.bark = lk.bark;
+    o.leaf = lk.leaf;
+    o.tint = hash11(float(inst.id) * 0.013f);
+    o.scale = inst.scale;
+    o.narrow = lk.leaf_kind;
+    return o;
+}
+
+float4 ps_mesh(MeshOut i, bool front : SV_IsFrontFace) : SV_Target {
+    if (!keep_pixel(i.clip.xy, i.packed)) discard;
+    // The cut: a log keeps the trunk above it, a stump below it.
+    if (i.mode == 1u && i.kind < 0.5f) clip(i.local_y - cut_height + 0.002f);
+    if (i.mode == 2u && i.kind < 0.5f) clip(cut_height + 0.002f - i.local_y);
+
+    float3 n = normalize(i.nrm);
+    float3 albedo;
+    bool foliage = false;
+    float ao = i.ao;
+    if (i.kind < 0.5f) {
+        if (!front) n = -n;
+        albedo = bark_albedo(i.bark, i.uv * i.scale, length(fwidth(i.uv)));
+    } else if (i.kind < 2.5f) {
+        foliage = true;
+        const float blur = length(fwidth(i.uv));
+        const float a = leaf_coverage(i.uv, i.kind, i.seed, blur, i.narrow);
+        // Coverage tested against the dither once the card is small enough
+        // to shimmer, against 0.5 while it is sharp.
+        const float thr = lerp(0.5f, dither(i.clip.xy), saturate(blur * 6.0f));
+        if (a < thr) discard;
+        const float var = 0.82f + 0.36f * frac(i.seed * 7.31f) ;
+        albedo = i.leaf * var * (0.9f + 0.2f * i.tint);
+        // Sunlit cards a touch yellower, shaded ones bluer: the cheapest
+        // depth cue a crown has.
+        albedo = lerp(albedo * float3(0.85f, 0.95f, 1.1f), albedo * float3(1.08f, 1.04f, 0.85f), ao);
+    } else {
+        // End grain: growth rings, darker heartwood, a bark rim.
+        const float r = i.uv.x / max(i.seed, 0.01f);
+        const float rings = 0.5f + 0.5f * sin(r * 60.0f + vnoise(i.world.xz * 6.0f) * 3.0f);
+        albedo = lerp(float3(0.66f, 0.52f, 0.34f), float3(0.48f, 0.34f, 0.20f), r * 0.6f) * (0.9f + 0.1f * rings);
+        if (r > 0.9f) albedo = i.bark;
+        ao = 1.0f;
+    }
+    if (debug > 0.5f && debug < 1.5f) {
+        // 1: which level drew it -- LOD 0 red, LOD 1 green (packed bit 29).
+        return float4(((i.packed >> 29) & 1u) != 0u ? float3(0.2f, 0.8f, 0.2f) : float3(0.9f, 0.2f, 0.2f), 1.0f);
+    }
+    return float4(shade(albedo, n, ao, i.world, foliage, shadow_factor(i.world, n)), 1.0f);
+}
+
+// The mesh as a shadow caster: the same cut, the same leaf coverage, no
+// colour. Without the leaf test every card would cast a solid square.
+void ps_mesh_shadow(MeshOut i) {
+    if (!keep_pixel(i.clip.xy, i.packed)) discard;
+    if (i.mode == 1u && i.kind < 0.5f) clip(i.local_y - cut_height + 0.002f);
+    if (i.mode == 2u && i.kind < 0.5f) clip(cut_height + 0.002f - i.local_y);
+    if (i.kind > 0.5f && i.kind < 2.5f) {
+        if (shadow_pass > 1.5f) {
+            // Past the first cascade a texel is 10 cm or more: a leaf is
+            // sub-texel, so test the card's round outline at its average
+            // coverage instead of evaluating every leaf.
+            const float rim = 1.0f - saturate((length(i.uv - 0.5f) - 0.40f) / 0.1f);
+            if (rim * 0.6f < dither(i.clip.xy)) discard;
+            return;
+        }
+        const float blur = length(fwidth(i.uv));
+        const float a = leaf_coverage(i.uv, i.kind, i.seed, blur, i.narrow);
+        const float thr = lerp(0.5f, dither(i.clip.xy), saturate(blur * 6.0f));
+        if (a < thr) discard;
+    }
+}
+
+// --- octahedral impostors -----------------------------------------------------
+//
+// Each model is baked from frames x frames directions over the upper
+// hemisphere, laid out by the hemi-octahedral map: a direction's x and z,
+// divided by |x| + |y| + |z|, rotated 45 degrees, fill the square. A pixel
+// finds the four frames nearest its view direction and blends them, each
+// sampled where the pixel's ray crosses that frame's plane -- which is what
+// keeps a tree solid as the view swings between frames.
+
+float2 hemi_oct_encode(float3 d) {
+    d.y = max(d.y, 0.0f);
+    const float s = abs(d.x) + abs(d.y) + abs(d.z);
+    const float2 p = float2(d.x, d.z) / s;
+    return float2(p.x + p.y, p.x - p.y) * 0.5f + 0.5f;
+}
+
+float3 hemi_oct_decode(float2 uv) {
+    const float2 e = uv * 2.0f - 1.0f;
+    const float x = 0.5f * (e.x + e.y), z = 0.5f * (e.x - e.y);
+    return normalize(float3(x, 1.0f - abs(x) - abs(z), z));
+}
+
+// The bake's basis for a view direction, used identically on both sides.
+void frame_basis(float3 dir, out float3 right, out float3 up) {
+    const float3 w = abs(dir.y) > 0.999f ? float3(0.0f, 0.0f, 1.0f) : float3(0.0f, 1.0f, 0.0f);
+    right = normalize(cross(w, dir));
+    up = cross(dir, right);
+}
+
+struct ImpOut {
+    float4 clip   : SV_Position;
+    float3 world  : TEXCOORD0;
+    nointerpolation float3 centre : TEXCOORD1;
+    nointerpolation float  bound  : TEXCOORD2;
+    nointerpolation float  slice  : TEXCOORD3;
+    nointerpolation float2 yaw    : TEXCOORD4;   // cos, sin
+    nointerpolation uint   packed : TEXCOORD5;
+    nointerpolation float  tint   : TEXCOORD6;
+};
+
+ImpOut vs_impostor(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
+    const uint packed = g_visible[g_list_offset + iid];
+    const TreeInstance inst = g_instances[packed & 0xFFFFFu];
+    const ModelInfo mi = g_models[inst.model];
+    const uint corner = vid & 3u;   // quad_base is a multiple of 4
+    const float2 c = float2((corner == 1u || corner == 2u) ? 1.0f : -1.0f,
+                            (corner >= 2u) ? 1.0f : -1.0f);
+    const float r = mi.bound * inst.scale;
+    const float3 centre = inst.pos + float3(0.0f, (mi.top * 0.5f) * inst.scale, 0.0f);
+    const float3 world = centre + (cam_right * c.x + cam_up * c.y) * r;
+    ImpOut o;
+    o.clip = mul(float4(world, 1.0f), view_proj);
+    o.world = world;
+    o.centre = centre;
+    o.bound = r;
+    o.slice = mi.slice;
+    // Yaw from the quaternion; the lean is a few degrees and the impostor
+    // ignores it.
+    const float yaw = 2.0f * atan2(inst.rot.y, inst.rot.w);
+    o.yaw = float2(cos(yaw), sin(yaw));
+    o.packed = packed;
+    o.tint = hash11(float(inst.id) * 0.013f);
+    return o;
+}
+
+// World -> the model's own frame (undo the yaw) and back.
+float3 to_local(float3 v, float2 cs) { return float3(cs.x * v.x - cs.y * v.z, v.y, cs.y * v.x + cs.x * v.z); }
+float3 to_world(float3 v, float2 cs) { return float3(cs.x * v.x + cs.y * v.z, v.y, -cs.y * v.x + cs.x * v.z); }
+
+// The four nearest baked views, sampled where a ray along `rd` through this
+// pixel's point on the card crosses each view's plane. The ray starts at the
+// pixel's own world point, which works for the camera's perspective ray and
+// for the sun's parallel one alike.
+bool impostor_fetch(ImpOut i, float3 rd, out float4 acc_a, out float4 acc_n) {
+    const float3 vloc = to_local(-rd, i.yaw);
+    const float n = float(frames);
+    const float2 g = hemi_oct_encode(vloc) * n - 0.5f;
+    const float2 g0 = floor(g);
+    const float2 f = g - g0;
+
+    acc_a = 0.0f; acc_n = 0.0f;
+    float wsum = 0.0f;
+    [unroll] for (int k = 0; k < 4; ++k) {
+        const float2 o = float2(k & 1, k >> 1);
+        const float2 fr = clamp(g0 + o, 0.0f, n - 1.0f);
+        const float w = (o.x > 0.5f ? f.x : 1.0f - f.x) * (o.y > 0.5f ? f.y : 1.0f - f.y);
+        const float3 dl = hemi_oct_decode((fr + 0.5f) / n);
+        float3 rl, ul;
+        frame_basis(dl, rl, ul);
+        // Where this pixel's ray crosses the frame's plane through the centre.
+        const float3 dw = to_world(dl, i.yaw);
+        const float den = dot(rd, dw);
+        if (abs(den) < 1e-4f) continue;
+        const float t = dot(i.centre - i.world, dw) / den;
+        const float3 hit = i.world + rd * t - i.centre;
+        const float3 hl = to_local(hit, i.yaw);
+        const float2 q = float2(dot(hl, rl), dot(hl, ul)) / i.bound;
+        if (any(abs(q) > 1.0f)) continue;
+        const float2 auv = (fr + float2(q.x * 0.5f + 0.5f, 0.5f - q.y * 0.5f)) / n;
+        acc_a += w * g_imp_albedo.Sample(g_linear, float3(auv, i.slice));
+        acc_n += w * g_imp_normal.Sample(g_linear, float3(auv, i.slice));
+        wsum += w;
+    }
+    if (wsum <= 0.0f) return false;
+    // A fixed threshold. A dithered one kept the averaged fraction of pixels
+    // and drew every distant crown as speckle; the bake makes cards nearly
+    // solid instead, so the averaged alpha of a crown stays above this.
+    return acc_a.a / wsum >= 0.45f;
+}
+
+float4 ps_impostor(ImpOut i) : SV_Target {
+    if (!keep_pixel(i.clip.xy, i.packed)) discard;
+    float4 acc_a, acc_n;
+    if (!impostor_fetch(i, normalize(i.world - cam_pos), acc_a, acc_n)) discard;
+    const float3 albedo = (acc_a.rgb / max(acc_a.a, 1e-4f)) * (0.9f + 0.2f * i.tint);
+    const float3 nl = normalize(acc_n.rgb / max(acc_n.a, 1e-4f) * 2.0f - 1.0f);
+    const float3 nw = to_world(nl, i.yaw);
+    if (debug > 0.5f && debug < 1.5f) return float4(0.2f, 0.3f, 0.95f, 1.0f);
+    // The card runs through the middle of the crown, so a shadow lookup on it
+    // would find the tree's own front half and darken every distant tree.
+    // Look from just outside its bound on the sun's side instead: hills and
+    // other trees still shade it, its own crown does not.
+    const float3 sun = normalize(float3(0.45f, 0.78f, 0.35f));
+    const float sh = shadow_factor(i.world + sun * i.bound, sun);
+    return float4(shade(albedo, nw, 1.0f, i.world, true, sh), 1.0f);
+}
+
+// An impostor casting: its card already faces the sun (the shadow pass hands
+// the light's basis in as the camera's), and it is sampled along the sun.
+void ps_impostor_shadow(ImpOut i) {
+    // One view, alpha only. A shadow needs neither the normal nor the blend
+    // between views, and the far cascade holds thousands of impostors
+    // overlapping under a high sun: four blended views of albedo and normal
+    // each was most of the shadow pass's cost.
+    const float3 rd = -normalize(float3(0.45f, 0.78f, 0.35f));
+    const float n = float(frames);
+    const float2 fr = clamp(floor(hemi_oct_encode(to_local(-rd, i.yaw)) * n), 0.0f, n - 1.0f);
+    const float3 dl = hemi_oct_decode((fr + 0.5f) / n);
+    float3 rl, ul;
+    frame_basis(dl, rl, ul);
+    const float3 dw = to_world(dl, i.yaw);
+    const float t = dot(i.centre - i.world, dw) / dot(rd, dw);
+    const float3 hl = to_local(i.world + rd * t - i.centre, i.yaw);
+    const float2 q = float2(dot(hl, rl), dot(hl, ul)) / i.bound;
+    if (any(abs(q) > 1.0f)) discard;
+    const float2 auv = (fr + float2(q.x * 0.5f + 0.5f, 0.5f - q.y * 0.5f)) / n;
+    if (g_imp_albedo.SampleLevel(g_linear, float3(auv, i.slice), 1.0f).a < 0.45f) discard;
+}
+
+// --- the bake ---------------------------------------------------------------
+//
+// One model from one direction, orthographic, into one frame of the atlas.
+// Albedo is stored with the baked occlusion multiplied in and premultiplied
+// by coverage, so the mip chain can be a plain average; the normal is in the
+// model's own frame, premultiplied the same way.
+
+struct BakeOut {
+    float4 clip  : SV_Position;
+    float3 nrm   : TEXCOORD0;
+    float2 uv    : TEXCOORD1;
+    float  ao    : TEXCOORD2;
+    nointerpolation float kind : TEXCOORD3;
+    nointerpolation float seed : TEXCOORD4;
+    nointerpolation float3 bark : TEXCOORD5;
+    nointerpolation float3 leaf : TEXCOORD6;
+    nointerpolation float narrow : TEXCOORD7;
+};
+
+BakeOut vs_bake(uint vid : SV_VertexID) {
+    const TreeVertex v = g_verts[vid];
+    const ModelInfo mi = g_models[instance_count];   // the model being baked
+    const SpeciesLook lk = g_looks[mi.species];
+    BakeOut o = (BakeOut)0;
+    if (v.kind > 2.5f) { o.clip = float4(0, 0, 0, 1); return o; }
+    const float3 rel = v.pos - float3(0.0f, bake_centre_y, 0.0f);
+    const float x = dot(rel, bake_right) / bake_r;
+    const float y = dot(rel, bake_up) / bake_r;
+    const float z = 0.5f - 0.5f * dot(rel, bake_dir) / bake_r;
+    o.clip = float4(x, y, z, 1.0f);
+    o.nrm = v.nrm;
+    o.uv = v.uv;
+    o.ao = v.ao;
+    o.kind = v.kind;
+    o.seed = v.seed;
+    o.bark = lk.bark;
+    o.leaf = lk.leaf;
+    o.narrow = lk.leaf_kind;
+    return o;
+}
+
+struct BakeTargets {
+    float4 albedo : SV_Target0;
+    float4 normal : SV_Target1;
+};
+
+BakeTargets ps_bake(BakeOut i, bool front : SV_IsFrontFace) {
+    float3 n = normalize(i.nrm);
+    float3 albedo;
+    float ao = i.ao;
+    if (i.kind < 0.5f) {
+        if (!front) n = -n;
+        albedo = bark_albedo(i.bark, i.uv, 1.0f);
+    } else {
+        // The bake is coarse (a frame is a few tens of pixels across a tree),
+        // so leaf coverage is judged soft and thresholded low: a crown should
+        // stay as dense as the mesh reads from the same distance.
+        // Near-solid cards: at a few tens of pixels per tree the leaf pattern
+        // is sub-pixel, and its gaps averaged through the mips into speckle.
+        const float a = leaf_coverage(i.uv, i.kind, i.seed, 0.6f, i.narrow);
+        if (a < 0.08f) discard;
+        albedo = i.leaf * (0.82f + 0.36f * frac(i.seed * 7.31f));
+        albedo = lerp(albedo * float3(0.85f, 0.95f, 1.1f), albedo * float3(1.08f, 1.04f, 0.85f), ao);
+    }
+    BakeTargets t;
+    t.albedo = float4(albedo * (0.45f + 0.55f * ao), 1.0f);
+    t.normal = float4(n * 0.5f + 0.5f, 1.0f);
+    return t;
+}

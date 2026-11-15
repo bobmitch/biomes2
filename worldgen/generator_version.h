@@ -47,7 +47,10 @@ namespace worldgen {
 //      no tunnels and layer 7 builds no shafts (a shaft must end in cave
 //      air). They were unreachable -- residency stopped 64 m down -- and cost
 //      geometry. To be brought back with better seeded placement.
-static const int kGeneratorVersion = 11;
+//  12  layer 8, trees: one candidate per 4 m cell, kept by biome density
+//      inside seeded patches, species by biome weight and altitude band.
+//      A tree is a pure function of its cell, which is its save identity.
+static const int kGeneratorVersion = 12;
 
 }  // namespace worldgen
 

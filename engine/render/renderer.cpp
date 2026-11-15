@@ -52,6 +52,25 @@ struct WaterConstants {
     float pad0[2];
 };
 
+// Matches cbuffer ShadowConstants in shadow.hlsli: 256 bytes.
+struct ShadowConstants {
+    float light_vp[3][16];
+    float split[4];        // far edge of each cascade; w = on
+    float texel[4];
+    float depth_range[4];
+    float cam[3];
+    float res;
+};
+static_assert(sizeof(ShadowConstants) == 256, "ShadowConstants must match shadow.hlsli");
+
+// Cascade far edges, metres from the camera. The last one is just past the
+// default tree draw distance; beyond it the shadow fades out under the fog.
+const float kCascadeSplit[4] = {0.2f, 35.0f, 140.0f, 520.0f};
+// How far towards the sun a caster may be and still shadow a cascade: the
+// tallest relief between here and the slice. Depth precision is not the
+// constraint at D32.
+const float kShadowBack = 400.0f;
+
 struct MeshConstants {
     float view_proj[16];
     float cam_pos[3];
@@ -481,8 +500,9 @@ bool Renderer::create_water_pipeline(std::string& error) {
 
 bool Renderer::create_mesh_pipeline(std::string& error) {
     if (!mesh_root_) {
-        // 24 DWORDs of constants + two root SRVs at 2 each = 28 of the 64.
-        D3D12_ROOT_PARAMETER params[3] = {};
+        // 24 DWORDs of constants + two root SRVs at 2 each + the shadow CBV
+        // (2) and its table (1) = 31 of the 64.
+        D3D12_ROOT_PARAMETER params[5] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         params[0].Constants.ShaderRegister = 0;
@@ -494,10 +514,31 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
         params[2].Descriptor.ShaderRegister = 1;
+        params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[3].Descriptor.ShaderRegister = 2;
+        D3D12_DESCRIPTOR_RANGE sr = {};
+        sr.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr.NumDescriptors = 1;
+        sr.BaseShaderRegister = 8;
+        params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[4].DescriptorTable.NumDescriptorRanges = 1;
+        params[4].DescriptorTable.pDescriptorRanges = &sr;
+        D3D12_STATIC_SAMPLER_DESC cmp = {};
+        cmp.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+        cmp.AddressU = cmp.AddressV = cmp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        cmp.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;   // outside: lit
+        cmp.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        cmp.MaxLOD = D3D12_FLOAT32_MAX;
+        cmp.ShaderRegister = 1;
+        cmp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 3;
+        rsd.NumParameters = 5;
         rsd.pParameters = params;
+        rsd.NumStaticSamplers = 1;
+        rsd.pStaticSamplers = &cmp;
         rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
         ComPtr<ID3DBlob> sig, sig_err;
@@ -572,10 +613,258 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
     hr = device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&wire));
     if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (wire)", hr); return false; }
 
+    // The terrain as a shadow caster: the same vertex shader under the
+    // light's view, depth only. No culling -- a thin ridge seen edge-on from
+    // the sun must still cast -- and a slope-scaled bias for acne.
+    pd.PS.pShaderBytecode = nullptr;
+    pd.PS.BytecodeLength = 0;
+    pd.NumRenderTargets = 0;
+    pd.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.SlopeScaledDepthBias = 2.0f;
+    pd.RasterizerState.DepthBiasClamp = 0.002f;
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    ComPtr<ID3D12PipelineState> shadow;
+    hr = device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&shadow));
+    if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (terrain shadow)", hr); return false; }
+
     if (ready_) wait_for_gpu();
     mesh_pso_ = pso;
     mesh_wire_pso_ = wire;
+    mesh_shadow_pso_ = shadow;
     return true;
+}
+
+bool Renderer::create_shadow_resources(std::string& error) {
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = kShadowRes;
+    rd.Height = kShadowRes;
+    rd.DepthOrArraySize = kCascades;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R32_TYPELESS;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE cv = {};
+    cv.Format = DXGI_FORMAT_D32_FLOAT;
+    cv.DepthStencil.Depth = 1.0f;
+    // Starts readable: every frame begins with it a shader resource, so a
+    // frame that skips the shadow pass still binds a valid (cleared) map.
+    HRESULT hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
+                                                  IID_PPV_ARGS(&shadow_map_));
+    if (FAILED(hr)) { error = hr_text("shadow map", hr); return false; }
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    hd.NumDescriptors = kCascades;
+    hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&shadow_dsv_heap_));
+    if (FAILED(hr)) { error = hr_text("shadow dsv heap", hr); return false; }
+    const UINT dinc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    for (UINT c = 0; c < kCascades; ++c) {
+        D3D12_DEPTH_STENCIL_VIEW_DESC dv = {};
+        dv.Format = DXGI_FORMAT_D32_FLOAT;
+        dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        dv.Texture2DArray.FirstArraySlice = c;
+        dv.Texture2DArray.ArraySize = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE h = shadow_dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += SIZE_T(c) * dinc;
+        device_->CreateDepthStencilView(shadow_map_.Get(), &dv, h);
+    }
+
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 3;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srv_heap_));
+    if (FAILED(hr)) { error = hr_text("shared srv heap", hr); return false; }
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Format = DXGI_FORMAT_R32_FLOAT;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2DArray.MipLevels = 1;
+    sd.Texture2DArray.ArraySize = kCascades;
+    device_->CreateShaderResourceView(shadow_map_.Get(), &sd, srv_heap_->GetCPUDescriptorHandleForHeapStart());
+
+    for (UINT f = 0; f < kFrameCount; ++f) {
+        D3D12_HEAP_PROPERTIES up = {};
+        up.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = 256;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        hr = device_->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd,
+                                              D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                              IID_PPV_ARGS(&shadow_cb_[f]));
+        if (FAILED(hr)) { error = hr_text("shadow cb", hr); return false; }
+        shadow_cb_[f]->Map(0, nullptr, &shadow_cb_cpu_[f]);
+        std::memset(shadow_cb_cpu_[f], 0, 256);
+    }
+    return true;
+}
+
+// One orthographic view down the sun per cascade, fitted to a sphere round
+// that cascade's slice of the view frustum. The sphere's radius depends only
+// on the split distances and the lens, so it never changes size as the camera
+// turns; its centre is snapped to whole shadow texels in light space, so a
+// static shadow edge stays on the same texels instead of crawling as the
+// camera moves.
+void Renderer::compute_cascades(const ViewConstants& view) {
+    float L[3] = {0.45f, 0.78f, 0.35f};
+    {
+        const float l = std::sqrt(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
+        for (int k = 0; k < 3; ++k) L[k] /= l;
+    }
+    // right = normalize(cross(Y, L)), up = cross(L, right)
+    float R[3] = {L[2], 0.0f, -L[0]};
+    {
+        const float l = std::sqrt(R[0] * R[0] + R[2] * R[2]);
+        R[0] /= l; R[2] /= l;
+    }
+    const float U[3] = {L[1] * R[2] - L[2] * R[1], L[2] * R[0] - L[0] * R[2], L[0] * R[1] - L[1] * R[0]};
+    const float diag = view.tan_half_fov * std::sqrt(1.0f + view.aspect * view.aspect);
+    for (UINT c = 0; c < kCascades; ++c) {
+        const float n = kCascadeSplit[c], f = kCascadeSplit[c + 1];
+        const float rn = n * diag, rf = f * diag;
+        float zc = ((f * f + rf * rf) - (n * n + rn * rn)) / (2.0f * (f - n));
+        if (zc > f) zc = f;
+        if (zc < n) zc = n;
+        float r = std::sqrt((zc - n) * (zc - n) + rn * rn);
+        const float rf2 = std::sqrt((f - zc) * (f - zc) + rf * rf);
+        if (rf2 > r) r = rf2;
+        r = std::ceil(r * 1.02f);
+        float ctr[3];
+        for (int k = 0; k < 3; ++k) ctr[k] = view.cam_pos[k] + view.cam_fwd[k] * zc;
+        const float texel = 2.0f * r / float(kShadowRes);
+        float cx = ctr[0] * R[0] + ctr[1] * R[1] + ctr[2] * R[2];
+        float cy = ctr[0] * U[0] + ctr[1] * U[1] + ctr[2] * U[2];
+        cx = std::floor(cx / texel) * texel;
+        cy = std::floor(cy / texel) * texel;
+        const float cz = -(ctr[0] * L[0] + ctr[1] * L[1] + ctr[2] * L[2]);
+        const float zn = cz - r - kShadowBack, zf = cz + r + 20.0f;
+        const float range = zf - zn;
+        Cascade& cs = cascades_[c];
+        float* m = cs.vp;
+        for (int k = 0; k < 16; ++k) m[k] = 0.0f;
+        for (int i = 0; i < 3; ++i) {
+            m[i * 4 + 0] = R[i] / r;
+            m[i * 4 + 1] = U[i] / r;
+            m[i * 4 + 2] = -L[i] / range;
+        }
+        m[12] = -cx / r;
+        m[13] = -cy / r;
+        m[14] = -zn / range;
+        m[15] = 1.0f;
+        cs.texel = texel;
+        cs.depth_range = range;
+        for (int k = 0; k < 3; ++k) { cs.right[k] = R[k]; cs.up[k] = U[k]; }
+        // Planes, as in tree culling: dot(n, p) + d >= 0 inside.
+        float col[4][4];
+        for (int cc = 0; cc < 4; ++cc) for (int rr = 0; rr < 4; ++rr) col[cc][rr] = m[rr * 4 + cc];
+        for (int k = 0; k < 4; ++k) {
+            cs.planes[0][k] = col[3][k] + col[0][k];
+            cs.planes[1][k] = col[3][k] - col[0][k];
+            cs.planes[2][k] = col[3][k] + col[1][k];
+            cs.planes[3][k] = col[3][k] - col[1][k];
+            cs.planes[4][k] = col[2][k];
+            cs.planes[5][k] = col[3][k] - col[2][k];
+        }
+        for (int p = 0; p < 6; ++p) {
+            const float l = std::sqrt(cs.planes[p][0] * cs.planes[p][0] + cs.planes[p][1] * cs.planes[p][1] +
+                                      cs.planes[p][2] * cs.planes[p][2]);
+            if (l > 0.0f) for (int k = 0; k < 4; ++k) cs.planes[p][k] /= l;
+        }
+    }
+}
+
+void Renderer::record_shadows(const ViewConstants& view) {
+    ShadowConstants sc = {};
+    sc.res = float(kShadowRes);
+    for (int k = 0; k < 3; ++k) sc.cam[k] = view.cam_pos[k];
+    for (UINT c = 0; c < kCascades; ++c) sc.split[c] = kCascadeSplit[c + 1];
+    const bool on = shadows_on_ && mode_ != Mode::Wireframe;
+    sc.split[3] = on ? 1.0f : 0.0f;
+    if (on) {
+        compute_cascades(view);
+        for (UINT c = 0; c < kCascades; ++c) {
+            std::memcpy(sc.light_vp[c], cascades_[c].vp, sizeof sc.light_vp[c]);
+            sc.texel[c] = cascades_[c].texel;
+            sc.depth_range[c] = cascades_[c].depth_range;
+        }
+    }
+    std::memcpy(shadow_cb_cpu_[frame_], &sc, sizeof sc);
+    if (!on) return;
+
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = shadow_map_.Get();
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    cmd_->ResourceBarrier(1, &b);
+
+    D3D12_VIEWPORT vp = {};
+    vp.Width = float(kShadowRes);
+    vp.Height = float(kShadowRes);
+    vp.MaxDepth = 1.0f;
+    D3D12_RECT sr = {0, 0, LONG(kShadowRes), LONG(kShadowRes)};
+    D3D12_INDEX_BUFFER_VIEW ibv = {};
+    ibv.BufferLocation = mesher_.indices()->GetGPUVirtualAddress();
+    ibv.SizeInBytes = kSlots * kSlotIndices * 4;
+    ibv.Format = DXGI_FORMAT_R32_UINT;
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
+    const UINT dinc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    for (UINT c = 0; c < kCascades; ++c) {
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv = shadow_dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+        dsv.ptr += SIZE_T(c) * dinc;
+        cmd_->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+        cmd_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        cmd_->RSSetViewports(1, &vp);
+        cmd_->RSSetScissorRects(1, &sr);
+        cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        // Terrain: every resident chunk, under the light.
+        MeshConstants mc = {};
+        std::memcpy(mc.view_proj, cascades_[c].vp, sizeof mc.view_proj);
+        mc.slot_vertices = static_cast<float>(kSlotVertices);
+        cmd_->SetDescriptorHeaps(1, heaps);
+        cmd_->SetPipelineState(mesh_shadow_pso_.Get());
+        cmd_->SetGraphicsRootSignature(mesh_root_.Get());
+        cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
+        cmd_->SetGraphicsRootShaderResourceView(1, mesher_.vertices()->GetGPUVirtualAddress());
+        cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
+        cmd_->SetGraphicsRootConstantBufferView(3, shadow_cb_[frame_]->GetGPUVirtualAddress());
+        cmd_->SetGraphicsRootDescriptorTable(4, srv_heap_->GetGPUDescriptorHandleForHeapStart());
+        cmd_->IASetIndexBuffer(&ibv);
+        cmd_->ExecuteIndirect(cmd_sig_.Get(), kSlots, mesher_.draw_args(), 0, nullptr, 0);
+
+        // Trees, culled against this cascade but levelled by the camera's
+        // distance, so a shadow always matches the tree that casts it.
+        if (trees_on_ && trees_.ready()) {
+            TreeShadowInputs si = {};
+            std::memcpy(si.view_proj, cascades_[c].vp, sizeof si.view_proj);
+            std::memcpy(si.planes, cascades_[c].planes, sizeof si.planes);
+            for (int k = 0; k < 3; ++k) {
+                si.cam_pos[k] = view.cam_pos[k];
+                si.light_right[k] = cascades_[c].right[k];
+                si.light_up[k] = cascades_[c].up[k];
+            }
+            si.time = view.time;
+            si.far_plane = kFarPlane;
+            trees_.record_shadow(cmd_.Get(), frame_, c, si, tree_settings_);
+        }
+    }
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    cmd_->ResourceBarrier(1, &b);
 }
 
 bool Renderer::reload_shaders(std::string& error) {
@@ -614,6 +903,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     if (!fence_event_) { error = "CreateEvent failed"; return false; }
 
     if (!create_depth(error)) return false;
+    if (!create_shadow_resources(error)) return false;
 
     UINT64 tsfreq = 0;
     queue_->GetTimestampFrequency(&tsfreq);
@@ -658,8 +948,56 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     wait_for_gpu();
     world_.release_staging();
 
+    // Trees: models, the impostor bake, and the CPU placement workers.
+    t0 = startup_now_ms();
+    {
+        std::vector<TreeLook> looks;
+        if (!load_tree_looks(world_.table(), "worldgen/data/archetypes.json", looks, error)) return false;
+        if (!trees_.init(device_.Get(), queue_.Get(), looks, srv_heap_.Get(), 1, error)) return false;
+        // Three workers: the first fill of a 500 m radius is ~300 tiles, and
+        // the frame loop never waits on them.
+        tree_field_.init(&world_, 3);
+    }
+    startup_log().push_back(std::make_pair(std::string("phase: tree models + impostor bake"), startup_now_ms() - t0));
+
     ready_ = true;
     return true;
+}
+
+void Renderer::update_trees(const ViewConstants& view, bool settle) {
+    if (!trees_.ready()) return;
+    // A tile beyond the draw distance is never drawn, but one tile of margin
+    // keeps a turn of the head from waiting on placement.
+    const float radius = tree_settings_.max_dist + 64.0f;
+    tree_field_.update(view.cam_pos[0], view.cam_pos[2], radius);
+    if (settle) {
+        // A still waits for every tile, the way it waits for every chunk.
+        for (int i = 0; i < 4000 && !tree_field_.settled(); ++i) {
+            Sleep(2);
+            tree_field_.update(view.cam_pos[0], view.cam_pos[2], radius);
+        }
+    }
+    if (tree_field_.version() == tree_field_seen_ && !tree_dirty_) return;
+    tree_field_seen_ = tree_field_.version();
+    tree_dirty_ = false;
+    const std::vector<worldgen::TreeInstance>& st = tree_field_.standing();
+    tree_all_.clear();
+    tree_all_.reserve(st.size() + tree_extras_.size());
+    for (size_t i = 0; i < st.size(); ++i) {
+        const worldgen::TreeInstance& t = st[i];
+        TreeGpuInstance g = {};
+        g.pos[0] = t.x; g.pos[1] = t.y; g.pos[2] = t.z;
+        g.scale = t.height / trees_.look(t.species).nominal_height;
+        tree_standing_rotation(t, g.rot);
+        g.model = t.species * kTreeVariants + (t.variant % kTreeVariants);
+        g.mode = 0;
+        std::unordered_map<uint32_t, float>::const_iterator h = tree_hits_.find(t.id);
+        g.hit_time = h == tree_hits_.end() ? -100.0f : h->second;
+        g.id = t.id;
+        tree_all_.push_back(g);
+    }
+    tree_all_.insert(tree_all_.end(), tree_extras_.begin(), tree_extras_.end());
+    trees_.set_instances(tree_all_);
 }
 
 void Renderer::wait_for_gpu() {
@@ -709,6 +1047,10 @@ void Renderer::resize(UINT width, UINT height) {
 }
 
 void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HANDLE rtv) {
+    // The sun's view first: the shadow map has to be finished before anything
+    // that samples it is drawn.
+    record_shadows(view);
+
     D3D12_VIEWPORT vp = {};
     vp.Width = static_cast<float>(width_);
     vp.Height = static_cast<float>(height_);
@@ -754,11 +1096,34 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         cmd_->SetGraphicsRootShaderResourceView(
             1, mesher_.vertices()->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
+        {
+            ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
+            cmd_->SetDescriptorHeaps(1, heaps);
+            cmd_->SetGraphicsRootConstantBufferView(3, shadow_cb_[frame_]->GetGPUVirtualAddress());
+            cmd_->SetGraphicsRootDescriptorTable(4, srv_heap_->GetGPUDescriptorHandleForHeapStart());
+        }
         cmd_->IASetIndexBuffer(&ibv);
         // One command per slot. A retired or never-used slot has all-zero
         // arguments and the command processor skips it, which is cheaper than
         // compacting the array every time a chunk moves.
         cmd_->ExecuteIndirect(cmd_sig_.Get(), kSlots, mesher_.draw_args(), 0, nullptr, 0);
+    }
+
+    // Trees after the ground, before the sea. Not in wireframe: the wire view
+    // is for reading the terrain mesh, and a forest over it hides the mesh.
+    if (trees_on_ && trees_.ready() && mode_ != Mode::Wireframe) {
+        TreeFrameInputs ti = {};
+        std::memcpy(ti.view_proj, mc.view_proj, sizeof ti.view_proj);
+        for (int k = 0; k < 3; ++k) {
+            ti.cam_pos[k] = view.cam_pos[k];
+            ti.cam_fwd[k] = view.cam_fwd[k];
+            ti.cam_right[k] = view.cam_right[k];
+            ti.cam_up[k] = view.cam_up[k];
+        }
+        ti.time = view.time;
+        ti.far_plane = kFarPlane;
+        ti.shadow_cb = shadow_cb_[frame_]->GetGPUVirtualAddress();
+        trees_.record(cmd_.Get(), frame_, ti, tree_settings_);
     }
 
     // The sea goes last: it is transparent, so it has to blend over whatever
@@ -1108,6 +1473,7 @@ void Renderer::render(const ViewConstants& view) {
 
     patches_added_.clear();
     patches_removed_.clear();
+    update_trees(view, false);
     streamer_.update(view.cam_pos[0], view.cam_pos[1], view.cam_pos[2]);
     {
         const std::vector<ChunkKey>& gone = streamer_.retired_keys();
@@ -1248,6 +1614,7 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
     stats_.empty_resident = streamer_.empty_resident();
     // A still of a finished world: no chunk mid-fade in a screenshot.
     streamer_.settle_fades();
+    update_trees(view, true);
 
     const D3D12_RESOURCE_DESC rd = targets_[frame_]->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
@@ -1880,6 +2247,8 @@ void Renderer::slot_report(const char* path) {
 
 void Renderer::shutdown() {
     if (ready_) wait_for_gpu();
+    tree_field_.shutdown();
+    trees_.shutdown();
     ready_ = false;
     if (fence_event_) {
         CloseHandle(fence_event_);

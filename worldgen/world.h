@@ -33,7 +33,9 @@ enum FeatureId : uint32_t {
     FEATURE_HEIGHT    = 6u,
     FEATURE_OVERHANG  = 7u,
     FEATURE_CAVE      = 8u,
-    FEATURE_ENTRANCE  = 9u
+    FEATURE_ENTRANCE  = 9u,
+    FEATURE_TREES     = 10u,   // which cells hold a tree, and its rolls
+    FEATURE_TREE_PATCH = 11u   // the patch / clearing noise
 };
 
 inline uint64_t hash64(uint64_t x) {
@@ -261,6 +263,7 @@ struct SeedWorld {
     AssignStats             stats;
     uint32_t s_cont = 0, s_dang = 0, s_wx = 0, s_wz = 0, s_height = 0;
     uint32_t s_overhang = 0, s_cave = 0, s_entrance = 0;
+    uint32_t s_trees = 0, s_tree_patch = 0;
     float    land_fraction = 0.0f;
 
     // --- layer 5 ---
@@ -357,6 +360,55 @@ bool caves_enabled(const ArchetypeTable& table);
 // done -- a half-built buffer would let one shaft terminate in another.
 // Builds nothing when !caves_enabled(table).
 void build_entrances(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table);
+
+// The biomes near a point and their normalised blend weights -- the same
+// weights layer 4 mixes heights with, divided by blend_divisor, so a biome
+// property blended through this fades at a coast exactly as the height does.
+// Returns how many entries are filled; biome < 0 entries never appear.
+int biome_mix(const SeedWorld& w, const WorldParams& wp, float x, float z,
+              int* biome, float* weight);
+
+// --- layer 8: trees -----------------------------------------------------------
+// A tree is a pure function of its candidate cell (see field.h), so the id
+// below is all a save needs to name one. Rotation is stored as a fraction of
+// a turn: turning it into sin and cos is presentation, on the far side of the
+// hash.
+struct TreeInstance {
+    float    x, y, z;        // trunk base on the ground, metres
+    float    height;         // metres, stunting included
+    float    yaw01;          // [0, 1) of a full turn
+    float    lean01;         // [0, 1), the engine's to interpret
+    uint32_t id;             // tree_id(i, j)
+    uint16_t species;        // index into TreeTable::species
+    uint16_t variant;        // which of the engine's meshes for the species, 0..255
+};
+
+inline uint32_t tree_id(int i, int j) {
+    return (static_cast<uint32_t>(i + 32768) << 16) | static_cast<uint32_t>(j + 32768);
+}
+inline void tree_cell(uint32_t id, int& i, int& j) {
+    i = static_cast<int>(id >> 16) - 32768;
+    j = static_cast<int>(id & 0xFFFFu) - 32768;
+}
+
+// Every tree whose candidate cell (i, j) lies in [i0, i1) x [j0, j1), appended
+// to `out` in cell order. Cell (i, j) covers [i*cell, (i+1)*cell) in x, so
+// tiles that are whole multiples of the cell never share or miss one.
+void trees_in_cells(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
+                    int i0, int j0, int i1, int j1, std::vector<TreeInstance>& out);
+
+// Why a candidate cell holds no tree. validate --tree-reasons tabulates these
+// per biome; a density that comes out far below the table's is otherwise a
+// guess between seven different filters.
+enum TreeReject {
+    TREE_KEPT = 0, TREE_OUTSIDE, TREE_NO_LAND, TREE_CLEARING, TREE_ROLL,
+    TREE_SHORE, TREE_SLOPE, TREE_RIVER, TREE_ALTITUDE, TREE_FIT_ROLL, TREE_SURFACE,
+    TREE_REJECT_COUNT
+};
+
+// The one tree a cell holds, if any. Same answer trees_in_cells gives.
+bool tree_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
+                  int i, int j, TreeInstance& out, int* reason = nullptr);
 
 // Layer 6. Positive is rock, negative is air; the sign change is the surface.
 float terrain_density(const SeedWorld& w, const WorldParams& wp,

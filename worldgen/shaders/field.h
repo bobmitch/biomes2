@@ -383,4 +383,61 @@ WG_FN float entrance_radius(float u, float mouth, float throat, float bowl, floa
     return r * (1.0f - 0.35f * tail);
 }
 
+// --- layer 8: trees ---------------------------------------------------------
+//
+// One candidate per cell of a square grid. The cell's hash decides everything
+// about its tree -- where in the cell, which species, how tall, which way it
+// faces -- so a tree is a pure function of its cell, its cell is its identity,
+// and a save marks a felled tree by naming the cell. Nothing is stored.
+//
+// Same split as layers 5 and 7: which biomes are near a point, and how high the
+// ground is there, are the caller's questions. The arithmetic is here, under
+// invariant 9 like everything else that reaches the hash.
+
+// A uniform in [0, 1) from 24 bits of a hash.
+WG_FN float tree_unit(uint h) {
+    return float(h >> 8u) * (1.0f / 16777216.0f);
+}
+
+// The k-th independent hash of a cell, k = 0.. for each decision.
+WG_FN uint tree_hash(int i, int j, uint seed, uint k) {
+    return pcg(hash2i(i, j, seed) ^ (k * 0x68E31DA4u));
+}
+
+// Where a patch's noise threshold sits for a given cover. The patch noise is a
+// 3-octave fBm whose distribution is close to normal and NOT uniform, so cover
+// c is not 1 - 2c. These are its measured quantiles at c = 0, 0.1 .. 1 over
+// 200 seeds (validate --tree-quantiles), interpolated linearly.
+WG_FN float tree_cover_threshold(float cover) {
+    float q[11];
+    q[0]  =  0.680f; q[1]  =  0.3346f; q[2]  =  0.2328f; q[3]  =  0.1497f;
+    q[4]  =  0.0736f; q[5]  =  0.000f; q[6]  = -0.0736f; q[7]  = -0.1497f;
+    q[8]  = -0.2328f; q[9]  = -0.3346f; q[10] = -0.680f;
+    const float f = wg_saturate(cover) * 10.0f;
+    int k = int(floor(f));
+    if (k > 9) k = 9;
+    const float t = f - float(k);
+    return q[k] + (q[k + 1] - q[k]) * t;
+}
+
+// 0 in a clearing, 1 inside a patch, thinning over `edge` noise units at the
+// boundary so a wood's margin is sparse rather than a wall.
+WG_FN float tree_patch(float x, float z, float freq, float cover, float edge, uint seed) {
+    if (cover <= 0.0f) return 0.0f;
+    if (cover >= 1.0f) return 1.0f;
+    const float n = fbm(x * freq, z * freq, 3, 2.0f, 0.5f, seed);
+    const float thr = tree_cover_threshold(cover);
+    return wg_smoothstep(thr - edge, thr + edge, n);
+}
+
+// How well a species suits an altitude: 0 outside its band, rising linearly
+// over `ramp` metres inside each end, 1 in the middle. Broadleaves give way to
+// conifers uphill through these ramps, and the top of the highest band is the
+// treeline.
+WG_FN float tree_altitude_fit(float h, float lo, float hi, float ramp) {
+    const float a = wg_saturate((h - lo) / ramp);
+    const float b = wg_saturate((hi - h) / ramp);
+    return a < b ? a : b;
+}
+
 #endif
