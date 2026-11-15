@@ -22,9 +22,10 @@ struct SceneOut {
     float4 ambient : SV_Target1;
 };
 
-// The terrain's fog: (distance / far plane) squared towards the horizon's
-// radiance, which is also what the sky clears to, so land meets sky without
-// a line. L2's aerial perspective replaces it.
+// No fog here since L2: the atmosphere's aerial perspective is applied to
+// every pixel by depth in the post chain's composite, so a surface writes
+// the light that leaves it and nothing else. `world`, `cam` and `far_plane`
+// are kept so no caller changed.
 // `contact` (the direct target's alpha) says how much screen-space contact
 // shadows may darken this surface: 1 for ground and bark, little or none for
 // leaves and grass, which shadow each other everywhere within the march and
@@ -35,12 +36,9 @@ struct SceneOut {
 // at full strength.
 SceneOut scene_out(float3 direct, float3 ambient, float3 world, float3 cam, float far_plane,
                    float contact = 1.0f, float ao = 1.0f) {
-    const float d = length(world - cam);
-    const float f = saturate(d / far_plane);
-    const float fog = f * f;
     SceneOut o;
-    o.direct = float4(min(direct * (1.0f - fog), kSceneMaxNits), contact);
-    o.ambient = float4(min(ambient * (1.0f - fog) + kSkyHorizon * fog, kSceneMaxNits), ao);
+    o.direct = float4(min(direct, kSceneMaxNits), contact);
+    o.ambient = float4(min(ambient, kSceneMaxNits), ao);
     return o;
 }
 

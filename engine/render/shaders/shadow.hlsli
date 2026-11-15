@@ -18,6 +18,15 @@ cbuffer ShadowConstants : register(b2) {
     float4 shadow_texel;       // world metres per shadow texel, per cascade
     float4 shadow_depth_range; // metres of light-space depth per cascade
     float3 shadow_cam;         float shadow_res;
+    // The frame's light (ADR-004 L2), read through lighting.hlsli. Here
+    // because every lit shader already binds this buffer for its shadows.
+    float4 l_sun_dir;          // the key light -- sun, or the moon at night -- towards it
+    float4 l_sun_lux;          // its illuminance at the camera's altitude
+    float4 l_sky_mean;         // the sky's mean radiance over the upper hemisphere
+    float4 l_ground;           // the lit ground's radiance, for the lower hemisphere
+    float4 l_sky_zenith;
+    float4 l_sky_horizon_sun;  // the horizon under the key light, and opposite it
+    float4 l_sky_horizon_away;
 };
 
 Texture2DArray<float>  g_shadow     : register(t8);

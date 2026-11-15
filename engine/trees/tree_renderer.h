@@ -34,6 +34,9 @@ struct TreeDrawSettings {
     float lod1_dist = 170.0f;   // simplified mesh inside this; impostors beyond
     float wind = 1.0f;
     float debug = 0.0f;         // 1 tints by level
+    // Towards the key light -- sun, or moon at night -- which an impostor's
+    // shadow card faces. The renderer sets it every frame (ADR-004 L2).
+    float sun_dir[3] = {0.465778f, 0.807348f, 0.362271f};
 };
 
 struct TreeFrameInputs {

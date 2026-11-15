@@ -2,6 +2,7 @@
 #include "engine/render/shader_compile.h"
 #include "engine/render/water_wave.h"
 #include "engine/render/lighting_units.h"
+#include "engine/render/atmosphere.h"
 
 #include <d3dcompiler.h>
 #include <cmath>
@@ -51,9 +52,10 @@ struct WaterConstants {
     float debug_mode;
     float cam_water;   // world y of the sea surface directly at the camera
     float pad0[2];
+    float light[7][4]; // the frame's light (ADR-004 L2): Renderer::fill_light
 };
 
-// Matches cbuffer ShadowConstants in shadow.hlsli: 256 bytes.
+// Matches cbuffer ShadowConstants in shadow.hlsli: 368 bytes, in a 512-byte buffer.
 struct ShadowConstants {
     float light_vp[3][16];
     float split[4];        // far edge of each cascade; w = on
@@ -61,14 +63,15 @@ struct ShadowConstants {
     float depth_range[4];
     float cam[3];
     float res;
+    float light[7][4];     // the frame's light (ADR-004 L2): Renderer::fill_light
 };
-static_assert(sizeof(ShadowConstants) == 256, "ShadowConstants must match shadow.hlsli");
+static_assert(sizeof(ShadowConstants) == 368, "ShadowConstants must match shadow.hlsli");
 
 // The scene is drawn into two HDR targets -- direct sunlight and everything
 // else -- which the post chain combines (scene_out.hlsli, post.hlsl).
 const DXGI_FORMAT kSceneFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
-// Matches cbuffer PostConstants in post.hlsl: 320 bytes.
+// Matches cbuffer PostConstants in post.hlsl: 384 bytes.
 struct PostConstants {
     float inv_view_proj[16];
     float view_proj[16];
@@ -86,9 +89,24 @@ struct PostConstants {
     float ev100_fixed; UINT  tonemap;
     float meter_lo;    float meter_hi;
     UINT  expo_flags;  float agx_saturation;
-    float agx_power;   float pad1;
+    float agx_power;   float cam_alt_km;
+    float sky_sun_dir[3];  float pad2;
+    float sky_moon_dir[3]; float pad3;
+    float sun_disk[3];     float pad4;
+    float moon_disk[3];    float pad5;
 };
-static_assert(sizeof(PostConstants) == 320, "PostConstants must match post.hlsl");
+static_assert(sizeof(PostConstants) == 384, "PostConstants must match post.hlsl");
+
+// Matches cbuffer AtmosphereConstants in atmosphere.hlsl.
+struct AtmosphereConstants {
+    float inv_view_proj[16];
+    float cam_pos[3];  float cam_alt_km;
+    float sun_dir[3];  float far_plane;
+    float sun_lux[3];  float pad0;
+    float moon_dir[3]; float pad1;
+    float moon_lux[3]; float pad2;
+};
+static_assert(sizeof(AtmosphereConstants) == 144, "AtmosphereConstants must match atmosphere.hlsl");
 
 // 4x4 inverse (row-major), by cofactors.
 bool invert4(const float m[16], float out[16]) {
@@ -503,7 +521,7 @@ bool Renderer::create_water_pipeline(std::string& error) {
         hp.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC rd = {};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rd.Width = 256;                 // CBVs are 256-byte aligned
+        rd.Width = 512;                 // CBVs are 256-byte aligned; 288 bytes since L2's light
         rd.Height = 1;
         rd.DepthOrArraySize = 1;
         rd.MipLevels = 1;
@@ -752,8 +770,10 @@ bool Renderer::create_shadow_resources(std::string& error) {
     }
 
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    // [0] shadow, [1..2] impostor atlases, [3..9] post SRVs, [10..13] post UAVs.
-    hd.NumDescriptors = 16;
+    // [0] shadow, [1..2] impostor atlases, [3..11] post SRVs (the last two the
+    // sky-view table and the aerial-perspective volume), [12..15] post UAVs,
+    // [16..17] the atmosphere's static tables, [18..19] its per-frame UAVs.
+    hd.NumDescriptors = 24;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srv_heap_));
     if (FAILED(hr)) { error = hr_text("shared srv heap", hr); return false; }
@@ -770,7 +790,7 @@ bool Renderer::create_shadow_resources(std::string& error) {
         up.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC bd = {};
         bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width = 256;
+        bd.Width = 512;
         bd.Height = 1;
         bd.DepthOrArraySize = 1;
         bd.MipLevels = 1;
@@ -781,7 +801,7 @@ bool Renderer::create_shadow_resources(std::string& error) {
                                               IID_PPV_ARGS(&shadow_cb_[f]));
         if (FAILED(hr)) { error = hr_text("shadow cb", hr); return false; }
         shadow_cb_[f]->Map(0, nullptr, &shadow_cb_cpu_[f]);
-        std::memset(shadow_cb_cpu_[f], 0, 256);
+        std::memset(shadow_cb_cpu_[f], 0, 512);
     }
     return true;
 }
@@ -793,7 +813,8 @@ bool Renderer::create_shadow_resources(std::string& error) {
 // static shadow edge stays on the same texels instead of crawling as the
 // camera moves.
 void Renderer::compute_cascades(const ViewConstants& view) {
-    float L[3] = {kSunDirX, kSunDirY, kSunDirZ};
+    // The key light: the sun, or the moon at night (sky.cpp).
+    float L[3] = {sky_frame_.key_dir[0], sky_frame_.key_dir[1], sky_frame_.key_dir[2]};
     {
         const float l = std::sqrt(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
         for (int k = 0; k < 3; ++k) L[k] /= l;
@@ -867,6 +888,7 @@ void Renderer::record_shadows(const ViewConstants& view) {
     for (UINT c = 0; c < kCascades; ++c) sc.split[c] = kCascadeSplit[c + 1];
     const bool on = shadows_on_ && mode_ != Mode::Wireframe;
     sc.split[3] = on ? 1.0f : 0.0f;
+    fill_light(sc.light);
     if (on) {
         compute_cascades(view);
         for (UINT c = 0; c < kCascades; ++c) {
@@ -944,12 +966,272 @@ void Renderer::record_shadows(const ViewConstants& view) {
     cmd_->ResourceBarrier(1, &b);
 }
 
+// ---------------------------------------------------------------------------
+// The atmosphere (ADR-004 L2). The static tables are built on the CPU by the
+// same code the GPU samples them with (sky.cpp, atmosphere_march.h) and
+// uploaded on the first frame; the sky-view table and the aerial-perspective
+// volume are rebuilt every frame (atmosphere.hlsl).
+// ---------------------------------------------------------------------------
+
+void Renderer::set_time_of_day(float hours) {
+    hours = std::fmod(hours, 24.0f);
+    if (hours < 0.0f) hours += 24.0f;
+    time_hours_ = hours;
+}
+
+void Renderer::update_sky(float cam_y) {
+    // Re-evaluate when the hour or the camera's height moved enough to show:
+    // the evaluation integrates the sky over the hemisphere (~0.3 ms).
+    if (std::fabs(time_hours_ - sky_hours_) < 1e-4f && std::fabs(cam_y - sky_cam_y_) < 5.0f) return;
+    sky_frame_ = sky_.evaluate(time_hours_, cam_y);
+    sky_hours_ = time_hours_;
+    sky_cam_y_ = cam_y;
+}
+
+void Renderer::fill_light(float out[7][4]) const {
+    const SkyFrame& f = sky_frame_;
+    const float* src[7] = {f.key_dir, f.key_lux, f.sky_mean, f.ground, f.zenith, f.horizon_sun, f.horizon_away};
+    for (int i = 0; i < 7; ++i) {
+        for (int k = 0; k < 3; ++k) out[i][k] = src[i][k];
+        out[i][3] = 0.0f;
+    }
+}
+
+bool Renderer::create_atmosphere(std::string& error) {
+    const double t0 = startup_now_ms();
+    if (!sky_.built()) sky_.build();
+    startup_log().push_back(std::make_pair(std::string("phase: atmosphere tables (CPU)"), startup_now_ms() - t0));
+    update_sky(0.0f);
+
+    D3D12_HEAP_PROPERTIES dh = {};
+    dh.Type = D3D12_HEAP_TYPE_DEFAULT;
+    auto tex = [&](ComPtr<ID3D12Resource>& out, bool vol, UINT w, UINT h, UINT d, DXGI_FORMAT fmt, bool uav,
+                   D3D12_RESOURCE_STATES state, const char* what) -> bool {
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = vol ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = w;
+        rd.Height = h;
+        rd.DepthOrArraySize = UINT16(d);
+        rd.MipLevels = 1;
+        rd.Format = fmt;
+        rd.SampleDesc.Count = 1;
+        rd.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+        const HRESULT hr = device_->CreateCommittedResource(&dh, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr,
+                                                            IID_PPV_ARGS(&out));
+        if (FAILED(hr)) { error = hr_text(what, hr); return false; }
+        return true;
+    };
+    const DXGI_FORMAT f32 = DXGI_FORMAT_R32G32B32A32_FLOAT, f16 = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (!tex(trans_tex_, false, kAtmTransW, kAtmTransH, 1, f32, false, D3D12_RESOURCE_STATE_COPY_DEST, "transmittance table")) return false;
+    if (!tex(ms_tex_, false, kAtmMsSize, kAtmMsSize, 1, f32, false, D3D12_RESOURCE_STATE_COPY_DEST, "multiple-scattering table")) return false;
+    if (!tex(sky_view_tex_, false, kAtmSkyW, kAtmSkyH, 1, f16, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "sky-view table")) return false;
+    if (!tex(ap_tex_, true, 32, 32, 32, f16, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "aerial-perspective volume")) return false;
+
+    // Upload buffers for the two static tables, filled now, copied on the
+    // first frame (record_atmosphere).
+    auto stage = [&](ComPtr<ID3D12Resource>& up, ID3D12Resource* dst, const std::vector<float>& src, UINT w, UINT h) -> bool {
+        const D3D12_RESOURCE_DESC dd = dst->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+        UINT64 total = 0;
+        device_->GetCopyableFootprints(&dd, 0, 1, 0, &fp, nullptr, nullptr, &total);
+        D3D12_HEAP_PROPERTIES uh = {};
+        uh.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = total;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const HRESULT hr = device_->CreateCommittedResource(&uh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                            nullptr, IID_PPV_ARGS(&up));
+        if (FAILED(hr)) { error = hr_text("atmosphere upload", hr); return false; }
+        unsigned char* p = nullptr;
+        up->Map(0, nullptr, reinterpret_cast<void**>(&p));
+        for (UINT y = 0; y < h; ++y)
+            std::memcpy(p + fp.Offset + size_t(y) * fp.Footprint.RowPitch, &src[size_t(y) * w * 4], size_t(w) * 16);
+        up->Unmap(0, nullptr);
+        return true;
+    };
+    if (!stage(trans_up_, trans_tex_.Get(), sky_.transmittance(), kAtmTransW, kAtmTransH)) return false;
+    if (!stage(ms_up_, ms_tex_.Get(), sky_.multiple_scattering(), kAtmMsSize, kAtmMsSize)) return false;
+    atm_uploaded_ = false;
+
+    // Descriptors: [10] sky-view and [11] the volume for the post chain,
+    // [16..17] the static tables and [18..19] the per-frame UAVs for ours.
+    const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto slot = [&](UINT i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE c = srv_heap_->GetCPUDescriptorHandleForHeapStart();
+        c.ptr += SIZE_T(i) * inc;
+        return c;
+    };
+    auto srv2 = [&](ID3D12Resource* r, DXGI_FORMAT fmt, UINT i) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = fmt;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        device_->CreateShaderResourceView(r, &sd, slot(i));
+    };
+    srv2(sky_view_tex_.Get(), f16, 10);
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = f16;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture3D.MipLevels = 1;
+        device_->CreateShaderResourceView(ap_tex_.Get(), &sd, slot(11));
+    }
+    srv2(trans_tex_.Get(), f32, 16);
+    srv2(ms_tex_.Get(), f32, 17);
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = f16;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        device_->CreateUnorderedAccessView(sky_view_tex_.Get(), nullptr, &ud, slot(18));
+        ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        ud.Texture3D.WSize = 32;
+        device_->CreateUnorderedAccessView(ap_tex_.Get(), nullptr, &ud, slot(19));
+    }
+
+    for (UINT f = 0; f < kFrameCount; ++f) {
+        D3D12_HEAP_PROPERTIES uh = {};
+        uh.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = 256;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const HRESULT hr = device_->CreateCommittedResource(&uh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                            nullptr, IID_PPV_ARGS(&atm_cb_[f]));
+        if (FAILED(hr)) { error = hr_text("atmosphere cb", hr); return false; }
+        atm_cb_[f]->Map(0, nullptr, &atm_cb_cpu_[f]);
+    }
+
+    {
+        D3D12_DESCRIPTOR_RANGE sr = {};
+        sr.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr.NumDescriptors = 2;
+        D3D12_DESCRIPTOR_RANGE ur = {};
+        ur.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ur.NumDescriptors = 2;
+        D3D12_ROOT_PARAMETER p[3] = {};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[1].DescriptorTable.NumDescriptorRanges = 1;
+        p[1].DescriptorTable.pDescriptorRanges = &sr;
+        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[2].DescriptorTable.NumDescriptorRanges = 1;
+        p[2].DescriptorTable.pDescriptorRanges = &ur;
+        for (int k = 0; k < 3; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_STATIC_SAMPLER_DESC ss = {};
+        ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        ss.MaxLOD = D3D12_FLOAT32_MAX;
+        ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rsd = {};
+        rsd.NumParameters = 3;
+        rsd.pParameters = p;
+        rsd.NumStaticSamplers = 1;
+        rsd.pStaticSamplers = &ss;
+        ComPtr<ID3DBlob> sig, err;
+        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+        if (FAILED(hr)) { error = "atmosphere root signature"; return false; }
+        hr = device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&atm_root_));
+        if (FAILED(hr)) { error = hr_text("CreateRootSignature (atmosphere)", hr); return false; }
+    }
+    return create_atmosphere_pipelines(error);
+}
+
+bool Renderer::create_atmosphere_pipelines(std::string& error) {
+    const char* kAtm = "engine/render/shaders/atmosphere.hlsl";
+    const char* entries[2] = {"cs_sky_view", "cs_aerial"};
+    ComPtr<ID3D12PipelineState>* outs[2] = {&sky_view_pso_, &aerial_pso_};
+    for (int k = 0; k < 2; ++k) {
+        ComPtr<ID3DBlob> cs;
+        if (!compile_shader(kAtm, entries[k], "cs_5_1", cs, error)) return false;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cd = {};
+        cd.pRootSignature = atm_root_.Get();
+        cd.CS.pShaderBytecode = cs->GetBufferPointer();
+        cd.CS.BytecodeLength = cs->GetBufferSize();
+        if (FAILED(device_->CreateComputePipelineState(&cd, IID_PPV_ARGS(outs[k]->GetAddressOf())))) {
+            error = "atmosphere compute pso";
+            return false;
+        }
+    }
+    return true;
+}
+
+void Renderer::record_atmosphere() {
+    auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+        D3D12_RESOURCE_BARRIER rb = {};
+        rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        rb.Transition.pResource = r;
+        rb.Transition.StateBefore = a;
+        rb.Transition.StateAfter = b;
+        rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd_->ResourceBarrier(1, &rb);
+    };
+    if (!atm_uploaded_) {
+        ID3D12Resource* dst[2] = {trans_tex_.Get(), ms_tex_.Get()};
+        ID3D12Resource* src[2] = {trans_up_.Get(), ms_up_.Get()};
+        for (int k = 0; k < 2; ++k) {
+            const D3D12_RESOURCE_DESC dd = dst[k]->GetDesc();
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+            device_->GetCopyableFootprints(&dd, 0, 1, 0, &fp, nullptr, nullptr, nullptr);
+            D3D12_TEXTURE_COPY_LOCATION d = {}, s = {};
+            d.pResource = dst[k];
+            d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            s.pResource = src[k];
+            s.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            s.PlacedFootprint = fp;
+            cmd_->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+            tr(dst[k], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        atm_uploaded_ = true;
+    }
+
+    AtmosphereConstants ac = {};
+    invert4(view_proj_, ac.inv_view_proj);
+    for (int k = 0; k < 3; ++k) {
+        ac.cam_pos[k] = cur_cam_[k];
+        ac.sun_dir[k] = sky_frame_.sun_dir[k];
+        ac.sun_lux[k] = sky_frame_.sun_lux_top[k];
+        ac.moon_dir[k] = sky_frame_.moon_dir[k];
+        ac.moon_lux[k] = sky_frame_.moon_lux_top[k];
+    }
+    ac.cam_alt_km = sky_frame_.cam_alt_km;
+    ac.far_plane = kFarPlane;
+    std::memcpy(atm_cb_cpu_[frame_], &ac, sizeof ac);
+
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
+    cmd_->SetDescriptorHeaps(1, heaps);
+    const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_GPU_DESCRIPTOR_HANDLE srvs = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+    srvs.ptr += UINT64(16) * inc;
+    D3D12_GPU_DESCRIPTOR_HANDLE uavs = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+    uavs.ptr += UINT64(18) * inc;
+    cmd_->SetComputeRootSignature(atm_root_.Get());
+    cmd_->SetComputeRootConstantBufferView(0, atm_cb_[frame_]->GetGPUVirtualAddress());
+    cmd_->SetComputeRootDescriptorTable(1, srvs);
+    cmd_->SetComputeRootDescriptorTable(2, uavs);
+    cmd_->SetPipelineState(sky_view_pso_.Get());
+    cmd_->Dispatch((kAtmSkyW + 7) / 8, (kAtmSkyH + 7) / 8, 1);
+    cmd_->SetPipelineState(aerial_pso_.Get());
+    cmd_->Dispatch(4, 4, 1);
+}
+
 bool Renderer::reload_shaders(std::string& error) {
     if (ready_) wait_for_gpu();
     if (!mesher_.reload_shaders(device_.Get(), error)) return false;
     if (!create_mesh_pipeline(error)) return false;
     if (!create_water_pipeline(error)) return false;
     if (!create_post_pipelines(error)) return false;
+    if (!create_atmosphere_pipelines(error)) return false;
     // Everything resident was built by the old kernel, so start again.
     streamer_.init();
     return true;
@@ -984,6 +1266,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
 
     if (!create_depth(error)) return false;
     if (!create_shadow_resources(error)) return false;
+    if (!create_atmosphere(error)) return false;
     if (!create_post_targets(error)) return false;
     if (!create_post_pipelines(error)) return false;
 
@@ -1168,7 +1451,7 @@ bool Renderer::create_post_targets(std::string& error) {
                                                           clear ? &cv : nullptr, IID_PPV_ARGS(&out)));
     };
     const float zero[4] = {0, 0, 0, 1};
-    const float sky[4] = {kSkyHorizonR, kSkyHorizonG, kSkyHorizonB, 1.0f};
+    const float sky[4] = {kSkyClearR, kSkyClearG, kSkyClearB, 1.0f};
     const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -1216,10 +1499,10 @@ bool Renderer::create_post_targets(std::string& error) {
     srv(scene_.Get(), kSceneFormat, 7);
     srv(history_[0].Get(), kSceneFormat, 8);
     srv(history_[1].Get(), kSceneFormat, 9);
-    uavd(ao_.Get(), DXGI_FORMAT_R8_UNORM, 10);
-    uavd(scene_.Get(), kSceneFormat, 11);
-    uavd(history_[0].Get(), kSceneFormat, 12);
-    uavd(history_[1].Get(), kSceneFormat, 13);
+    uavd(ao_.Get(), DXGI_FORMAT_R8_UNORM, 12);
+    uavd(scene_.Get(), kSceneFormat, 13);
+    uavd(history_[0].Get(), kSceneFormat, 14);
+    uavd(history_[1].Get(), kSceneFormat, 15);
     hist_valid_ = false;
     return true;
 }
@@ -1228,7 +1511,7 @@ bool Renderer::create_post_pipelines(std::string& error) {
     if (!post_root_) {
         D3D12_DESCRIPTOR_RANGE sr = {};
         sr.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        sr.NumDescriptors = 7;
+        sr.NumDescriptors = 9;
         D3D12_DESCRIPTOR_RANGE ur = {};
         ur.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         ur.NumDescriptors = 4;
@@ -1247,19 +1530,22 @@ bool Renderer::create_post_pipelines(std::string& error) {
         p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
         p[4].Descriptor.ShaderRegister = 5;
         for (int k = 0; k < 5; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_STATIC_SAMPLER_DESC ss[2] = {};
+        D3D12_STATIC_SAMPLER_DESC ss[3] = {};
         ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         ss[1].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-        for (int k = 0; k < 2; ++k) {
+        ss[2].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        for (int k = 0; k < 3; ++k) {
             ss[k].AddressU = ss[k].AddressV = ss[k].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
             ss[k].MaxLOD = D3D12_FLOAT32_MAX;
             ss[k].ShaderRegister = k;
             ss[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         }
+        // The sky-view table is world azimuth in u: it wraps.
+        ss[2].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
         rsd.NumParameters = 5;
         rsd.pParameters = p;
-        rsd.NumStaticSamplers = 2;
+        rsd.NumStaticSamplers = 3;
         rsd.pStaticSamplers = ss;
         ComPtr<ID3DBlob> sig, err;
         HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
@@ -1355,7 +1641,14 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     std::memcpy(pc.view_proj, view_proj_, sizeof pc.view_proj);
     std::memcpy(pc.prev_view_proj, prev_vp_, sizeof pc.prev_view_proj);
     for (int k = 0; k < 3; ++k) pc.cam_pos[k] = cur_cam_[k];
-    pc.sun_dir[0] = kSunDirX; pc.sun_dir[1] = kSunDirY; pc.sun_dir[2] = kSunDirZ;
+    for (int k = 0; k < 3; ++k) {
+        pc.sun_dir[k] = sky_frame_.key_dir[k];          // contact shadows march towards the key light
+        pc.sky_sun_dir[k] = sky_frame_.sun_dir[k];
+        pc.sky_moon_dir[k] = sky_frame_.moon_dir[k];
+        pc.sun_disk[k] = sky_frame_.sun_disk[k];
+        pc.moon_disk[k] = sky_frame_.moon_disk[k];
+    }
+    pc.cam_alt_km = sky_frame_.cam_alt_km;
     pc.near_plane = kNearPlane;
     pc.far_plane = kFarPlane;
     pc.sharpen = taa_on_ && !wire ? 0.5f : 0.0f;
@@ -1411,6 +1704,10 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
         rb.UAV.pResource = r;
         cmd_->ResourceBarrier(1, &rb);
     };
+    // The sky-view table and the aerial-perspective volume for this frame.
+    record_atmosphere();
+    tr(sky_view_tex_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    tr(ap_tex_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     tr(depth_.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, read);
     tr(hdr_direct_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
     tr(hdr_ambient_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
@@ -1421,7 +1718,7 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     D3D12_GPU_DESCRIPTOR_HANDLE srvs = srv_heap_->GetGPUDescriptorHandleForHeapStart();
     srvs.ptr += UINT64(3) * inc;
     D3D12_GPU_DESCRIPTOR_HANDLE uavs = srv_heap_->GetGPUDescriptorHandleForHeapStart();
-    uavs.ptr += UINT64(10) * inc;
+    uavs.ptr += UINT64(12) * inc;
     cmd_->SetComputeRootSignature(post_root_.Get());
     cmd_->SetComputeRootConstantBufferView(0, post_cb_[frame_]->GetGPUVirtualAddress());
     cmd_->SetComputeRootDescriptorTable(1, srvs);
@@ -1476,6 +1773,8 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     cmd_->DrawInstanced(3, 1, 0, 0);
 
     // Back to where the next frame starts.
+    tr(sky_view_tex_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    tr(ap_tex_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     tr(ao_.Get(), read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     tr(scene_.Get(), read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     tr(depth_.Get(), read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -1490,6 +1789,9 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
 }
 
 void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HANDLE rtv) {
+    // This frame's sun, moon and sky (ADR-004 L2), before anything uses them.
+    update_sky(view.cam_pos[1]);
+    for (int k = 0; k < 3; ++k) tree_settings_.sun_dir[k] = sky_frame_.key_dir[k];
     // The sun's view first: the shadow map has to be finished before anything
     // that samples it is drawn.
     record_shadows(view);
@@ -1543,10 +1845,11 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
 
     {
         // The mesh does not cover the screen, so the sky is cleared rather
-        // than drawn: into the ambient target, with no direct light. The
-        // sky's radiance at the horizon (lighting_units.h), in nits, which
-        // capture()'s crack test compares against exactly.
-        const float sky[4] = {kSkyHorizonR, kSkyHorizonG, kSkyHorizonB, 1.0f};
+        // than drawn -- since L2 by the post chain, from the atmosphere. The
+        // ambient target is cleared to a MARKER (lighting_units.h) that
+        // capture()'s crack test compares against exactly and the composite
+        // reads the sea's coverage from.
+        const float sky[4] = {kSkyClearR, kSkyClearG, kSkyClearB, 1.0f};
         const float none[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         cmd_->ClearRenderTargetView(hdr[0], none, 0, nullptr);
         cmd_->ClearRenderTargetView(hdr[1], sky, 0, nullptr);
@@ -1629,7 +1932,8 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         wc.time = view.time;
         // The same sun the terrain is lit by, or the two surfaces disagree
         // about where the light is and the sea looks pasted on.
-        wc.sun_dir[0] = kSunDirX; wc.sun_dir[1] = kSunDirY; wc.sun_dir[2] = kSunDirZ;
+        for (int k = 0; k < 3; ++k) wc.sun_dir[k] = sky_frame_.key_dir[k];
+        fill_light(wc.light);
         wc.far_plane = kFarPlane;
         // The camera basis, because the grid is built on the SCREEN and needs
         // to know which way each pixel looks.
@@ -2256,6 +2560,37 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
         cmd_->ResourceBarrier(1, &db2);
     }
 
+    // The sky-view table, for the CPU-to-GPU agreement check.
+    ComPtr<ID3D12Resource> sky_rb;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT sfp = {};
+    {
+        const D3D12_RESOURCE_DESC sdsc = sky_view_tex_->GetDesc();
+        UINT64 stotal = 0;
+        device_->GetCopyableFootprints(&sdsc, 0, 1, 0, &sfp, nullptr, nullptr, &stotal);
+        D3D12_RESOURCE_DESC sb = bd;
+        sb.Width = stotal;
+        hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &sb, D3D12_RESOURCE_STATE_COPY_DEST,
+                                              nullptr, IID_PPV_ARGS(&sky_rb));
+        if (FAILED(hr)) { error = hr_text("CreateCommittedResource (sky readback)", hr); return false; }
+        D3D12_RESOURCE_BARRIER t = {};
+        t.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        t.Transition.pResource = sky_view_tex_.Get();
+        t.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        t.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        t.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        cmd_->ResourceBarrier(1, &t);
+        D3D12_TEXTURE_COPY_LOCATION sd = {}, ss = {};
+        sd.pResource = sky_rb.Get();
+        sd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        sd.PlacedFootprint = sfp;
+        ss.pResource = sky_view_tex_.Get();
+        ss.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        cmd_->CopyTextureRegion(&sd, 0, 0, 0, &ss, nullptr);
+        t.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        t.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        cmd_->ResourceBarrier(1, &t);
+    }
+
     // The exposure meter: what the histogram saw and what it chose.
     ComPtr<ID3D12Resource> meter_rb;
     {
@@ -2322,6 +2657,47 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
     D3D12_RANGE none = {0, 0};
     readback->Unmap(0, &none);
 
+    // The sky table against the CPU's own march of the same texels: a grid
+    // of 16 x 12, at the GPU's 30 steps. Half floats read back, so anything
+    // under 0.1% is the storage, not the model.
+    sky_check_ = SkyCheck();
+    {
+        unsigned char* sp = nullptr;
+        if (SUCCEEDED(sky_rb->Map(0, nullptr, reinterpret_cast<void**>(&sp)))) {
+            auto h2f = [](unsigned short h) {
+                const unsigned e = (h >> 10) & 31u, m = h & 1023u;
+                if (e == 0) return float(m) / 16777216.0f;
+                return std::ldexp(float(m | 1024u), int(e) - 25);
+            };
+            double sum = 0.0;
+            for (int gy = 0; gy < 12; ++gy) {
+                for (int gx = 0; gx < 16; ++gx) {
+                    const int x = (gx * kAtmSkyW) / 16 + 5, y = (gy * kAtmSkyH) / 12 + 4;
+                    const unsigned short* px = reinterpret_cast<const unsigned short*>(
+                        sp + size_t(sfp.Offset) + size_t(y) * sfp.Footprint.RowPitch) + size_t(x) * 4;
+                    const float g = 0.2126f * h2f(px[0]) + 0.7152f * h2f(px[1]) + 0.0722f * h2f(px[2]);
+                    float dir[3], c[3];
+                    Sky::sky_texel_dir(x, y, sky_frame_.cam_alt_km, dir);
+                    sky_.radiance(sky_frame_, sky_frame_.cam_alt_km, dir, c, 30);
+                    const float l = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
+                    if (l <= 1e-6f) continue;
+                    const float rel = std::fabs(g - l) / l;
+                    sum += rel;
+                    ++sky_check_.texels;
+                    if (rel > sky_check_.worst_rel) {
+                        sky_check_.worst_rel = rel;
+                        sky_check_.worst_at[0] = float(x);
+                        sky_check_.worst_at[1] = float(y);
+                    }
+                }
+            }
+            sky_check_.mean_rel = sky_check_.texels ? float(sum / sky_check_.texels) : 0.0f;
+            sky_check_.valid = sky_check_.texels > 0;
+            D3D12_RANGE nr = {0, 0};
+            sky_rb->Unmap(0, &nr);
+        }
+    }
+
     exposure_report_ = ExposureReport();
     {
         void* mp = nullptr;
@@ -2384,9 +2760,9 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
                     const unsigned short* dp = drow_h + x * 4;
                     const unsigned short* ap = arow_h + x * 4;
                     const bool clear = d && dp[0] == 0 && dp[1] == 0 && dp[2] == 0 &&
-                                       half(ap[0]) == kSkyHorizonR &&
-                                       half(ap[1]) == kSkyHorizonG &&
-                                       half(ap[2]) == kSkyHorizonB;
+                                       half(ap[0]) == kSkyClearR &&
+                                       half(ap[1]) == kSkyClearG &&
+                                       half(ap[2]) == kSkyClearB;
                     cracks_.undrawn += clear;
                     if (clear && cracks_.where.size() < 200) cracks_.where.push_back(std::make_pair(int(x), int(y)));
                 }

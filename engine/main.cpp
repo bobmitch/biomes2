@@ -30,6 +30,7 @@
 #include "engine/render/renderer.h"
 #include "engine/render/water_wave.h"
 #include "engine/render/shader_compile.h"
+#include "engine/render/sky.h"
 #include "engine/camera.h"
 #include "engine/physics/physics_world.h"
 #include "engine/trees/felling.h"
@@ -158,6 +159,8 @@ void step_window_physics(float dt, float t, float vx, float vz, bool jump, float
 }
 bool g_captured = false;
 bool g_want_shot = false;
+// Time of day running on its own (H): an hour every ten seconds.
+bool g_time_lapse = false;
 
 void set_capture(HWND hwnd, bool on) {
     if (on == g_captured) return;
@@ -243,6 +246,13 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // Exposure and tonemap (ADR-004 L1): U cycles AgX -> ACES -> raw,
             // and , . step the exposure compensation by half a stop.
             if (wp == 'U') { g_renderer.set_tonemap((g_renderer.tonemap() + 2u) % 3u); return 0; }
+            // Time of day (ADR-004 L2): Page Up / Page Down step half an hour,
+            // H runs the clock at an hour every ten seconds.
+            if (wp == VK_PRIOR || wp == VK_NEXT) {
+                g_renderer.set_time_of_day(g_renderer.time_of_day() + (wp == VK_PRIOR ? 0.5f : -0.5f));
+                return 0;
+            }
+            if (wp == 'H') { g_time_lapse = !g_time_lapse; return 0; }
             if (wp == VK_OEM_COMMA || wp == VK_OEM_PERIOD) {
                 g_renderer.set_ev_comp(g_renderer.ev_comp() + (wp == VK_OEM_PERIOD ? 0.5f : -0.5f));
                 return 0;
@@ -392,6 +402,16 @@ static int run_sea_report(const char* path) {
 }
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
+    // --sky-report (ADR-004 L2): the atmosphere model against published
+    // clear-sky references. CPU only -- no device, no window, no world.
+    if (std::string(cmdline ? cmdline : "").find("--sky-report") != std::string::npos) {
+        std::string err;
+        const bool ok = engine::write_sky_report("build/sky_report.txt", err);
+        if (!ok) {
+            if (FILE* ef = std::fopen("build/engine_error.txt", "w")) { std::fputs(err.c_str(), ef); std::fclose(ef); }
+        }
+        return ok ? 0 : 1;
+    }
     // --shot <path> renders one frame at a fixed camera and writes it out
     // without showing the window, with residency filled first so the image is
     // the finished world rather than eight chunks of it.
@@ -662,6 +682,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (c2.find("--no-post") != std::string::npos) {
             g_renderer.set_taa(false); g_renderer.set_ao(false); g_renderer.set_contact(false);
         }
+        // Time of day (ADR-004 L2), hours: --time 6.5 is half past six.
+        const size_t tod = c2.find("--time");
+        if (tod != std::string::npos) g_renderer.set_time_of_day(float(std::atof(c2.c_str() + tod + 6)));
         // Exposure and tonemap (ADR-004 L1).
         const size_t evc = c2.find("--ev-comp");
         if (evc != std::string::npos) g_renderer.set_ev_comp(float(std::atof(c2.c_str() + evc + 9)));
@@ -970,6 +993,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                         std::fprintf(f, " %d %d", cc.where[q].first, cc.where[q].second);
                     std::fprintf(f, "\n");
                 }
+            }
+            {
+                // The atmosphere (ADR-004 L2): the hour, the light, and the
+                // GPU's sky table against the CPU's march of it.
+                const engine::SkyFrame& sf = g_renderer.sky_frame();
+                const float kl = 0.2126f * sf.key_lux[0] + 0.7152f * sf.key_lux[1] + 0.0722f * sf.key_lux[2];
+                const float sm = 3.14159265f * (0.2126f * sf.sky_mean[0] + 0.7152f * sf.sky_mean[1] + 0.0722f * sf.sky_mean[2]);
+                std::fprintf(f, "sky: %02d:%02d, sun %.1f deg up; key light the %s, %.4g lux; sky on level ground %.4g lux\n",
+                             int(sf.hours), int((sf.hours - float(int(sf.hours))) * 60.0f), sf.sun_elevation_deg,
+                             sf.key_is_moon ? "moon" : "sun", kl, sm);
+                const engine::Renderer::SkyCheck& sk = g_renderer.last_sky_check();
+                if (sk.valid)
+                    std::fprintf(f, "sky table GPU vs CPU: %d texels, mean %.3f%%, worst %.3f%% at (%.0f, %.0f)\n",
+                                 sk.texels, sk.mean_rel * 100.0f, sk.worst_rel * 100.0f, sk.worst_at[0], sk.worst_at[1]);
             }
             {
                 // The exposure meter (ADR-004 L1): what it saw and what it
@@ -3307,6 +3344,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_renderer.capture(view, "build/shot.bmp", err);
         }
 
+        if (g_time_lapse) g_renderer.set_time_of_day(g_renderer.time_of_day() + float(dt) * 0.1f);
         const double frame_ms = dt * 1000.0;
         if (frame_ms > worst_frame_ms) worst_frame_ms = frame_ms;
         fps_accum += dt;
@@ -3314,10 +3352,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (fps_accum >= 0.5) {
             const engine::FrameStats st = g_renderer.stats();
             char title[400];
+            const float tod = g_renderer.time_of_day();
             std::snprintf(title, sizeof(title),
-                          "biomes2 engine - %s [M] %s [T] - trees %.0f m [-=] %s - %.0f fps (worst %.1f ms) - "
+                          "biomes2 engine - %02d:%02d%s [PgUp/PgDn H] - %s [M] %s [T] - trees %.0f m [-=] %s - %.0f fps (worst %.1f ms) - "
                           "%zu chunks, %u tris - %u meshed/frame in %.3f ms - "
                           "%zu pending, %zu slots free%s%s",
+                          int(tod), int((tod - float(int(tod))) * 60.0f), g_time_lapse ? " running" : "",
                           g_renderer.mode() == engine::Mode::Mesh ? "shaded" : "wireframe",
                           g_renderer.texture_mode() < 0.5f ? "flat"
                           : g_renderer.texture_mode() < 1.5f ? "detail"

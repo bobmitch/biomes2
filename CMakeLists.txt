@@ -155,7 +155,8 @@ if(BIOMES2_ENGINE)
     engine/trees/tree_renderer.cpp
     engine/trees/felling.cpp
     engine/foliage/foliage_renderer.cpp
-    engine/render/rt_check.cpp)
+    engine/render/rt_check.cpp
+    engine/render/sky.cpp)
   target_include_directories(engine PRIVATE ${PROJECT_SOURCE_DIR})
   # M1: the engine links the generator now. Track B was built against the
   # trivial field precisely so a pipeline bug could never be confused with a

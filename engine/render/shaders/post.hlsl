@@ -7,7 +7,10 @@
 //                pixel and frame that TAA integrates.
 //   cs_composite full resolution: direct x screen-space contact shadow
 //                (a short march towards the sun through the depth buffer)
-//                + ambient x AO (depth-aware upsample) -> one HDR colour.
+//                + ambient x AO (depth-aware upsample) -> one HDR colour;
+//                then the atmosphere (L2): aerial perspective over every
+//                surface by its depth, and the sky -- the sky-view table, the
+//                sun's and the moon's disks -- wherever nothing was drawn.
 //   cs_taa       reproject last frame's result by depth, clip it to this
 //                frame's neighbourhood (YCoCg variance box), blend 1:9.
 //   cs_hist_*    a 256-bin histogram of log2 luminance of what TAA produced
@@ -41,7 +44,11 @@ cbuffer PostConstants : register(b0) {
     float  ev100_fixed; uint  tonemap;   // a fixed EV100 when > -100, else metered; 0 raw, 1 AgX, 2 ACES
     float  meter_lo;    float meter_hi;  // the metered band, as fractions of the pixels
     uint   expo_flags;  float agx_saturation;   // expo_flags 1: adapt instantly (a still)
-    float  agx_power;   float pad1;      // AgX look: a contrast power on the curve's output
+    float  agx_power;   float cam_alt_km;   // AgX look; the camera's altitude for the sky table
+    float3 sky_sun_dir;  float pad2;         // the sun and moon themselves, for their disks
+    float3 sky_moon_dir; float pad3;
+    float3 sun_disk;     float pad4;         // disk radiance seen from the camera, nits
+    float3 moon_disk;    float pad5;
 };
 
 Texture2D<float>  g_depth   : register(t0);
@@ -51,6 +58,8 @@ Texture2D<float>  g_ao      : register(t3);
 Texture2D<float4> g_scene   : register(t4);
 Texture2D<float4> g_hist0   : register(t5);
 Texture2D<float4> g_hist1   : register(t6);
+Texture2D<float4> g_skyview : register(t7);   // atmosphere.hlsl: the sky round the camera
+Texture3D<float4> g_ap      : register(t8);   // atmosphere.hlsl: in-scatter (rgb), transmittance (a)
 
 RWTexture2D<float>  u_ao    : register(u0);
 RWTexture2D<float4> u_scene : register(u1);
@@ -63,6 +72,10 @@ RWStructuredBuffer<float4> u_expo    : register(u5);
 
 SamplerState g_linear : register(s0);
 SamplerState g_point  : register(s1);
+SamplerState g_wrap_u : register(s2);   // the sky table wraps round in azimuth
+
+#include "engine/render/atmosphere.h"
+#include "engine/render/lighting_units.h"
 
 float ign(float2 p) {
     return frac(52.9829189f * frac(dot(p, float2(0.06711056f, 0.00583715f))));
@@ -137,6 +150,41 @@ void cs_ao(uint3 id : SV_DispatchThreadID) {
     u_ao[id.xy] = saturate(1.0f - occl * 0.25f * 1.1f);
 }
 
+// --- the atmosphere ---------------------------------------------------------------
+
+// The sky along a direction: the sky-view table, then the sun's disk, limb
+// darkened, and the moon's.
+float3 sky_at(float3 d) {
+    float u, v;
+    atm_sky_uv(d, kAtmGround + cam_alt_km, u, v);
+    float3 c = g_skyview.SampleLevel(g_wrap_u, float2(u, v), 0).rgb;
+    const float r_sun = 0.2667f * 0.0174533f, r_moon = 0.259f * 0.0174533f;
+    // The angle to each centre, from the chord: acos is too coarse this
+    // close to 1 in single precision.
+    const float a_sun = 2.0f * asin(saturate(0.5f * length(d - sky_sun_dir)));
+    const float a_moon = 2.0f * asin(saturate(0.5f * length(d - sky_moon_dir)));
+    if (a_sun < r_sun) {
+        const float t = a_sun / r_sun;
+        c += sun_disk * (1.0f - 0.6f * (1.0f - sqrt(max(0.0f, 1.0f - t * t))));
+    }
+    if (a_moon < r_moon) c += moon_disk;
+    return min(c, kSceneMaxNits);
+}
+
+// The haze between the camera and a point `dist` metres away along this
+// pixel's ray: (in-scattered light, transmittance). The volume's slice k ends
+// at far * ((k + 1) / 32)^2 (atmosphere.hlsl); nearer than slice 0 fades
+// from nothing.
+float4 aerial(float2 uv, float dist) {
+    const float w = sqrt(saturate(dist / far_plane)) * 32.0f - 1.0f;
+    float4 s = g_ap.SampleLevel(g_linear, float3(uv, (max(w, 0.0f) + 0.5f) / 32.0f), 0);
+    if (w < 0.0f) {
+        const float f = w + 1.0f;
+        s = float4(s.rgb * f, lerp(1.0f, s.a, f));
+    }
+    return s;
+}
+
 // --- composite ----------------------------------------------------------------
 
 float ao_upsample(int2 p, float z) {
@@ -193,8 +241,18 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     const float3 amb = g_ambient[p].rgb;
     // A debug colour (scene_flat): as is, marked for the final pass.
     if (g_ambient[p].a < -0.5f) { u_scene[p] = float4(amb, 0.0f); return; }
-    if (z >= 1.0f) { u_scene[p] = float4(dir + amb, 1.0f); return; }
     const float2 uv = (float2(p) + 0.5f) * inv_size;
+    if (z >= 1.0f) {
+        // Nothing with depth: the sky. The sea beyond the clipmap draws
+        // without depth, blending its colour into the direct target and
+        // taking its share out of the ambient one, which was cleared to the
+        // marker -- so what is left of the marker is how much sky shows.
+        const float3 d = normalize(world_at(uv, 1.0f) - cam_pos);
+        const float vis = saturate(amb.g / kSkyClearG);
+        const float4 apf = aerial(uv, far_plane);
+        u_scene[p] = float4(dir * apf.a + apf.rgb * (1.0f - vis) + sky_at(d) * vis, 1.0f);
+        return;
+    }
     const float3 P = world_at(uv, z);
     const float aow = saturate(g_ambient[p].a);
     const float ao = (flags & 2u) != 0u ? lerp(1.0f, ao_upsample(p, z), aow) : 1.0f;
@@ -202,6 +260,9 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     const float cs = ((flags & 4u) != 0u && cmask > 0.01f && dot(dir, dir) > 1e-6f)
                    ? lerp(1.0f, contact_shadow(p, z, P), 0.7f * saturate(cmask)) : 1.0f;   // never fully black: sky light still reaches a crease
     float3 c = dir * cs + amb * ao;
+    // The atmosphere between the eye and the surface.
+    const float4 ap = aerial(uv, length(P - cam_pos));
+    c = c * ap.a + ap.rgb;
     float mark = 1.0f;
     if (debug > 0.5f && debug < 1.5f) { c = ao.xxx; mark = 0.0f; }
     if (debug > 1.5f && debug < 2.5f) { c = cs.xxx; mark = 0.0f; }

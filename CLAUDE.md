@@ -52,8 +52,10 @@ one frame at a fixed camera and writes a BMP without opening a window.
 The engine's headless modes all write a text file under `build/` and exit:
 `--shot`, `--flight <s>`, `--walk <s>`, `--overhang`, `--dig`, `--dig-save`,
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
-`--band-report`, `--sea-report`, `--swim`, `--blend-report`, `--tab-test`
-and `--fell` (with `--fell-save` / `--fell-verify`). `--flight` also takes `--settle`, `--holes` and
+`--band-report`, `--sea-report`, `--swim`, `--blend-report`, `--tab-test`,
+`--sky-report` (CPU only, no device: the atmosphere against clear-sky
+references) and `--fell` (with `--fell-save` / `--fell-verify`). Every mode
+takes `--time <hours>` (ADR-004 L2: 14 by default, which is the pre-L2 sun). `--flight` also takes `--settle`, `--holes` and
 `--flight-speed <m/s>` and `--flight-from x y z`; `--shot` takes
 `--slot-report`; every mode takes `--mesh-debug 1|2` (curtain, creases) and
 the streaming A/B switches `--no-lod-align`,
@@ -521,11 +523,11 @@ at ground level, 0.09 of it the effects.
 
 ### Light in physical units (ADR-004 L1)
 
-**Both targets hold radiance in nits.** `engine/render/lighting_units.h` is
-the one copy of the light -- sun in lux, sky in nits, the sun's direction --
-and it compiles as C++ and HLSL like `water_wave.h`, so the clear colour,
-the crack test, the shadow and post constants and every shader read the same
-numbers. Every authored colour in the engine is still sRGB-encoded as typed;
+**Both targets hold radiance in nits.** Since L2 the light itself comes
+from the atmosphere (below); `engine/render/lighting_units.h`, which compiles
+as C++ and HLSL like `water_wave.h`, keeps what does not move -- the clear
+MARKER the crack test and the composite read, the ground's bounce albedo,
+the clamp. Every authored colour in the engine is still sRGB-encoded as typed;
 `srgb_to_linear` comes first, in the shader (or in `world_gpu.cpp` for the
 terrain materials). `lighting.hlsli` has the BRDF (Lambert + GGX, Smith
 height-correlated, Schlick, F0 0.04) and the ADR's shading-facing GI
@@ -570,8 +572,58 @@ and keeps AgX's hue handling, which a torch's orange will need.
   ms a frame; the flight's mean frame 1.83 -> 2.05 ms, walking unchanged.
 - **The sea reads duller than before L1**, grey-green where it was teal: the
   old teal came from blending in display space, and a physically blended
-  grazing reflection is mostly sky. Untuned on purpose: L2 replaces the
-  sky it reflects and L7 owns water reflections.
+  grazing reflection is mostly sky. L2 did not fix it -- the sky it reflects
+  is real now and the sea is no better at noon (at sunset its glitter path
+  is the best thing in the engine). L7 owns water reflections.
+
+### The atmosphere and time of day (ADR-004 L2)
+
+Hillaire 2020 on Bruneton's Earth, with a real day's aerosol. The model is
+`engine/render/atmosphere.h` (the medium, phase functions, table
+parameterisations) and `atmosphere_march.h` (integration along a ray), both
+compiled as C++ AND HLSL. The CPU (`sky.cpp`) builds the transmittance and
+multiple-scattering tables once (~200 ms) and uploads them; the GPU
+(`atmosphere.hlsl`) builds a sky-view table and a 32^3 aerial-perspective
+volume every frame from them; the post composite draws the sky, the sun's
+and moon's disks behind everything and the haze in front of every surface
+by its depth. Scene shaders no longer fog.
+
+- **The CPU computes each frame's light** -- the key light (sun, or the
+  moon once it puts more light on the ground), its illuminance at the
+  camera's altitude, the sky's irradiance integrated over the hemisphere,
+  the ground's bounce, three sky samples for reflections -- in `evaluate()`
+  (0.18 ms; re-run only when the hour or the camera's height changes) and
+  hands it to every lit shader in the SHADOW constant buffer, which they
+  already bound. The sea gets the same seven float4 in its own constants;
+  `lighting.hlsli` reads them as `l_sun_dir` and friends. Shadows, contact
+  shadows and impostor shadow cards follow the key light.
+- **`--sky-report` is the instrument**, against the IES clear sky: the direct
+  beam within 2-7% of the reference from 20 degrees up and the diffuse sky
+  within 4-11%; the worst is x1.14 at 10 degrees, where the IES single-
+  coefficient formula over-attenuates. **The shipped Mie is an aerosol
+  optical depth of 0.005**, cleaner than any real day, and the report showed
+  it: the sky on level ground at HALF the reference everywhere and the low
+  sun's beam up to 8x too strong. 0.073 (single-scattering albedo 0.9) fixed
+  both; 0.09 overshot the sky by 1.27x.
+- **Every `--shot` checks the GPU against the CPU**: the sky-view table read
+  back and 192 texels compared with the CPU's march at the GPU's step count.
+  Mean 0.04%, worst 0.12% at noon; 0.52% worst at sunset, where the horizon
+  is steepest; half-float storage is ~0.1% on its own. The shot report also
+  prints the hour, the key light and its lux.
+- **The sky is drawn in post, so the crack test survived.** The ambient
+  target still clears to a constant -- now a marker, `kSkyClear` -- and the
+  composite reads what fraction of it a blended sea left as the share of sky
+  to show. Crack counts identical before and after on every view.
+- **Time:** `--time <h>`; Page Up / Page Down step half an hour; `H` runs an
+  hour every ten seconds; the title shows the clock. Latitude 40 N,
+  declination +15: sunrise 05:08, sunset 18:52. World +x is west and +z
+  south, which puts 14:00's sun on the fixed pre-L2 sun to under a degree.
+- **Night is a full moon opposite the sun**, 0.19 lux on the ground,
+  exposed like a camera: the meter bottoms out at EV100 -2, which draws a
+  moonlit landscape as a dim blue day. No stars, no moon phases, no Purkinje
+  shift yet.
+- Cost: walking 2.08 -> 2.10 ms; flying 2.05 -> 1.99 ms (the scene shaders
+  lost their fog).
 
 - **Cracks are counted in the engine, as UNDRAWN pixels** (ADR-004 L0):
   below the horizon, far depth, and both HDR scene targets still at their

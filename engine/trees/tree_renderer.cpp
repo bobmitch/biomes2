@@ -780,7 +780,7 @@ void TreeRenderer::set_instances(const std::vector<TreeGpuInstance>& inst) {
 namespace {
 void fill_common(TreeFrame& tf, UINT count, UINT models, UINT quad_first, UINT quad_base,
                  const TreeDrawSettings& s) {
-    tf.sun_dir[0] = kSunDirX; tf.sun_dir[1] = kSunDirY; tf.sun_dir[2] = kSunDirZ;
+    tf.sun_dir[0] = s.sun_dir[0]; tf.sun_dir[1] = s.sun_dir[1]; tf.sun_dir[2] = s.sun_dir[2];
     tf.max_dist = s.max_dist;
     tf.lod0_dist = (std::min)(s.lod0_dist, s.max_dist);
     tf.lod1_dist = (std::min)(s.lod1_dist, s.max_dist);

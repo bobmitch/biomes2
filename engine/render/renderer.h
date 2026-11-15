@@ -18,6 +18,7 @@
 #include "engine/trees/tree_renderer.h"
 #include "engine/foliage/foliage_renderer.h"
 #include "engine/render/rt_check.h"
+#include "engine/render/sky.h"
 
 #include <unordered_map>
 #include <vector>
@@ -224,6 +225,11 @@ public:
     unsigned tonemap() const { return tonemap_; }
     void set_agx_saturation(float s) { agx_saturation_ = s; }
     void set_agx_power(float p) { agx_power_ = p; }
+    // Time of day (ADR-004 L2), hours 0..24. The sun, the moon, the sky and
+    // every light the scene uses follow it.
+    void  set_time_of_day(float hours);
+    float time_of_day() const { return time_hours_; }
+    const SkyFrame& sky_frame() const { return sky_frame_; }
     // What the meter saw in the last capture(): the histogram and the
     // exposure it chose. bins[k] covers log2 nits kLumLogMin + k * step.
     struct ExposureReport {
@@ -234,6 +240,15 @@ public:
         std::vector<unsigned> bins;
     };
     const ExposureReport& last_exposure() const { return exposure_report_; }
+    // The GPU's sky-view table against the CPU's march of the same texels,
+    // from the last capture() (ADR-004 L2): the atmosphere's --probe-field.
+    struct SkyCheck {
+        bool  valid = false;
+        int   texels = 0;
+        float worst_rel = 0.0f, mean_rel = 0.0f;   // relative luminance error
+        float worst_at[2] = {0, 0};                // texel (x, y)
+    };
+    const SkyCheck& last_sky_check() const { return sky_check_; }
 
     // What the device can do (ADR-004): ray-tracing tier, shader model.
     const DeviceCaps& caps() const { return caps_; }
@@ -377,6 +392,25 @@ private:
     ComPtr<ID3D12RootSignature> post_root_;
     ComPtr<ID3D12PipelineState> ao_pso_, composite_pso_, taa_pso_, final_pso_;
     ComPtr<ID3D12PipelineState> hist_clear_pso_, hist_pso_, expo_pso_;
+    // The atmosphere (ADR-004 L2): the CPU model and this frame's light, the
+    // two static tables uploaded from it, and the per-frame sky-view table
+    // and aerial-perspective volume (atmosphere.hlsl).
+    bool create_atmosphere(std::string& error);
+    bool create_atmosphere_pipelines(std::string& error);
+    void update_sky(float cam_y);
+    void record_atmosphere();
+    void fill_light(float out[7][4]) const;
+    Sky      sky_;
+    SkyFrame sky_frame_;
+    float    time_hours_ = 14.0f;
+    float    sky_hours_ = -1.0f, sky_cam_y_ = -1.0e9f;   // what sky_frame_ was evaluated for
+    ComPtr<ID3D12RootSignature> atm_root_;
+    ComPtr<ID3D12PipelineState> sky_view_pso_, aerial_pso_;
+    ComPtr<ID3D12Resource> trans_tex_, ms_tex_, sky_view_tex_, ap_tex_;
+    ComPtr<ID3D12Resource> trans_up_, ms_up_;
+    ComPtr<ID3D12Resource> atm_cb_[kFrameCount];
+    void* atm_cb_cpu_[kFrameCount] = {};
+    bool  atm_uploaded_ = false;
     ComPtr<ID3D12Resource> lumhist_, expo_;   // 256 bins; 2 float4 of exposure state
     ComPtr<ID3D12Resource> post_cb_[kFrameCount];
     void* post_cb_cpu_[kFrameCount] = {};
@@ -398,6 +432,7 @@ private:
     bool  exposure_snap_ = false;            // a still: adapt instantly
     unsigned long long last_post_tick_ = 0;
     ExposureReport exposure_report_;
+    SkyCheck sky_check_;
     TreeField        tree_field_;
     TreeRenderer     trees_;
     TreeDrawSettings tree_settings_;

@@ -29,7 +29,6 @@
 
 #include "engine/field/real_field.hlsl"
 #include "engine/render/water_wave.h"
-#include "engine/render/shaders/lighting.hlsli"
 
 cbuffer WaterConstants : register(b0) {
     row_major float4x4 view_proj;
@@ -40,7 +39,18 @@ cbuffer WaterConstants : register(b0) {
     float3 cam_up;     float pad1;
     float  sea_level;  float sea_state;  float grid_cells;  float extent;
     float  debug_mode; float cam_water; float2 pad0;
+    // The frame's light (ADR-004 L2), the same values the shadow constants
+    // carry for everything else; lighting.hlsli reads them by these names.
+    float4 l_sun_dir;
+    float4 l_sun_lux;
+    float4 l_sky_mean;
+    float4 l_ground;
+    float4 l_sky_zenith;
+    float4 l_sky_horizon_sun;
+    float4 l_sky_horizon_away;
 };
+
+#include "engine/render/shaders/lighting.hlsli"
 
 struct VSOut {
     float4 clip   : SV_Position;
@@ -293,15 +303,14 @@ float4 water_colour(VSOut i) {
     const float diffuse = 0.25f + 0.75f * saturate(dot(n, l));
     // What lights the water's body and its foam: the sun on level water and
     // the sky, as on level ground.
-    const float3 light_in = (kSunLux * kSunDirY * diffuse + kPi * kSkyMean) / kPi;
+    const float3 light_in = (kSunLux * max(kSunDir.y, 0.0f) * diffuse + kPi * kSkyMean) / kPi;
 
     float3 col = lerp(body * light_in, sky, fres) + spec;
     col = lerp(col, srgb_to_linear(float3(0.86f, 0.90f, 0.93f)) * light_in, foam);
 
-    // Into the haze, the same way the terrain does, or the sea meets the sky
-    // at a hard line.
-    const float haze = saturate(i.dist / far_plane);
-    col = min(lerp(col, kSkyHorizon, haze * haze), kSceneMaxNits);
+    // No haze here since L2: the post chain's aerial perspective covers the
+    // sea as it covers the land.
+    col = min(col, kSceneMaxNits);
 
     // Shallow water is see-through; deep water is not. Fresnel wins at
     // grazing angles either way, which is correct -- you cannot see into a

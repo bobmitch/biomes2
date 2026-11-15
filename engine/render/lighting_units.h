@@ -6,8 +6,11 @@
 // between the two.
 //
 // ADR-004 L1. Illuminance in lux, radiance in cd/m^2 (nits), per channel in
-// linear sRGB primaries. Until L2's atmosphere computes these from the sun's
-// elevation, they are a clear midday with the sun 54 degrees up:
+// linear sRGB primaries. SINCE L2 THE LIGHT ITSELF IS NOT HERE: the sun, the
+// sky and the moon come from the atmosphere (atmosphere.h, sky.cpp) every
+// frame and reach the shaders through the shadow constants. What remains is
+// what does not move: the sky's clear MARKER, the ground's bounce albedo and
+// the clamp. Before L2 these were a clear midday with the sun 54 degrees up:
 //
 //   sun     ~100,000 lux on a surface facing it, slightly warm;
 //   sky     ~13,400 lux on open level ground (an average radiance of
@@ -27,32 +30,15 @@
 #ifndef ENGINE_RENDER_LIGHTING_UNITS_H
 #define ENGINE_RENDER_LIGHTING_UNITS_H
 
-// The direction TOWARDS the sun, normalised: (0.45, 0.78, 0.35) / |...|.
-static const float kSunDirX = 0.465778f;
-static const float kSunDirY = 0.807348f;
-static const float kSunDirZ = 0.362271f;
-
-// Sun illuminance normal to the beam, lux.
-static const float kSunLuxR = 103700.0f;
-static const float kSunLuxG = 99600.0f;
-static const float kSunLuxB = 93400.0f;
-
-// The sky's mean radiance over the upper hemisphere, nits: pi times this is
-// the illuminance it puts on level ground.
-static const float kSkyMeanR = 2300.0f;
-static const float kSkyMeanG = 4300.0f;
-static const float kSkyMeanB = 9800.0f;
-
-// The sky at the horizon and at the zenith, nits. The horizon is also the
-// clear colour of the ambient target and the colour of the fog, so it is
-// chosen to be exactly representable in half float (the crack test compares
-// against what the target holds): multiples of 4 below 8192, of 8 above.
-static const float kSkyHorizonR = 3160.0f;
-static const float kSkyHorizonG = 5080.0f;
-static const float kSkyHorizonB = 9552.0f;
-static const float kSkyZenithR = 950.0f;
-static const float kSkyZenithG = 2700.0f;
-static const float kSkyZenithB = 9100.0f;
+// What the ambient target is cleared to. Since L2 the sky is drawn by the
+// post chain from the atmosphere, so this is a MARKER, not a colour anyone
+// sees: the crack test reads "nothing drawn here" from it, and the composite
+// reads how much of the sky a blended sea left showing as the fraction of it
+// that survives. Exactly representable in half float, so both compare it
+// exactly: multiples of 4 below 8192, of 8 above.
+static const float kSkyClearR = 3160.0f;
+static const float kSkyClearG = 5080.0f;
+static const float kSkyClearB = 9552.0f;
 
 // What the ground reflects back up, as an albedo: a mix of grass, soil and
 // shade. The no-GI ambient's lower hemisphere is this times what lands on it.

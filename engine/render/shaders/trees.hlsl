@@ -429,7 +429,9 @@ void ps_impostor_shadow(ImpOut i) {
     // between views, and the far cascade holds thousands of impostors
     // overlapping under a high sun: four blended views of albedo and normal
     // each was most of the shadow pass's cost.
-    const float3 rd = -kSunDir;
+    // The trees' own constant, not the frame light's: in a shadow pass the
+    // shadow-constant slot is bound to this pass's buffer, not the frame's.
+    const float3 rd = -normalize(sun_dir);
     const float n = float(frames);
     const float2 fr = clamp(floor(hemi_oct_encode(to_local(-rd, i.yaw)) * n), 0.0f, n - 1.0f);
     const float3 dl = hemi_oct_decode((fr + 0.5f) / n);

@@ -242,7 +242,7 @@ Each one is measured with an instrument, not judged only by eye.
 | --- | --- | --- |
 | **L0** ✅ | DXC alongside FXC; check the device's DXR tier at init; crack detection moved from colour to depth | `--check-rt`; crack counts identical before and after |
 | **L1** ✅ | Units, auto-exposure, tonemap, PBR materials, biome terrain materials | a histogram report; A/B stills |
-| **L2** | Hillaire atmosphere, aerial perspective, time of day (`--time`, a key) | `--sky-report`: sun and sky radiance against reference values |
+| **L2** ✅ | Hillaire atmosphere, aerial perspective, time of day (`--time`, a key) | `--sky-report`: sun and sky radiance against reference values |
 | **L3** | Clustered local lights, shadow atlas, a torch you can carry | `--lights-report`: lights per cluster, shadow budget, ms |
 | **L4** | Froxel volumetric fog: sun, local lights, height and local media | A/B stills; ms |
 | **L5** | RT scene: BLAS per chunk and per tree model, TLAS; `gi_trace` / `gi_occluded` on DXR; ray-traced sun shadow A/B against the cascades | `--rt-report`: BLAS count and memory, build ms, agreement with the CSM |
@@ -321,6 +321,37 @@ the day it does not.
 - **Not right yet:** the sea is duller than before (teal came from blending
   in display space); the sky is still one clear colour with a gradient only
   in reflections; the sun never moves. All three are L2's.
+
+## L2 — done, 2026-11-15
+
+- **One model, two compilers.** `atmosphere.h` and `atmosphere_march.h` are
+  C++ and HLSL at once, like `water_wave.h`. The CPU builds the static
+  tables (transmittance 256 x 64, multiple scattering 32 x 32) and uploads
+  them; the GPU builds the sky-view table (192 x 108, WORLD azimuth, so the
+  sun's sky and the moon's share it) and a 32^3 aerial-perspective volume
+  each frame. Every `--shot` reads the sky table back and compares 192
+  texels with the CPU's march: mean 0.04% at noon, 0.52% worst at sunset.
+- **The instrument, against the IES clear sky:** the direct beam within
+  2-7% and the diffuse sky within 4-11% for the sun 20 degrees up and more.
+  Getting there needed a real day's aerosol: Bruneton's Mie is an optical
+  depth of 0.005, which drew the diffuse sky at half the reference. 0.073
+  with single-scattering albedo 0.9 is what ships.
+- **The light reaches the scene shaders through the shadow constants**, as
+  seven float4 computed on the CPU each frame from the same model: the key
+  light (sun or moon) and its illuminance at the camera, the sky's
+  hemisphere irradiance, the ground's bounce, and three sky samples for
+  specular. `lighting.hlsli`'s GI fallback reads them; no call site changed.
+- **Aerial perspective replaced the fog**, applied in the post composite by
+  depth, so every surface -- terrain, trees, grass, sea -- gets the same
+  haze from one place. The sky is drawn there too, behind a cleared marker
+  that keeps L0's crack test exact.
+- **Time of day** with `--time`, Page Up/Down and a time-lapse (`H`); a
+  full moon opposite the sun takes over the key light at night.
+- **Cost:** walking +0.02 ms, flying -0.06 ms (fog removed), 0.18 ms of CPU
+  when the hour or camera height changes.
+- **Not done:** stars, moon phases, night-vision tone (Purkinje), clouds,
+  and light shafts through the haze (L4's froxels). The sea is still the
+  weakest surface.
 
 ## Risks
 

@@ -1,7 +1,14 @@
 // ---------------------------------------------------------------------------
 // How every scene shader lights a surface (ADR-004 L1).
 //
-//   units          lighting_units.h: the sun in lux, the sky in nits.
+//   units          the sun in lux, the sky in nits (lighting_units.h).
+//   the light      the FRAME's (L2): the key light -- sun, or moon at night --
+//                  and the sky's radiance, computed by the atmosphere on the
+//                  CPU each frame (sky.cpp) and declared by the includer as
+//                  l_sun_dir, l_sun_lux, l_sky_mean, l_ground, l_sky_zenith,
+//                  l_sky_horizon_sun, l_sky_horizon_away (float4 each; the
+//                  shadow constants for terrain, trees and grass, the sea's
+//                  own constants for the sea).
 //   albedo         authored as sRGB-encoded colours, as every colour in this
 //                  engine always was; srgb_to_linear() before any lighting.
 //   BRDF           Lambert diffuse + GGX specular (Smith height-correlated
@@ -25,25 +32,28 @@
 #include "engine/render/lighting_units.h"
 
 static const float  kPi = 3.14159265f;
-static const float3 kSunDir   = float3(kSunDirX, kSunDirY, kSunDirZ);
-static const float3 kSunLux   = float3(kSunLuxR, kSunLuxG, kSunLuxB);
-static const float3 kSkyMean  = float3(kSkyMeanR, kSkyMeanG, kSkyMeanB);
-static const float3 kSkyHorizon = float3(kSkyHorizonR, kSkyHorizonG, kSkyHorizonB);
-static const float3 kSkyZenith  = float3(kSkyZenithR, kSkyZenithG, kSkyZenithB);
-// The ground as a light source for whatever faces down at it: its albedo
-// times the sun on level ground plus the sky, over pi.
-static const float3 kGroundRadiance =
-    float3(kGroundBounceR, kGroundBounceG, kGroundBounceB) / kPi * (kSunLux * kSunDirY + kPi * kSkyMean);
+#define kSunDir         (l_sun_dir.xyz)
+#define kSunLux         (l_sun_lux.rgb)
+#define kSkyMean        (l_sky_mean.rgb)
+#define kGroundRadiance (l_ground.rgb)
 
 float3 srgb_to_linear(float3 c) {
     c = max(c, 0.0f);
     return c <= 0.04045f ? c / 12.92f : pow((c + 0.055f) / 1.055f, 2.4f);
 }
 
-// The sky's radiance along a direction. A gradient from the horizon to the
-// zenith; below the horizon, the horizon. L2's sky-view LUT replaces it.
+// The sky's radiance along a direction, from three samples of the real one:
+// the horizon under the key light, the horizon opposite, the zenith. The
+// sunward glow is narrow, so the blend round the horizon is cubed towards
+// it. Good enough for what reads it -- rough specular and the sea's
+// reflection; the sky itself is drawn from the full sky-view table.
 float3 sky_radiance(float3 dir) {
-    return lerp(kSkyHorizon, kSkyZenith, saturate(dir.y * 1.4f));
+    const float2 hd = dir.xz, hs = l_sun_dir.xz;
+    const float lh = length(hd), ls = length(hs);
+    const float a = (lh > 1e-4f && ls > 1e-4f) ? dot(hd / lh, hs / ls) : 0.0f;
+    const float s = 0.5f + 0.5f * a;
+    const float3 horizon = lerp(l_sky_horizon_away.rgb, l_sky_horizon_sun.rgb, s * s * s);
+    return lerp(horizon, l_sky_zenith.rgb, saturate(dir.y * 1.4f));
 }
 
 // --- the shading-facing GI interface (ADR-004), no-RT fallback --------------
