@@ -81,6 +81,12 @@ struct SeedResult {
     std::vector<double> tree_area;    // m^2 sampled per biome
     int   golden_trees = 0;           // trees that went into the hash
     uint64_t hash = 0;
+    // The same hash, split by layer, computed alongside it: grid (layers 0,
+    // 1, 4-6 sampled), biomes (layer 3), entrances (7), trees (8). When the
+    // gate fails these say WHICH layer moved; on a two-OS split that is the
+    // difference between a day of guessing and one CI run.
+    uint64_t layer_hash[4] = {0, 0, 0, 0};
+    std::string tree_dump;            // the first trees hashed, bit-exact
     float mean_patch_cells = 0.0f;
     float mean_patch_km2 = 0.0f;
     std::vector<int>   biome_cells;   // per biome
@@ -504,6 +510,8 @@ static SeedResult eval_seed(uint64_t world_seed,
     // because the point is to catch a changed generator, not float noise.
     {
         uint64_t h = 0xCBF29CE484222325ull;
+        uint64_t lh[4] = {0xCBF29CE484222325ull, 0xCBF29CE484222325ull,
+                          0xCBF29CE484222325ull, 0xCBF29CE484222325ull};
         const int HG = 256;
         const float R = wp.radius, hstep = 2.0f * R / HG;
         for (int gj = 0; gj < HG; ++gj) {
@@ -518,6 +526,9 @@ static SeedResult eval_seed(uint64_t world_seed,
                 h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(hh * 4096.0f)));
                 h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(dd * 4096.0f)));
                 h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(tt * 64.0f)));
+                lh[0] = fnv1a(lh[0], static_cast<uint64_t>(static_cast<int64_t>(hh * 4096.0f)));
+                lh[0] = fnv1a(lh[0], static_cast<uint64_t>(static_cast<int64_t>(dd * 4096.0f)));
+                lh[0] = fnv1a(lh[0], static_cast<uint64_t>(static_cast<int64_t>(tt * 64.0f)));
                 // Layer 6 at every 64th column, two depths each. The pin has
                 // to cover the whole generator, and density is part of it now;
                 // sampling every column in 3D would cost more than the rest of
@@ -527,11 +538,14 @@ static SeedResult eval_seed(uint64_t world_seed,
                     const float d2 = terrain_density(w, wp, table, x, tt - 80.0f, z);
                     h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(d1 * 64.0f)));
                     h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(d2 * 64.0f)));
+                    lh[0] = fnv1a(lh[0], static_cast<uint64_t>(static_cast<int64_t>(d1 * 64.0f)));
+                    lh[0] = fnv1a(lh[0], static_cast<uint64_t>(static_cast<int64_t>(d2 * 64.0f)));
                 }
             }
         }
         for (int i = 0; i < n; ++i) {
             h = fnv1a(h, static_cast<uint64_t>(biome[i] + 1));
+            lh[1] = fnv1a(lh[1], static_cast<uint64_t>(biome[i] + 1));
         }
 
         // Layer 7 goes in by its buffer rather than by sampling. A grid sample
@@ -546,12 +560,14 @@ static SeedResult eval_seed(uint64_t world_seed,
         // flipping and the shaft going somewhere else entirely, which shows up
         // in metres.
         h = fnv1a(h, static_cast<uint64_t>(w.entrance_count));
+        lh[2] = fnv1a(lh[2], static_cast<uint64_t>(w.entrance_count));
         for (size_t m = 0; m < w.entrances.size(); ++m) {
             const SeedWorld::EntranceSeg& e = w.entrances[m];
             h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(e.ax * 64.0f)));
             h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(e.ay * 64.0f)));
             h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(e.az * 64.0f)));
             h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(e.ra * 64.0f)));
+            lh[2] = fnv1a(lh[2], static_cast<uint64_t>(static_cast<int64_t>(e.ax * 64.0f)));
         }
         // Layer 8 by its instances, like layer 7: a tree is a few metres
         // across and the grid above samples every 156 m, so sampling would
@@ -571,8 +587,22 @@ static SeedResult eval_seed(uint64_t world_seed,
                 ts.clear();
                 trees_in_cells(w, wp, table, ci - 8, cj - 8, ci + 8, cj + 8, ts);
                 h = fnv1a(h, static_cast<uint64_t>(ts.size()));
+                lh[3] = fnv1a(lh[3], static_cast<uint64_t>(ts.size()));
                 for (size_t m = 0; m < ts.size(); ++m) {
                     const TreeInstance& t = ts[m];
+                    lh[3] = fnv1a(lh[3], static_cast<uint64_t>(t.id));
+                    lh[3] = fnv1a(lh[3], static_cast<uint64_t>(static_cast<int64_t>(t.y * 64.0f)));
+                    if (out.tree_dump.size() < 2400) {
+                        // Bit patterns, not printed floats: the question is
+                        // whether two builds agree to the bit, and where not.
+                        uint32_t bx, by, bz, bh;
+                        std::memcpy(&bx, &t.x, 4); std::memcpy(&by, &t.y, 4);
+                        std::memcpy(&bz, &t.z, 4); std::memcpy(&bh, &t.height, 4);
+                        char line[160];
+                        std::snprintf(line, sizeof line, "      tile %d tree %08x sp %u var %u x %08x y %08x z %08x h %08x\n",
+                                      tiles, t.id, unsigned(t.species), unsigned(t.variant), bx, by, bz, bh);
+                        out.tree_dump += line;
+                    }
                     h = fnv1a(h, static_cast<uint64_t>(t.id));
                     h = fnv1a(h, (static_cast<uint64_t>(t.species) << 16) | t.variant);
                     h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(t.x * 64.0f)));
@@ -585,6 +615,7 @@ static SeedResult eval_seed(uint64_t world_seed,
             }
         }
         out.hash = h;
+        for (int k = 0; k < 4; ++k) out.layer_hash[k] = lh[k];
     }
 
     // Spearman over biomes that got cells.
@@ -1130,6 +1161,10 @@ static const int kGoldenSeeds = 8;
 // against 1.1 s here. Threading cannot move a hash: each seed is an
 // independent build_world with its own per-feature seeds (invariant 4), and
 // if that were ever untrue this is the one check that would say so.
+// Per-layer hashes and seed 0's first trees, from the last golden_hashes.
+static uint64_t g_layer_hash[kGoldenSeeds][4];
+static std::string g_seed0_trees;
+
 static void golden_hashes(const WorldParams& wp, const ArchetypeTable& table,
                           const AssignParams& ap,
                           std::vector<std::pair<uint64_t, uint64_t> >& out) {
@@ -1145,7 +1180,10 @@ static void golden_hashes(const WorldParams& wp, const ArchetypeTable& table,
         pool.push_back(std::thread([&, th]() {
             for (int i = static_cast<int>(th); i < kGoldenSeeds;
                  i += static_cast<int>(nthreads)) {
-                hashes[i] = eval_seed(static_cast<uint64_t>(i), gw, table, ap).hash;
+                const SeedResult r = eval_seed(static_cast<uint64_t>(i), gw, table, ap);
+                hashes[i] = r.hash;
+                for (int k = 0; k < 4; ++k) g_layer_hash[i][k] = r.layer_hash[k];
+                if (i == 0) g_seed0_trees = r.tree_dump;
             }
         }));
     }
@@ -1256,6 +1294,18 @@ static int run_golden_gate(const WorldParams& wp, const ArchetypeTable& table,
                         static_cast<unsigned long long>(g.seeds[i].second),
                         static_cast<unsigned long long>(now[i].second));
         }
+        std::printf("\n  By layer (grid / biomes / entrances / trees), to compare with\n"
+                    "  a build that agrees with the pin -- the layer that differs is\n"
+                    "  the one that moved:\n");
+        for (size_t i = 0; i < now.size(); ++i) {
+            std::printf("    seed %llu: %016llx %016llx %016llx %016llx\n",
+                        static_cast<unsigned long long>(now[i].first),
+                        static_cast<unsigned long long>(g_layer_hash[i][0]),
+                        static_cast<unsigned long long>(g_layer_hash[i][1]),
+                        static_cast<unsigned long long>(g_layer_hash[i][2]),
+                        static_cast<unsigned long long>(g_layer_hash[i][3]));
+        }
+        std::printf("    seed 0's first trees, bit-exact:\n%s", g_seed0_trees.c_str());
         std::printf("\n  Saves store edits as absolute density against the base\n");
         std::printf("  terrain, so a world that changes under them corrupts them.\n");
         std::printf("  Either revert the change, or bump kGeneratorVersion in\n");
@@ -1265,6 +1315,17 @@ static int run_golden_gate(const WorldParams& wp, const ArchetypeTable& table,
 
     std::printf("golden gate: %d seeds pinned at generator_version %d, all matching\n",
                 static_cast<int>(now.size()), kGeneratorVersion);
+    if (std::getenv("VALIDATE_LAYER_HASHES")) {
+        for (size_t i = 0; i < now.size(); ++i) {
+            std::printf("    seed %llu: %016llx %016llx %016llx %016llx\n",
+                        static_cast<unsigned long long>(now[i].first),
+                        static_cast<unsigned long long>(g_layer_hash[i][0]),
+                        static_cast<unsigned long long>(g_layer_hash[i][1]),
+                        static_cast<unsigned long long>(g_layer_hash[i][2]),
+                        static_cast<unsigned long long>(g_layer_hash[i][3]));
+        }
+        std::printf("    seed 0's first trees, bit-exact:\n%s", g_seed0_trees.c_str());
+    }
     return 0;
 }
 
