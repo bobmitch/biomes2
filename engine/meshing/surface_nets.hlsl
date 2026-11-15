@@ -71,6 +71,12 @@ RWStructuredBuffer<uint>   g_chunk_flags : register(u7);   // 1 per slot
 RWStructuredBuffer<int4>   g_brick_hdr   : register(u8);   // (bx, by, bz, slot)
 RWStructuredBuffer<float>  g_brick_den   : register(u9);   // kBrickVoxels per slot
 RWStructuredBuffer<uint>   g_brick_mask  : register(u10);  // kBrickMaskWords per slot
+// Each vertex's surface material (ADR-004 L1), parallel to g_vertices and
+// indexed the same way: (ground, rock), each RGB as sqrt(linear albedo) and
+// roughness in A, 8 bits apiece. A separate buffer rather than a wider
+// Vertex, so nothing that reads vertices -- physics, the shadow pass, the
+// readbacks -- changes stride.
+RWStructuredBuffer<uint2>  g_vertex_mat  : register(u21);
 
 // A column with no surface in it. Jolt spells its equivalent
 // HeightFieldShapeConstants::cNoCollisionValue; the conversion happens on the
@@ -238,6 +244,47 @@ float3 field_normal(float3 p) {
 }
 
 // ---------------------------------------------------------------------------
+// The surface material at (x, z): each biome's material (archetypes.json
+// "materials", rows 3 and 4 of g_arch) blended with the weights layer 4
+// blends HEIGHTS with -- the same warp, the same four cells, the same
+// blend_weight -- so a material boundary sits where the shape changes and
+// never cuts across a slope the shape blends smoothly. An ocean cell's share
+// goes to the seabed row after the last biome, which is what turns a coast
+// sandy. Once per vertex, at mesh time: per pixel it would be a cell search
+// for every fragment of a static world.
+// ---------------------------------------------------------------------------
+uint pack_material(float4 m) {
+    const uint4 q = uint4(round(saturate(float4(sqrt(saturate(m.rgb)), m.a)) * 255.0f));
+    return q.x | (q.y << 8) | (q.z << 16) | (q.w << 24);
+}
+
+uint2 terrain_material(float x, float z) {
+    const float wx = x + w_warp_amp * fbm(x * w_warp_freq, z * w_warp_freq, 2, 2.0f, 0.5f, w_s_wx);
+    const float wz = z + w_warp_amp * fbm(x * w_warp_freq, z * w_warp_freq, 2, 2.0f, 0.5f, w_s_wz);
+    int4 idx; float4 dist; float d5;
+    const int found = cell_nearest4(wx, wz, idx, dist, d5);
+    const int ids[4] = {idx.x, idx.y, idx.z, idx.w};
+    const float ds[4] = {dist.x, dist.y, dist.z, dist.w};
+    float4 ground = 0.0f, rock = 0.0f;
+    float wl = 0.0f, wall = 0.0f;
+    [unroll] for (int k = 0; k < 4; ++k) {
+        if (k >= found || ids[k] < 0) continue;
+        const float wk = blend_weight(ds[k], ds[0], d5, w_blend_width);
+        wall += wk;
+        const int b = (int)g_cells[ids[k]].z;
+        if (b < 0 || wk <= 0.0f) continue;
+        ground += wk * g_arch[b * kArchRows + 3];
+        rock += wk * g_arch[b * kArchRows + 4];
+        wl += wk;
+    }
+    const float4 sea_g = g_arch[w_biome_count * kArchRows + 3];
+    const float4 sea_r = g_arch[w_biome_count * kArchRows + 4];
+    const float ocean = wall > 0.0f ? saturate(1.0f - wl / wall) : 1.0f;
+    if (wl > 0.0f) { ground /= wl; rock /= wl; } else { ground = sea_g; rock = sea_r; }
+    return uint2(pack_material(lerp(ground, sea_g, ocean)), pack_material(lerp(rock, sea_r, ocean)));
+}
+
+// ---------------------------------------------------------------------------
 // Pass 2 -- one vertex per cell that the surface passes through.
 // ---------------------------------------------------------------------------
 [numthreads(4, 4, 4)]
@@ -331,6 +378,8 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
     v.pos = world;
     v.nrm = nrm;
     g_vertices[vbase + local_slot] = v;
+    const uint2 mat = terrain_material(world.x, world.z);
+    g_vertex_mat[vbase + local_slot] = mat;
     // Slot-relative, so the draw's BaseVertexLocation does the rebasing and an
     // index never has to be rewritten when a chunk moves slot. Packed: the
     // surface vertex in the low 16 bits, the skirt vertex (or 0xFFFF) in the
@@ -367,6 +416,7 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
         s.nrm = nrm * 0.5f;
         skirt_slot = local_slot + 1u;
         g_vertices[vbase + skirt_slot] = s;
+        g_vertex_mat[vbase + skirt_slot] = mat;
     }
     g_cell_vertex[ci] = (local_slot & 0xFFFFu) | (skirt_slot << 16);
 }

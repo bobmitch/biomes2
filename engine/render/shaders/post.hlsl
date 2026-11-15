@@ -10,10 +10,18 @@
 //                + ambient x AO (depth-aware upsample) -> one HDR colour.
 //   cs_taa       reproject last frame's result by depth, clip it to this
 //                frame's neighbourhood (YCoCg variance box), blend 1:9.
-//   ps_final     sharpen, then a tonemap that is the IDENTITY below 0.8 and
-//                rolls off above: the sky's clear colour passes through bit
-//                for bit, which keeps the external crack detector (sky colour
-//                below the horizon = a hole) meaning what it says.
+//   cs_hist_*    a 256-bin histogram of log2 luminance of what TAA produced
+//   cs_exposure  -> the mean of its 10-90% band, adapted over time like an
+//                eye (faster into light than out of it), as an exposure that
+//                puts that mean at middle grey (ADR-004 L1).
+//   ps_final     exposure, sharpen, then AgX (or a fitted ACES, for A/B) into
+//                the back buffer, which is UNORM: the tonemap's output is
+//                display-encoded already.
+//
+// The scene arrives in nits (lighting_units.h). A debug colour does not: its
+// ambient alpha is negative (scene_out.hlsli: scene_flat), the composite
+// writes alpha 0 for it, TAA carries that through, and ps_final passes it to
+// the screen untouched. The meter skips it.
 // ---------------------------------------------------------------------------
 
 cbuffer PostConstants : register(b0) {
@@ -29,6 +37,11 @@ cbuffer PostConstants : register(b0) {
     uint   hist_cur;  uint flags;        // 1 taa, 2 ao, 4 contact, 8 history valid
     uint   frame;     float ao_radius;
     float  contact_len; float debug;     // 1 ao only, 2 contact only
+    float  dt;          float ev_comp;   // seconds since last frame; exposure compensation, stops
+    float  ev100_fixed; uint  tonemap;   // a fixed EV100 when > -100, else metered; 0 raw, 1 AgX, 2 ACES
+    float  meter_lo;    float meter_hi;  // the metered band, as fractions of the pixels
+    uint   expo_flags;  float agx_saturation;   // expo_flags 1: adapt instantly (a still)
+    float  agx_power;   float pad1;      // AgX look: a contrast power on the curve's output
 };
 
 Texture2D<float>  g_depth   : register(t0);
@@ -43,6 +56,10 @@ RWTexture2D<float>  u_ao    : register(u0);
 RWTexture2D<float4> u_scene : register(u1);
 RWTexture2D<float4> u_hist0 : register(u2);
 RWTexture2D<float4> u_hist1 : register(u3);
+RWStructuredBuffer<uint>   u_lumhist : register(u4);   // 256 bins
+// [0] (adapted log2 nits, exposure, EV100, this frame's target log2 nits)
+// [1] (low percentile nits, high percentile nits, pixels metered, 1 once valid)
+RWStructuredBuffer<float4> u_expo    : register(u5);
 
 SamplerState g_linear : register(s0);
 SamplerState g_point  : register(s1);
@@ -174,6 +191,8 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     const float z = g_depth[p];
     const float3 dir = g_direct[p].rgb;
     const float3 amb = g_ambient[p].rgb;
+    // A debug colour (scene_flat): as is, marked for the final pass.
+    if (g_ambient[p].a < -0.5f) { u_scene[p] = float4(amb, 0.0f); return; }
     if (z >= 1.0f) { u_scene[p] = float4(dir + amb, 1.0f); return; }
     const float2 uv = (float2(p) + 0.5f) * inv_size;
     const float3 P = world_at(uv, z);
@@ -183,9 +202,10 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     const float cs = ((flags & 4u) != 0u && cmask > 0.01f && dot(dir, dir) > 1e-6f)
                    ? lerp(1.0f, contact_shadow(p, z, P), 0.7f * saturate(cmask)) : 1.0f;   // never fully black: sky light still reaches a crease
     float3 c = dir * cs + amb * ao;
-    if (debug > 0.5f && debug < 1.5f) c = ao.xxx;
-    if (debug > 1.5f && debug < 2.5f) c = cs.xxx;
-    u_scene[p] = float4(c, 1.0f);
+    float mark = 1.0f;
+    if (debug > 0.5f && debug < 1.5f) { c = ao.xxx; mark = 0.0f; }
+    if (debug > 1.5f && debug < 2.5f) { c = cs.xxx; mark = 0.0f; }
+    u_scene[p] = float4(c, mark);
 }
 
 // --- TAA ----------------------------------------------------------------------
@@ -201,7 +221,8 @@ float3 from_ycocg(float3 y) {
 void cs_taa(uint3 id : SV_DispatchThreadID) {
     if (id.x >= width || id.y >= height) return;
     const int2 p = int2(id.xy);
-    const float3 cur = g_scene[p].rgb;
+    const float4 cur4 = g_scene[p];
+    const float3 cur = cur4.rgb;
     float3 outc = cur;
     if ((flags & 1u) != 0u && (flags & 8u) != 0u) {
         // Where this pixel's surface was last frame.
@@ -236,8 +257,95 @@ void cs_taa(uint3 id : SV_DispatchThreadID) {
             outc = lerp(from_ycocg(hy), cur, 0.1f);
         }
     }
-    if (hist_cur == 0u) u_hist0[p] = float4(outc, 1.0f);
-    else u_hist1[p] = float4(outc, 1.0f);
+    // Alpha carries the debug mark (0) through to the final pass.
+    if (hist_cur == 0u) u_hist0[p] = float4(outc, cur4.a);
+    else u_hist1[p] = float4(outc, cur4.a);
+}
+
+// --- exposure -------------------------------------------------------------------
+//
+// Metered on what TAA produced (what will be shown), every second pixel each
+// way. log2 luminance over [-10, 18] in 256 bins, about a ninth of a stop
+// each: 0.001 nits, a moonless cave, to 262,000, past a glint off the sea.
+
+static const float kLumLogMin = -10.0f;
+static const float kLumLogMax = 18.0f;
+
+float4 metered(int2 p) {
+    p = clamp(p, int2(0, 0), int2(width - 1, height - 1));
+    if ((flags & 1u) == 0u) return g_scene[p];
+    return hist_cur == 0u ? g_hist0[p] : g_hist1[p];
+}
+
+[numthreads(256, 1, 1)]
+void cs_hist_clear(uint3 id : SV_DispatchThreadID) {
+    u_lumhist[id.x] = 0u;
+}
+
+groupshared uint gs_bins[256];
+
+[numthreads(16, 16, 1)]
+void cs_histogram(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    gs_bins[gi] = 0u;
+    GroupMemoryBarrierWithGroupSync();
+    const int2 p = int2(id.xy) * 2;
+    if (p.x < int(width) && p.y < int(height)) {
+        const float4 c = metered(p);
+        if (c.a > 0.5f) {
+            const float lum = dot(max(c.rgb, 0.0f), float3(0.2126f, 0.7152f, 0.0722f));
+            const float t = (log2(max(lum, 1e-6f)) - kLumLogMin) / (kLumLogMax - kLumLogMin);
+            InterlockedAdd(gs_bins[uint(saturate(t) * 255.0f + 0.5f)], 1u);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gs_bins[gi] > 0u) InterlockedAdd(u_lumhist[gi], gs_bins[gi]);
+}
+
+float bin_log2(uint b) {
+    return kLumLogMin + float(b) / 255.0f * (kLumLogMax - kLumLogMin);
+}
+
+[numthreads(256, 1, 1)]
+void cs_exposure(uint3 id : SV_DispatchThreadID) {
+    gs_bins[id.x] = u_lumhist[id.x];
+    GroupMemoryBarrierWithGroupSync();
+    if (id.x != 0u) return;
+    uint total = 0u;
+    for (uint b = 0u; b < 256u; ++b) total += gs_bins[b];
+    const float4 prev = u_expo[0];
+    const bool valid = u_expo[1].w > 0.5f;
+    // The mean log luminance of the band between the two percentiles: the
+    // darkest tenth (deep shade, a cave mouth) and the brightest tenth (sky
+    // near the sun, a glint) do not pull the exposure around.
+    const float lo = float(total) * meter_lo, hi = float(total) * meter_hi;
+    float acc = 0.0f, wsum = 0.0f, cum = 0.0f;
+    float lo_log = kLumLogMin, hi_log = kLumLogMax;
+    bool lo_found = false, hi_found = false;
+    for (uint k = 0u; k < 256u; ++k) {
+        const float c = float(gs_bins[k]);
+        const float a = max(cum, lo), e = min(cum + c, hi);
+        if (e > a) { acc += (e - a) * bin_log2(k); wsum += e - a; }
+        if (!lo_found && cum + c >= lo && c > 0.0f) { lo_log = bin_log2(k); lo_found = true; }
+        if (!hi_found && cum + c >= hi && c > 0.0f) { hi_log = bin_log2(k); hi_found = true; }
+        cum += c;
+    }
+    // EV100 -2 (a dim interior) to 18 (snow in full sun), as log2 nits:
+    // EV100 = log2(L * 100 / 12.5), the reflected-light meter's calibration.
+    float target = wsum > 0.0f ? acc / wsum : (valid ? prev.w : 10.0f);
+    target = clamp(target, -5.0f, 15.0f);
+    float adapted = target;
+    if (valid && (expo_flags & 1u) == 0u) {
+        // Into the light in about a second, out of it in about three: the eye
+        // closes faster than it opens.
+        const float rate = target > prev.x ? 3.0f : 1.0f;
+        adapted = prev.x + (target - prev.x) * (1.0f - exp2(-dt * rate));
+    }
+    float ev100 = adapted + 3.0f;
+    if (ev100_fixed > -100.0f) { ev100 = ev100_fixed; adapted = ev100 - 3.0f; }
+    // The metered mean lands on middle grey, 0.18, before the tonemap.
+    const float exposure = 0.18f * exp2(ev_comp) / exp2(adapted);
+    u_expo[0] = float4(adapted, exposure, ev100, target);
+    u_expo[1] = float4(exp2(lo_log), exp2(hi_log), float(total), 1.0f);
 }
 
 // --- final --------------------------------------------------------------------
@@ -252,22 +360,70 @@ FsOut vs_full(uint vid : SV_VertexID) {
 }
 
 float3 fetch(int2 p) {
-    p = clamp(p, int2(0, 0), int2(width - 1, height - 1));
-    if ((flags & 1u) == 0u) return g_scene[p].rgb;
-    return hist_cur == 0u ? g_hist0[p].rgb : g_hist1[p].rgb;
+    return metered(p).rgb;
 }
 
-float3 tonemap(float3 x) {
-    // Identity to 0.8, then an exponential shoulder towards 1. Everything the
-    // old LDR image showed is unchanged; only highlights that would have
-    // clipped are compressed.
+// The pre-L1 display path, kept as --tonemap 0 for debug views that write
+// display values (the sea's --water-debug): no exposure, identity to 0.8,
+// then an exponential shoulder towards 1.
+float3 tonemap_raw(float3 x) {
     const float k = 0.8f;
     return x <= k ? x : k + (1.0f - k) * (1.0f - exp(-(x - k) / (1.0f - k)));
 }
 
+// AgX (Troy Sobotka), with Benjamin Wrensch's polynomial fit of the default
+// contrast curve. Linear sRGB in; display-encoded sRGB out, which is what a
+// UNORM back buffer wants. Its virtue over a per-channel curve is that a
+// bright saturated colour desaturates towards white as it brightens instead
+// of skewing hue -- a sunset sky stays orange rather than going yellow.
+float3 agx_contrast(float3 x) {
+    const float3 x2 = x * x;
+    const float3 x4 = x2 * x2;
+    return 15.5f * x4 * x2 - 40.14f * x4 * x + 31.96f * x4 - 6.868f * x2 * x + 0.4298f * x2 + 0.1191f * x - 0.00232f;
+}
+
+float3 agx(float3 c) {
+    // Rows here are the GLSL reference's columns, and mul(v, M) is its M * v.
+    const float3x3 inset = float3x3(0.842479062253094f, 0.0423282422610123f, 0.0423756549057051f,
+                                    0.0784335999999992f, 0.878468636469772f, 0.0784336f,
+                                    0.0792237451477643f, 0.0791661274605434f, 0.879142973793104f);
+    const float3x3 outset = float3x3(1.19687900512017f, -0.0528968517574562f, -0.0529716355144438f,
+                                     -0.0980208811401368f, 1.15190312990417f, -0.0980434501171241f,
+                                     -0.0990297440797205f, -0.0989611768448433f, 1.15107367264116f);
+    const float min_ev = -12.47393f, max_ev = 4.026069f;
+    c = mul(max(c, 0.0f), inset);
+    c = (clamp(log2(max(c, 1e-10f)), min_ev, max_ev) - min_ev) / (max_ev - min_ev);
+    c = agx_contrast(c);
+    // The look (the reference's agxLook, slope 1): AgX's base output is
+    // deliberately flat. A power for contrast, then saturation about the
+    // luminance. The default is the reference "punchy" look, power 1.35 and
+    // saturation 1.4 (--agx-power, --agx-sat): base AgX drew every view
+    // pastel, and punchy matched a fitted ACES on the four A/B stills while
+    // keeping AgX's hue handling for what is coming -- a torch's orange and
+    // a spell's blue stay themselves as they brighten, where ACES skews them.
+    c = pow(max(c, 0.0f), agx_power);
+    const float l = dot(c, float3(0.2126f, 0.7152f, 0.0722f));
+    c = l + agx_saturation * (c - l);
+    return saturate(mul(c, outset));
+}
+
+// Narkowicz's fit of the ACES filmic curve, for A/B. Linear in and out.
+float3 aces_fitted(float3 x) {
+    x *= 0.6f;
+    return saturate(x * (2.51f * x + 0.03f) / (x * (2.43f * x + 0.59f) + 0.14f));
+}
+
+float3 linear_to_srgb(float3 c) {
+    c = saturate(c);
+    return c <= 0.0031308f ? c * 12.92f : 1.055f * pow(c, 1.0f / 2.4f) - 0.055f;
+}
+
 float4 ps_final(FsOut i) : SV_Target {
     const int2 p = int2(i.pos.xy);
-    const float3 c = fetch(p);
+    const float4 c4 = metered(p);
+    // A debug colour: straight to the screen.
+    if (c4.a < 0.5f) return float4(saturate(c4.rgb), 1.0f);
+    const float3 c = c4.rgb;
     float3 o = c;
     if (sharpen > 0.0f) {
         // A contrast-adaptive cross sharpen: pull away from the neighbours'
@@ -279,5 +435,9 @@ float4 ps_final(FsOut i) : SV_Target {
         const float3 mean = 0.25f * (n + s + e + w);
         o = clamp(c + (c - mean) * sharpen, mn, mx);
     }
-    return float4(tonemap(max(o, 0.0f)), 1.0f);
+    o = max(o, 0.0f);
+    if (tonemap == 0u) return float4(tonemap_raw(o), 1.0f);
+    o *= u_expo[0].y;
+    if (tonemap == 2u) return float4(linear_to_srgb(aces_fitted(o)), 1.0f);
+    return float4(agx(o), 1.0f);
 }

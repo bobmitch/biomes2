@@ -225,6 +225,8 @@ public:
     void         read_all_counts(std::vector<UINT>& out);
 
     ID3D12Resource* vertices()  const { return vertices_.Get(); }
+    // Per-vertex surface material, parallel to vertices() (surface_nets.hlsl).
+    ID3D12Resource* vertex_materials() const { return vertex_mat_.Get(); }
     ID3D12Resource* indices()   const { return indices_.Get(); }
     ID3D12Resource* draw_args() const { return draw_args_.Get(); }
 
@@ -248,7 +250,7 @@ private:
     ComPtr<ID3D12PipelineState> pso_clear_, pso_density_, pso_vertices_,
                                 pso_quads_, pso_args_, pso_retire_, pso_heights_;
 
-    ComPtr<ID3D12Resource> density_, cell_vertex_, vertices_, indices_;
+    ComPtr<ID3D12Resource> density_, cell_vertex_, vertices_, indices_, vertex_mat_;
     ComPtr<ID3D12Resource> counters_, draw_args_;
     ComPtr<ID3D12Resource> counter_readback_, vertex_readback_, args_readback_;
     ComPtr<ID3D12Resource> density_readback_;

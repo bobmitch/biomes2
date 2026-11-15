@@ -1,6 +1,7 @@
 #include "engine/render/renderer.h"
 #include "engine/render/shader_compile.h"
 #include "engine/render/water_wave.h"
+#include "engine/render/lighting_units.h"
 
 #include <d3dcompiler.h>
 #include <cmath>
@@ -67,7 +68,7 @@ static_assert(sizeof(ShadowConstants) == 256, "ShadowConstants must match shadow
 // else -- which the post chain combines (scene_out.hlsli, post.hlsl).
 const DXGI_FORMAT kSceneFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
-// Matches cbuffer PostConstants in post.hlsl: 288 bytes.
+// Matches cbuffer PostConstants in post.hlsl: 320 bytes.
 struct PostConstants {
     float inv_view_proj[16];
     float view_proj[16];
@@ -81,9 +82,13 @@ struct PostConstants {
     UINT  hist_cur, flags;
     UINT  frame;       float ao_radius;
     float contact_len; float debug;
-    float pad[2];
+    float dt;          float ev_comp;
+    float ev100_fixed; UINT  tonemap;
+    float meter_lo;    float meter_hi;
+    UINT  expo_flags;  float agx_saturation;
+    float agx_power;   float pad1;
 };
-static_assert(sizeof(PostConstants) == 288, "PostConstants must match post.hlsl");
+static_assert(sizeof(PostConstants) == 320, "PostConstants must match post.hlsl");
 
 // 4x4 inverse (row-major), by cofactors.
 bool invert4(const float m[16], float out[16]) {
@@ -564,9 +569,9 @@ bool Renderer::create_water_pipeline(std::string& error) {
 
 bool Renderer::create_mesh_pipeline(std::string& error) {
     if (!mesh_root_) {
-        // 24 DWORDs of constants + two root SRVs at 2 each + the shadow CBV
-        // (2) and its table (1) = 31 of the 64.
-        D3D12_ROOT_PARAMETER params[5] = {};
+        // 24 DWORDs of constants + three root SRVs at 2 each + the shadow CBV
+        // (2) and its table (1) = 33 of the 64.
+        D3D12_ROOT_PARAMETER params[6] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         params[0].Constants.ShaderRegister = 0;
@@ -589,6 +594,10 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         params[4].DescriptorTable.NumDescriptorRanges = 1;
         params[4].DescriptorTable.pDescriptorRanges = &sr;
+        // Each vertex's surface material (ADR-004 L1), parallel to t0.
+        params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        params[5].Descriptor.ShaderRegister = 2;
         D3D12_STATIC_SAMPLER_DESC cmp = {};
         cmp.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
         cmp.AddressU = cmp.AddressV = cmp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
@@ -599,7 +608,7 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         cmp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 5;
+        rsd.NumParameters = 6;
         rsd.pParameters = params;
         rsd.NumStaticSamplers = 1;
         rsd.pStaticSamplers = &cmp;
@@ -784,7 +793,7 @@ bool Renderer::create_shadow_resources(std::string& error) {
 // static shadow edge stays on the same texels instead of crawling as the
 // camera moves.
 void Renderer::compute_cascades(const ViewConstants& view) {
-    float L[3] = {0.45f, 0.78f, 0.35f};
+    float L[3] = {kSunDirX, kSunDirY, kSunDirZ};
     {
         const float l = std::sqrt(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
         for (int k = 0; k < 3; ++k) L[k] /= l;
@@ -907,6 +916,7 @@ void Renderer::record_shadows(const ViewConstants& view) {
         cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
         cmd_->SetGraphicsRootShaderResourceView(1, mesher_.vertices()->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
+        cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootConstantBufferView(3, shadow_cb_[frame_]->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootDescriptorTable(4, srv_heap_->GetGPUDescriptorHandleForHeapStart());
         cmd_->IASetIndexBuffer(&ibv);
@@ -1158,7 +1168,7 @@ bool Renderer::create_post_targets(std::string& error) {
                                                           clear ? &cv : nullptr, IID_PPV_ARGS(&out)));
     };
     const float zero[4] = {0, 0, 0, 1};
-    const float sky[4] = {0.40f, 0.50f, 0.66f, 1.0f};
+    const float sky[4] = {kSkyHorizonR, kSkyHorizonG, kSkyHorizonB, 1.0f};
     const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -1222,7 +1232,7 @@ bool Renderer::create_post_pipelines(std::string& error) {
         D3D12_DESCRIPTOR_RANGE ur = {};
         ur.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         ur.NumDescriptors = 4;
-        D3D12_ROOT_PARAMETER p[3] = {};
+        D3D12_ROOT_PARAMETER p[5] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -1230,7 +1240,13 @@ bool Renderer::create_post_pipelines(std::string& error) {
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[2].DescriptorTable.NumDescriptorRanges = 1;
         p[2].DescriptorTable.pDescriptorRanges = &ur;
-        for (int k = 0; k < 3; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        // The exposure meter (ADR-004 L1): the luminance histogram (u4) and
+        // the exposure state (u5), which ps_final reads too.
+        p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        p[3].Descriptor.ShaderRegister = 4;
+        p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        p[4].Descriptor.ShaderRegister = 5;
+        for (int k = 0; k < 5; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_STATIC_SAMPLER_DESC ss[2] = {};
         ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         ss[1].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
@@ -1241,7 +1257,7 @@ bool Renderer::create_post_pipelines(std::string& error) {
             ss[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         }
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 3;
+        rsd.NumParameters = 5;
         rsd.pParameters = p;
         rsd.NumStaticSamplers = 2;
         rsd.pStaticSamplers = ss;
@@ -1266,11 +1282,32 @@ bool Renderer::create_post_pipelines(std::string& error) {
             if (FAILED(hr)) { error = hr_text("post cb", hr); return false; }
             post_cb_[f]->Map(0, nullptr, &post_cb_cpu_[f]);
         }
+        // The meter's buffers. Root UAVs, so ALLOW_UNORDERED_ACCESS is not
+        // optional (CLAUDE.md: the M1 hang). A committed default-heap buffer
+        // starts zeroed, which the exposure kernel reads as "no history yet".
+        for (int k = 0; k < 2; ++k) {
+            D3D12_HEAP_PROPERTIES dh = {};
+            dh.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC bd = {};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = k == 0 ? 256 * 4 : 2 * 16;
+            bd.Height = 1;
+            bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            hr = device_->CreateCommittedResource(&dh, D3D12_HEAP_FLAG_NONE, &bd,
+                                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                  IID_PPV_ARGS(k == 0 ? &lumhist_ : &expo_));
+            if (FAILED(hr)) { error = hr_text("exposure meter buffer", hr); return false; }
+        }
     }
     const char* kPost = "engine/render/shaders/post.hlsl";
-    const char* cs_e[3] = {"cs_ao", "cs_composite", "cs_taa"};
-    ComPtr<ID3D12PipelineState>* cs_o[3] = {&ao_pso_, &composite_pso_, &taa_pso_};
-    for (int k = 0; k < 3; ++k) {
+    const char* cs_e[6] = {"cs_ao", "cs_composite", "cs_taa", "cs_hist_clear", "cs_histogram", "cs_exposure"};
+    ComPtr<ID3D12PipelineState>* cs_o[6] = {&ao_pso_, &composite_pso_, &taa_pso_,
+                                            &hist_clear_pso_, &hist_pso_, &expo_pso_};
+    for (int k = 0; k < 6; ++k) {
         ComPtr<ID3DBlob> cs;
         if (!compile_shader(kPost, cs_e[k], "cs_5_1", cs, error)) return false;
         D3D12_COMPUTE_PIPELINE_STATE_DESC cd = {};
@@ -1318,7 +1355,7 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     std::memcpy(pc.view_proj, view_proj_, sizeof pc.view_proj);
     std::memcpy(pc.prev_view_proj, prev_vp_, sizeof pc.prev_view_proj);
     for (int k = 0; k < 3; ++k) pc.cam_pos[k] = cur_cam_[k];
-    pc.sun_dir[0] = 0.45f; pc.sun_dir[1] = 0.78f; pc.sun_dir[2] = 0.35f;
+    pc.sun_dir[0] = kSunDirX; pc.sun_dir[1] = kSunDirY; pc.sun_dir[2] = kSunDirZ;
     pc.near_plane = kNearPlane;
     pc.far_plane = kFarPlane;
     pc.sharpen = taa_on_ && !wire ? 0.5f : 0.0f;
@@ -1335,6 +1372,26 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     pc.ao_radius = 1.2f;
     pc.contact_len = 0.5f;
     pc.debug = post_debug_;
+    // Exposure (ADR-004 L1). The time since the last post pass drives the
+    // eye's adaptation; a still adapts instantly instead, so the picture
+    // does not depend on how many warm-up frames it took.
+    {
+        LARGE_INTEGER now, freq;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&freq);
+        const unsigned long long t = static_cast<unsigned long long>(now.QuadPart);
+        const double dt = last_post_tick_ ? double(t - last_post_tick_) / double(freq.QuadPart) : 0.0;
+        last_post_tick_ = t;
+        pc.dt = static_cast<float>(dt < 0.0 ? 0.0 : (dt > 0.25 ? 0.25 : dt));
+    }
+    pc.ev_comp = ev_comp_;
+    pc.ev100_fixed = ev100_fixed_;
+    pc.tonemap = wire ? 0u : tonemap_;
+    pc.meter_lo = 0.10f;
+    pc.meter_hi = 0.90f;
+    pc.expo_flags = exposure_snap_ ? 1u : 0u;
+    pc.agx_saturation = agx_saturation_;
+    pc.agx_power = agx_power_;
     std::memcpy(post_cb_cpu_[frame_], &pc, sizeof pc);
 
     const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
@@ -1369,6 +1426,8 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     cmd_->SetComputeRootConstantBufferView(0, post_cb_[frame_]->GetGPUVirtualAddress());
     cmd_->SetComputeRootDescriptorTable(1, srvs);
     cmd_->SetComputeRootDescriptorTable(2, uavs);
+    cmd_->SetComputeRootUnorderedAccessView(3, lumhist_->GetGPUVirtualAddress());
+    cmd_->SetComputeRootUnorderedAccessView(4, expo_->GetGPUVirtualAddress());
 
     // AO at half resolution.
     cmd_->SetPipelineState(ao_pso_.Get());
@@ -1386,6 +1445,17 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     uavb(cur);
     tr(cur, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
 
+    // Meter what TAA produced, then choose this frame's exposure from it.
+    cmd_->SetPipelineState(hist_clear_pso_.Get());
+    cmd_->Dispatch(1, 1, 1);
+    uavb(lumhist_.Get());
+    cmd_->SetPipelineState(hist_pso_.Get());
+    cmd_->Dispatch(((width_ + 1) / 2 + 15) / 16, ((height_ + 1) / 2 + 15) / 16, 1);
+    uavb(lumhist_.Get());
+    cmd_->SetPipelineState(expo_pso_.Get());
+    cmd_->Dispatch(1, 1, 1);
+    uavb(expo_.Get());
+
     // Sharpen and tonemap into the back buffer.
     D3D12_VIEWPORT vp = {};
     vp.Width = float(width_);
@@ -1399,6 +1469,8 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     cmd_->SetGraphicsRootConstantBufferView(0, post_cb_[frame_]->GetGPUVirtualAddress());
     cmd_->SetGraphicsRootDescriptorTable(1, srvs);
     cmd_->SetGraphicsRootDescriptorTable(2, uavs);
+    cmd_->SetGraphicsRootUnorderedAccessView(3, lumhist_->GetGPUVirtualAddress());
+    cmd_->SetGraphicsRootUnorderedAccessView(4, expo_->GetGPUVirtualAddress());
     cmd_->SetPipelineState(final_pso_.Get());
     cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cmd_->DrawInstanced(3, 1, 0, 0);
@@ -1471,8 +1543,10 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
 
     {
         // The mesh does not cover the screen, so the sky is cleared rather
-        // than drawn: into the ambient target, with no direct light.
-        const float sky[4] = {0.40f, 0.50f, 0.66f, 1.0f};
+        // than drawn: into the ambient target, with no direct light. The
+        // sky's radiance at the horizon (lighting_units.h), in nits, which
+        // capture()'s crack test compares against exactly.
+        const float sky[4] = {kSkyHorizonR, kSkyHorizonG, kSkyHorizonB, 1.0f};
         const float none[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         cmd_->ClearRenderTargetView(hdr[0], none, 0, nullptr);
         cmd_->ClearRenderTargetView(hdr[1], sky, 0, nullptr);
@@ -1491,6 +1565,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         cmd_->SetGraphicsRootShaderResourceView(
             1, mesher_.vertices()->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
+        cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress());
         {
             ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
             cmd_->SetDescriptorHeaps(1, heaps);
@@ -1554,7 +1629,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         wc.time = view.time;
         // The same sun the terrain is lit by, or the two surfaces disagree
         // about where the light is and the sea looks pasted on.
-        wc.sun_dir[0] = 0.45f; wc.sun_dir[1] = 0.78f; wc.sun_dir[2] = 0.35f;
+        wc.sun_dir[0] = kSunDirX; wc.sun_dir[1] = kSunDirY; wc.sun_dir[2] = kSunDirZ;
         wc.far_plane = kFarPlane;
         // The camera basis, because the grid is built on the SCREEN and needs
         // to know which way each pixel looks.
@@ -2062,6 +2137,14 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
                                                   nullptr, IID_PPV_ARGS(&readback));
     if (FAILED(hr)) { error = hr_text("CreateCommittedResource (readback)", hr); return false; }
 
+    // A still adapts its exposure instantly (ADR-004 L1), so the picture is
+    // the scene's and not an artefact of how many frames it took.
+    struct SnapGuard {
+        bool& f;
+        explicit SnapGuard(bool& flag) : f(flag) { f = true; }
+        ~SnapGuard() { f = false; }
+    } snap_guard(exposure_snap_);
+
     // TAA needs frames to converge: a still renders sixteen with the same
     // camera and the jitter walking, and captures the last.
     if (taa_on_ && mode_ != Mode::Wireframe) {
@@ -2173,6 +2256,32 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
         cmd_->ResourceBarrier(1, &db2);
     }
 
+    // The exposure meter: what the histogram saw and what it chose.
+    ComPtr<ID3D12Resource> meter_rb;
+    {
+        D3D12_RESOURCE_DESC mb = bd;
+        mb.Width = 256 * 4 + 2 * 16;
+        hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &mb, D3D12_RESOURCE_STATE_COPY_DEST,
+                                              nullptr, IID_PPV_ARGS(&meter_rb));
+        if (FAILED(hr)) { error = hr_text("CreateCommittedResource (meter readback)", hr); return false; }
+        ID3D12Resource* src_m[2] = {lumhist_.Get(), expo_.Get()};
+        const UINT64 off[2] = {0, 256 * 4};
+        const UINT64 len[2] = {256 * 4, 2 * 16};
+        for (int k = 0; k < 2; ++k) {
+            D3D12_RESOURCE_BARRIER t = {};
+            t.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            t.Transition.pResource = src_m[k];
+            t.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            t.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            t.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            cmd_->ResourceBarrier(1, &t);
+            cmd_->CopyBufferRegion(meter_rb.Get(), off[k], src_m[k], 0, len[k]);
+            t.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            t.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            cmd_->ResourceBarrier(1, &t);
+        }
+    }
+
     D3D12_TEXTURE_COPY_LOCATION dst = {};
     dst.pResource = readback.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -2213,6 +2322,25 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
     D3D12_RANGE none = {0, 0};
     readback->Unmap(0, &none);
 
+    exposure_report_ = ExposureReport();
+    {
+        void* mp = nullptr;
+        if (SUCCEEDED(meter_rb->Map(0, nullptr, &mp))) {
+            const unsigned* bins = static_cast<const unsigned*>(mp);
+            const float* st = reinterpret_cast<const float*>(static_cast<const unsigned char*>(mp) + 256 * 4);
+            exposure_report_.bins.assign(bins, bins + 256);
+            exposure_report_.adapted_log2 = st[0];
+            exposure_report_.exposure = st[1];
+            exposure_report_.ev100 = st[2];
+            exposure_report_.target_log2 = st[3];
+            exposure_report_.lo_nits = st[4];
+            exposure_report_.hi_nits = st[5];
+            exposure_report_.metered = st[6];
+            exposure_report_.valid = st[7] > 0.5f;
+            meter_rb->Unmap(0, &none);
+        }
+    }
+
     // Holes below the horizon, both ways. A pixel is below the horizon if
     // its view ray points more than ~1 degree under it: rays nearer the
     // horizon can pass over the rim of the world legitimately.
@@ -2250,21 +2378,17 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
                     const float dl = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
                     if (dir[1] / dl > -0.0175f) continue;
                     ++cracks_.below_horizon;
-                    const bool c = crow[x * 3 + 0] == 168 && crow[x * 3 + 1] == 128 && crow[x * 3 + 2] == 102;
                     const bool d = drow[x] >= 1.0f;
-                    cracks_.by_colour += c;
                     cracks_.by_depth += d;
-                    cracks_.both += (c && d);
                     // Nothing drawn: far depth, no direct light, ambient still the sky clear.
                     const unsigned short* dp = drow_h + x * 4;
                     const unsigned short* ap = arow_h + x * 4;
                     const bool clear = d && dp[0] == 0 && dp[1] == 0 && dp[2] == 0 &&
-                                       std::fabs(half(ap[0]) - 0.40f) < 2e-3f &&
-                                       std::fabs(half(ap[1]) - 0.50f) < 2e-3f &&
-                                       std::fabs(half(ap[2]) - 0.66f) < 2e-3f;
+                                       half(ap[0]) == kSkyHorizonR &&
+                                       half(ap[1]) == kSkyHorizonG &&
+                                       half(ap[2]) == kSkyHorizonB;
                     cracks_.undrawn += clear;
                     if (clear && cracks_.where.size() < 200) cracks_.where.push_back(std::make_pair(int(x), int(y)));
-                    cracks_.undrawn_and_colour += (clear && c);
                 }
             }
             D3D12_RANGE dnone = {0, 0};

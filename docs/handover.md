@@ -46,6 +46,8 @@ of having them.
 | Ground cover | `engine --walk 15 --uncapped [--no-foliage]` | 1.83 vs 1.54 ms a frame walking through a meadow; a woodland-edge still draws ~24k near blades, 13k far, 13k cards, 219 bushes, 0 overflowed |
 | Cracks | `engine --shot ... ` then `<shot>.txt` | default view 0 undrawn; rough hillside `--cam 2420 118 3390 0.6 -0.25` 0 (was 49: a skirt edge-on to a wall, fixed by leaning it outward); 1400 m vista ~73,800 (the void past the world's rim) |
 | Ray tracing | `engine --check-rt` | DXR 1.1, SM 6.5, DXC 1.6; 64 rays, 0 disagreements with the CPU |
+| Exposure (L1) | `engine --shot ...` then `<shot>.txt` | EV100 spawn 13.7, rough hillside 14.9, `--altitude 1400` 15.1, `--sea-shot` 15.4; histogram printed per stop |
+| Lighting cost (L1) | `engine --walk 15 --uncapped`, `--flight 10 --settle` | walk 2.07 -> 2.08 ms mean; flight 1.83 -> 2.05 ms mean, meshing 0.089 -> 0.102 ms/frame |
 | Post chain | `engine --walk 15 --uncapped [--no-post]` | 2.14 vs 2.05 ms (effects); 1.83 ms before the HDR frame existed. 60 m/s vsync flight 99th 23.0-23.4 ms against 22.3 with foliage and post off (one 31 ms outlier run) |
 | Shadows | `engine --flight 10 [--no-shadows]` | spawn 1.66 vs 0.78 ms; densest forest (`--flight-from -704 60 -448`) 2.66 vs 0.97 ms |
 | Felling | `engine --fell --fell-save`, then `--fell-verify` | walk stopped 0.55 m from the axis (bark + capsule 0.54), 9 of 9 swings, log tipped 72 degrees and rested in 9.3 s; reloaded 0.0000 m from rest, tree not standing |

@@ -21,6 +21,19 @@
     ]
   },
   "_note_ground": "Ground cover -- grass, flowers, bushes -- drawn by the engine on the GPU from the seed. Presentation only: nothing here reaches the golden hash or a save, and a missing block means bare ground. grass is blade density at full patch (1 = the engine's maximum), cover the share of the biome inside a grass patch, dry how far the colour leans to dry_color, narrow 1 for reeds; flowers and bushes are chances per 1 m cell. Grass thins under a tree canopy by the same patch noise layer 8 plants trees with.",
+  "_note_materials": "Terrain surface materials (ADR-004 L1), indexed by each biome's material_id. Presentation only, like ground: nothing here reaches the golden hash or a save. The engine blends them per mesh vertex with the same four-cell weights layer 4 blends heights with, so a material boundary falls where the terrain's shape changes. ground is level ground -- what shows between and under the grass, so it leans the grass's way where there is grass; rock is anything steeper than about 40 degrees. Colours are sRGB-encoded, as authored; the engine linearises them. Roughness is perceptual, 0 mirror to 1 chalk. seabed is what an ocean cell's share of the blend becomes, so coasts fade to sand.",
+  "materials": [
+    {"id": 0, "ground": [0.36, 0.45, 0.21], "ground_roughness": 0.92, "rock": [0.50, 0.46, 0.40], "rock_roughness": 0.78},
+    {"id": 1, "ground": [0.31, 0.33, 0.18], "ground_roughness": 0.95, "rock": [0.42, 0.42, 0.35], "rock_roughness": 0.80},
+    {"id": 2, "ground": [0.32, 0.40, 0.20], "ground_roughness": 0.70, "rock": [0.33, 0.30, 0.25], "rock_roughness": 0.55},
+    {"id": 3, "ground": [0.42, 0.44, 0.26], "ground_roughness": 0.90, "rock": [0.52, 0.50, 0.47], "rock_roughness": 0.75},
+    {"id": 4, "ground": [0.64, 0.49, 0.34], "ground_roughness": 0.92, "rock": [0.62, 0.40, 0.28], "rock_roughness": 0.80},
+    {"id": 5, "ground": [0.33, 0.37, 0.24], "ground_roughness": 0.93, "rock": [0.44, 0.44, 0.44], "rock_roughness": 0.78},
+    {"id": 6, "ground": [0.23, 0.22, 0.21], "ground_roughness": 0.90, "rock": [0.16, 0.15, 0.15], "rock_roughness": 0.70},
+    {"id": 7, "ground": [0.90, 0.92, 0.95], "ground_roughness": 0.60, "rock": [0.58, 0.64, 0.70], "rock_roughness": 0.40},
+    {"id": 8, "ground": [0.47, 0.42, 0.35], "ground_roughness": 0.92, "rock": [0.34, 0.31, 0.28], "rock_roughness": 0.78}
+  ],
+  "seabed": {"ground": [0.62, 0.57, 0.45], "ground_roughness": 0.85, "rock": [0.45, 0.43, 0.38], "rock_roughness": 0.75},
   "sea_level": 0.0,
   "biomes": [
     {

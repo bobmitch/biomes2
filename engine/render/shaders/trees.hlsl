@@ -120,10 +120,16 @@ float3 bark_albedo(float3 base, float2 uv, float footprint) {
 }
 
 // `sh` is the sun's visibility from shadow.hlsli: it scales the direct and
-// the transmitted light, never the sky.
-SceneOut shade(float3 albedo, float3 n, float ao, float3 world, bool foliage, float sh) {
-    const float3 sun = normalize(float3(0.45f, 0.78f, 0.35f));
-    const float sky = saturate(n.y * 0.5f + 0.5f);
+// the transmitted light, never the sky. `albedo` is as authored (sRGB).
+//
+// In physical units since ADR-004 L1 (lighting.hlsli). The shapes are the
+// ones that were tuned by eye before it, rescaled against the terrain's, and
+// the extra fill on both is a STAND-IN for light the no-GI ambient cannot
+// know about -- bounce between leaves and off the floor under a crown --
+// which DDGI (L6) computes and these multipliers should then be removed for.
+SceneOut shade(float3 albedo_srgb, float3 n, float ao, float3 world, bool foliage, float sh) {
+    const float3 albedo = srgb_to_linear(albedo_srgb);
+    const float3 v = normalize(cam_pos - world);
     float3 dir, amb;
     if (foliage) {
         // A crown is lit THROUGH as much as on: wrapped diffuse, light that
@@ -131,19 +137,15 @@ SceneOut shade(float3 albedo, float3 n, float ao, float3 world, bool foliage, fl
         // that reaches the underside. With the ground's plain Lambert term
         // the underside of every crown went black -- shards of black card
         // against the sky, which is what the first close-up showed.
-        const float lam = saturate((dot(n, sun) + 0.6f) / 1.6f);
-        const float3 v = normalize(cam_pos - world);
-        const float back = saturate(dot(-v, sun));
-        const float through = 0.45f * back * back * back * sh;
-        dir = albedo * (0.66f * lam * sh * (0.45f + 0.55f * ao) + through);
-        amb = albedo * 0.34f * (0.45f + 0.55f * ao) + float3(0.10f, 0.13f, 0.18f) * (0.5f + 0.5f * sky) * ao;
+        dir = leaf_sun_light(albedo, n, v, 0.6f, 0.7f, sh) * (0.85f * (0.45f + 0.55f * ao));
+        amb = albedo / kPi * gi_diffuse(world, n, v) * (1.3f * (0.45f + 0.55f * ao));
     } else {
         // Bark gets more fill than open ground: under a crown, light that
         // bounced off leaves and the floor reaches the shaded side, and with
-        // the ground's 0.22 every trunk's shadow side read as black.
-        const float lam = saturate(dot(n, sun));
-        dir = albedo * (0.70f * lam * sh * (0.35f + 0.65f * ao));
-        amb = albedo * 0.36f * ao + float3(0.12f, 0.15f, 0.19f) * (0.4f + 0.6f * sky) * ao;
+        // the ground's fill every trunk's shadow side read as black.
+        const Surface s = make_surface(albedo, 0.85f, n, v);
+        dir = sun_light(s, sh) * (0.9f * (0.35f + 0.65f * ao));
+        amb = ambient_light(s, world) * (1.3f * ao);
     }
     return scene_out(dir, amb, world, cam_pos, far_plane, foliage ? 0.0f : 1.0f, foliage ? 0.6f : 1.0f);
 }
@@ -416,8 +418,7 @@ SceneOut ps_impostor(ImpOut i) {
     // would find the tree's own front half and darken every distant tree.
     // Look from just outside its bound on the sun's side instead: hills and
     // other trees still shade it, its own crown does not.
-    const float3 sun = normalize(float3(0.45f, 0.78f, 0.35f));
-    const float sh = shadow_factor(i.world + sun * i.bound, sun);
+    const float sh = shadow_factor(i.world + kSunDir * i.bound, kSunDir);
     return shade(albedo, nw, 1.0f, i.world, true, sh);
 }
 
@@ -428,7 +429,7 @@ void ps_impostor_shadow(ImpOut i) {
     // between views, and the far cascade holds thousands of impostors
     // overlapping under a high sun: four blended views of albedo and normal
     // each was most of the shadow pass's cost.
-    const float3 rd = -normalize(float3(0.45f, 0.78f, 0.35f));
+    const float3 rd = -kSunDir;
     const float n = float(frames);
     const float2 fr = clamp(floor(hemi_oct_encode(to_local(-rd, i.yaw)) * n), 0.0f, n - 1.0f);
     const float3 dl = hemi_oct_decode((fr + 0.5f) / n);

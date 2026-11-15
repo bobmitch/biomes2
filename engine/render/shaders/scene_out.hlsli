@@ -8,18 +8,23 @@
 //
 // Fog belongs to the ambient side: it is light scattered in from the sky, and
 // a fogged pixel should not be shadowed by the geometry it hides.
+//
+// Since ADR-004 L1 both targets hold RADIANCE in nits (lighting_units.h):
+// auto-exposure and the tonemap turn it into a picture in post.hlsl.
 // ---------------------------------------------------------------------------
 #ifndef ENGINE_SCENE_OUT_HLSLI
 #define ENGINE_SCENE_OUT_HLSLI
 
-static const float3 kSceneSky = float3(0.40f, 0.50f, 0.66f);
+#include "engine/render/shaders/lighting.hlsli"
 
 struct SceneOut {
     float4 direct  : SV_Target0;
     float4 ambient : SV_Target1;
 };
 
-// The terrain's fog: (distance / far plane) squared towards the sky colour.
+// The terrain's fog: (distance / far plane) squared towards the horizon's
+// radiance, which is also what the sky clears to, so land meets sky without
+// a line. L2's aerial perspective replaces it.
 // `contact` (the direct target's alpha) says how much screen-space contact
 // shadows may darken this surface: 1 for ground and bark, little or none for
 // leaves and grass, which shadow each other everywhere within the march and
@@ -34,17 +39,20 @@ SceneOut scene_out(float3 direct, float3 ambient, float3 world, float3 cam, floa
     const float f = saturate(d / far_plane);
     const float fog = f * f;
     SceneOut o;
-    o.direct = float4(direct * (1.0f - fog), contact);
-    o.ambient = float4(ambient * (1.0f - fog) + kSceneSky * fog, ao);
+    o.direct = float4(min(direct * (1.0f - fog), kSceneMaxNits), contact);
+    o.ambient = float4(min(ambient * (1.0f - fog) + kSkyHorizon * fog, kSceneMaxNits), ao);
     return o;
 }
 
-// A debug colour, shown as is: all in the ambient target, so contact shadows
-// never touch it (AO still darkens it where AO is on; --no-ao for a pure tint).
+// A debug colour, shown as is: no exposure, no tonemap, no AO, no contact
+// shadow. A NEGATIVE ambient alpha marks it, and post.hlsl carries the mark
+// through the composite and TAA to the final pass, which passes the colour
+// straight to the screen. Without the mark auto-exposure would meter a
+// magenta of 1 nit against a sky of 7000 and show it as black.
 SceneOut scene_flat(float3 c) {
     SceneOut o;
-    o.direct = float4(0.0f, 0.0f, 0.0f, 1.0f);
-    o.ambient = float4(c, 1.0f);
+    o.direct = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    o.ambient = float4(c, -1.0f);
     return o;
 }
 

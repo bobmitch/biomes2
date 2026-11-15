@@ -240,6 +240,13 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == 'Y') { g_renderer.set_taa(!g_renderer.taa()); return 0; }
             if (wp == 'O') { g_renderer.set_ao(!g_renderer.ao()); return 0; }
             if (wp == 'J') { g_renderer.set_contact(!g_renderer.contact()); return 0; }
+            // Exposure and tonemap (ADR-004 L1): U cycles AgX -> ACES -> raw,
+            // and , . step the exposure compensation by half a stop.
+            if (wp == 'U') { g_renderer.set_tonemap((g_renderer.tonemap() + 2u) % 3u); return 0; }
+            if (wp == VK_OEM_COMMA || wp == VK_OEM_PERIOD) {
+                g_renderer.set_ev_comp(g_renderer.ev_comp() + (wp == VK_OEM_PERIOD ? 0.5f : -0.5f));
+                return 0;
+            }
             if (wp == VK_F6) { g_want_save = true; return 0; }
             if (wp == VK_F9) { g_want_load = true; return 0; }
             if (wp == VK_F5) {
@@ -655,6 +662,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (c2.find("--no-post") != std::string::npos) {
             g_renderer.set_taa(false); g_renderer.set_ao(false); g_renderer.set_contact(false);
         }
+        // Exposure and tonemap (ADR-004 L1).
+        const size_t evc = c2.find("--ev-comp");
+        if (evc != std::string::npos) g_renderer.set_ev_comp(float(std::atof(c2.c_str() + evc + 9)));
+        const size_t evf = c2.find("--ev100");
+        if (evf != std::string::npos) g_renderer.set_ev100_fixed(float(std::atof(c2.c_str() + evf + 7)));
+        const size_t tmo = c2.find("--tonemap");
+        if (tmo != std::string::npos) g_renderer.set_tonemap(unsigned(std::atoi(c2.c_str() + tmo + 9)));
+        const size_t asat = c2.find("--agx-sat");
+        if (asat != std::string::npos) g_renderer.set_agx_saturation(float(std::atof(c2.c_str() + asat + 9)));
+        const size_t apow = c2.find("--agx-power");
+        if (apow != std::string::npos) g_renderer.set_agx_power(float(std::atof(c2.c_str() + apow + 11)));
         const size_t pdb = c2.find("--post-debug");
         if (pdb != std::string::npos) g_renderer.set_post_debug(float(std::atof(c2.c_str() + pdb + 12)));
         const size_t fd = c2.find("--foliage-debug");
@@ -943,15 +961,50 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                          st.vertices, st.indices, st.indices / 3, st.overflowed);
             {
                 const engine::Renderer::CrackCount& cc = g_renderer.last_cracks();
-                std::fprintf(f, "cracks below the horizon: %zu undrawn (far depth, scene targets clear) -- "
-                                "%zu by final sky colour, %zu of them both; far depth alone %zu; "
-                                "of %zu pixels below it\n", cc.undrawn, cc.by_colour, cc.undrawn_and_colour,
-                             cc.by_depth, cc.below_horizon);
+                std::fprintf(f, "cracks below the horizon: %zu undrawn (far depth, scene targets clear); "
+                                "far depth alone %zu; of %zu pixels below it\n",
+                             cc.undrawn, cc.by_depth, cc.below_horizon);
                 if (!cc.where.empty()) {
                     std::fprintf(f, "undrawn pixels (x y):");
                     for (size_t q = 0; q < cc.where.size(); ++q)
                         std::fprintf(f, " %d %d", cc.where[q].first, cc.where[q].second);
                     std::fprintf(f, "\n");
+                }
+            }
+            {
+                // The exposure meter (ADR-004 L1): what it saw and what it
+                // chose. The histogram is of log2 luminance in nits, every
+                // second pixel each way, of what TAA produced.
+                const engine::Renderer::ExposureReport& er = g_renderer.last_exposure();
+                if (er.valid) {
+                    std::fprintf(f, "exposure: EV100 %.2f (metered mean %.0f nits, this frame's target %.0f), "
+                                    "x%.3g, compensation %+.1f stops, tonemap %s\n",
+                                 er.ev100, std::exp2(er.adapted_log2), std::exp2(er.target_log2), er.exposure,
+                                 g_renderer.ev_comp(),
+                                 g_renderer.tonemap() == 1u ? "AgX" : g_renderer.tonemap() == 2u ? "ACES" : "raw");
+                    std::fprintf(f, "exposure: %.0f pixels metered; 10th percentile %.0f nits, 90th %.0f nits "
+                                    "(%.1f stops apart)\n",
+                                 er.metered, er.lo_nits, er.hi_nits,
+                                 er.lo_nits > 0.0f ? std::log2(er.hi_nits / er.lo_nits) : 0.0f);
+                    // One row per stop: the share of metered pixels, as a bar.
+                    const float step = (er.log_max - er.log_min) / 255.0f;
+                    double tot = 0.0;
+                    for (size_t k = 0; k < er.bins.size(); ++k) tot += er.bins[k];
+                    for (int stop = int(er.log_min); stop < int(er.log_max); ++stop) {
+                        double c = 0.0;
+                        for (size_t k = 0; k < er.bins.size(); ++k) {
+                            const float l = er.log_min + float(k) * step;
+                            if (l >= float(stop) - 0.5f * step && l < float(stop + 1) - 0.5f * step) c += er.bins[k];
+                        }
+                        if (c <= 0.0) continue;
+                        const double share = tot > 0.0 ? c / tot : 0.0;
+                        char bar[61];
+                        const int nb = int(share * 120.0 + 0.5) > 60 ? 60 : int(share * 120.0 + 0.5);
+                        for (int q = 0; q < nb; ++q) bar[q] = '#';
+                        bar[nb] = 0;
+                        std::fprintf(f, "  %7.1f-%-8.1f nits %5.1f%% %s\n", std::exp2(float(stop)),
+                                     std::exp2(float(stop + 1)), share * 100.0, bar);
+                    }
                 }
             }
             {

@@ -405,16 +405,16 @@ FolOut vs_blade(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     return o;
 }
 
-SceneOut shade_foliage(float3 albedo, float3 n, float ao, float3 world, float3 toward_eye,
+// `albedo` as authored (sRGB). Physical units since ADR-004 L1: the wrapped
+// and transmitted sun of lighting.hlsli, and the GI interface's diffuse with
+// a little extra fill standing in for light scattered between blades, which
+// the no-GI ambient cannot see (trees.hlsl's shade says the same).
+SceneOut shade_foliage(float3 albedo_srgb, float3 n, float ao, float3 world, float3 toward_eye,
                        float contact = 0.0f, float ssao = 0.4f) {
-    const float3 sun = normalize(float3(0.45f, 0.78f, 0.35f));
+    const float3 albedo = srgb_to_linear(albedo_srgb);
     const float sh = shadow_factor(world, float3(0.0f, 1.0f, 0.0f));
-    const float lam = saturate((dot(n, sun) + 0.5f) / 1.5f);
-    const float back = saturate(dot(-toward_eye, sun));
-    const float through = 0.6f * back * back * back * sh;
-    const float sky = saturate(n.y * 0.5f + 0.5f);
-    return scene_out(albedo * (0.85f * lam * sh * ao + through),
-                     albedo * 0.32f * ao + float3(0.10f, 0.13f, 0.18f) * (0.5f + 0.5f * sky) * ao,
+    return scene_out(leaf_sun_light(albedo, n, toward_eye, 0.5f, 0.7f, sh) * (1.09f * ao),
+                     albedo / kPi * gi_diffuse(world, n, toward_eye) * (1.3f * ao),
                      world, cam_pos, far_plane, contact, ssao);
 }
 

@@ -58,7 +58,7 @@ cbuffer WorldConstants : register(b1) {
 RWStructuredBuffer<float4> g_cells        : register(u11);   // xy position, z biome
 RWStructuredBuffer<uint>   g_cell_off     : register(u12);
 RWStructuredBuffer<uint>   g_cell_item    : register(u13);
-RWStructuredBuffer<float4> g_arch         : register(u14);   // 3 per biome
+RWStructuredBuffer<float4> g_arch         : register(u14);   // kArchRows per biome
 RWStructuredBuffer<float4> g_rivers       : register(u15);   // 2 per segment
 RWStructuredBuffer<uint>   g_river_off    : register(u16);
 RWStructuredBuffer<uint>   g_river_item   : register(u17);
@@ -66,11 +66,15 @@ RWStructuredBuffer<float4> g_ent          : register(u18);   // 2 per segment
 RWStructuredBuffer<uint>   g_ent_off      : register(u19);
 RWStructuredBuffer<uint>   g_ent_item     : register(u20);
 
+// Rows per biome in g_arch: three of shape, then two of surface material
+// (ADR-004 L1), which only the mesher reads. world_gpu.cpp's kArchFloats.
+static const int kArchRows = 5;
+
 BiomeProfile profile_of(int b) {
     BiomeProfile p;
-    const float4 a0 = g_arch[b * 3 + 0];
-    const float4 a1 = g_arch[b * 3 + 1];
-    const float4 a2 = g_arch[b * 3 + 2];
+    const float4 a0 = g_arch[b * kArchRows + 0];
+    const float4 a1 = g_arch[b * kArchRows + 1];
+    const float4 a2 = g_arch[b * kArchRows + 2];
     p.base_elevation = a0.x;
     p.amplitude = a0.y;
     p.octaves = (int)a0.z;

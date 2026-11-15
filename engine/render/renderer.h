@@ -214,24 +214,40 @@ public:
     void set_contact(bool on) { contact_on_ = on; }
     bool contact() const { return contact_on_; }
     void set_post_debug(float d) { post_debug_ = d; }
+    // Exposure and tonemap (ADR-004 L1). Metered by default; a fixed EV100
+    // (> -100) overrides the meter. Tonemap 0 is the pre-L1 display path
+    // (no exposure), 1 AgX, 2 a fitted ACES.
+    void set_ev_comp(float stops) { ev_comp_ = stops; }
+    float ev_comp() const { return ev_comp_; }
+    void set_ev100_fixed(float ev) { ev100_fixed_ = ev; }
+    void set_tonemap(unsigned mode) { tonemap_ = mode; }
+    unsigned tonemap() const { return tonemap_; }
+    void set_agx_saturation(float s) { agx_saturation_ = s; }
+    void set_agx_power(float p) { agx_power_ = p; }
+    // What the meter saw in the last capture(): the histogram and the
+    // exposure it chose. bins[k] covers log2 nits kLumLogMin + k * step.
+    struct ExposureReport {
+        bool  valid = false;
+        float adapted_log2 = 0, exposure = 0, ev100 = 0, target_log2 = 0;
+        float lo_nits = 0, hi_nits = 0, metered = 0;
+        float log_min = -10.0f, log_max = 18.0f;
+        std::vector<unsigned> bins;
+    };
+    const ExposureReport& last_exposure() const { return exposure_report_; }
 
     // What the device can do (ADR-004): ray-tracing tier, shader model.
     const DeviceCaps& caps() const { return caps_; }
     ID3D12Device*       device() const { return device_.Get(); }
     ID3D12CommandQueue* queue() const { return queue_.Get(); }
 
-    // Holes, counted by the last capture() two ways, below the horizon only:
-    // pixels that are exactly the sky's clear colour, and pixels whose depth
-    // is the far plane. The colour count is what the external crack detector
-    // has always done; the depth count is the one that survives a tonemap
-    // that changes the sky (ADR-004 L0). They must agree before it does.
+    // Holes, counted by the last capture() below the horizon only.
     // `undrawn` is the definition that survives a tonemap: far depth AND both
     // HDR scene targets still at their clear values -- nothing, sea included,
     // was drawn there. Far depth alone counts the sea beyond the clipmap,
-    // which writes no depth, as holes.
+    // which writes no depth, as holes. (The old count by final sky colour
+    // went with L1: the tonemap is entitled to change the sky's colour.)
     struct CrackCount {
-        size_t below_horizon = 0, by_colour = 0, by_depth = 0, both = 0;
-        size_t undrawn = 0, undrawn_and_colour = 0;
+        size_t below_horizon = 0, by_depth = 0, undrawn = 0;
         std::vector<std::pair<int, int> > where;   // the first undrawn pixels, for --pick
     };
     const CrackCount& last_cracks() const { return cracks_; }
@@ -360,6 +376,8 @@ private:
     ComPtr<ID3D12DescriptorHeap> post_rtv_heap_;
     ComPtr<ID3D12RootSignature> post_root_;
     ComPtr<ID3D12PipelineState> ao_pso_, composite_pso_, taa_pso_, final_pso_;
+    ComPtr<ID3D12PipelineState> hist_clear_pso_, hist_pso_, expo_pso_;
+    ComPtr<ID3D12Resource> lumhist_, expo_;   // 256 bins; 2 float4 of exposure state
     ComPtr<ID3D12Resource> post_cb_[kFrameCount];
     void* post_cb_cpu_[kFrameCount] = {};
     float view_proj_[16] = {};      // this frame, jittered
@@ -375,6 +393,11 @@ private:
     DeviceCaps caps_;
     CrackCount cracks_;
     float post_debug_ = 0.0f;
+    float ev_comp_ = 0.0f, ev100_fixed_ = -1000.0f, agx_saturation_ = 1.4f, agx_power_ = 1.35f;
+    unsigned tonemap_ = 1;
+    bool  exposure_snap_ = false;            // a still: adapt instantly
+    unsigned long long last_post_tick_ = 0;
+    ExposureReport exposure_report_;
     TreeField        tree_field_;
     TreeRenderer     trees_;
     TreeDrawSettings tree_settings_;

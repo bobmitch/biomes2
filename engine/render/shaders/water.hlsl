@@ -29,6 +29,7 @@
 
 #include "engine/field/real_field.hlsl"
 #include "engine/render/water_wave.h"
+#include "engine/render/shaders/lighting.hlsli"
 
 cbuffer WaterConstants : register(b0) {
     row_major float4x4 view_proj;
@@ -170,13 +171,12 @@ VSOut vs_main(uint vid : SV_VertexID) {
 
 // Sky, matching the colour the renderer clears to so the horizon joins up.
 float3 sky_colour(float3 dir) {
-    // The horizon end must not be BRIGHTER than the sky the renderer
-    // actually clears to, or the sea near the horizon glows whiter than the
-    // sky above it -- which it did, and it reads as a bug even though a
-    // grazing reflection genuinely is bright.
-    const float3 horizon = float3(0.44f, 0.54f, 0.68f);
-    const float3 zenith  = float3(0.20f, 0.34f, 0.60f);
-    return lerp(horizon, zenith, saturate(dir.y * 1.4f));
+    // The sky's radiance, the same function every surface's specular sees
+    // (lighting.hlsli). Its horizon end is exactly what the sky clears to:
+    // brighter, and the sea near the horizon glowed whiter than the sky above
+    // it -- which it did once, and it reads as a bug even though a grazing
+    // reflection genuinely is bright.
+    return sky_radiance(dir);
 }
 
 // Debug views, so that "the sea looks wrong" can be turned into a number
@@ -241,8 +241,8 @@ float4 water_colour(VSOut i) {
 
     // Deeper water is darker and bluer. The shallow end is what makes a beach
     // read as a beach rather than as a line where blue stops.
-    const float3 shallow = float3(0.22f, 0.52f, 0.52f);
-    const float3 deep    = float3(0.016f, 0.075f, 0.16f);
+    const float3 shallow = srgb_to_linear(float3(0.22f, 0.52f, 0.52f));
+    const float3 deep    = srgb_to_linear(float3(0.016f, 0.075f, 0.16f));
     const float  dmix = saturate(i.depth / 22.0f);
     float3 body = lerp(shallow, deep, dmix * dmix);
 
@@ -260,9 +260,15 @@ float4 water_colour(VSOut i) {
     // Sun glitter. The exponent falls as the sea gets rougher: a calm sea
     // gives one hard highlight, a rough one scatters it into a broad track,
     // because the facets that catch the sun are spread over more angles.
+    //
+    // Normalised Blinn-Phong, (shine + 8) / 8 pi, so the glint carries the
+    // sun's real energy (ADR-004 L1): a calm sea's highlight is tens of
+    // thousands of nits, which is why it is the one thing kSceneMaxNits
+    // exists for.
     const float3 h = normalize(l + v);
     const float  shine = lerp(900.0f, 60.0f, saturate(sea_state));
-    const float  spec = pow(saturate(dot(n, h)), shine) * lerp(1.6f, 0.7f, saturate(sea_state));
+    const float3 spec = kSunLux * ((shine + 8.0f) / (8.0f * kPi) * pow(saturate(dot(n, h)), shine) *
+                                   saturate(dot(n, l))) * f_schlick(float3(0.02f, 0.02f, 0.02f), saturate(dot(v, h)));
 
     // Foam where the water is shallow enough to break, and on the crests once
     // the sea is rough. Both are gated on `fade` so the far field does not
@@ -285,14 +291,17 @@ float4 water_colour(VSOut i) {
     if (dbg.a > 0.0f) return dbg;
 
     const float diffuse = 0.25f + 0.75f * saturate(dot(n, l));
+    // What lights the water's body and its foam: the sun on level water and
+    // the sky, as on level ground.
+    const float3 light_in = (kSunLux * kSunDirY * diffuse + kPi * kSkyMean) / kPi;
 
-    float3 col = lerp(body * diffuse, sky, fres) + spec;
-    col = lerp(col, float3(0.86f, 0.90f, 0.93f) * diffuse, foam);
+    float3 col = lerp(body * light_in, sky, fres) + spec;
+    col = lerp(col, srgb_to_linear(float3(0.86f, 0.90f, 0.93f)) * light_in, foam);
 
     // Into the haze, the same way the terrain does, or the sea meets the sky
     // at a hard line.
     const float haze = saturate(i.dist / far_plane);
-    col = lerp(col, float3(0.40f, 0.50f, 0.66f), haze * haze);
+    col = min(lerp(col, kSkyHorizon, haze * haze), kSceneMaxNits);
 
     // Shallow water is see-through; deep water is not. Fresnel wins at
     // grazing angles either way, which is correct -- you cannot see into a

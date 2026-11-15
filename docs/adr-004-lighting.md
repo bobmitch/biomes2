@@ -2,7 +2,7 @@
 
 **Status:** accepted for the GI backbone (DDGI on hardware ray tracing,
 behind two explicit interfaces); the rest proposed
-**Date:** 2026-11-15
+**Date:** 2026-11-14
 **Extends:** [ADR-003](adr-003-graphics-api.md) (D3D12). Touches nothing upstream of the golden hash.
 
 ## Context
@@ -241,7 +241,7 @@ Each one is measured with an instrument, not judged only by eye.
 | | What | Instrument |
 | --- | --- | --- |
 | **L0** ✅ | DXC alongside FXC; check the device's DXR tier at init; crack detection moved from colour to depth | `--check-rt`; crack counts identical before and after |
-| **L1** | Units, auto-exposure, tonemap, PBR materials, biome terrain materials | a histogram report; A/B stills |
+| **L1** ✅ | Units, auto-exposure, tonemap, PBR materials, biome terrain materials | a histogram report; A/B stills |
 | **L2** | Hillaire atmosphere, aerial perspective, time of day (`--time`, a key) | `--sky-report`: sun and sky radiance against reference values |
 | **L3** | Clustered local lights, shadow atlas, a torch you can carry | `--lights-report`: lights per cluster, shadow budget, ms |
 | **L4** | Froxel volumetric fog: sun, local lights, height and local media | A/B stills; ms |
@@ -254,7 +254,7 @@ Each one is measured with an instrument, not judged only by eye.
 the characteristic failure of every probe GI, and the eye forgives it until
 the day it does not.
 
-## L0 — done, 2026-11-15
+## L0 — done, 2026-11-14
 
 - **DXC** compiles SM 6 targets (`cs_6_5` etc.) through the same
   preprocess-and-hash path and shader cache as FXC; the build copies the
@@ -279,6 +279,48 @@ the day it does not.
   pinholes with it off -- TAA and the sharpen move a one-pixel hole off the
   exact sky colour. Far depth alone is wrong too: the sea beyond the clipmap
   writes no depth and counted as 106,000 holes.
+
+## L1 — done, 2026-11-14
+
+- **Units.** `engine/render/lighting_units.h` holds the light once, for C++
+  and HLSL alike: the sun at ~100,000 lux, the sky at a mean ~4,300 nits
+  (~13,400 lux on level ground), the horizon ~5,000 nits. Shade on level
+  ground gets 14% of sun, a clear day. Both scene targets hold radiance in
+  nits; every authored colour is linearised before it is lit.
+- **The GI interface exists before the GI.** `lighting.hlsli` defines
+  `gi_diffuse`, `gi_specular` and `gi_sky_visibility` with the no-RT
+  fallback (two hemispheres, sky and ground bounce, exact against the cosine
+  lobe; GTAO still applied in post), and terrain, trees, grass and the sea
+  all call it. L6 replaces bodies, not call sites. Trees and grass keep a
+  fill multiplier (1.3) standing in for inter-leaf bounce -- L6 should
+  delete it, and `--leak-test` will show whether anything else leaks.
+- **BRDF:** Lambert + GGX (Smith height-correlated, Schlick, F0 0.04,
+  metal), Karis's analytic environment BRDF for the ambient specular, a
+  wrapped and transmitted sun for leaves and blades, normalised Blinn-Phong
+  glints on the sea (the one thing clamped, at 60,000 nits, under half
+  float's ceiling: an Inf would poison TAA's history).
+- **Exposure:** a 256-bin log2 luminance histogram of TAA's output (every
+  second pixel), the mean of its 10-90% band to middle grey 0.18, adapted
+  at 3 stops' rate into light and 1 out of it; stills adapt instantly.
+  The instrument is the shot report: EV100 spawn 13.7, rough hillside 14.9,
+  1400 m vista 15.1, sea view 15.4 -- a sunny scene with shade to a bright
+  seascape, which is where a camera would put them (sunny-16 is 15).
+- **Tonemap:** AgX with the reference "punchy" look (power 1.35, saturation
+  1.4). On four A/B stills base AgX was pastel everywhere and punchy matched
+  a fitted ACES; AgX wins on hue for saturated highlights, which torches and
+  magic will be. `--tonemap 2` keeps ACES, `--tonemap 0` the pre-L1 path.
+- **Biome terrain materials:** archetypes.json `materials` (ground, rock,
+  roughness; plus `seabed`), blended per vertex in the mesher with layer
+  4's own weights, so material boundaries follow shape boundaries and coasts
+  go sandy. The golden gate did not move: the block is presentation.
+- **Debug tints bypass exposure** through a mark in the ambient alpha
+  carried to the final pass; `--mesh-debug 1` is now exactly magenta.
+- **Cost:** walking 2.07 -> 2.08 ms; flight 1.83 -> 2.05 ms mean (GGX over a
+  terrain-filled frame, and meshing 0.089 -> 0.102 ms for the material
+  blend). Crack counts identical on all four A/B views.
+- **Not right yet:** the sea is duller than before (teal came from blending
+  in display space); the sky is still one clear colour with a gradient only
+  in reflections; the sun never moves. All three are L2's.
 
 ## Risks
 

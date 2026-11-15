@@ -64,7 +64,9 @@ the streaming A/B switches `--no-lod-align`,
 `--tree-lod0 <m>`, `--no-trees`, `--no-shadows`, `--no-foliage`,
 `--foliage-debug 1`, and the post chain's `--no-taa`, `--no-ao`,
 `--no-contact`, `--no-post` and `--post-debug 1|2` (AO alone, contact
-shadows alone). `--sea-shot` only PLACES the camera: pair it with `--shot`,
+shadows alone), and exposure's `--ev-comp <stops>`, `--ev100 <v>` (fixed,
+no meter), `--tonemap 0|1|2` (raw pre-L1 path / AgX / fitted ACES),
+`--agx-sat` and `--agx-power`. `--sea-shot` only PLACES the camera: pair it with `--shot`,
 or it falls through to the window loop with no window and never exits. `--walk` takes `--uncapped` to time frames at ground
 level, where the grass is. It is a GUI subsystem binary, so a shell does not wait
 on it: run it with `Start-Process -Wait` or the file you read will be the
@@ -401,7 +403,8 @@ last run's.
 - **Shaders are cached** under `build/shader_cache/<hash>.cso`. The hash covers
   the preprocessed source with its includes, the entry point, target, flags
   and compiler version, so editing a shader or anything it includes (field.h)
-  recompiles it and nothing else. Warm start ~1 s, cold ~8 s.
+  recompiles it and nothing else. Warm start ~1 s, cold ~18 s, most of it
+  foliage's `cs_bake` (7.8 s) and the mesher's `cs_vertices` (4.1 s).
   `--no-shader-cache` forces compiles; `--check-dialect` always compiles,
   because compiling is the thing it checks. `build/startup.txt` times every
   shader and init phase on every start.
@@ -511,10 +514,64 @@ sun's direct light, and everything else (sky, bounce, fog). Then
 direct x screen-space contact shadow (a 0.5 m march towards the sun through
 depth) + ambient x AO; TAA (Halton 2,3 jitter over 8 frames, reprojection by
 depth with the unjittered previous matrix, YCoCg variance clipping, 1:9
-blend); then a light contrast-adaptive sharpen and a tonemap into the back
-buffer. Y / O / J toggle TAA, AO and contact shadows. A still renders 16
-frames so TAA converges. Cost: ~0.3 ms a frame at ground level, 0.09 of it
-the effects.
+blend); the exposure meter; then exposure, a light contrast-adaptive
+sharpen and AgX into the back buffer. Y / O / J toggle TAA, AO and contact
+shadows. A still renders 16 frames so TAA converges. Cost: ~0.3 ms a frame
+at ground level, 0.09 of it the effects.
+
+### Light in physical units (ADR-004 L1)
+
+**Both targets hold radiance in nits.** `engine/render/lighting_units.h` is
+the one copy of the light -- sun in lux, sky in nits, the sun's direction --
+and it compiles as C++ and HLSL like `water_wave.h`, so the clear colour,
+the crack test, the shadow and post constants and every shader read the same
+numbers. Every authored colour in the engine is still sRGB-encoded as typed;
+`srgb_to_linear` comes first, in the shader (or in `world_gpu.cpp` for the
+terrain materials). `lighting.hlsli` has the BRDF (Lambert + GGX, Smith
+height-correlated, Schlick, F0 0.04) and the ADR's shading-facing GI
+interface -- `gi_diffuse`, `gi_specular`, `gi_sky_visibility` -- with its
+no-RT fallback: sky irradiance from above, the ground's bounce from below.
+Terrain, trees, grass and the sea all light through it. Trees and grass
+keep a little extra fill as a STAND-IN for inter-leaf bounce; DDGI (L6)
+should remove those multipliers.
+
+**Auto-exposure** meters a 256-bin log2 histogram of what TAA produced and
+puts the mean of its 10-90% band at middle grey 0.18, adapting like an eye
+(faster into light than out). A still adapts instantly. Every `--shot`
+writes the EV100, the band and the histogram to `<shot>.txt`: spawn EV100
+13.7, the badlands hillside 14.9, a sea view 15.4. `,` `.` step the
+compensation; `U` cycles AgX / ACES / raw.
+
+**AgX, with the reference "punchy" look** (power 1.35, saturation 1.4). Base
+AgX drew every view pastel; punchy matched a fitted ACES on the A/B stills
+and keeps AgX's hue handling, which a torch's orange will need.
+
+- **A debug tint is marked, not exposed.** `scene_flat` writes a NEGATIVE
+  ambient alpha; the composite turns it into alpha 0, TAA carries it, and
+  `ps_final` passes the colour straight through, so `--mesh-debug 1`'s
+  magenta is exactly (255, 0, 255) -- it was (236, 0, 236) through the old
+  tonemap. Without the mark auto-exposure meters a 1-nit magenta against a
+  5,000-nit sky and draws it black. The sea's `--water-debug` views are not
+  marked: pair them with `--tonemap 0`.
+- **A nearly neutral sky goes grey under AgX**, and a sea view -- all sky
+  and reflected sky -- meters it to a slate. The sky's hues are the pre-L1
+  sky's, linearised (blue/red ~3 at the horizon); its luminance is physical.
+- **Terrain has a material per biome**: archetypes.json's `materials`
+  block, indexed by `material_id`, ground and rock with a roughness each,
+  plus `seabed` -- presentation only, and the golden gate confirmed it. The
+  MESHER blends them per vertex with layer 4's own warp, four cells and
+  `blend_weight`, so a material boundary sits where the shape changes; an
+  ocean cell's share goes to the seabed, which is what makes coasts sandy.
+  They ride in `g_arch` rows 3-4 (`kArchRows` = 5 in `real_field.hlsl`,
+  `kArchFloats` = 20 in `world_gpu.cpp` -- keep them equal; `--probe-field`
+  is the check, 6 um after the change) and come out in `g_vertex_mat`, a
+  buffer PARALLEL to the vertex pool so nothing that reads vertices changed
+  stride. Slope picks ground or rock per pixel. Cost: meshing 0.089 -> 0.102
+  ms a frame; the flight's mean frame 1.83 -> 2.05 ms, walking unchanged.
+- **The sea reads duller than before L1**, grey-green where it was teal: the
+  old teal came from blending in display space, and a physically blended
+  grazing reflection is mostly sky. Untuned on purpose: L2 replaces the
+  sky it reflects and L7 owns water reflections.
 
 - **Cracks are counted in the engine, as UNDRAWN pixels** (ADR-004 L0):
   below the horizon, far depth, and both HDR scene targets still at their
@@ -523,8 +580,8 @@ the effects.
   old sky-colour test, which TAA had ALREADY blinded: on the rough hillside
   it read 0 with post on against 49 real pinholes with post off. Far depth
   alone is not a crack either -- the sea beyond the clipmap writes none.
-  The tonemap is still the identity below 0.8 (L1 replaces it); nothing
-  depends on that any more.
+  The sky's clear value is `kSkyHorizon` in nits, chosen to be exact in
+  half float so the test compares it exactly.
 - **A skirt straight down −normal is edge-on to a wall seen face-on.** The
   rough hillside's ~50 "pinholes" (2420, 118, 3390) were one slit, 5 x 20
   px: a steep wall crossed by a LOD 0 / LOD 1 border at z = 3456, viewed 15°
@@ -709,7 +766,9 @@ the way to tell is worth keeping because the eye gets it wrong. They read as
 black beside lit ground; measured, the darkest pixel in frame is (22, 29, 21)
 and `mesh.hlsl` cannot go below `rock * 0.22` ≈ (19, 26, 16), which is a
 normal pointing straight down. Three causes are distinguishable without
-guessing:
+guessing. (The colours below are the pre-L1 display path; under exposure
+and AgX they no longer hold, so reproduce them with `--tonemap 0` -- or,
+better, count holes with the undrawn test, which is tonemap-proof.)
 
 | what you see | cause |
 | --- | --- |
@@ -762,7 +821,8 @@ look wrong.
 
 Controls: `--sea-state <0..1>`, `--sea-shot` (stands the camera off the nearest
 coast, which is the only vantage a 7 m swell reads as a swell from),
-`--water-debug 1..5` (depth, foam, normal, displacement, surviving amplitude),
+`--water-debug 1..5` (depth, foam, normal, displacement, surviving amplitude;
+with `--tonemap 0` since L1),
 `--no-water`, and `[` `]` `K` in the window.
 
 The water asks the SHARED FIELD FUNCTION how deep it is, so the shoreline is

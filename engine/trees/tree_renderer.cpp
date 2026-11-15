@@ -1,5 +1,6 @@
 #include "engine/trees/tree_renderer.h"
 #include "engine/render/shader_compile.h"
+#include "engine/render/lighting_units.h"
 
 #include <windows.h>
 
@@ -779,7 +780,7 @@ void TreeRenderer::set_instances(const std::vector<TreeGpuInstance>& inst) {
 namespace {
 void fill_common(TreeFrame& tf, UINT count, UINT models, UINT quad_first, UINT quad_base,
                  const TreeDrawSettings& s) {
-    tf.sun_dir[0] = 0.45f; tf.sun_dir[1] = 0.78f; tf.sun_dir[2] = 0.35f;
+    tf.sun_dir[0] = kSunDirX; tf.sun_dir[1] = kSunDirY; tf.sun_dir[2] = kSunDirZ;
     tf.max_dist = s.max_dist;
     tf.lod0_dist = (std::min)(s.lod0_dist, s.max_dist);
     tf.lod1_dist = (std::min)(s.lod1_dist, s.max_dist);

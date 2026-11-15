@@ -1,6 +1,7 @@
 #include "engine/field/world_gpu.h"
 
 #include "worldgen/generator_version.h"
+#include "worldgen/assign/json_lite.h"
 
 #include <cmath>
 #include <cstring>
@@ -81,6 +82,10 @@ bool make_default(ID3D12Device* d, UINT64 bytes, ComPtr<ID3D12Resource>& out,
         staging_.push_back(stage);                                                  \
     } while (0)
 
+// Floats per biome in the archetype buffer: 3 float4 of shape, 2 of
+// material. real_field.hlsl's kArchRows must agree.
+static const size_t kArchFloats = 20;
+
 bool WorldGpu::diag_no_overhang = false;
 
 bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
@@ -150,11 +155,40 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
         UPLOAD(cell_items_, items.data(), items.size() * 4, "cell items");
     }
 
-    // --- archetypes: the shaping half, three float4 each -------------------
+    // --- archetypes: the shaping half, three float4 each, then the surface
+    // material (ADR-004 L1), two more: (ground rgb linear, roughness), (rock
+    // rgb linear, roughness). One extra row set after the last biome holds
+    // the seabed, which is what an ocean cell's share of the blend becomes.
+    // The materials are presentation and come from archetypes.json's
+    // "materials" block, which worldgen never reads.
     {
-        std::vector<float> a(static_cast<size_t>(nbiomes) * 12, 0.0f);
+        std::vector<float> a(static_cast<size_t>(nbiomes + 1) * kArchFloats, 0.0f);
+        auto lin = [](double c) {
+            const float x = c < 0.0 ? 0.0f : float(c);
+            return x <= 0.04045f ? x / 12.92f : std::pow((x + 0.055f) / 1.055f, 2.4f);
+        };
+        auto put_material = [&](float* p, const jsonlite::Value& m) {
+            const jsonlite::Array& g = m.array("ground");
+            const jsonlite::Array& r = m.array("rock");
+            for (int k = 0; k < 3; ++k) { p[12 + k] = lin(g[k].num); p[16 + k] = lin(r[k].num); }
+            p[15] = float(m.number("ground_roughness"));
+            p[19] = float(m.number("rock_roughness"));
+        };
+        try {
+            const jsonlite::Value root = jsonlite::parse_file("worldgen/data/archetypes.json");
+            const jsonlite::Array& mats = root.array("materials");
+            for (int i = 0; i < nbiomes; ++i) {
+                const uint32_t id = table_[i].material_id;
+                for (size_t m = 0; m < mats.size(); ++m)
+                    if (uint32_t(mats[m].number("id")) == id) put_material(&a[size_t(i) * kArchFloats], mats[m]);
+            }
+            put_material(&a[size_t(nbiomes) * kArchFloats], root.at("seabed"));
+        } catch (const std::exception& e) {
+            error = std::string("archetypes.json materials: ") + e.what();
+            return false;
+        }
         for (int i = 0; i < nbiomes; ++i) {
-            float* p = &a[size_t(i) * 12];
+            float* p = &a[size_t(i) * kArchFloats];
             p[0] = table_[i].base_elevation;
             p[1] = table_[i].amplitude;
             p[2] = static_cast<float>(table_[i].octaves);

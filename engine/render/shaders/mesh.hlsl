@@ -20,6 +20,10 @@ StructuredBuffer<Vertex> g_vertices : register(t0);
 // dither threshold is below v; 2 fading out, drawn where it is at or above v.
 // Streamer::fill_visibility writes it.
 StructuredBuffer<float2> g_fade : register(t1);
+// Each vertex's surface material, parallel to g_vertices (surface_nets.hlsl:
+// terrain_material). (ground, rock): sqrt(linear albedo) in RGB, roughness in
+// A, 8 bits each.
+StructuredBuffer<uint2> g_vertex_mat : register(t2);
 
 cbuffer MeshConstants : register(b0) {
     row_major float4x4 view_proj;
@@ -40,7 +44,14 @@ struct VSOut {
     float3 nrm   : TEXCOORD1;
     nointerpolation float2 fade : TEXCOORD2;
     float  skirt : TEXCOORD3;   // 1 at a skirt vertex, 0 at a surface vertex
+    float4 ground : TEXCOORD4;  // linear albedo, roughness
+    float4 rock   : TEXCOORD5;
 };
+
+float4 unpack_material(uint m) {
+    const float4 q = float4(m & 0xFFu, (m >> 8) & 0xFFu, (m >> 16) & 0xFFu, m >> 24) / 255.0f;
+    return float4(q.rgb * q.rgb, q.a);
+}
 
 // No input layout. With an index buffer bound, SV_VertexID is already the
 // index-buffer-resolved vertex, so the attributes can come straight out of the
@@ -57,6 +68,9 @@ VSOut vs_main(uint vid : SV_VertexID) {
     // Exact: the kernel stores a skirt vertex's normal at half length. A
     // surface triangle is 0 everywhere; a curtain triangle is not.
     o.skirt = dot(v.nrm, v.nrm) < 0.5f ? 1.0f : 0.0f;
+    const uint2 m = g_vertex_mat[vid];
+    o.ground = unpack_material(m.x);
+    o.rock = unpack_material(m.y);
     return o;
 }
 
@@ -162,19 +176,20 @@ SceneOut ps_main(VSOut i) {
     if (mesh_debug > 1.5f && i.skirt <= 0.001f && length(i.nrm) < 0.9f)
         return scene_flat(float3(0.0f, 1.0f, 1.0f));
     const float3 n = normalize(i.nrm);
-    const float3 sun = normalize(float3(0.45f, 0.78f, 0.35f));
-    const float  lam = saturate(dot(n, sun));
-    const float  sky = saturate(n.y * 0.5f + 0.5f);
+    const float3 v = normalize(cam_pos - i.world);
 
-    float3 rock = float3(0.46f, 0.40f, 0.34f);
-    rock = lerp(rock, float3(0.34f, 0.46f, 0.28f), saturate(n.y * n.y));
-    rock = apply_surface_texture(rock, i.world, n);
+    // The biome's material (ADR-004 L1): its ground on the level, its rock on
+    // anything steeper than about 40 degrees. Was one hard-coded rock and
+    // one green, blended by n.y squared, in every biome alike.
+    const float level = smoothstep(0.62f, 0.86f, n.y);
+    const float4 mat = lerp(i.rock, i.ground, level);
+    float3 albedo = apply_surface_texture(mat.rgb, i.world, n);
 
     // Sun shadow: from the terrain itself and from the trees (shadow.hlsli).
+    const float lam = dot(n, kSunDir);
     const float sh = lam > 0.0f ? shadow_factor(i.world, n) : 1.0f;
+    const Surface s = make_surface(albedo, mat.a, n, v);
     // Direct and ambient apart (scene_out.hlsli): the post chain shades
     // each with its own occlusion.
-    return scene_out(rock * (0.78f * lam * sh),
-                     rock * 0.22f + float3(0.10f, 0.13f, 0.18f) * sky,
-                     i.world, cam_pos, far_plane);
+    return scene_out(sun_light(s, sh), ambient_light(s, i.world), i.world, cam_pos, far_plane);
 }
