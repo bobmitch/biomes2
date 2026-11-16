@@ -60,39 +60,107 @@ float3 sky_radiance(float3 dir) {
 //
 // `view` is the unit direction from the surface TO the eye.
 
-// Irradiance (lux) arriving at a surface with this normal, from everything
-// but the sun's direct beam.
-float gi_sky_visibility(float3 world, float3 n);
+// What gi_diffuse found, for gi_specular and gi_sky_visibility in the same
+// shading call: how much of the sky term the canopy leaves (the fallback's
+// answer) and how much of an open-sky ambient the probes found (DDGI's,
+// which knows about caves, so it scales the ground's share too). Unset < 0.
+static float g_gi_sky = -1.0f;
+static float g_gi_all = -1.0f;
+// Irradiance a vertex shader already computed (xyz), and its g_gi_all (w);
+// w < 0 none. Trees and grass read the probes per vertex: their cards and
+// blades overdraw too much to read eight probes a pixel.
+static float4 g_gi_vertex = float4(0.0f, 0.0f, 0.0f, -1.0f);
+// How much of gi_diffuse's answer came from the probes: 0 the fallback.
+static float g_gi_cover = 0.0f;
 
-float3 gi_diffuse(float3 world, float3 n, float3 view) {
-    // Two uniform hemispheres, sky above and ground below: integrated against
-    // the cosine lobe this is exact, not a fit. The sky's share is what the
-    // canopy leaves; the ground's bounce and local light are not touched.
-    const float up = 0.5f + 0.5f * n.y;
-    return kPi * (kSkyMean * (up * gi_sky_visibility(world, n)) + kGroundRadiance * (1.0f - up));
-}
-
-// Radiance (nits) arriving along the mirror direction, prefiltered by
-// roughness: a smooth surface sees the sky or the ground in that direction,
-// a rough one sees the hemisphere's average.
-float3 gi_specular(float3 world, float3 n, float3 view, float roughness) {
-    const float3 r = reflect(-view, n);
-    const float sv = gi_sky_visibility(world, n);
-    const float3 sharp = lerp(kGroundRadiance, sky_radiance(r) * sv, smoothstep(-0.15f, 0.15f, r.y));
-    const float3 broad = lerp(kGroundRadiance, kSkyMean * sv, 0.5f + 0.5f * n.y);
-    return lerp(sharp, broad, roughness * roughness);
-}
-
-// How much of the sky a point sees: 0 in a sealed cave. Since L6 the crowns
-// overhead count, through the canopy map (canopy.hlsli) wherever the
-// includer binds it -- the shadow table's third range; the sea does not.
-// Caves and terrain horizons still see all of it until the probes.
-float gi_sky_visibility(float3 world, float3 n) {
+float gi_canopy(float3 world) {
 #ifdef ENGINE_CANOPY_HLSLI
     return canopy_visibility(world);
 #else
     return 1.0f;
 #endif
+}
+
+float gi_luma(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
+
+// Trees and grass carried a 1.3x fill on their ambient: a stand-in for the
+// light that bounces between leaves and blades and off the floor under a
+// crown, which the fallback cannot see. The probes compute that bounce, so
+// wherever they answered the stand-in goes; the fallback keeps it. Call
+// after gi_diffuse.
+float gi_fill(float stand_in) { return lerp(stand_in, 1.0f, g_gi_cover); }
+
+// Irradiance (lux) arriving at a surface with this normal, from everything
+// but the sun's direct beam. With DDGI (L6) the probes answer wherever they
+// cover the point -- sky, bounce, local light, all of it, and none in a
+// sealed cave. Elsewhere, and on the tier without RT, two uniform
+// hemispheres: sky above (what the canopy leaves) and ground below,
+// integrated against the cosine lobe, which is exact rather than a fit.
+float3 gi_diffuse(float3 world, float3 n, float3 view) {
+    if (g_gi_vertex.w >= 0.0f) {
+        g_gi_sky = 1.0f;
+        g_gi_all = g_gi_vertex.w;
+        return g_gi_vertex.xyz;
+    }
+    const float up = 0.5f + 0.5f * n.y;
+    float cover = 0.0f;
+    float3 E = float3(0.0f, 0.0f, 0.0f);
+#ifdef ENGINE_DDGI_HLSLI
+    E = ddgi_irradiance(world, n, view, cover);
+#endif
+    const float3 open = kPi * (kSkyMean * up + kGroundRadiance * (1.0f - up));
+    const float ratio = saturate(gi_luma(E) / max(gi_luma(open), 1e-4f));
+    g_gi_cover = cover;
+    if (cover >= 1.0f) {
+        g_gi_sky = 1.0f;
+        g_gi_all = ratio;
+        return E;
+    }
+    const float sv = gi_canopy(world);
+    float3 fb = kPi * (kSkyMean * (up * sv) + kGroundRadiance * (1.0f - up));
+    const float3 fb_hemis = fb;   // the two hemispheres, before the heightfield
+#ifdef ENGINE_HFGI_HLSLI
+    // The heightfield GI: the sky the terrain round it leaves (through the
+    // canopy) and the light that terrain really bounces, in place of the
+    // two uniform hemispheres -- wherever the map covers the point.
+    {
+        float vis_e, hcov;
+        float3 hb;
+        hfgi_sample(world, n, vis_e, hb, hcov);
+        if (hcov > 0.0f) fb = lerp(fb, kSkyMean * (vis_e * sv) + hb, hcov);
+    }
+#endif
+#ifdef ENGINE_SSGI_HLSLI
+    // The bounce off the surfaces on screen round it (last frame's cs_ssgi).
+    if (l_prev_cam.w > 1.5f) return ssgi_irradiance(world) + 1e-3f;   // BIOMES_SSGI_DBG: the bounce alone
+    fb += ssgi_irradiance(world);
+#endif
+    g_gi_sky = lerp(sv, 1.0f, cover);
+    // The specular follows the diffuse: what the heightfield took from the
+    // two hemispheres (a valley floor, a cave called covered) it takes from
+    // the reflection too.
+    g_gi_all = lerp(saturate(gi_luma(fb) / max(gi_luma(fb_hemis), 1e-4f)), ratio, cover);
+    return lerp(fb, E, cover);
+}
+
+// Radiance (nits) arriving along the mirror direction, prefiltered by
+// roughness: a smooth surface sees the sky or the ground in that direction,
+// a rough one sees the hemisphere's average. Scaled by what gi_diffuse
+// found: a probe-lit cave reflects no sky.
+float3 gi_specular(float3 world, float3 n, float3 view, float roughness) {
+    const float3 r = reflect(-view, n);
+    const float sky = g_gi_sky >= 0.0f ? g_gi_sky : gi_canopy(world);
+    const float all = g_gi_all >= 0.0f ? g_gi_all : 1.0f;
+    const float3 sharp = lerp(kGroundRadiance, sky_radiance(r) * sky, smoothstep(-0.15f, 0.15f, r.y));
+    const float3 broad = lerp(kGroundRadiance, kSkyMean * sky, 0.5f + 0.5f * n.y);
+    return lerp(sharp, broad, roughness * roughness) * all;
+}
+
+// How much of the sky a point sees: 0 in a sealed cave. With DDGI, what the
+// probes found relative to an open sky; otherwise what the canopy leaves.
+float gi_sky_visibility(float3 world, float3 n) {
+    if (g_gi_all >= 0.0f) return g_gi_sky * g_gi_all;
+    return gi_canopy(world);
 }
 
 // --- BRDF -----------------------------------------------------------------

@@ -174,6 +174,79 @@ GiHit gi_trace_masked(GiRay r, uint mask) {
 
 GiHit gi_trace(GiRay r) { return gi_trace_masked(r, kRtMaskSurfaces); }
 
+// For DDGI's probe rays (L6): the nearest OPAQUE hit -- terrain and bark,
+// the cards culled -- and the optical depth of the crowns in front of it,
+// which stand for the cards as a volume: a probe needs a crown's average
+// shade, not its leaves, and 128 rays a probe cannot afford the alpha test.
+// `back` is a terrain face seen from behind: the ray started inside rock,
+// which is how relocation and classification find a probe in it.
+//
+// Crown segments are kept and clipped to the final hit after traversal: the
+// committed distance only shrinks as nearer triangles are found, and a crown
+// met early may lie behind the hit that ends up nearest.
+GiHit gi_trace_probe(GiRay r, out float tau, out bool back) {
+    RayQuery<RAY_FLAG_CULL_NON_OPAQUE> q;
+    RayDesc rd;
+    rd.Origin = r.origin; rd.TMin = r.tmin; rd.Direction = r.dir; rd.TMax = r.tmax;
+    q.TraceRayInline(g_tlas, RAY_FLAG_NONE, kRtMaskSurfaces | kRtMaskCrowns, rd);
+    float3 seg[8];
+    uint ns = 0u;
+    float tau_far = 0.0f;
+    while (q.Proceed()) {
+        if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
+        const float3 o = q.CandidateObjectRayOrigin();
+        const float3 d = q.CandidateObjectRayDirection();
+        const float a = dot(d, d), b = dot(o, d), c = dot(o, o) - 1.0f;
+        const float disc = b * b - a * c;
+        if (disc <= 0.0f) continue;
+        const float s = sqrt(disc);
+        const float t0 = max((-b - s) / a, q.RayTMin());
+        const float t1 = min((-b + s) / a, q.CommittedRayT());
+        if (t1 <= t0) continue;
+        const float sigma = g_rt_tree_info[q.CandidateInstanceID() & 0x3FFFFFu].bark.w;
+        if (ns < 8u) seg[ns++] = float3(t0, t1, sigma);
+        else tau_far += sigma * (t1 - t0);   // past eight crowns, the clip is approximate
+    }
+    GiHit h;
+    h.hit = false; h.t = r.tmax; h.normal = float3(0.0f, 1.0f, 0.0f);
+    h.albedo = float3(0.0f, 0.0f, 0.0f); h.emission = float3(0.0f, 0.0f, 0.0f); h.material = 0u;
+    back = false;
+    if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        h.hit = true;
+        h.t = q.CommittedRayT();
+        const uint inst = q.CommittedInstanceID();
+        const uint prim = q.CommittedPrimitiveIndex();
+        const float2 bc = q.CommittedTriangleBarycentrics();
+        const float3 w = float3(1.0f - bc.x - bc.y, bc.x, bc.y);
+        if ((inst & kRtTreeFlag) != 0u) {
+            const TreeRtInfo ti = g_rt_tree_info[inst & 0x3FFFFFu];
+            const uint ib = ti.ibase_bark + 3u * prim;
+            const float3 p0 = g_rt_tree_pos[ti.vbase + g_rt_tree_idx[ib + 0u]];
+            const float3 p1 = g_rt_tree_pos[ti.vbase + g_rt_tree_idx[ib + 1u]];
+            const float3 p2 = g_rt_tree_pos[ti.vbase + g_rt_tree_idx[ib + 2u]];
+            const float3x4 m = q.CommittedObjectToWorld3x4();
+            h.normal = normalize(mul(m, float4(cross(p1 - p0, p2 - p0), 0.0f)));
+            h.albedo = ti.bark.rgb;
+            h.material = 1u;
+        } else {
+            const uint base = inst * kRtSlotIndices + 3u * prim;
+            const uint i0 = g_rt_tidx[base], i1 = g_rt_tidx[base + 1u], i2 = g_rt_tidx[base + 2u];
+            // Vertex normals point into the air (the field's gradient), so a
+            // ray meeting one from the side it points to started in rock.
+            h.normal = normalize(normalize(g_rt_tvert[i0].nrm) * w.x + normalize(g_rt_tvert[i1].nrm) * w.y +
+                                 normalize(g_rt_tvert[i2].nrm) * w.z);
+            back = dot(h.normal, r.dir) > 0.0f;
+            const uint2 m0 = g_rt_tmat[i0];
+            const float4 ground = rt_unpack_material(m0.x), rock = rt_unpack_material(m0.y);
+            h.albedo = lerp(rock.rgb, ground.rgb, smoothstep(0.62f, 0.86f, h.normal.y));
+        }
+        if (dot(h.normal, r.dir) > 0.0f) h.normal = -h.normal;
+    }
+    tau = tau_far;
+    for (uint k = 0u; k < ns; ++k) tau += seg[k].z * max(0.0f, min(seg[k].y, h.t) - seg[k].x);
+    return h;
+}
+
 // The terrain along r, and the point to start a shadow ray from there:
 // Hanika's shadow-terminator fix ("Hacking the Shadow Terminator", Ray
 // Tracing Gems II). Shading uses smooth vertex normals over a faceted

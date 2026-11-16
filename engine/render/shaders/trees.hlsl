@@ -124,10 +124,11 @@ float3 bark_albedo(float3 base, float2 uv, float footprint) {
 // the transmitted light, never the sky. `albedo` is as authored (sRGB).
 //
 // In physical units since ADR-004 L1 (lighting.hlsli). The shapes are the
-// ones that were tuned by eye before it, rescaled against the terrain's, and
-// the extra fill on both is a STAND-IN for light the no-GI ambient cannot
-// know about -- bounce between leaves and off the floor under a crown --
-// which DDGI (L6) computes and these multipliers should then be removed for.
+// ones that were tuned by eye before it, rescaled against the terrain's. The
+// ambient arrives per vertex (gi in MeshOut), with the fallback's 1.3x fill
+// -- a stand-in for bounce between leaves and off the floor under a crown --
+// already in it where the probes did not answer, and gone where they did
+// (lighting.hlsli's gi_fill).
 SceneOut shade(float3 albedo_srgb, float3 n, float ao, float3 world, bool foliage, float sh, float4 clip) {
     const float3 albedo = srgb_to_linear(albedo_srgb);
     const float3 v = normalize(cam_pos - world);
@@ -139,7 +140,7 @@ SceneOut shade(float3 albedo_srgb, float3 n, float ao, float3 world, bool foliag
         // the underside of every crown went black -- shards of black card
         // against the sky, which is what the first close-up showed.
         dir = leaf_sun_light(albedo, n, v, 0.6f, 0.7f, sh) * (0.85f * (0.45f + 0.55f * ao));
-        amb = albedo / kPi * gi_diffuse(world, n, v) * (1.3f * (0.45f + 0.55f * ao)) +
+        amb = albedo / kPi * gi_diffuse(world, n, v) * (0.45f + 0.55f * ao) +
               local_lights_leaf(albedo, n, v, 0.6f, 0.7f, world, clip) * (0.85f * (0.45f + 0.55f * ao));
     } else {
         // Bark gets more fill than open ground: under a crown, light that
@@ -147,7 +148,7 @@ SceneOut shade(float3 albedo_srgb, float3 n, float ao, float3 world, bool foliag
         // the ground's fill every trunk's shadow side read as black.
         const Surface s = make_surface(albedo, 0.85f, n, v);
         dir = sun_light(s, sh) * (0.9f * (0.35f + 0.65f * ao));
-        amb = ambient_light(s, world) * (1.3f * ao) + local_lights(s, world, clip) * (0.35f + 0.65f * ao);
+        amb = ambient_light(s, world) * ao + local_lights(s, world, clip) * (0.35f + 0.65f * ao);
     }
     return scene_out(dir, amb, world, cam_pos, far_plane, foliage ? 0.0f : 1.0f, foliage ? 0.6f : 1.0f);
 }
@@ -170,7 +171,7 @@ struct MeshOut {
     nointerpolation float tint : TEXCOORD11;
     nointerpolation float scale : TEXCOORD12;
     nointerpolation float narrow : TEXCOORD13;
-    float  sky   : TEXCOORD14;   // the canopy map's sky visibility, per vertex (canopy.hlsli)
+    float4 gi    : TEXCOORD14;   // gi_diffuse per vertex: irradiance, and its scale for specular (lighting.hlsli)
 };
 
 MeshOut degenerate() {
@@ -235,7 +236,12 @@ MeshOut mesh_vertex(uint vid, uint iid, bool lit) {
     o.tint = hash11(float(inst.id) * 0.013f);
     o.scale = inst.scale;
     o.narrow = lk.leaf_kind;
-    o.sky = lit ? canopy_visibility(world) : 1.0f;
+    o.gi = float4(0.0f, 0.0f, 0.0f, 1.0f);
+    if (lit) {
+        o.gi.rgb = gi_diffuse(world, normalize(o.nrm), normalize(cam_pos - world));
+        o.gi.rgb *= gi_fill(1.3f);
+        o.gi.a = g_gi_all;
+    }
     return o;
 }
 
@@ -280,7 +286,7 @@ SceneOut ps_mesh(MeshOut i, bool front : SV_IsFrontFace) {
         // 1: which level drew it -- LOD 0 red, LOD 1 green (packed bit 29).
         return scene_flat(((i.packed >> 29) & 1u) != 0u ? float3(0.2f, 0.8f, 0.2f) : float3(0.9f, 0.2f, 0.2f));
     }
-    g_canopy_vis = i.sky;
+    g_gi_vertex = i.gi;
     return shade(albedo, n, ao, i.world, foliage, shadow_factor(i.world, n), i.clip);
 }
 
@@ -344,7 +350,7 @@ struct ImpOut {
     nointerpolation float2 yaw    : TEXCOORD4;   // cos, sin
     nointerpolation uint   packed : TEXCOORD5;
     nointerpolation float  tint   : TEXCOORD6;
-    float  sky    : TEXCOORD7;   // the canopy map's sky visibility, per corner
+    float4 gi     : TEXCOORD7;   // gi_diffuse per corner (lighting.hlsli)
 };
 
 ImpOut impostor_vertex(uint vid, uint iid, bool lit) {
@@ -369,7 +375,12 @@ ImpOut impostor_vertex(uint vid, uint iid, bool lit) {
     o.yaw = float2(cos(yaw), sin(yaw));
     o.packed = packed;
     o.tint = hash11(float(inst.id) * 0.013f);
-    o.sky = lit ? canopy_visibility(o.world) : 1.0f;
+    o.gi = float4(0.0f, 0.0f, 0.0f, 1.0f);
+    if (lit) {
+        o.gi.rgb = gi_diffuse(o.world, float3(0.0f, 1.0f, 0.0f), normalize(cam_pos - o.world));
+        o.gi.rgb *= gi_fill(1.3f);
+        o.gi.a = g_gi_all;
+    }
     return o;
 }
 
@@ -434,7 +445,7 @@ SceneOut ps_impostor(ImpOut i) {
     // Look from just outside its bound on the sun's side instead: hills and
     // other trees still shade it, its own crown does not.
     const float sh = shadow_factor(i.world + kSunDir * i.bound, kSunDir);
-    g_canopy_vis = i.sky;
+    g_gi_vertex = i.gi;
     return shade(albedo, nw, 1.0f, i.world, true, sh, i.clip);
 }
 

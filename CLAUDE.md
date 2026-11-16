@@ -55,7 +55,9 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--band-report`, `--sea-report`, `--swim`, `--blend-report`, `--tab-test`,
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
 references), `--rt-report` (ADR-004 L5: the ray-tracing scene at three
-views, and L6's sky visibility with and without crowns), `--lights-report` (ADR-004 L3: local lights at night, six
+views, and L6's sky visibility with and without crowns), `--leak-test`
+(ADR-004 L6: a sealed chamber, unlit and torch-lit, DDGI against the
+fallback), `--gi-report` (DDGI at three views), `--lights-report` (ADR-004 L3: local lights at night, six
 configurations timed) and `--fell` (with `--fell-save` / `--fell-verify`).
 Every mode takes `--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
@@ -643,10 +645,14 @@ by its depth. Scene shaders no longer fog.
   clock. Latitude 40 N,
   declination +15: sunrise 05:08, sunset 18:52. World +x is west and +z
   south, which puts 14:00's sun on the fixed pre-L2 sun to under a degree.
-- **Night is a full moon opposite the sun**, 0.19 lux on the ground,
-  exposed like a camera: the meter bottoms out at EV100 -2, which draws a
-  moonlit landscape as a dim blue day. No stars, no moon phases, no Purkinje
-  shift yet.
+- **Night is a full moon opposite the sun**, 0.19 lux on the ground. The
+  meter's floor decides what night looks like: anything metered darker
+  renders darker than middle grey. At EV100 -2 a moonlit meadow metered up
+  to a dim blue day; the floor is now **EV100 -1** (`cs_exposure`'s clamp),
+  so moonlight renders a stop under middle grey -- ambience -- and a torch
+  or a fire, far above the scene's mean, carries the picture. EV100 0 was
+  tried: two stops read as near black. No stars, no moon phases, no
+  Purkinje shift yet.
 - Cost: walking 2.08 -> 2.10 ms; flying 2.05 -> 1.99 ms (the scene shaders
   lost their fog).
 
@@ -849,6 +855,172 @@ corner and reference height ride in `l_canopy` (ShadowConstants, 432 bytes).
   constants where the map's corner would be). Net: +0.06 ms walking.
 - At EV100 13 the shaded half of the woodland floor goes from luma 82.6 to
   62.2 (the traced sky: 58.5); crowns seen from above keep their tops.
+
+### DDGI probes (ADR-004 L6, step 3)
+
+Ray-traced probe GI, **OFF by default** since its +2.8 ms walking was judged
+too dear (`--gi`, `I`; `--gi-report` and `--leak-test` switch it on
+themselves). Off, `gi_diffuse` is the heightfield GI (below) with the
+canopy map. It stays as the reference anything cheaper is measured
+against.
+`engine/render/ddgi.{h,cpp}`, `shaders/ddgi_update.hlsl` (the update),
+`ddgi.hlsli` (the reader), `ddgi_common.hlsli` (the layout both share).
+Three camera-centred cascades of 24 x 12 x 24 probes, 2, 8 and 32 m apart,
+addressed by world grid coordinate and stored at it mod the dims, so they
+scroll; a slot whose stored coordinate is not the one it should hold is
+"not yet traced" and is never sampled. 128 rays a probe, a quarter of the
+probes a frame, hysteresis 0.92; 8x8 irradiance and 16x16 depth-moment
+tiles, gutters written by the blend from group memory.
+
+- **Probe rays** go through `gi_trace_probe`: the nearest OPAQUE hit
+  (terrain, bark; cards culled) and the crowns' optical depth before it.
+  A miss is the sky (below the horizon, the lit ground); a hit is lit by
+  the key light (a `gi_transmittance` ray), the first 8 local lights through
+  their shadow atlas, and last frame's probes (every further bounce). A
+  terrain face seen from behind is rock: distance negative, no radiance.
+- **Probes in rock** (more than a quarter of rays backfacing) step through
+  the nearest wall or switch OFF and trace 32 rays; probes with nothing in
+  reach go IDLE (32 rays). 22-57% of a cascade is rock, and at spawn from
+  46 m up all but 53 of cascade 0 are idle.
+- **The leak is decided by what an off probe means.** First version: a
+  point whose cascade-0 neighbours were all off fell through to cascade 1,
+  whose nearest probes stand outside in daylight; the Chebyshev floor (0.05)
+  and the weights' normalisation handed their light back -- 210 nits in a
+  sealed chamber. Now only NOT-YET-TRACED or idle neighbours justify asking
+  a coarser cascade; all-off is "walled in", irradiance 0.
+- **The air leaked too.** The atmosphere's aerial perspective and the
+  mist's sky term assume sunlit, sky-lit air: 3.4 and 10 nits in the
+  chamber with the walls black. `cs_ddgi_camera` measures the probes' share
+  of an open sky's light at the eye (six directions), the CPU reads it back
+  two frames late (`Ddgi::camera_sky`), and post and fog scale their
+  in-scattering by it over the first 64 m, back to full by 256 m. A fade
+  starting at the eye left 6% of the haze at 4 m: 0.2 nits, the residue.
+- **`--leak-test`**: a 4 m sphere dug 10 m under flat ground; it settles
+  1200 frames inside, then measures each config, outside LAST. Sealed and
+  unlit 0.001 nits (the histogram's floor) with or without mist, the
+  chamber's 19 cascade-0 probes all ACTIVE, against 566 on the fallback and
+  2,985 outside; a carried torch's bounce adds 1.08x its direct light,
+  which in a closed chamber means walls of albedo 0.07 -- the meadow
+  material it was dug from. Luminance is read from the meter's histogram
+  (`band_nits`): the meter's own target stops at EV100 -2. It prints, per
+  config, what the probes say at the eye and the chamber's probe states.
+- **Its first pass was an accident, twice over.** (1) `field_normal`
+  ignored the player's edits, so every DUG surface had the undug rock's
+  normal -- "up" ten metres down -- and the chamber's ceiling and walls
+  faced into rock: every probe inside read "in rock", switched off, and
+  the walled-in rule returned black, which is what a sealed chamber should
+  look like. The raster has shaded dug surfaces with those normals since
+  edits existed. A cell that touches an edit now takes its gradient from
+  its own eight (edited) corners. (2) A still's residency loop meshed
+  without telling the RT scene, whose drawn-slot scan only catches changed
+  KEYS; a dig re-meshes the same key, so the BLAS kept the undug rock.
+  `capture()` now calls `note_meshed`. The probe states line is what
+  showed both: "19 off in rock" in a hole dug for the purpose.
+- **Re-entry transient:** stepping out of the chamber and back scrolls its
+  probes out of cascade 0 and swaps the LODs round it; the fresh probes
+  catch light through the half-rebuilt scene and it decays at 0.92 an
+  update -- 10 lux at the eye after 240 frames, under 0.01 after ~1000.
+  Not fixed.
+- **Sky rays were thrown away for the first version.** A miss stored
+  distance 1e27 and an untraced ray 2e27, and the readers skip anything at
+  or past HALF of the latter -- exactly a miss. The probes saw only the
+  ground and its bounce: facing up in open air a third of the sky's light
+  and a twentieth of its blue, and shaded birch trunks read olive (RGB 36,
+  48, 8). `kDdgiUnused` is 1e30 now; the trunk is (35, 53, 29) and the
+  probes' sky colour matches the fallback's facing up (B/G 1.54 v 1.50).
+  `--gi-report` prints the probes' six-way irradiance at the eye beside
+  the fallback's, which is how it was found.
+- **`--gi-report`**: luminance with DDGI against the fallback (bare
+  hillside 1.03, wood 0.72, spawn 0.87), update ms, the eye's six-way
+  irradiance against the fallback's, per-cascade active / off in rock /
+  idle / not yet traced.
+- **The bounce is warm in the badlands and it is physical**: shaded sand
+  takes ~14% of sunlit sand's red (linear), where half a hemisphere of
+  sunlit sand at that albedo predicts ~18%; the probe rays decode albedo as
+  the raster does. The fallback's grey ground bounce never had it.
+- **Trees and grass read the probes per VERTEX** (`g_gi_vertex` in
+  `lighting.hlsli`, set from an interpolant); `gi_diffuse` also leaves
+  `g_gi_all` for `gi_specular`, so a probe-lit cave reflects no sky.
+- **The 1.3x fill on trees and grass is gone where the probes answer**
+  (`gi_fill`): it stood in for bounce between leaves and blades and off the
+  floor, which the probes compute. The fallback keeps it.
+- **Cost, walking** (`--walk 15 --uncapped`): 2.46 -> 5.24 ms. Split with
+  `BIOMES_GI_DBG` (1 samples stale probes and skips the update, 2 updates
+  and never samples): the update ~1.1 ms, sampling ~1.0 ms (terrain per
+  pixel -- removing trees or grass does not change the delta), the RT scene
+  now built every frame ~0.65 ms. Not optimised yet.
+- **Not done:** the mist's sky term per froxel rather than at the camera;
+  logs and stumps are not in the TLAS; the re-entry transient.
+
+### Heightfield GI (ADR-004 L6, step 5) -- the default diffuse GI
+
+On by default (`--no-hfgi`, `Z`); DDGI replaces it where on. The world is
+mostly 2.5D, and the light that matters -- the sky the terrain round a
+point leaves, the light that terrain bounces at it -- comes as often from
+off screen as on. `engine/render/height_gi.{h,cpp}`, `shaders/height_gi.hlsl`
+(the update), `hfgi.hlsli` (the reader), `hfgi_common.hlsli` (the layout):
+
+- **The map**: 256 x 256 texels of 2 m round the camera. The resident
+  terrain is drawn into it from above (`mesh.hlsl`'s `ps_top`, an
+  orthographic `mesh_top_pso_`: albedo into RGBA16F, depth for height),
+  rebuilt when the camera has moved 8 m, the clock a minute, or 60 frames
+  have passed.
+- **`cs_hf_light`**: per texel the height, a normal from the neighbours,
+  the sun through a march over the heightfield and through the canopy
+  map, and the radiance sent back -- albedo / pi times sun, sky and the
+  last rebuild's bounce (every further bounce, a rebuild at a time).
+- **`cs_hf_gather`**: twelve azimuths out to ~90 m, each rise of the
+  horizon a band of terrain whose radiance goes into an L1 spherical
+  harmonic, open sky above the last into a visibility harmonic -- analytic
+  in elevation. `gi_diffuse` evaluates both for any normal: kSkyMean x
+  visibility x canopy, plus the bounce, in place of the two hemispheres.
+- **Above and below the top surface**: a point 40 m above it fades to an
+  open hemisphere. A point more than 1.5 m BELOW it is under rock or an
+  overhang; it looks for the nearest column whose surface is below it (4,
+  8, 16 m out) and takes that column's light, faded over 12 m. None: walled
+  in, no sky and no bounce. "Below means covered" alone drew every
+  overhang's underside black.
+- **The air**: `cs_hf_camera` is the heightfield's `cs_ddgi_camera` -- the
+  map's share of an open sky at the eye, read back, scaling the haze and
+  the mist near the camera. Without it the sealed chamber's walls were
+  black and its air 13.8 nits.
+- **Measured**: the badlands' shade (63, 37, 25) -> (70, 31, 19), DDGI
+  (81, 30, 16); the wood's shaded floor 58.1 -> 55.1 (DDGI 44.8), the birch
+  trunk (83, 93, 69) -> (57, 75, 54) (DDGI 35, 53, 29). `--leak-test`'s
+  no-RT config: sealed and unlit **0.001 nits** (the histogram's floor),
+  where the bare fallback leaks 566. **Cost +0.05 ms walking** (2.36 ->
+  2.41), against DDGI's +2.8.
+- **Not done**: crowns as bouncers (the canopy map dims the sky, nothing
+  sends the leaves' green), local lights in the bounce, anything past
+  256 m, and true caves seen from inside a big cavern (it sees only the
+  nearest opening's light).
+- Heap [48..52] the scene's SRVs (t38..t42, a sixth range of the lit
+  tables), [53..55] the update's inputs, [56..61] its UAVs; the heap is 64.
+
+### Screen-space bounce (ADR-004 L6, an experiment, OFF by default)
+
+`--ssgi` (`X`). `post.hlsl`'s `cs_ssgi`, at half resolution after AO:
+three slices swept both ways, each depth sample a thick occluder setting
+bits in a 32-sector visibility mask (Therrien et al. 2023), gathering the
+light this frame's two scene targets say leaves it. The scene reads it NEXT
+frame in `gi_diffuse` (`ssgi.hlsli`), reprojected through last frame's
+matrix (`l_prev_vp`, `l_prev_cam` in ShadowConstants, now 576 bytes in a
+1 KB buffer) with a depth check. Heap [45] SRV (t29, a fifth range of the
+lit tables), [46] UAV; `--post-debug 3` shows it.
+
+- **It measured as not worth it here**: shade +1-2% (wood floor 58.1 ->
+  59.5, a firelit night 14.5 -> 15.1, the badlands 63 -> 66 red where DDGI
+  gives 81) for +0.3 ms walking. The bounce that matters in this world
+  comes from terrain and canopy that is OFF screen or behind the camera:
+  a slope facing the camera is lit by what is behind the camera. That is
+  structural, not tuning -- a 30 m reach and distance-scaled thickness
+  moved it a point.
+- **A debug lesson**: a reader that tests with a CONSTANT texture value
+  cannot tell a wrong uv from a right one. Four probes (`BIOMES_SSGI_DBG`
+  1 bounce-only ambient, 2 without the depth check) pointed at bindings and
+  slots before a uv-coloured probe showed the reprojection was right and
+  the content simply small; and the post view's own auto-exposure made it
+  look bright. View such things at the scene's fixed exposure.
 
 - **Cracks are counted in the engine, as UNDRAWN pixels** (ADR-004 L0):
   below the horizon, far depth, and both HDR scene targets still at their

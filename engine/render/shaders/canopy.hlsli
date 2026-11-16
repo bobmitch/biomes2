@@ -64,14 +64,10 @@ float canopy_visibility_raw(float3 world) {
     return lerp(1.0f, vis, saturate(edge / 32.0f));
 }
 
-// A value the vertex shader already computed, when >= 0. Trees set it per
-// pixel from an interpolant: their leaf cards overdraw so heavily that
-// reading the map per PIXEL cost 0.1 ms of a 2.4 ms walking frame, against
-// 0.02 ms for all the terrain. The map is smooth at the scale of a card.
-static float g_canopy_vis = -1.0f;
-
+// Trees and grass read it per VERTEX, through lighting.hlsli's g_gi_vertex:
+// leaf cards overdraw so heavily that reading the map per pixel cost 0.1 ms
+// of a 2.4 ms walking frame, against 0.02 ms for all the terrain.
 float canopy_visibility(float3 world) {
-    if (g_canopy_vis >= 0.0f) return g_canopy_vis;
     return l_canopy.w > 1.5f ? canopy_visibility_raw(world) : 1.0f;
 }
 

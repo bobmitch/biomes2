@@ -160,6 +160,14 @@ float3 apply_surface_texture(float3 albedo, float3 p, float3 n) {
     return albedo * shade;
 }
 
+// The heightfield GI's top-down view (height_gi.h): the terrain's albedo as
+// lighting sees it, ground or rock by slope. Fades and skirts do not matter
+// from above: the depth test keeps the top.
+float4 ps_top(VSOut i) : SV_Target0 {
+    const float3 n = normalize(i.nrm);
+    return float4(lerp(i.rock.rgb, i.ground.rgb, smoothstep(0.62f, 0.86f, n.y)), 1.0f);
+}
+
 SceneOut ps_main(VSOut i) {
     if (i.fade.x > 0.5f) {
         const float t = dither_threshold(i.clip.xy);

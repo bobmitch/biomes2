@@ -365,7 +365,33 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
     // so it looks identical; the CPU tests the length (is_skirt_vertex) to
     // keep the curtain out of physics and out of every check that measures a
     // vertex against the field. Do not normalise vertex normals in a kernel.
-    const float3 nrm = field_normal(world);
+    // The analytic field knows nothing of the player's edits, so a dug
+    // surface took the UNDUG rock's gradient: ten metres under the ground
+    // that is roughly "up" everywhere, and a chamber's ceiling and walls
+    // faced into the rock. Shading lit them as such, and DDGI (L6), which
+    // reads "ray meets a face from behind" as "this probe is in rock",
+    // switched off every probe inside --leak-test's chamber. Where the cell
+    // touches an edit, the gradient comes from its own eight corners, which
+    // are the edited densities the surface was placed by.
+    bool edited = false;
+    if (brick_count > 0u) {
+        [loop] for (uint k = 0u; k < 8u && !edited; ++k) {
+            float ed;
+            edited = edited_density(corner_world(id + corner_offset(k)), ed);
+        }
+    }
+    float3 nrm;
+    if (edited) {
+        const float3 t = local;
+        const float3 g = float3(
+            lerp(lerp(d[1] - d[0], d[3] - d[2], t.y), lerp(d[5] - d[4], d[7] - d[6], t.y), t.z),
+            lerp(lerp(d[2] - d[0], d[3] - d[1], t.x), lerp(d[6] - d[4], d[7] - d[5], t.x), t.z),
+            lerp(lerp(d[4] - d[0], d[5] - d[1], t.x), lerp(d[6] - d[2], d[7] - d[3], t.x), t.y));
+        // Density is positive in rock: the outward normal is minus the gradient.
+        nrm = dot(g, g) > 1e-12f ? -normalize(g) : float3(0.0f, 1.0f, 0.0f);
+    } else {
+        nrm = field_normal(world);
+    }
     const bool border = id.x == 0u || id.x == kCells - 1u ||
                         id.z == 0u || id.z == kCells - 1u;
     const uint need = border ? 2u : 1u;

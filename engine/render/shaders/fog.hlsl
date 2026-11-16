@@ -32,7 +32,7 @@ cbuffer FogConstants : register(b0) {
     float  near_z;     float log_ratio;   uint history_valid; float time_factor;
     float  map_extent; float haze;        float sea_level;    float patch;
     float2 wind;       float phase_g;     float albedo;
-    float  screen_w;   float screen_h;    float density_scale; float pad0;
+    float  screen_w;   float screen_h;    float density_scale; float cam_sky;   // cam_sky: DDGI's share of open sky at the eye
 };
 
 Texture2D<float4>   g_fog_map    : register(t0);   // fog.h: density, thinning height, surface y
@@ -116,7 +116,9 @@ void cs_fog_inject(uint3 id : SV_DispatchThreadID) {
     float3 L = kSunLux * (key_visibility(p) * hg_phase(dot(d, kSunDir), phase_g));
     // The sky above and the ground below, scattered isotropically: the mean
     // radiance over the sphere.
-    L += 0.5f * (kSkyMean + kGroundRadiance);
+    // Near the camera, only the share of it the probes say reaches the eye:
+    // mist in a sealed chamber glowed with daylight (--leak-test, 10 nits).
+    L += 0.5f * (kSkyMean + kGroundRadiance) * lerp(cam_sky, 1.0f, saturate((length(p - shadow_cam) - 64.0f) / 192.0f));
     if (l_cluster.w > 0.5f) {
         const uint c = cluster_of(p, float4(uv * float2(screen_w, screen_h), 0.0f, 1.0f));
         const uint n = g_cluster_n[c];

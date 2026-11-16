@@ -159,7 +159,9 @@ if(BIOMES2_ENGINE)
     engine/render/sky.cpp
     engine/render/fog.cpp
     engine/render/rt_scene.cpp
-    engine/render/canopy.cpp)
+    engine/render/canopy.cpp
+    engine/render/ddgi.cpp
+    engine/render/height_gi.cpp)
   target_include_directories(engine PRIVATE ${PROJECT_SOURCE_DIR})
   # M1: the engine links the generator now. Track B was built against the
   # trivial field precisely so a pipeline bug could never be confused with a

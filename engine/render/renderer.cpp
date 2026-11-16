@@ -67,8 +67,12 @@ struct ShadowConstants {
     float light[7][4];     // the frame's light (ADR-004 L2): Renderer::fill_light
     float cluster[3][4];   // local lights' clusters (ADR-004 L3): Renderer::record_lights
     float canopy[4];       // the canopy map (ADR-004 L6): min corner x, z, reference height, 0 off / 1 built / 2 applied
+    float ddgi[4][4];      // DDGI (ADR-004 L6): per cascade base x, y, z and spacing; [3].x on
+    float prev_vp[16];     // the screen-space bounce (ssgi.hlsli): last frame's jittered view-projection
+    float prev_cam[4];     // ... its camera; w on
+    float hf[4];           // the heightfield GI (hfgi.hlsli): map corner x, z; w on
 };
-static_assert(sizeof(ShadowConstants) == 432, "ShadowConstants must match shadow.hlsli");
+static_assert(sizeof(ShadowConstants) == 592, "ShadowConstants must match shadow.hlsli");
 
 // Matches cbuffer ClusterConstants in lights.hlsl.
 struct ClusterConstants {
@@ -166,9 +170,9 @@ struct PostConstants {
     float meter_lo;    float meter_hi;
     UINT  expo_flags;  float agx_saturation;
     float agx_power;   float cam_alt_km;
-    float sky_sun_dir[3];  float pad2;
-    float sky_moon_dir[3]; float pad3;
-    float sun_disk[3];     float pad4;
+    float sky_sun_dir[3];  float ssgi_radius;
+    float sky_moon_dir[3]; float ssgi_thickness;
+    float sun_disk[3];     float cam_sky;
     float moon_disk[3];    float pad5;
     float cam_fwd[3];      float fog_on;
     float fog_near;        float fog_log_ratio; float rt_shadows; float rt_sky;
@@ -185,7 +189,7 @@ struct FogConstants {
     float near_z;       float log_ratio; UINT history_valid; float time_factor;
     float map_extent;   float haze;      float sea_level;    float patch;
     float wind[2];      float phase_g;   float albedo;
-    float screen_w;     float screen_h;  float density_scale; float pad0;
+    float screen_w;     float screen_h;  float density_scale; float cam_sky;
 };
 static_assert(sizeof(FogConstants) == 192, "FogConstants must match fog.hlsl");
 // Matches cbuffer RtConstants in rt_shadow.hlsl.
@@ -717,7 +721,7 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         params[3].Descriptor.ShaderRegister = 2;
         // The shadow table: the sun's map at heap [0], and since ADR-004 L3
         // the local lights' buffers and atlas at [24..28] (t20..t24).
-        D3D12_DESCRIPTOR_RANGE sr[3] = {};
+        D3D12_DESCRIPTOR_RANGE sr[6] = {};
         sr[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr[0].NumDescriptors = 1;
         sr[0].BaseShaderRegister = 8;
@@ -730,9 +734,24 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         sr[2].NumDescriptors = 1;
         sr[2].BaseShaderRegister = 25;
         sr[2].OffsetInDescriptorsFromTableStart = 38;
+        // ADR-004 L6: the DDGI probes at [40..42] (t26..t28).
+        sr[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[3].NumDescriptors = 3;
+        sr[3].BaseShaderRegister = 26;
+        sr[3].OffsetInDescriptorsFromTableStart = 40;
+        // ADR-004 L6: the screen-space bounce at [45] (t29).
+        sr[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[4].NumDescriptors = 1;
+        sr[4].BaseShaderRegister = 29;
+        sr[4].OffsetInDescriptorsFromTableStart = 45;
+        // ADR-004 L6: the heightfield GI at [48..52] (t38..t42).
+        sr[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[5].NumDescriptors = 5;
+        sr[5].BaseShaderRegister = 38;
+        sr[5].OffsetInDescriptorsFromTableStart = 48;
         params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        params[4].DescriptorTable.NumDescriptorRanges = 3;
+        params[4].DescriptorTable.NumDescriptorRanges = 6;
         params[4].DescriptorTable.pDescriptorRanges = sr;
         // Each vertex's surface material (ADR-004 L1), parallel to t0.
         params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -746,12 +765,21 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         cmp.MaxLOD = D3D12_FLOAT32_MAX;
         cmp.ShaderRegister = 1;
         cmp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        // s3: DDGI's linear sampler (ddgi.hlsli), visible to the vertex
+        // shaders too -- trees and grass read the probes per vertex.
+        D3D12_STATIC_SAMPLER_DESC lin = {};
+        lin.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        lin.AddressU = lin.AddressV = lin.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        lin.MaxLOD = D3D12_FLOAT32_MAX;
+        lin.ShaderRegister = 3;
+        lin.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        const D3D12_STATIC_SAMPLER_DESC samplers[2] = {cmp, lin};
 
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
         rsd.NumParameters = 6;
         rsd.pParameters = params;
-        rsd.NumStaticSamplers = 1;
-        rsd.pStaticSamplers = &cmp;
+        rsd.NumStaticSamplers = 2;
+        rsd.pStaticSamplers = samplers;
         rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
         ComPtr<ID3DBlob> sig, sig_err;
@@ -845,10 +873,26 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
     hr = device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&shadow));
     if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (terrain shadow)", hr); return false; }
 
+    // The terrain from above, for the heightfield GI (height_gi.h): the same
+    // vertex shader, its albedo into one RGBA16F target, depth kept. No
+    // culling: the top-down matrix mirrors one axis.
+    ComPtr<ID3DBlob> ps_top;
+    if (!compile_shader(kMeshShaderPath, "ps_top", "ps_5_1", ps_top, error)) return false;
+    pd.PS.pShaderBytecode = ps_top->GetBufferPointer();
+    pd.PS.BytecodeLength = ps_top->GetBufferSize();
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    pd.RasterizerState.SlopeScaledDepthBias = 0.0f;
+    pd.RasterizerState.DepthBiasClamp = 0.0f;
+    ComPtr<ID3D12PipelineState> top;
+    hr = device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&top));
+    if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (terrain top-down)", hr); return false; }
+
     if (ready_) wait_for_gpu();
     mesh_pso_ = pso;
     mesh_wire_pso_ = wire;
     mesh_shadow_pso_ = shadow;
+    mesh_top_pso_ = top;
     return true;
 }
 
@@ -900,7 +944,7 @@ bool Renderer::create_shadow_resources(std::string& error) {
     // second range of the table that starts at the sun's map, [0];
     // [29..35] the mist (L4): its map, two inject volumes (this frame's and
     // last's, swapping), the integrated volume, and their UAVs.
-    hd.NumDescriptors = 48;
+    hd.NumDescriptors = 64;   // [48..61] the heightfield GI (L6)
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srv_heap_));
     if (FAILED(hr)) { error = hr_text("shared srv heap", hr); return false; }
@@ -917,7 +961,7 @@ bool Renderer::create_shadow_resources(std::string& error) {
         up.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC bd = {};
         bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width = 512;
+        bd.Width = 1024;   // ShadowConstants is 576 bytes since L6
         bd.Height = 1;
         bd.DepthOrArraySize = 1;
         bd.MipLevels = 1;
@@ -928,7 +972,7 @@ bool Renderer::create_shadow_resources(std::string& error) {
                                               IID_PPV_ARGS(&shadow_cb_[f]));
         if (FAILED(hr)) { error = hr_text("shadow cb", hr); return false; }
         shadow_cb_[f]->Map(0, nullptr, &shadow_cb_cpu_[f]);
-        std::memset(shadow_cb_cpu_[f], 0, 512);
+        std::memset(shadow_cb_cpu_[f], 0, 1024);
     }
     return true;
 }
@@ -1016,6 +1060,20 @@ void Renderer::record_shadows(const ViewConstants& view) {
     const bool on = shadows_on_ && mode_ != Mode::Wireframe;
     sc.split[3] = on ? 1.0f : 0.0f;
     fill_light(sc.light);
+    // BIOMES_GI_DBG splits DDGI's cost for A/B: 1 samples stale probes and
+    // skips the update, 2 updates them and never samples.
+    static const int gi_dbg = std::getenv("BIOMES_GI_DBG") ? std::atoi(std::getenv("BIOMES_GI_DBG")) : 0;
+    ddgi_.constants(gi_active() && gi_dbg != 2, sc.ddgi);
+    // view_proj_ and cur_cam_ are still LAST frame's here: record_scene sets
+    // this frame's after the shadows. Last frame's cs_ssgi used them.
+    std::memcpy(sc.prev_vp, view_proj_, sizeof sc.prev_vp);
+    for (int k = 0; k < 3; ++k) sc.prev_cam[k] = cur_cam_[k];
+    sc.prev_cam[3] = (ssgi_on_ && ssgi_valid_ && mode_ != Mode::Wireframe) ? 1.0f : 0.0f;
+    // BIOMES_SSGI_DBG: the ambient is the screen-space bounce alone (1), and
+    // without the reprojection's depth check (2).
+    static const bool ssgi_dbg = std::getenv("BIOMES_SSGI_DBG") != nullptr;
+    hfgi_.constants(hfgi_on_ && mode_ != Mode::Wireframe && !gi_dbg_hf_off(), sc.hf);
+    if (ssgi_dbg && sc.prev_cam[3] > 0.5f) sc.prev_cam[3] = std::atoi(std::getenv("BIOMES_SSGI_DBG")) == 2 ? 3.0f : 2.0f;
     std::memcpy(sc.cluster, cluster_consts_, sizeof sc.cluster);
     sc.cluster[2][3] = (rt_shadows_ && rt_ok_ && mode_ != Mode::Wireframe) ? 1.0f : 0.0f;
     // The canopy map darkens the sky term unless the traced sky (--rt-sky)
@@ -1112,13 +1170,13 @@ void Renderer::set_rt_shadows(bool on) {
 
 void Renderer::set_rt_sky(bool on) {
     rt_sky_ = on;
-    rt_.crowns_ = on && (rt_sky_mask_ & RtScene::kMaskCrowns) != 0u;
+    rt_.crowns_ = (on && (rt_sky_mask_ & RtScene::kMaskCrowns) != 0u) || (gi_on_ && ddgi_.ready());
     if (on) set_rt_active(true);
 }
 
 void Renderer::set_rt_sky_mask(unsigned mask) {
     rt_sky_mask_ = mask;
-    rt_.crowns_ = rt_sky_ && (mask & RtScene::kMaskCrowns) != 0u;
+    rt_.crowns_ = (rt_sky_ && (mask & RtScene::kMaskCrowns) != 0u) || (gi_on_ && ddgi_.ready());
 }
 
 void Renderer::set_rt_active(bool on) {
@@ -1262,7 +1320,157 @@ bool Renderer::create_rt(std::string& error) {
         }
     }
     rt_ok_ = true;
+    // DDGI (ADR-004 L6) traces this scene. Failing to build it is not an
+    // error: the engine lights with the no-RT fallback.
+    {
+        std::string why;
+        const double t0 = startup_now_ms();
+        if (ddgi_.init(device_.Get(), srv_heap_.Get(), why)) {
+            D3D12_QUERY_HEAP_DESC qd = {};
+            qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+            qd.Count = 2 * kFrameCount;
+            D3D12_HEAP_PROPERTIES rh = {};
+            rh.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd2 = {};
+            rd2.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd2.Width = 16 * kFrameCount;
+            rd2.Height = 1;
+            rd2.DepthOrArraySize = 1;
+            rd2.MipLevels = 1;
+            rd2.SampleDesc.Count = 1;
+            rd2.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(device_->CreateQueryHeap(&qd, IID_PPV_ARGS(&ddgi_queries_))) ||
+                FAILED(device_->CreateCommittedResource(&rh, D3D12_HEAP_FLAG_NONE, &rd2, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                        nullptr, IID_PPV_ARGS(&ddgi_query_rb_)))) {
+                ddgi_queries_.Reset();
+                ddgi_query_rb_.Reset();
+            }
+            if (gi_on_) set_rt_active(true);
+            rt_.crowns_ = gi_on_ || rt_sky_;
+            startup_log().push_back(std::make_pair(std::string("phase: ddgi probes"), startup_now_ms() - t0));
+        } else {
+            startup_log().push_back(std::make_pair(std::string("ddgi off: ") + why, 0.0));
+        }
+    }
     return true;
+}
+
+void Renderer::record_hfgi(const float vp[16]) {
+    auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+        D3D12_RESOURCE_BARRIER rb = {};
+        rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        rb.Transition.pResource = r;
+        rb.Transition.StateBefore = a;
+        rb.Transition.StateAfter = b;
+        rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd_->ResourceBarrier(1, &rb);
+    };
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    tr(hfgi_.albedo(), read, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    tr(hfgi_.depth(), read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = hfgi_.rtv(), dsv = hfgi_.dsv();
+    const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    cmd_->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    cmd_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    D3D12_VIEWPORT vpt = {};
+    vpt.Width = vpt.Height = float(HeightGi::kSize);
+    vpt.MaxDepth = 1.0f;
+    const D3D12_RECT sr = {0, 0, LONG(HeightGi::kSize), LONG(HeightGi::kSize)};
+    cmd_->RSSetViewports(1, &vpt);
+    cmd_->RSSetScissorRects(1, &sr);
+    cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    MeshConstants mc = {};
+    std::memcpy(mc.view_proj, vp, sizeof mc.view_proj);
+    mc.slot_vertices = static_cast<float>(kSlotVertices);
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
+    cmd_->SetDescriptorHeaps(1, heaps);
+    cmd_->SetPipelineState(mesh_top_pso_.Get());
+    cmd_->SetGraphicsRootSignature(mesh_root_.Get());
+    cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
+    cmd_->SetGraphicsRootShaderResourceView(1, mesher_.vertices()->GetGPUVirtualAddress());
+    cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
+    cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress());
+    cmd_->SetGraphicsRootConstantBufferView(3, shadow_cb_[frame_]->GetGPUVirtualAddress());
+    cmd_->SetGraphicsRootDescriptorTable(4, srv_heap_->GetGPUDescriptorHandleForHeapStart());
+    D3D12_INDEX_BUFFER_VIEW ibv = {};
+    ibv.BufferLocation = mesher_.indices()->GetGPUVirtualAddress();
+    ibv.SizeInBytes = kSlots * kSlotIndices * 4;
+    ibv.Format = DXGI_FORMAT_R32_UINT;
+    cmd_->IASetIndexBuffer(&ibv);
+    cmd_->ExecuteIndirect(cmd_sig_.Get(), kSlots, mesher_.draw_args(), 0, nullptr, 0);
+    hfgi_.record(cmd_.Get(), UINT(frame_), shadow_cb_[frame_]->GetGPUVirtualAddress());
+}
+
+void Renderer::set_gi(bool on) {
+    gi_on_ = on;
+    if (on && rt_ok_) set_rt_active(true);
+    // Nothing else wants the scene: stop building it.
+    if (!on && !rt_shadows_ && !rt_sky_) set_rt_active(false);
+    rt_.crowns_ = (gi_on_ && rt_ok_) || rt_sky_;
+}
+
+void Renderer::record_ddgi() {
+    auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+        D3D12_RESOURCE_BARRIER rb = {};
+        rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        rb.Transition.pResource = r;
+        rb.Transition.StateBefore = a;
+        rb.Transition.StateAfter = b;
+        rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd_->ResourceBarrier(1, &rb);
+    };
+    const D3D12_RESOURCE_STATES nps = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES ps = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES ib = D3D12_RESOURCE_STATE_INDEX_BUFFER;
+    Ddgi::Inputs in;
+    in.shadow_cb = shadow_cb_[frame_]->GetGPUVirtualAddress();
+    in.tlas = rt_.tlas();
+    in.terrain_vertices = mesher_.vertices()->GetGPUVirtualAddress();
+    in.terrain_indices = mesher_.indices()->GetGPUVirtualAddress();
+    in.terrain_materials = mesher_.vertex_materials()->GetGPUVirtualAddress();
+    in.tree_positions = rt_.tree_positions() ? rt_.tree_positions()->GetGPUVirtualAddress() : 0;
+    in.tree_indices = rt_.tree_indices() ? rt_.tree_indices()->GetGPUVirtualAddress() : 0;
+    in.tree_info = rt_.tree_info() ? rt_.tree_info()->GetGPUVirtualAddress() : 0;
+    in.tree_attributes = rt_.tree_attributes() ? rt_.tree_attributes()->GetGPUVirtualAddress() : 0;
+    // What a crown's leaves send along a ray that dies in them: a leaf's
+    // albedo over pi times the light on an average leaf -- half the sky, and
+    // the key light at a mean cosine of a quarter (half the leaves face away).
+    {
+        const float leaf[3] = {0.04f, 0.08f, 0.02f};
+        for (int k = 0; k < 3; ++k)
+            in.leaf_radiance[k] = leaf[k] / 3.14159265f *
+                                  (3.14159265f * sky_frame_.sky_mean[k] * 0.5f + sky_frame_.key_lux[k] * 0.25f);
+    }
+    in.max_lights = gi_local_lights_ ? 8u : 0u;
+    if (ddgi_queries_) cmd_->EndQuery(ddgi_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, UINT(frame_) * 2);
+    tr(mesher_.indices(), ib, ib | nps);
+    tr(light_atlas_.Get(), ps, ps | nps);
+    ddgi_.record(cmd_.Get(), UINT(post_frame_), UINT(frame_), in);
+    tr(light_atlas_.Get(), ps | nps, ps);
+    tr(mesher_.indices(), ib | nps, ib);
+    if (ddgi_queries_) {
+        cmd_->EndQuery(ddgi_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, UINT(frame_) * 2 + 1);
+        cmd_->ResolveQueryData(ddgi_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, UINT(frame_) * 2, 2,
+                               ddgi_query_rb_.Get(), UINT64(frame_) * 16);
+        ddgi_query_pending_[frame_] = true;
+    }
+}
+
+void Renderer::read_ddgi_time() {
+    if (!ddgi_query_pending_[frame_]) return;
+    UINT64* t = nullptr;
+    D3D12_RANGE rr = {SIZE_T(frame_) * 16, SIZE_T(frame_) * 16 + 16};
+    if (SUCCEEDED(ddgi_query_rb_->Map(0, &rr, reinterpret_cast<void**>(&t)))) {
+        UINT64 freq = 0;
+        queue_->GetTimestampFrequency(&freq);
+        const UINT64* s = t + frame_ * 2;
+        const double ms = freq ? double(s[1] - s[0]) * 1000.0 / double(freq) : 0.0;
+        ddgi_ms_ = ddgi_ms_ == 0.0f ? float(ms) : float(0.95 * ddgi_ms_ + 0.05 * ms);
+        D3D12_RANGE nr = {0, 0};
+        ddgi_query_rb_->Unmap(0, &nr);
+    }
+    ddgi_query_pending_[frame_] = false;
 }
 
 void Renderer::record_rt_trace() {
@@ -1671,6 +1879,7 @@ void Renderer::record_fog() {
     fc.screen_w = float(width_);
     fc.screen_h = float(height_);
     fc.density_scale = fog_density_;
+    fc.cam_sky = gi_active() ? ddgi_.camera_sky() : (hfgi_on_ ? hfgi_.camera_sky() : 1.0f);
     std::memcpy(fog_cb_cpu_[frame_], &fc, sizeof fc);
 
     // The sun's shadow map and the light atlas are read by pixel shaders
@@ -2527,6 +2736,8 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         if (!trees_.init(device_.Get(), queue_.Get(), looks, srv_heap_.Get(), 1, error)) return false;
         // The canopy map (ADR-004 L6) from the same models' crowns.
         if (!canopy_.init(device_.Get(), srv_heap_.Get(), error)) return false;
+        // The heightfield GI (L6): the default diffuse GI without DDGI.
+        if (!hfgi_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         canopy_.set_models(trees_.models(), trees_.looks());
         // Three workers: the first fill of a 500 m radius is ~300 tiles, and
         // the frame loop never waits on them.
@@ -2677,6 +2888,7 @@ bool Renderer::create_post_targets(std::string& error) {
              D3D12_RESOURCE_STATE_RENDER_TARGET, sky) ||
         !tex(scene_, w, h, kSceneFormat, uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr) ||
         !tex(ao_, (w + 1) / 2, (h + 1) / 2, DXGI_FORMAT_R8_UNORM, uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr) ||
+        !tex(ssgi_, (w + 1) / 2, (h + 1) / 2, DXGI_FORMAT_R16G16B16A16_FLOAT, uav, read, nullptr) ||
         !tex(history_[0], w, h, kSceneFormat, uav, read, nullptr) ||
         !tex(history_[1], w, h, kSceneFormat, uav, read, nullptr)) {
         error = "post targets";
@@ -2716,6 +2928,11 @@ bool Renderer::create_post_targets(std::string& error) {
     srv(history_[0].Get(), kSceneFormat, 8);
     srv(history_[1].Get(), kSceneFormat, 9);
     uavd(ao_.Get(), DXGI_FORMAT_R8_UNORM, 12);
+    // The screen-space bounce (L6): the scene reads [45] (t29, a fifth range
+    // of the lit tables), cs_ssgi writes [46] (u6).
+    srv(ssgi_.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 45);
+    uavd(ssgi_.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 46);
+    ssgi_valid_ = false;
     uavd(scene_.Get(), kSceneFormat, 13);
     uavd(history_[0].Get(), kSceneFormat, 14);
     uavd(history_[1].Get(), kSceneFormat, 15);
@@ -2730,7 +2947,12 @@ bool Renderer::create_post_pipelines(std::string& error) {
         sr.NumDescriptors = 9;
         // t9, the mist's integrated volume, sits at heap [32]: 29 past the
         // table's start at [3].
-        D3D12_DESCRIPTOR_RANGE sr2[3] = {sr, {}, {}};
+        D3D12_DESCRIPTOR_RANGE sr2[4] = {sr, {}, {}, {}};
+        // t11, the screen-space bounce (L6), at heap [45], for --post-debug 3.
+        sr2[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr2[3].NumDescriptors = 1;
+        sr2[3].BaseShaderRegister = 11;
+        sr2[3].OffsetInDescriptorsFromTableStart = 42;
         sr2[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr2[1].NumDescriptors = 1;
         sr2[1].BaseShaderRegister = 9;
@@ -2743,10 +2965,14 @@ bool Renderer::create_post_pipelines(std::string& error) {
         D3D12_DESCRIPTOR_RANGE ur = {};
         ur.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         ur.NumDescriptors = 4;
-        D3D12_ROOT_PARAMETER p[5] = {};
+        D3D12_DESCRIPTOR_RANGE ur6 = {};
+        ur6.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ur6.NumDescriptors = 1;
+        ur6.BaseShaderRegister = 6;
+        D3D12_ROOT_PARAMETER p[6] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[1].DescriptorTable.NumDescriptorRanges = 3;
+        p[1].DescriptorTable.NumDescriptorRanges = 4;
         p[1].DescriptorTable.pDescriptorRanges = sr2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[2].DescriptorTable.NumDescriptorRanges = 1;
@@ -2757,7 +2983,11 @@ bool Renderer::create_post_pipelines(std::string& error) {
         p[3].Descriptor.ShaderRegister = 4;
         p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
         p[4].Descriptor.ShaderRegister = 5;
-        for (int k = 0; k < 5; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        // The screen-space bounce's output (L6), u6 at heap [46].
+        p[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[5].DescriptorTable.NumDescriptorRanges = 1;
+        p[5].DescriptorTable.pDescriptorRanges = &ur6;
+        for (int k = 0; k < 6; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_STATIC_SAMPLER_DESC ss[3] = {};
         ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         ss[1].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
@@ -2771,7 +3001,7 @@ bool Renderer::create_post_pipelines(std::string& error) {
         // The sky-view table is world azimuth in u: it wraps.
         ss[2].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 5;
+        rsd.NumParameters = 6;
         rsd.pParameters = p;
         rsd.NumStaticSamplers = 3;
         rsd.pStaticSamplers = ss;
@@ -2818,10 +3048,10 @@ bool Renderer::create_post_pipelines(std::string& error) {
         }
     }
     const char* kPost = "engine/render/shaders/post.hlsl";
-    const char* cs_e[6] = {"cs_ao", "cs_composite", "cs_taa", "cs_hist_clear", "cs_histogram", "cs_exposure"};
-    ComPtr<ID3D12PipelineState>* cs_o[6] = {&ao_pso_, &composite_pso_, &taa_pso_,
-                                            &hist_clear_pso_, &hist_pso_, &expo_pso_};
-    for (int k = 0; k < 6; ++k) {
+    const char* cs_e[7] = {"cs_ao", "cs_composite", "cs_taa", "cs_hist_clear", "cs_histogram", "cs_exposure", "cs_ssgi"};
+    ComPtr<ID3D12PipelineState>* cs_o[7] = {&ao_pso_, &composite_pso_, &taa_pso_,
+                                            &hist_clear_pso_, &hist_pso_, &expo_pso_, &ssgi_pso_};
+    for (int k = 0; k < 7; ++k) {
         ComPtr<ID3DBlob> cs;
         if (!compile_shader(kPost, cs_e[k], "cs_5_1", cs, error)) return false;
         D3D12_COMPUTE_PIPELINE_STATE_DESC cd = {};
@@ -2916,6 +3146,9 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     pc.fog_log_ratio = std::log(kFogFar / kFogNear);
     pc.rt_shadows = (rt_shadows_ && rt_ok_ && !wire) ? 1.0f : 0.0f;
     pc.rt_sky = (rt_sky_ && rt_ok_ && !wire) ? 1.0f : 0.0f;
+    pc.ssgi_radius = ssgi_on_ && !wire ? ssgi_radius_ : 0.0f;
+    pc.ssgi_thickness = 0.75f;
+    pc.cam_sky = gi_active() ? ddgi_.camera_sky() : (hfgi_on_ ? hfgi_.camera_sky() : 1.0f);
     pc.near_plane = kNearPlane;
     pc.far_plane = kFarPlane;
     pc.sharpen = taa_on_ && !wire ? 0.5f : 0.0f;
@@ -3003,6 +3236,9 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     cmd_->SetComputeRootDescriptorTable(2, uavs);
     cmd_->SetComputeRootUnorderedAccessView(3, lumhist_->GetGPUVirtualAddress());
     cmd_->SetComputeRootUnorderedAccessView(4, expo_->GetGPUVirtualAddress());
+    D3D12_GPU_DESCRIPTOR_HANDLE ssgi_uav = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+    ssgi_uav.ptr += UINT64(46) * inc;
+    cmd_->SetComputeRootDescriptorTable(5, ssgi_uav);
 
     // The traced key-light shadow and the RT instruments (L5).
     if (rt_ok_ && rt_active_ && !(rt_.debug_ & 1u)) {
@@ -3013,11 +3249,22 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
         cmd_->SetComputeRootDescriptorTable(2, uavs);
         cmd_->SetComputeRootUnorderedAccessView(3, lumhist_->GetGPUVirtualAddress());
         cmd_->SetComputeRootUnorderedAccessView(4, expo_->GetGPUVirtualAddress());
+        cmd_->SetComputeRootDescriptorTable(5, ssgi_uav);
     }
     // AO at half resolution.
     cmd_->SetPipelineState(ao_pso_.Get());
     cmd_->Dispatch(((width_ + 1) / 2 + 7) / 8, ((height_ + 1) / 2 + 7) / 8, 1);
     tr(ao_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+    // The screen-space bounce (L6), for the NEXT frame's scene to read.
+    if (ssgi_on_ && !wire) {
+        tr(ssgi_.Get(), read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cmd_->SetPipelineState(ssgi_pso_.Get());
+        cmd_->Dispatch(((width_ + 1) / 2 + 7) / 8, ((height_ + 1) / 2 + 7) / 8, 1);
+        tr(ssgi_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+        ssgi_valid_ = true;
+    } else {
+        ssgi_valid_ = false;
+    }
     // Direct x contact + ambient x AO.
     cmd_->SetPipelineState(composite_pso_.Get());
     cmd_->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
@@ -3122,7 +3369,24 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     record_lights(view);
     // The sun's view first: the shadow map has to be finished before anything
     // that samples it is drawn.
+    // The heightfield GI (L6): when due, the terrain from above, then lit and
+    // gathered. Before the shadow constants, which carry the map's corner.
+    if (hfgi_on_ && hfgi_.ready() && mode_ != Mode::Wireframe) {
+        float vp[16];
+        if (hfgi_.begin(view.cam_pos, sky_frame_.hours, post_frame_, vp)) record_hfgi(vp);
+    }
+    // DDGI's cascades follow the camera; the shadow constants carry them.
+    ddgi_.begin_frame(view.cam_pos);
     record_shadows(view);
+    // The heightfield's sky share at the eye, for the haze and the mist.
+    if (hfgi_on_ && !gi_active() && mode_ != Mode::Wireframe)
+        hfgi_.record_camera(cmd_.Get(), UINT(frame_), shadow_cb_[frame_]->GetGPUVirtualAddress());
+    // The probes after the lights and the TLAS, before anything is lit.
+    static const bool gi_no_update = std::getenv("BIOMES_GI_DBG") && std::atoi(std::getenv("BIOMES_GI_DBG")) == 1;
+    if (gi_active() && !gi_no_update) {
+        read_ddgi_time();
+        record_ddgi();
+    }
 
     D3D12_VIEWPORT vp = {};
     vp.Width = static_cast<float>(width_);
@@ -3760,6 +4024,13 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
         // No latency to wait out here: wait_for_gpu() above means the
         // counters just copied are this pass's own.
         const std::vector<Streamer::MeshedChunk>& done = streamer_.last_meshed();
+        // The RT scene hears of these too. Its drawn-slot scan only catches
+        // a chunk whose KEY changed, and a dig re-meshes the same key in the
+        // same slot: a still taken after a dig traced the rock as it was
+        // before, and --leak-test's chamber did not exist for the probes --
+        // all 19 of its probes sat "in rock". The counts are on the CPU
+        // already (wait_for_gpu above), hence `landed`.
+        if (rt_ok_ && rt_active_) rt_.note_meshed(done, true);
         for (size_t i = 0; i < done.size(); ++i) {
             UINT v = 0, ix = 0;
             mesher_.slot_counts(done[i].slot, v, ix);

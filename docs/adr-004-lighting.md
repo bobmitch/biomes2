@@ -353,6 +353,95 @@ the day it does not.
   and light shafts through the haze (L4's froxels). The sea is still the
   weakest surface.
 
+## L6, step 5 — heightfield GI, the default, 2026-11-15
+
+Step 4's recommendation, built: a 512 m map round the camera of the
+terrain seen from above, lit (sun through the heightfield and the canopy,
+sky, last rebuild's bounce) and gathered along twelve azimuths into L1
+harmonics of sky visibility and bounce radiance, read by `gi_diffuse`.
+
+- **It is the no-RT tier's GI and the default.** It closes most of the gap
+  to DDGI on terrain: the badlands' shade 63 -> 70 red (DDGI 81), the
+  wood's floor 58.1 -> 55.1 (DDGI 44.8). **+0.05 ms walking**.
+- **The leak test passes without RT**: a point under the top surface with
+  no opening within 12 m is walled in; the camera's sky share from the map
+  quiets the haze and the mist. Sealed and unlit 0.001 nits, against 566 on
+  the bare fallback.
+- **Overhangs** are lit from their nearest opening, faded with the
+  distance in; treating "under the surface" as covered drew them black.
+- **Not done:** crowns as bouncers, local lights in the bounce (a torch's
+  bounce is DDGI's), the far field past 256 m, large caverns.
+
+## L6, step 4 — cheaper GI, explored; DDGI made opt-in, 2026-11-15
+
+DDGI's +2.8 ms walking was judged too dear. It stays, off by default
+(`--gi`), as the reference anything cheaper is measured against.
+
+- **Screen-space bounce, built and measured** (`--ssgi`, off by default):
+  a visibility-bitmask gather (Therrien et al. 2023) at half resolution,
+  read by `gi_diffuse` next frame through reprojection. It adds 1-2% to the
+  shade for 0.3 ms. The bounce that matters here -- terrain-scale, canopy
+  -- comes from surfaces off screen or behind the camera, which no
+  screen-space method sees; on the badlands it recovers 3 of DDGI's 18
+  points of red in shade.
+- **What would close the gap without RT** is off-screen-aware and cheap
+  because the world is mostly 2.5D: a camera-centred heightfield map (like
+  the canopy map) holding the sunlit ground's outgoing radiance and a
+  horizon-based sky visibility, gathered per texel in 2D and read by
+  `gi_diffuse` at a point's xz and height. It would give terrain bounce and
+  terrain occlusion of the sky everywhere, screen or not. Caves and
+  overhangs are not 2.5D; a coarse sky-visibility volume sampled from the
+  density field (L6b's SDF idea, trimmed) is the companion for them.
+- **Shadows** stay the cascades (RT shadows were already opt-in). Better
+  filtering -- contact-hardening PCSS with a rotated Poisson kernel that TAA
+  integrates -- is the next quality step there.
+- **Night exposure**: the meter's floor rose from EV100 -2 to -1, so
+  moonlight is ambience a stop under middle grey and light sources carry
+  the night.
+
+## L6, step 3 — DDGI probes, 2026-11-15
+
+- **As specified:** three camera-centred cascades (2, 8, 32 m) of
+  24 x 12 x 24 probes, 128 rays a probe, a quarter a frame; octahedral
+  irradiance (8x8) and depth moments (16x16); Chebyshev visibility;
+  relocation and classification; misses sample the sky; hits are lit by the
+  key light (a shadow ray), the local lights (their atlas) and the previous
+  frame's probes. Crowns attenuate the rays as volumes (step 1), as section
+  5 asked, and scatter a leaf radiance.
+- **Classification has three states**, not two: off in rock, idle in open
+  air, active. They mean different things to a reader: off is a wall and
+  must not be looked past; idle and not-yet-traced say nothing and let a
+  coarser cascade answer. Treating "off" as "ask the next cascade" was a
+  210-nit leak into a sealed chamber.
+- **`--leak-test` passes**: sealed and unlit at the histogram's floor
+  (0.001 nits), the chamber's probes all active, against 566 nits on the
+  fallback; a torch's bounce adds 1.08x its direct light, the factor a
+  closed chamber of the meadow material's albedo gives. It also found what
+  the ADR had not listed: the aerial perspective and the mist assumed lit
+  air, and glowed in the chamber. They now take the probes' sky share at
+  the camera.
+- **The first pass was an accident**: dug surfaces had the UNDUG field's
+  normals (an engine bug as old as edits), so the chamber's probes read
+  "in rock" and the walled-in rule returned black; and a still's meshing
+  did not reach the RT scene, so the BLAS held the undug rock. Both fixed;
+  the test now prints the chamber's probe states so it cannot pass that
+  way again.
+- **Sky rays were dropped** by a sentinel collision (a miss's distance was
+  exactly half the "untraced" marker the readers skip from): the probes
+  lit everything with ground bounce alone, which read as an olive cast.
+- **`--gi-report`**: DDGI against the fallback -- bare hillside 1.03, wood
+  0.72, spawn 0.87 -- and the probes' six-way irradiance at the eye; facing
+  up in open air their sky colour matches the fallback's.
+- **The trees' and grass's 1.3x fill is gone wherever the probes answer**;
+  the fallback keeps it.
+- **Cost:** +2.8 ms walking (update 1.1, sampling 1.0, RT scene 0.65);
+  58.8 MB. Above the budget a High tier wants; the first target is the
+  per-pixel sampling.
+- **Not done:** per-froxel sky visibility for the mist; GTAO restricted to
+  the probe light; logs and stumps in the TLAS; a re-entry transient (fresh
+  probes catching light through a half-rebuilt scene, decaying over ~1000
+  frames); L6b's SDF tracer.
+
 ## L6, step 2 — the canopy map, 2026-11-15
 
 The no-RT tier's canopy shade, and the default wherever the traced sky is

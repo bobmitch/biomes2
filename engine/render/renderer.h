@@ -23,6 +23,8 @@
 #include "engine/render/fog.h"
 #include "engine/render/rt_scene.h"
 #include "engine/render/canopy.h"
+#include "engine/render/ddgi.h"
+#include "engine/render/height_gi.h"
 
 #include <unordered_map>
 #include <vector>
@@ -297,6 +299,36 @@ public:
     bool canopy() const { return canopy_on_; }
     unsigned canopy_trees() const { return canopy_.trees_last_frame(); }
     unsigned long long canopy_builds() const { return canopy_.builds(); }
+    // DDGI (ADR-004 L6): ray-traced probe GI. OFF by default since its
+    // +2.8 ms walking was judged too dear (--gi, I); kept as the reference
+    // the screen-space GI is measured against. Off, gi_diffuse is the
+    // fallback with the canopy map and screen-space bounce.
+    void set_gi(bool on);
+    bool gi() const { return gi_on_; }
+    bool gi_active() const { return gi_on_ && rt_ok_ && ddgi_.ready() && mode_ != Mode::Wireframe; }
+    // The screen-space bounce (ADR-004 L6's no-RT experiment): OFF by
+    // default (--ssgi, X). It measured 1-2% more light in shade for 0.3 ms --
+    // the bounce that matters here comes from terrain and canopy off screen
+    // or behind the camera. Read by gi_diffuse where DDGI does not answer.
+    void set_ssgi(bool on) { ssgi_on_ = on; if (!on) ssgi_valid_ = false; }
+    // The heightfield GI (ADR-004 L6, height_gi.h): the default diffuse GI
+    // where DDGI is off (--no-hfgi, Z).
+    void set_hfgi(bool on) { hfgi_on_ = on; }
+    bool hfgi() const { return hfgi_on_; }
+    unsigned long long hfgi_rebuilds() const { return hfgi_.rebuilds(); }
+    bool ssgi() const { return ssgi_on_; }
+    float gi_ms() const { return ddgi_ms_; }
+    // Whether the probes see local lights (--leak-test's A/B: the torch's
+    // bounce against its direct light alone).
+    void set_gi_local_lights(bool on) { gi_local_lights_ = on; }
+    unsigned long long gi_updates() const { return ddgi_.updates(); }
+    UINT64 gi_bytes() const { return ddgi_.bytes(); }
+    const Ddgi::CameraIrradiance& gi_camera_irradiance() const { return ddgi_.camera_irradiance(); }
+    float gi_camera_sky() const { return ddgi_.camera_sky(); }
+    bool gi_counts(Ddgi::Counts& out, std::string& error, const float centre[3] = nullptr, float radius = 0.0f) {
+        wait_for_gpu();
+        return ddgi_.count(queue_.Get(), out, error, centre, radius);
+    }
     const RtScene::Stats& rt_scene_stats() const { return rt_.stats(); }
     struct RtStats {
         uint32_t lit_lit = 0, shadow_shadow = 0, rt_only = 0, csm_only = 0;
@@ -471,7 +503,15 @@ private:
     ComPtr<ID3D12Resource> hdr_direct_, hdr_ambient_, scene_, ao_, history_[2];
     ComPtr<ID3D12DescriptorHeap> post_rtv_heap_;
     ComPtr<ID3D12RootSignature> post_root_;
-    ComPtr<ID3D12PipelineState> ao_pso_, composite_pso_, taa_pso_, final_pso_;
+    ComPtr<ID3D12PipelineState> ao_pso_, composite_pso_, taa_pso_, final_pso_, ssgi_pso_;
+    ComPtr<ID3D12Resource> ssgi_;              // the screen-space bounce (L6): irradiance, distance
+    HeightGi hfgi_;
+    bool hfgi_on_ = true;
+    ComPtr<ID3D12PipelineState> mesh_top_pso_;
+    void record_hfgi(const float vp[16]);
+    static bool gi_dbg_hf_off() { return false; }
+    bool ssgi_on_ = false, ssgi_valid_ = false;
+    float ssgi_radius_ = 30.0f;   // the dunes' bounce comes from slopes 20-50 m off; at 6 m it found almost none
     ComPtr<ID3D12PipelineState> hist_clear_pso_, hist_pso_, expo_pso_;
     // The atmosphere (ADR-004 L2): the CPU model and this frame's light, the
     // two static tables uploaded from it, and the per-frame sky-view table
@@ -494,6 +534,14 @@ private:
     void record_rt_trace();
     bool capture_raw_ = false;
     RtScene rt_;
+    Ddgi ddgi_;
+    bool gi_on_ = false, gi_local_lights_ = true;
+    void record_ddgi();
+    void read_ddgi_time();
+    ComPtr<ID3D12QueryHeap> ddgi_queries_;
+    ComPtr<ID3D12Resource>  ddgi_query_rb_;
+    bool  ddgi_query_pending_[kFrameCount] = {};
+    float ddgi_ms_ = 0.0f;
     CanopyMap canopy_;
     bool canopy_on_ = true, canopy_built_ = false;
     unsigned long long tree_list_version_ = 0;   // bumped whenever tree_all_ is rebuilt

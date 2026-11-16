@@ -34,6 +34,18 @@ cbuffer ShadowConstants : register(b2) {
     // The canopy map (ADR-004 L6, canopy.hlsli): its min corner x, z, the
     // height its crown heights are relative to; w 0 none, 1 built, 2 applied.
     float4 l_canopy;
+    // DDGI (ADR-004 L6, ddgi.hlsli): per cascade (base grid x, y, z, spacing);
+    // l_ddgi3.x on.
+    float4 l_ddgi0;
+    float4 l_ddgi1;
+    float4 l_ddgi2;
+    float4 l_ddgi3;
+    // The screen-space bounce (ssgi.hlsli): last frame's jittered view-
+    // projection and camera; w on.
+    row_major float4x4 l_prev_vp;
+    float4 l_prev_cam;
+    // The heightfield GI (hfgi.hlsli): the map's min corner x, z; w on.
+    float4 l_hf;
 };
 
 Texture2DArray<float>  g_shadow     : register(t8);
@@ -76,5 +88,8 @@ float shadow_factor(float3 world, float3 n) {
 }
 
 #include "engine/render/shaders/canopy.hlsli"
+#include "engine/render/shaders/ddgi.hlsli"
+#include "engine/render/shaders/ssgi.hlsli"
+#include "engine/render/shaders/hfgi.hlsli"
 
 #endif

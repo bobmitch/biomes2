@@ -183,7 +183,7 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         // segment count. 8 DWORDs.
         // The shadow table: the sun's map at heap [0], and since ADR-004 L3
         // the local lights' buffers and atlas at [24..28] (t20..t24).
-        D3D12_DESCRIPTOR_RANGE sr[3] = {};
+        D3D12_DESCRIPTOR_RANGE sr[6] = {};
         sr[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr[0].NumDescriptors = 1;
         sr[0].BaseShaderRegister = 8;
@@ -196,12 +196,27 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         sr[2].NumDescriptors = 1;
         sr[2].BaseShaderRegister = 25;
         sr[2].OffsetInDescriptorsFromTableStart = 38;
+        // ADR-004 L6: the DDGI probes at [40..42] (t26..t28).
+        sr[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[3].NumDescriptors = 3;
+        sr[3].BaseShaderRegister = 26;
+        sr[3].OffsetInDescriptorsFromTableStart = 40;
+        // ADR-004 L6: the screen-space bounce at [45] (t29).
+        sr[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[4].NumDescriptors = 1;
+        sr[4].BaseShaderRegister = 29;
+        sr[4].OffsetInDescriptorsFromTableStart = 45;
+        // ADR-004 L6: the heightfield GI at [48..52] (t38..t42).
+        sr[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[5].NumDescriptors = 5;
+        sr[5].BaseShaderRegister = 38;
+        sr[5].OffsetInDescriptorsFromTableStart = 48;
         D3D12_ROOT_PARAMETER p[5] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[2].Descriptor.ShaderRegister = 4;
         p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[3].DescriptorTable.NumDescriptorRanges = 3;
+        p[3].DescriptorTable.NumDescriptorRanges = 6;
         p[3].DescriptorTable.pDescriptorRanges = sr;
         p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         p[4].Constants.ShaderRegister = 3;
@@ -215,11 +230,20 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         cmp.MaxLOD = D3D12_FLOAT32_MAX;
         cmp.ShaderRegister = 1;
         cmp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        // s3: DDGI's linear sampler (ddgi.hlsli), visible to the vertex
+        // shaders too -- trees and grass read the probes per vertex.
+        D3D12_STATIC_SAMPLER_DESC lin = {};
+        lin.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        lin.AddressU = lin.AddressV = lin.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        lin.MaxLOD = D3D12_FLOAT32_MAX;
+        lin.ShaderRegister = 3;
+        lin.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        const D3D12_STATIC_SAMPLER_DESC samplers[2] = {cmp, lin};
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
         rsd.NumParameters = 5;
         rsd.pParameters = p;
-        rsd.NumStaticSamplers = 1;
-        rsd.pStaticSamplers = &cmp;
+        rsd.NumStaticSamplers = 2;
+        rsd.pStaticSamplers = samplers;
         ComPtr<ID3DBlob> sig, err;
         HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
         if (FAILED(hr)) {

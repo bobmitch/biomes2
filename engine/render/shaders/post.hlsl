@@ -45,9 +45,9 @@ cbuffer PostConstants : register(b0) {
     float  meter_lo;    float meter_hi;  // the metered band, as fractions of the pixels
     uint   expo_flags;  float agx_saturation;   // expo_flags 1: adapt instantly (a still)
     float  agx_power;   float cam_alt_km;   // AgX look; the camera's altitude for the sky table
-    float3 sky_sun_dir;  float pad2;         // the sun and moon themselves, for their disks
-    float3 sky_moon_dir; float pad3;
-    float3 sun_disk;     float pad4;         // disk radiance seen from the camera, nits
+    float3 sky_sun_dir;  float ssgi_radius;     // the sun and moon themselves, for their disks; the bounce's reach, m (0 off)
+    float3 sky_moon_dir; float ssgi_thickness;  // the thickness assumed behind each depth sample, m
+    float3 sun_disk;     float cam_sky;      // disk radiance seen from the camera, nits; cam_sky: DDGI's share of open sky at the eye
     float3 moon_disk;    float pad5;
     float3 cam_fwd;      float fog_on;       // the mist (L4): fog.hlsl's integrated volume
     float  fog_near;     float fog_log_ratio; float rt_shadows; float rt_sky;   // L5's traced key-light visibility, L6's traced sky
@@ -64,11 +64,13 @@ Texture2D<float4> g_skyview : register(t7);   // atmosphere.hlsl: the sky round 
 Texture3D<float4> g_ap      : register(t8);   // atmosphere.hlsl: in-scatter (rgb), transmittance (a)
 Texture3D<float4> g_fog     : register(t9);   // fog.hlsl: in-scatter (rgb), transmittance (a), to each slice's far side
 Texture2D<float2> g_rtvis   : register(t10);  // rt_shadow.hlsl: x the key light's visibility, y the sky's, traced
+Texture2D<float4> g_ssgi_view : register(t11); // cs_ssgi's output, for --post-debug 3 (UAV-bound in cs_ssgi itself)
 
 RWTexture2D<float>  u_ao    : register(u0);
 RWTexture2D<float4> u_scene : register(u1);
 RWTexture2D<float4> u_hist0 : register(u2);
 RWTexture2D<float4> u_hist1 : register(u3);
+RWTexture2D<float4> u_ssgi  : register(u6);   // cs_ssgi: irradiance (rgb, lux), distance from the camera (a)
 RWStructuredBuffer<uint>   u_lumhist : register(u4);   // 256 bins
 // [0] (adapted log2 nits, exposure, EV100, this frame's target log2 nits)
 // [1] (low percentile nits, high percentile nits, pixels metered, 1 once valid)
@@ -152,6 +154,103 @@ void cs_ao(uint3 id : SV_DispatchThreadID) {
         occl += best;
     }
     u_ao[id.xy] = saturate(1.0f - occl * 0.25f * 1.1f);
+}
+
+// --- screen-space indirect light (ADR-004 L6, the no-RT GI) ------------------
+//
+// The irradiance a surface gets from the surfaces round it that are on
+// screen: per half-resolution pixel, three slices, each swept both ways in
+// screen space, every depth sample a thick occluder whose angular extent in
+// the slice sets bits in a 32-sector visibility mask (Therrien et al. 2023).
+// The light a sample sends is what this frame's two scene targets say leaves
+// it -- the sun's direct light and everything else, the bounce included --
+// and it counts only for the sectors it is the first to cover, weighted by
+// the cosine at the receiver. The scene reads the result NEXT frame through
+// gi_diffuse (ssgi.hlsli), reprojected; that frame's ambient then carries it
+// into this pass again, which is every further bounce, a frame at a time.
+
+[numthreads(8, 8, 1)]
+void cs_ssgi(uint3 id : SV_DispatchThreadID) {
+    const uint hw = (width + 1) / 2, hh = (height + 1) / 2;
+    if (id.x >= hw || id.y >= hh) return;
+    const int2 mx = int2(width - 1, height - 1);
+    const int2 p = min(int2(id.xy) * 2, mx);
+    const float z = g_depth[p];
+    if (z >= 1.0f || ssgi_radius <= 0.0f) { u_ssgi[id.xy] = float4(0.0f, 0.0f, 0.0f, 0.0f); return; }
+    const float2 uv = (float2(p) + 0.5f) * inv_size;
+    const float3 P = world_at(uv, z);
+    const float3 n = normal_at(p, P);
+    const float dist = length(P - cam_pos);
+    const float3 V = (cam_pos - P) / max(dist, 1e-4f);
+    const float focal = 0.5f * float(height) * view_proj[1][1];
+    const float r_px = clamp(ssgi_radius * focal / max(dist, 0.1f), 4.0f, 256.0f);
+    const float thick = ssgi_thickness + 0.02f * dist;
+    const float noise = ign(float2(id.xy) + float(frame % 32u) * 5.588238f);
+    const float kPi_ = 3.14159265f, kHalfPi = 1.5707963f;
+    float3 lsum = float3(0.0f, 0.0f, 0.0f);
+    float wsum = 0.0f;
+    [loop] for (int k = 0; k < 3; ++k) {
+        const float a = (noise + float(k)) * (kPi_ / 3.0f);
+        const float2 d = float2(cos(a), sin(a));   // pixels: x right, y down
+        // The slice in the world: a step along d on screen at P's depth,
+        // made perpendicular to the view, is its tangent.
+        float3 T = world_at(uv + d * inv_size * 4.0f, z) - P;
+        T -= V * dot(T, V);
+        const float tl = length(T);
+        if (tl < 1e-6f) continue;
+        T /= tl;
+        const float3 A = cross(T, V);
+        float3 np = n - A * dot(n, A);
+        const float nl = length(np);
+        if (nl < 1e-4f) continue;
+        np /= nl;
+        const float g = atan2(dot(np, T), dot(np, V));   // the projected normal, from the view direction
+        uint mask = 0u;
+        float3 ls = float3(0.0f, 0.0f, 0.0f);
+        [unroll] for (int side = 0; side < 2; ++side) {
+            const float sgn = side == 0 ? 1.0f : -1.0f;
+            [loop] for (int j = 0; j < 8; ++j) {
+                // Denser near the pixel, where occluders matter most.
+                const float t = (float(j) + frac(noise + 0.618034f * float(j + 1))) / 8.0f;
+                const float2 q = float2(p) + 0.5f + sgn * d * (r_px * t * t + 1.0f);
+                if (any(q < 0.0f) || q.x >= float(width) || q.y >= float(height)) break;
+                const int2 qi = int2(q);
+                const float zq = g_depth[qi];
+                if (zq >= 1.0f) continue;   // sky: the fallback's sky term already has it
+                const float3 S = world_at((float2(qi) + 0.5f) * inv_size, zq);
+                const float3 dv = S - P;
+                const float dl = length(dv);
+                if (dl < 0.02f || dl > ssgi_radius) continue;
+                // The occluder's front and, a thickness behind it, its back.
+                // Thicker with distance: eight samples a side over 30 m leave
+                // gaps, and a sliver 0.75 m thick marked a sunlit slope across
+                // a valley as a few thin sectors -- the bounce came out a
+                // fraction of DDGI's. Ground is solid; most of what is out
+                // there is thick.
+                const float3 db = dv - V * max(thick, 0.35f * dl);
+                const float af = atan2(dot(dv, T), dot(dv, V));
+                const float ab = atan2(dot(db, T), dot(db, V));
+                const float lo = clamp(min(af, ab) - g, -kHalfPi, kHalfPi);
+                const float hi = clamp(max(af, ab) - g, -kHalfPi, kHalfPi);
+                const uint b0 = min(31u, uint((lo / kPi_ + 0.5f) * 32.0f));
+                const uint b1 = min(32u, uint(ceil((hi / kPi_ + 0.5f) * 32.0f)));
+                if (b1 <= b0) continue;
+                const uint nb = b1 - b0;
+                const uint bits = (nb >= 32u ? 0xFFFFFFFFu : ((1u << nb) - 1u)) << b0;
+                const uint fresh = bits & ~mask;
+                if (fresh == 0u) continue;
+                // The cosine-weighted share of the hemisphere the interval
+                // covers, times the part of it nothing nearer already took.
+                const float w = 0.5f * (sin(hi) - sin(lo)) * float(countbits(fresh)) / float(nb);
+                ls += (g_direct[qi].rgb + g_ambient[qi].rgb) * w;
+                mask |= bits;
+            }
+        }
+        lsum += ls * nl;
+        wsum += nl;
+    }
+    const float3 E = wsum > 0.0f ? kPi_ * lsum / wsum : float3(0.0f, 0.0f, 0.0f);
+    u_ssgi[id.xy] = float4(min(E, float3(60000.0f, 60000.0f, 60000.0f)), dist);
 }
 
 // --- the atmosphere ---------------------------------------------------------------
@@ -293,14 +392,24 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     const float skv = rt_sky > 0.5f ? g_rtvis[p].y : 1.0f;
     float3 c = dir * (cs * rtv) + amb * (ao * skv);
     // The atmosphere between the eye and the surface.
-    const float4 ap = aerial(uv, length(P - cam_pos));
-    c = c * ap.a + ap.rgb;
+    // The haze assumes sunlit, sky-lit air the whole way. Near the camera
+    // the air is lit as the camera is -- in a sealed chamber, not at all --
+    // so its in-scattering takes the probes' share of open sky at the eye
+    // over the first 64 m, then fades back to the full haze by 256 m, where
+    // the air is somewhere else. (A fade starting at the eye left 6% of the
+    // haze 4 m into a sealed chamber: 0.2 nits, the whole residue.)
+    const float dist = length(P - cam_pos);
+    const float4 ap = aerial(uv, dist);
+    c = c * ap.a + ap.rgb * lerp(cam_sky, 1.0f, saturate((dist - 64.0f) / 192.0f));
     // Then the mist, which is nearer than the bulk of the air.
     const float4 mf = mist(uv, dot(P - cam_pos, cam_fwd));
     c = c * mf.a + mf.rgb;
     float mark = 1.0f;
     if (debug > 0.5f && debug < 1.5f) { c = ao.xxx; mark = 0.0f; }
     if (debug > 1.5f && debug < 2.5f) { c = cs.xxx; mark = 0.0f; }
+    // The screen-space bounce's irradiance, as the radiance a white
+    // Lambertian surface would send back: exposed like the scene.
+    if (debug > 2.5f && debug < 3.5f) c = g_ssgi_view[min(p / 2, int2((width + 1) / 2 - 1, (height + 1) / 2 - 1))].rgb / 3.14159265f;
     u_scene[p] = float4(c, mark);
 }
 
@@ -430,10 +539,15 @@ void cs_exposure(uint3 id : SV_DispatchThreadID) {
         if (!hi_found && cum + c >= hi && c > 0.0f) { hi_log = bin_log2(k); hi_found = true; }
         cum += c;
     }
-    // EV100 -2 (a dim interior) to 18 (snow in full sun), as log2 nits:
-    // EV100 = log2(L * 100 / 12.5), the reflected-light meter's calibration.
+    // EV100 -1 to 18 (snow in full sun), as log2 nits: EV100 = log2(L * 100 /
+    // 12.5), the reflected-light meter's calibration. The floor is where the
+    // eye stops compensating, and it decides what night looks like: at EV100
+    // -2 a full-moon meadow metered all the way up to a dim blue day. At -1
+    // moonlight renders a stop under middle grey (0 was tried: two stops read
+    // as near black) -- ambience -- and a
+    // torch or a fire, far above the scene's mean, carries the picture.
     float target = wsum > 0.0f ? acc / wsum : (valid ? prev.w : 10.0f);
-    target = clamp(target, -5.0f, 15.0f);
+    target = clamp(target, -4.0f, 15.0f);
     float adapted = target;
     if (valid && (expo_flags & 1u) == 0u) {
         // Into the light in about a second, out of it in about three: the eye

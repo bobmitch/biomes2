@@ -184,7 +184,7 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         range.BaseShaderRegister = 5;
         // The shadow table: the sun's map at heap [0], and since ADR-004 L3
         // the local lights' buffers and atlas at [24..28] (t20..t24).
-        D3D12_DESCRIPTOR_RANGE srange[3] = {};
+        D3D12_DESCRIPTOR_RANGE srange[6] = {};
         srange[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         srange[0].NumDescriptors = 1;
         srange[0].BaseShaderRegister = 8;
@@ -197,6 +197,21 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         srange[2].NumDescriptors = 1;
         srange[2].BaseShaderRegister = 25;
         srange[2].OffsetInDescriptorsFromTableStart = 38;
+        // ADR-004 L6: the DDGI probes at [40..42] (t26..t28).
+        srange[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srange[3].NumDescriptors = 3;
+        srange[3].BaseShaderRegister = 26;
+        srange[3].OffsetInDescriptorsFromTableStart = 40;
+        // ADR-004 L6: the screen-space bounce at [45] (t29).
+        srange[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srange[4].NumDescriptors = 1;
+        srange[4].BaseShaderRegister = 29;
+        srange[4].OffsetInDescriptorsFromTableStart = 45;
+        // ADR-004 L6: the heightfield GI at [48..52] (t38..t42).
+        srange[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srange[5].NumDescriptors = 5;
+        srange[5].BaseShaderRegister = 38;
+        srange[5].OffsetInDescriptorsFromTableStart = 48;
         D3D12_ROOT_PARAMETER p[10] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         p[0].Constants.ShaderRegister = 1;
@@ -213,7 +228,7 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         p[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[8].Descriptor.ShaderRegister = 2;
         p[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[9].DescriptorTable.NumDescriptorRanges = 3;
+        p[9].DescriptorTable.NumDescriptorRanges = 6;
         p[9].DescriptorTable.pDescriptorRanges = srange;
         for (int k = 0; k < 10; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
@@ -234,10 +249,19 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         cmp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
+        // s3: DDGI's linear sampler (ddgi.hlsli), visible to the vertex
+        // shaders too -- trees and grass read the probes per vertex.
+        D3D12_STATIC_SAMPLER_DESC lin = {};
+        lin.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        lin.AddressU = lin.AddressV = lin.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        lin.MaxLOD = D3D12_FLOAT32_MAX;
+        lin.ShaderRegister = 3;
+        lin.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        const D3D12_STATIC_SAMPLER_DESC samplers[3] = {ssa[0], ssa[1], lin};
         rsd.NumParameters = 10;
         rsd.pParameters = p;
-        rsd.NumStaticSamplers = 2;
-        rsd.pStaticSamplers = ssa;
+        rsd.NumStaticSamplers = 3;
+        rsd.pStaticSamplers = samplers;
         ComPtr<ID3DBlob> sig, err;
         HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
         if (FAILED(hr)) {

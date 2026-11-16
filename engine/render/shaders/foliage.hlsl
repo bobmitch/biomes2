@@ -345,7 +345,15 @@ struct FolOut {
     nointerpolation float  dry  : TEXCOORD5;
     nointerpolation uint   flags : TEXCOORD6;
     nointerpolation uint   seed : TEXCOORD7;
+    float4 gi : TEXCOORD8;   // gi_diffuse per vertex (lighting.hlsli): blades overdraw too much to read the probes a pixel
 };
+
+FolOut with_gi(FolOut o) {
+    o.gi = float4(gi_diffuse(o.world, normalize(o.nrm), normalize(cam_pos - o.world)), 0.0f);
+    o.gi.rgb *= gi_fill(1.3f);   // the stand-in for bounce between blades, where the probes did not answer
+    o.gi.a = g_gi_all;
+    return o;
+}
 
 // Wind: a gust field drifting across the ground, plus a quick flutter.
 float2 wind_at(float2 p) {
@@ -403,19 +411,19 @@ FolOut vs_blade(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     o.dry = float(b.color >> 24) / 255.0f;
     o.flags = b.a >> 24;
     o.seed = b.seed;
-    return o;
+    return with_gi(o);
 }
 
 // `albedo` as authored (sRGB). Physical units since ADR-004 L1: the wrapped
-// and transmitted sun of lighting.hlsli, and the GI interface's diffuse with
-// a little extra fill standing in for light scattered between blades, which
-// the no-GI ambient cannot see (trees.hlsl's shade says the same).
+// and transmitted sun of lighting.hlsli, and the GI interface's diffuse,
+// per vertex, with the fallback's fill for light scattered between blades
+// where the probes did not answer (with_gi; trees.hlsl's shade the same).
 SceneOut shade_foliage(float4 clip, float3 albedo_srgb, float3 n, float ao, float3 world, float3 toward_eye,
                        float contact = 0.0f, float ssao = 0.4f) {
     const float3 albedo = srgb_to_linear(albedo_srgb);
     const float sh = shadow_factor(world, float3(0.0f, 1.0f, 0.0f));
     return scene_out(leaf_sun_light(albedo, n, toward_eye, 0.5f, 0.7f, sh) * (1.09f * ao),
-                     albedo / kPi * gi_diffuse(world, n, toward_eye) * (1.3f * ao) +
+                     albedo / kPi * gi_diffuse(world, n, toward_eye) * ao +
                      local_lights_leaf(albedo, n, toward_eye, 0.5f, 0.7f, world, clip) * ao,
                      world, cam_pos, far_plane, contact, ssao);
 }
@@ -440,6 +448,7 @@ SceneOut ps_blade(FolOut i, bool front : SV_IsFrontFace) {
     if (debug > 0.5f) return scene_flat(float3(0.9f, 0.9f, 0.1f));
     // Blades take a little: the base of a sward darkening where it meets a
     // trunk or a stone reads; blade-on-blade does not.
+    g_gi_vertex = i.gi;
     return shade_foliage(i.clip, albedo, n, ao, i.world, normalize(cam_pos - i.world), 0.3f * (1.0f - i.uv.y));
 }
 
@@ -465,7 +474,7 @@ FolOut vs_card(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     o.dry = float(b.color >> 24) / 255.0f;
     o.flags = b.a >> 24;
     o.seed = b.seed;
-    return o;
+    return with_gi(o);
 }
 
 SceneOut ps_card(FolOut i) {
@@ -490,6 +499,7 @@ SceneOut ps_card(FolOut i) {
     const float3 albedo = lerp(i.col, i.dcol, dryness);
     const float ao = lerp(0.4f, 1.0f, i.uv.y);
     if (debug > 0.5f) return scene_flat(float3(0.1f, 0.6f, 0.9f));
+    g_gi_vertex = i.gi;
     return shade_foliage(i.clip, albedo, normalize(i.nrm), ao, i.world, normalize(cam_pos - i.world));
 }
 
@@ -525,7 +535,7 @@ FolOut vs_bush(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     o.dry = float(b.color >> 24) / 255.0f * 0.5f;
     o.flags = 0u;
     o.seed = h;
-    return o;
+    return with_gi(o);
 }
 
 SceneOut ps_bush(FolOut i) {
@@ -536,5 +546,6 @@ SceneOut ps_bush(FolOut i) {
     const float3 albedo = lerp(i.col, i.dcol, i.dry) * (0.85f + 0.3f * funit(fhash(i.seed, 9u)));
     const float ao = lerp(0.45f, 1.0f, saturate(i.nrm.y));
     if (debug > 0.5f) return scene_flat(float3(0.9f, 0.2f, 0.9f));
+    g_gi_vertex = i.gi;
     return shade_foliage(i.clip, albedo, normalize(i.nrm), ao, i.world, normalize(cam_pos - i.world));
 }
