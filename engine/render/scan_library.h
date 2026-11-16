@@ -36,7 +36,8 @@ struct ScanMaterialGpu {
     float ground_layer, rock_layer, ground_inv_tile, rock_inv_tile;
     float ground_tint[3], ground_rough;   // authored / scan mean; authored roughness
     float rock_tint[3], rock_rough;
-    float ground_scan_rough, rock_scan_rough, pad0, pad1;   // the scans' own mean roughness
+    float ground_scan_rough, rock_scan_rough;   // the scans' own mean roughness
+    float ground_depth, rock_depth;             // parallax depth, metres (scans.json depth_m)
 };
 static_assert(sizeof(ScanMaterialGpu) == 64, "ScanMaterialGpu must match mesh.hlsl");
 
@@ -55,7 +56,7 @@ public:
     // A loaded set's layer, 1 / its tile in metres, and the retint that takes
     // its mean albedo to `authored_srgb`. False (layer -1) if not loaded.
     bool lookup(const std::string& name, const float authored_srgb[3], float& layer, float& inv_tile,
-                float tint[3]) const;
+                float tint[3], float& depth_m) const;
     bool ready() const { return layers_ > 0; }
     UINT layers() const { return layers_; }
     // What init found, for startup.txt: sets loaded, missing, MB uploaded.
@@ -65,7 +66,7 @@ private:
     template <class T> using ComPtr = Microsoft::WRL::ComPtr<T>;
     UINT layers_ = 0;
     std::string note_;
-    struct Info { int layer; float mean[3]; float tile; };
+    struct Info { int layer; float mean[3]; float tile; float depth; };
     std::map<std::string, Info> info_;
     ComPtr<ID3D12Resource> albedo_, nra_, table_;
 };

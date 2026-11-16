@@ -50,6 +50,8 @@ struct SpeciesLook {
     float  bark_layer;      // the CC0 bark scan's layer (scan_library.h); -1 procedural
     float3 bark_tint;       // authored / scan mean, linear
     float  bark_inv_tile;   // 1 / the scan's tile in metres
+    float  bark_depth;      // the scan's parallax depth, metres (pom.hlsli)
+    float3 pad;
 };
 
 // The CC0 scans (scan_library.h): A sRGB albedo + height, B normal xy,
@@ -57,6 +59,7 @@ struct SpeciesLook {
 Texture2DArray<float4> g_scan_a    : register(t44);
 Texture2DArray<float4> g_scan_b    : register(t45);
 SamplerState           g_scan_samp : register(s5);
+#include "engine/render/shaders/pom.hlsli"
 
 cbuffer DrawOffset : register(b1) { uint g_list_offset; };
 
@@ -123,17 +126,37 @@ float3 linear_to_srgb_bark(float3 c) {
 // the screen-space derivatives of position and uv (Schueler, "Normal
 // Mapping without Precomputed Tangents"). Returns sRGB albedo, as shade()
 // takes, and the perturbed normal.
-float3 bark_scan(float3 n, float3 world, float2 uv, float layer, float inv_tile, float3 tint,
-                 out float3 nout, out float ao) {
-    const float2 t = uv * inv_tile;
-    const float4 a = g_scan_a.Sample(g_scan_samp, float3(t, layer));
-    const float4 b = g_scan_b.Sample(g_scan_samp, float3(t, layer));
+//
+// Parallax (pom.hlsli) when `depth_m` > 0 and parallax is on: the trunk's uv
+// is isotropic metres, so the unit tangents T and B carry the view and the
+// key light straight into uv shifts. `psh` is the bark's self-shadow
+// towards the key light, for the caller's direct term.
+float3 bark_scan(float3 n, float3 world, float2 uv, float layer, float inv_tile, float3 tint, float depth_m,
+                 out float3 nout, out float ao, out float psh) {
+    float2 t = uv * inv_tile;
     const float3 dp1 = ddx(world), dp2 = ddy(world);
     const float2 du1 = ddx(t), du2 = ddy(t);
     const float3 dp2perp = cross(dp2, n), dp1perp = cross(n, dp1);
     const float3 T = dp2perp * du1.x + dp1perp * du2.x;
     const float3 B = dp2perp * du1.y + dp1perp * du2.y;
     const float inv = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-20f));
+    psh = 1.0f;
+    const float3 v = normalize(cam_pos - world);
+    const float fade = pom_fade(length(cam_pos - world), depth_m) * (l_shadow_frame.y > 0.5f ? 1.0f : 0.0f);
+    if (depth_m * fade > 0.0005f && dot(T, T) > 1e-20f && dot(B, B) > 1e-20f) {
+        const float3 Tu = normalize(T), Bu = normalize(B);
+        const float vz = max(dot(v, n), 0.2f);
+        const float scale = depth_m * fade * inv_tile;
+        const float2 view_step = -float2(dot(v, Tu), dot(v, Bu)) / vz * scale;
+        const int steps = int(lerp(6.0f, 16.0f, saturate(1.0f - dot(v, n))));
+        const float th = pom_march(t, layer, view_step, du1, du2, steps);
+        t += view_step * th;
+        const float lz = dot(kSunDir, n);
+        if (lz > 0.05f)
+            psh = pom_shadow_faded(t, th, layer, float2(dot(kSunDir, Tu), dot(kSunDir, Bu)) / lz * scale, lz, du1, du2);
+    }
+    const float4 a = g_scan_a.SampleGrad(g_scan_samp, float3(t, layer), du1, du2);
+    const float4 b = g_scan_b.SampleGrad(g_scan_samp, float3(t, layer), du1, du2);
     float2 tn = b.xy * 2.0f - 1.0f;
     const float tz = sqrt(saturate(1.0f - dot(tn, tn)));
     const float3 p = T * inv * tn.x + B * inv * tn.y + n * tz;
@@ -209,7 +232,7 @@ struct MeshOut {
     nointerpolation float scale : TEXCOORD12;
     nointerpolation float narrow : TEXCOORD13;
     nointerpolation float4 bscan : TEXCOORD15;      // the bark scan: tint rgb, layer (-1 none)
-    nointerpolation float bscan_tile : TEXCOORD16;  // 1 / its tile, metres
+    nointerpolation float2 bscan_tile : TEXCOORD16; // 1 / its tile, metres; parallax depth, metres
     float4 gi    : TEXCOORD14;   // gi_diffuse per vertex: irradiance, and its scale for specular (lighting.hlsli)
 };
 
@@ -276,7 +299,7 @@ MeshOut mesh_vertex(uint vid, uint iid, bool lit) {
     o.scale = inst.scale;
     o.narrow = lk.leaf_kind;
     o.bscan = float4(lk.bark_tint, lk.bark_layer);
-    o.bscan_tile = lk.bark_inv_tile;
+    o.bscan_tile = float2(lk.bark_inv_tile, lk.bark_depth);
     o.gi = float4(0.0f, 0.0f, 0.0f, 1.0f);
     if (lit) {
         o.gi.rgb = gi_diffuse(world, normalize(o.nrm), normalize(cam_pos - world));
@@ -299,11 +322,15 @@ SceneOut ps_mesh(MeshOut i, bool front : SV_IsFrontFace) {
     float3 albedo;
     bool foliage = false;
     float ao = i.ao;
+    float bark_psh = 1.0f;   // the bark scan's parallax self-shadow
+    float3 ng = n;           // the geometric normal: the shadow lookup's offset
     if (i.kind < 0.5f) {
         if (!front) n = -n;
+        ng = n;
         if (i.bscan.w >= 0.0f) {
             float bao;
-            albedo = bark_scan(n, i.world, i.uv * i.scale, i.bscan.w, i.bscan_tile, i.bscan.rgb, n, bao);
+            albedo = bark_scan(n, i.world, i.uv * i.scale, i.bscan.w, i.bscan_tile.x, i.bscan.rgb,
+                               i.bscan_tile.y, n, bao, bark_psh);
             ao *= bao;
         } else {
             albedo = bark_albedo(i.bark, i.uv * i.scale, length(fwidth(i.uv)));
@@ -334,7 +361,7 @@ SceneOut ps_mesh(MeshOut i, bool front : SV_IsFrontFace) {
         return scene_flat(((i.packed >> 29) & 1u) != 0u ? float3(0.2f, 0.8f, 0.2f) : float3(0.9f, 0.2f, 0.2f));
     }
     g_gi_vertex = i.gi;
-    return shade(albedo, n, ao, i.world, foliage, shadow_factor(i.world, n), i.clip);
+    return shade(albedo, n, ao, i.world, foliage, shadow_factor(i.world, ng) * bark_psh, i.clip);
 }
 
 // What the coarse shadow casters let through, matched to the real leaves'

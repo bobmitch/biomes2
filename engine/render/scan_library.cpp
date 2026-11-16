@@ -99,6 +99,20 @@ bool ScanLibrary::init(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12De
         error = std::string("scan library: archetypes.json materials: ") + e.what();
         return false;
     }
+    // Each set's parallax depth from the manifest; 0.05 m if it gives none.
+    std::map<std::string, float> depth_of;
+    try {
+        const jsonlite::Value man = jsonlite::parse_file("assets/textures/scans.json");
+        const jsonlite::Value& sets = man.at("sets");
+        for (const auto& kv : sets.obj)
+            depth_of[kv.first] = kv.second.has("depth_m") ? float(kv.second.number("depth_m")) : 0.05f;
+    } catch (const std::exception&) {
+        // No manifest: no packs either, and every layer stays -1.
+    }
+    auto depth = [&](const std::string& n) {
+        const auto it = depth_of.find(n);
+        return it == depth_of.end() ? 0.05f : it->second;
+    };
     auto want = [&](const std::string& n) {
         if (n.empty() || index.count(n)) return;
         Pack p;
@@ -121,7 +135,7 @@ bool ScanLibrary::init(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12De
     for (const auto& kv : index) {
         if (kv.second < 0) continue;
         const Pack& p = packs[size_t(kv.second)];
-        info_[kv.first] = Info{kv.second, {p.mean[0], p.mean[1], p.mean[2]}, p.tile};
+        info_[kv.first] = Info{kv.second, {p.mean[0], p.mean[1], p.mean[2]}, p.tile, depth(kv.first)};
     }
 
     // --- the table ---------------------------------------------------------
@@ -143,6 +157,8 @@ bool ScanLibrary::init(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12De
              t.ground_rough, t.ground_scan_rough);
         fill(rows[i].rock, rows[i].r, rows[i].rr, t.rock_layer, t.rock_inv_tile, t.rock_tint,
              t.rock_rough, t.rock_scan_rough);
+        t.ground_depth = rows[i].ground.empty() ? 0.0f : depth(rows[i].ground);
+        t.rock_depth = rows[i].rock.empty() ? 0.0f : depth(rows[i].rock);
     }
 
     // --- resources -----------------------------------------------------------
@@ -298,14 +314,16 @@ bool ScanLibrary::init(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12De
 }
 
 bool ScanLibrary::lookup(const std::string& name, const float authored_srgb[3], float& layer, float& inv_tile,
-                         float tint[3]) const {
+                         float tint[3], float& depth_m) const {
     layer = -1.0f;
+    depth_m = 0.0f;
     inv_tile = 1.0f;
     for (int k = 0; k < 3; ++k) tint[k] = 1.0f;
     const auto it = info_.find(name);
     if (it == info_.end()) return false;
     layer = float(it->second.layer);
     inv_tile = 1.0f / (std::max)(it->second.tile, 0.05f);
+    depth_m = it->second.depth;
     for (int k = 0; k < 3; ++k) tint[k] = srgb_to_linear(authored_srgb[k]) / (std::max)(it->second.mean[k], 1e-3f);
     return true;
 }

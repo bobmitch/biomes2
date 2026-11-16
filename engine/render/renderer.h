@@ -316,6 +316,9 @@ public:
     // The heightfield GI (ADR-004 L6, height_gi.h): the default diffuse GI
     // where DDGI is off (--no-hfgi, Z).
     void set_hfgi(bool on) { hfgi_on_ = on; }
+    // Parallax occlusion on the scans' height (pom.hlsli; --no-pom, P).
+    void set_pom(bool on) { pom_on_ = on; }
+    bool pom() const { return pom_on_; }
     bool hfgi() const { return hfgi_on_; }
     unsigned long long hfgi_rebuilds() const { return hfgi_.rebuilds(); }
     // The far terrain shadow past the cascades (far_shadow.h; --no-far-shadow).
@@ -523,6 +526,7 @@ private:
     bool far_on_ = true;
     void record_far(const float vp[16]);
     bool hfgi_on_ = true;
+    bool pom_on_ = true;
     ComPtr<ID3D12PipelineState> mesh_top_pso_;
     void record_hfgi(const float vp[16]);
     static bool gi_dbg_hf_off() { return false; }

@@ -67,8 +67,9 @@ struct LookGpu {
     float bark[3]; float leaf_kind;
     float leaf[3]; float bark_layer;   // the bark scan's layer, -1 procedural
     float bark_tint[3]; float bark_inv_tile;
+    float bark_depth; float pad[3];   // the bark scan's parallax depth, metres
 };
-static_assert(sizeof(LookGpu) == 48, "SpeciesLook must match trees.hlsl");
+static_assert(sizeof(LookGpu) == 64, "SpeciesLook must match trees.hlsl");
 
 std::string hr_text(const char* what, HRESULT hr) {
     char buf[256];
@@ -503,6 +504,7 @@ bool TreeRenderer::init(ID3D12Device* device, ID3D12CommandQueue* queue,
         lk[s].leaf_kind = looks_[s].form == TreeForm::Weeping ? 1.0f : 0.0f;
         lk[s].bark_layer = looks_[s].bark_layer;
         lk[s].bark_inv_tile = looks_[s].bark_inv_tile;
+        lk[s].bark_depth = looks_[s].bark_depth;
         for (int k = 0; k < 3; ++k) lk[s].bark_tint[k] = looks_[s].bark_tint[k];
     }
 

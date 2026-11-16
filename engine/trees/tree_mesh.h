@@ -51,7 +51,7 @@ struct TreeLook {
     // empty keeps the procedural bark. The renderer fills the rest from the
     // scan library before the trees initialise.
     std::string bark_scan;
-    float bark_layer = -1.0f, bark_inv_tile = 1.0f, bark_tint[3] = {1.0f, 1.0f, 1.0f};
+    float bark_layer = -1.0f, bark_inv_tile = 1.0f, bark_tint[3] = {1.0f, 1.0f, 1.0f}, bark_depth = 0.0f;
 };
 
 // A model's crown as an ellipsoid about the trunk axis, in model metres:

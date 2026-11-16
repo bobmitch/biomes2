@@ -36,12 +36,14 @@ struct ScanMaterial {
     float ground_layer, rock_layer, ground_inv_tile, rock_inv_tile;
     float3 ground_tint; float ground_rough;
     float3 rock_tint;   float rock_rough;
-    float ground_scan_rough, rock_scan_rough, pad0, pad1;
+    float ground_scan_rough, rock_scan_rough;
+    float ground_depth, rock_depth;   // parallax depth, metres (pom.hlsli)
 };
 Texture2DArray<float4>         g_scan_a    : register(t44);
 Texture2DArray<float4>         g_scan_b    : register(t45);
 StructuredBuffer<ScanMaterial> g_scan_mat  : register(t46);
 SamplerState                   g_scan_samp : register(s5);   // anisotropic, wrap
+#include "engine/render/shaders/pom.hlsli"
 
 cbuffer MeshConstants : register(b0) {
     row_major float4x4 view_proj;
@@ -203,7 +205,7 @@ struct ScanSample {
     float  ao;
 };
 
-ScanSample scan_triplanar(float layer, float inv_tile, float3 p, float3 n, float3 bw) {
+ScanSample scan_triplanar(float layer, float inv_tile, float3 p, float3 n, float3 bw, float3 dpx, float3 dpy) {
     ScanSample o = (ScanSample)0;
     const float3 sg = float3(n.x < 0.0f ? -1.0f : 1.0f, n.y < 0.0f ? -1.0f : 1.0f, n.z < 0.0f ? -1.0f : 1.0f);
     float3 nsum = 0.0f;
@@ -211,11 +213,19 @@ ScanSample scan_triplanar(float layer, float inv_tile, float3 p, float3 n, float
         const float w = bw[k];
         if (w < 0.01f) continue;
         float2 uv = k == 0 ? p.zy : (k == 1 ? p.xz : p.xy);
+        float2 gx = k == 0 ? dpx.zy : (k == 1 ? dpx.xz : dpx.xy);
+        float2 gy = k == 0 ? dpy.zy : (k == 1 ? dpy.xz : dpy.xy);
         const float flip = k == 0 ? sg.x : (k == 1 ? sg.y : -sg.z);
         uv.x *= flip;
+        gx.x *= flip;
+        gy.x *= flip;
         uv *= inv_tile;
-        const float4 a = g_scan_a.Sample(g_scan_samp, float3(uv, layer));
-        const float4 b = g_scan_b.Sample(g_scan_samp, float3(uv, layer));
+        gx *= inv_tile;
+        gy *= inv_tile;
+        // Explicit gradients: the parallax shift is discontinuous, and its
+        // derivatives would pick wild mips along every step it takes.
+        const float4 a = g_scan_a.SampleGrad(g_scan_samp, float3(uv, layer), gx, gy);
+        const float4 b = g_scan_b.SampleGrad(g_scan_samp, float3(uv, layer), gx, gy);
         float2 t = b.xy * 2.0f - 1.0f;
         t.x *= flip;
         const float tz = sqrt(saturate(1.0f - dot(t, t)));
@@ -242,8 +252,10 @@ static const float kScanHeightGain = 0.6f;
 
 struct ScanResult { float3 albedo; float rough; float3 n; float ao; bool ok; };
 
-ScanResult scan_surface(VSOut i, float3 n, float level) {
+ScanResult scan_surface(VSOut i, float3 n, float level, float3 v, out float psh) {
     ScanResult r = (ScanResult)0;
+    psh = 1.0f;
+    const float3 dpx = ddx(i.world), dpy = ddy(i.world);
     const float wts[12] = {i.w0.x, i.w0.y, i.w0.z, i.w0.w, i.w1.x, i.w1.y, i.w1.z, i.w1.w,
                            i.w2.x, i.w2.y, i.w2.z, i.w2.w};
     uint m0 = 0u, m1 = 0u;
@@ -263,7 +275,7 @@ ScanResult scan_surface(VSOut i, float3 n, float level) {
     float3 bw = abs(n);
     bw = bw * bw * bw * bw;
     bw /= (bw.x + bw.y + bw.z);
-    const float3 p = i.world;
+    float3 p = i.world;
 
     float wc[4] = {b0 / tot * level, b0 / tot * (1.0f - level), b1 / tot * level, b1 / tot * (1.0f - level)};
     ScanSample sc[4];
@@ -277,8 +289,61 @@ ScanResult scan_surface(VSOut i, float3 n, float level) {
         tint[c] = ground ? M.ground_tint : M.rock_tint;
         rscale[c] = ground ? M.ground_rough / M.ground_scan_rough : M.rock_rough / M.rock_scan_rough;
         if (wc[c] < 0.005f) { wc[c] = 0.0f; continue; }
-        sc[c] = scan_triplanar(ground ? M.ground_layer : M.rock_layer,
-                               ground ? M.ground_inv_tile : M.rock_inv_tile, p, n, bw);
+    }
+    // Parallax (pom.hlsli): the heaviest candidate's height map, in the
+    // plane the normal faces most; its shift moves every candidate's sample
+    // point, and its self-shadow darkens the key light.
+    const float pom_dist = length(cam_pos - i.world);
+    if (l_shadow_frame.y > 0.5f && pom_dist < 45.0f) {
+        int cd = 0;
+        [unroll] for (int c4 = 1; c4 < 4; ++c4) if (wc[c4] > wc[cd]) cd = c4;
+        ScanMaterial MD = M1;
+        if (cd < 2) MD = M0;
+        const bool gd = (cd & 1) == 0;
+        const float layer = gd ? MD.ground_layer : MD.rock_layer;
+        const float inv_tile = gd ? MD.ground_inv_tile : MD.rock_inv_tile;
+        // Only where one plane clearly dominates: where two weigh alike the
+        // dominant one flips from pixel to pixel and the shift with it,
+        // which drew a dark seam along a cliff's crease.
+        const float dom = saturate((max(bw.x, max(bw.y, bw.z)) - 0.55f) / 0.3f);
+        const float depth_m = gd ? MD.ground_depth : MD.rock_depth;
+        const float depth = depth_m * pom_fade(pom_dist, depth_m) * dom;
+        const float3 sg = float3(n.x < 0.0f ? -1.0f : 1.0f, n.y < 0.0f ? -1.0f : 1.0f, n.z < 0.0f ? -1.0f : 1.0f);
+        float3 U, V, A;
+        float2 uv;
+        if (bw.y >= bw.x && bw.y >= bw.z) {
+            U = float3(sg.y, 0.0f, 0.0f); V = float3(0.0f, 0.0f, 1.0f); A = float3(0.0f, sg.y, 0.0f);
+            uv = float2(p.x * sg.y, p.z);
+        } else if (bw.x >= bw.z) {
+            U = float3(0.0f, 0.0f, sg.x); V = float3(0.0f, 1.0f, 0.0f); A = float3(sg.x, 0.0f, 0.0f);
+            uv = float2(p.z * sg.x, p.y);
+        } else {
+            U = float3(-sg.z, 0.0f, 0.0f); V = float3(0.0f, 1.0f, 0.0f); A = float3(0.0f, 0.0f, sg.z);
+            uv = float2(-p.x * sg.z, p.y);
+        }
+        if (depth > 0.0005f) {
+            uv *= inv_tile;
+            const float2 gx = float2(dot(dpx, U), dot(dpx, V)) * inv_tile;
+            const float2 gy = float2(dot(dpy, U), dot(dpy, V)) * inv_tile;
+            const float scale = depth * inv_tile;
+            const float vz = max(dot(v, A), 0.2f);
+            const float2 view_step = -float2(dot(v, U), dot(v, V)) / vz * scale;
+            const int steps = int(lerp(6.0f, 20.0f, saturate(1.0f - dot(v, A))));
+            const float th = pom_march(uv, layer, view_step, gx, gy, steps);
+            p += (U * view_step.x + V * view_step.y) * (th / inv_tile);
+            const float lz = dot(kSunDir, A);
+            if (lz > 0.05f)
+                psh = pom_shadow_faded(uv + view_step * th, th, layer,
+                                       float2(dot(kSunDir, U), dot(kSunDir, V)) / lz * scale, lz, gx, gy);
+        }
+    }
+    [unroll] for (int c5 = 0; c5 < 4; ++c5) {
+        if (wc[c5] <= 0.0f) continue;
+        ScanMaterial M = M1;
+        if (c5 < 2) M = M0;
+        const bool ground = (c5 & 1) == 0;
+        sc[c5] = scan_triplanar(ground ? M.ground_layer : M.rock_layer,
+                                ground ? M.ground_inv_tile : M.rock_inv_tile, p, n, bw, dpx, dpy);
     }
     float top = -1e9f;
     [unroll] for (int c2 = 0; c2 < 4; ++c2)
@@ -343,7 +408,8 @@ SceneOut ps_main(VSOut i) {
     // metric grid, 3 scans and grid.
     const bool scans = (texture_mode > 0.5f && texture_mode < 1.5f) || texture_mode > 2.5f;
     ScanResult sr = (ScanResult)0;
-    if (scans) sr = scan_surface(i, n, level);
+    float psh = 1.0f;   // the scans' parallax self-shadow
+    if (scans) sr = scan_surface(i, n, level, v, psh);
     if (sr.ok) {
         albedo = sr.albedo;
         rough = sr.rough;
@@ -358,7 +424,7 @@ SceneOut ps_main(VSOut i) {
     // The geometric normal decides it and offsets the lookup; the scan's
     // normal shades.
     const float lam = dot(n, kSunDir);
-    const float sh = lam > 0.0f ? shadow_factor(i.world, n) : 1.0f;
+    const float sh = lam > 0.0f ? shadow_factor(i.world, n) * psh : 1.0f;
     const Surface s = make_surface(albedo, rough, ns, v);
     // Direct and ambient apart (scene_out.hlsli): the post chain shades
     // each with its own occlusion. The scan's occlusion is ambient only.

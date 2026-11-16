@@ -71,7 +71,7 @@ fallback), `--gi-report` (DDGI at three views), `--lights-report` (ADR-004 L3: l
 configurations timed) and `--fell` (with `--fell-save` / `--fell-verify`).
 Every mode takes `--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
-`--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`; `--shot` also
+`--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`; `--shot` also
 takes `--lights <n>` (campfires round the camera) and `--ground` (the
 `--cam` x and z at eye height on the ground). `--flight` also takes `--settle`, `--holes` and
 `--flight-speed <m/s>` and `--flight-from x y z`; `--shot` takes
@@ -509,10 +509,38 @@ confirmed it twice.
 - **Cost**, walking (`--walk 15 --uncapped`, packs present vs moved aside):
   2.75 / 2.89 ms against 2.69 / 2.72; startup +132 ms; 247 MB of textures
   at 1K. The flight's median rose to 2.50 ms with far more terrain on screen.
-- **Not done**: parallax occlusion mapping (the height channel is already
-  packed for it), anti-tiling beyond what the mips and the retint give (no
+- **Not done**: anti-tiling beyond what the mips and the retint give (no
   repetition shows from 160 m up on the badlands), BC compression (4x less
-  memory), scans for the grass, leaves and placed rocks.
+  memory), scans for the grass, leaves and placed rocks, silhouettes.
+
+**Parallax occlusion** (`engine/render/shaders/pom.hlsli`; `P`, `--no-pom`)
+on the scans' height channel, terrain and bark. No silhouettes and no depth
+write: outlines stay the mesh's, so nothing downstream (TAA, AO, the crack
+count, physics) sees it. `depth_m` per set in `scans.json` says how many
+metres the height map's range stands for: ground 3-5 cm, rock 15-18 cm,
+bark 1.5-3 cm.
+
+- **Terrain**: the heaviest of the four candidates, in the triplanar plane
+  the normal faces most; its shift moves every candidate's sample point.
+  Only where one plane clearly dominates (`dom`): where two weigh alike the
+  dominant one flips pixel to pixel and the shift with it. Every triplanar
+  fetch now takes EXPLICIT gradients from the unshifted position, or the
+  shift's discontinuities pick wild mips.
+- **Bark**: the trunk's metre uvs and the derivative frame already there.
+- **Self-shadow** towards the key light, six taps from the hit, multiplying
+  the direct term only (the shadow-map lookup keeps the geometric normal),
+  faded out as the light grazes, where six taps stride across the map and
+  find occluders that are not there.
+- **Reach scales with depth**: 300 x depth_m, 10 to 45 m, fading over the
+  far half -- 3 cm of meadow stops at 10 m, 15 cm of rock carries to 45.
+  A flat 45 m cost +0.33 ms walking, mostly meadow under grass, where 3 cm
+  cannot be seen; scaled, **+0.12 ms** (2.93 / 2.96 against 2.82 / 2.82).
+- **What it looks like**: it reads on rock at a grazing angle -- the badlands
+  cliff at (2453.4, 106.5, 3402) yaw 1.91, 09:00, ledges that hide what is
+  behind them and shadow what is below -- and barely under grass. A thin
+  high ridge in a height map hides a dark band of the map's floor behind it
+  from a grazing view; that is the effect working, and Rock029's 20 cm made
+  it look like a smudge, so it is 15 cm.
 
 ### Trees
 

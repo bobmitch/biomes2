@@ -1122,6 +1122,7 @@ void Renderer::record_shadows(const ViewConstants& view) {
     const bool on = shadows_on_ && mode_ != Mode::Wireframe;
     if (!on) sc.res = -sc.res;
     sc.shadow_frame[0] = float(post_frame_ % 1024u);
+    sc.shadow_frame[1] = pom_on_ ? 1.0f : 0.0f;   // parallax on the scans (pom.hlsli)
     far_.constants(on && far_on_, sc.far_map);
     if (sc.far_map[3] > 0.5f && std::getenv("BIOMES_FAR_DBG")) sc.far_map[3] = 2.0f;   // the far map in place of the cascades, to judge it
     fill_light(sc.light);
@@ -2870,7 +2871,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
             for (const TreeLook& l : looks) if (!l.bark_scan.empty()) bark.push_back(l.bark_scan);
             if (!scans_.init(device_.Get(), queue_.Get(), srv_heap_.Get(), mids, bark, error)) return false;
             for (TreeLook& l : looks)
-                if (!l.bark_scan.empty()) scans_.lookup(l.bark_scan, l.bark, l.bark_layer, l.bark_inv_tile, l.bark_tint);
+                if (!l.bark_scan.empty()) scans_.lookup(l.bark_scan, l.bark, l.bark_layer, l.bark_inv_tile, l.bark_tint, l.bark_depth);
             startup_log().push_back(std::make_pair("phase: scans -- " + scans_.note(), startup_now_ms() - ts));
         }
         if (!trees_.init(device_.Get(), queue_.Get(), looks, srv_heap_.Get(), 1, error)) return false;

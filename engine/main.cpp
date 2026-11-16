@@ -286,6 +286,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == 'X') { g_renderer.set_ssgi(!g_renderer.ssgi()); return 0; }
             // The heightfield GI (L6), for A/B.
             if (wp == 'Z') { g_renderer.set_hfgi(!g_renderer.hfgi()); return 0; }
+            if (wp == 'P') { g_renderer.set_pom(!g_renderer.pom()); return 0; }
             if (wp == 'H') { g_time_lapse = !g_time_lapse; return 0; }
             if (wp == VK_OEM_COMMA || wp == VK_OEM_PERIOD) {
                 g_renderer.set_ev_comp(g_renderer.ev_comp() + (wp == VK_OEM_PERIOD ? 0.5f : -0.5f));
@@ -765,6 +766,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (c2.find("--no-ssgi") != std::string::npos) g_renderer.set_ssgi(false);
         if (c2.find("--no-hfgi") != std::string::npos) g_renderer.set_hfgi(false);
         if (c2.find("--no-far-shadow") != std::string::npos) g_renderer.set_far_shadow(false);
+        if (c2.find("--no-pom") != std::string::npos) g_renderer.set_pom(false);
         if (c2.find("--no-crowns") != std::string::npos)
             g_renderer.set_rt_sky_mask(engine::RtScene::kMaskTerrain | engine::RtScene::kMaskTrees);
         if (c2.find("--rt-report") != std::string::npos) { g_renderer.set_rt_active(true); g_renderer.set_rt_checks(true); }
