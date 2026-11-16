@@ -214,9 +214,11 @@ struct AtmosphereConstants {
 };
 static_assert(sizeof(AtmosphereConstants) == 144, "AtmosphereConstants must match atmosphere.hlsl");
 
-// 4x4 inverse (row-major), by cofactors.
-bool invert4(const float m[16], float out[16]) {
-    float inv[16];
+// 4x4 inverse (row-major), by cofactors. In double for the TAA's
+// reprojection, which float cannot carry kilometres from the origin.
+template <class T>
+bool invert4(const T m[16], T out[16]) {
+    T inv[16];
     inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
     inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
     inv[8] = m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
@@ -235,7 +237,7 @@ bool invert4(const float m[16], float out[16]) {
     inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
     const double det = double(m[0]) * inv[0] + double(m[1]) * inv[4] + double(m[2]) * inv[8] + double(m[3]) * inv[12];
     if (det == 0.0) return false;
-    for (int i = 0; i < 16; ++i) out[i] = float(inv[i] / det);
+    for (int i = 0; i < 16; ++i) out[i] = T(inv[i] / det);
     return true;
 }
 
@@ -276,38 +278,41 @@ std::string hr_text(const char* what, HRESULT hr) {
 // column-major by default, which transposes silently and puts the geometry
 // somewhere behind the camera -- stating it in both places is cheaper than
 // debugging it once.
-void mat_mul(const float a[16], const float b[16], float out[16]) {
+template <class T>
+void mat_mul(const T a[16], const T b[16], T out[16]) {
     for (int r = 0; r < 4; ++r) {
         for (int c = 0; c < 4; ++c) {
-            float v = 0.0f;
+            T v = T(0);
             for (int k = 0; k < 4; ++k) v += a[r * 4 + k] * b[k * 4 + c];
             out[r * 4 + c] = v;
         }
     }
 }
 
-void build_view_proj(const ViewConstants& v, float out[16]) {
-    const float* R = v.cam_right;
-    const float* U = v.cam_up;
-    const float* F = v.cam_fwd;
-    const float* P = v.cam_pos;
-    const float dr = R[0] * P[0] + R[1] * P[1] + R[2] * P[2];
-    const float du = U[0] * P[0] + U[1] * P[1] + U[2] * P[2];
-    const float df = F[0] * P[0] + F[1] * P[1] + F[2] * P[2];
-    const float view[16] = {
-        R[0], U[0], F[0], 0.0f,
-        R[1], U[1], F[1], 0.0f,
-        R[2], U[2], F[2], 0.0f,
-        -dr,  -du,  -df,  1.0f
+template <class T>
+void build_view_proj(const ViewConstants& v, T out[16]) {
+    const T R[3] = {T(v.cam_right[0]), T(v.cam_right[1]), T(v.cam_right[2])};
+    const T U[3] = {T(v.cam_up[0]), T(v.cam_up[1]), T(v.cam_up[2])};
+    const T F[3] = {T(v.cam_fwd[0]), T(v.cam_fwd[1]), T(v.cam_fwd[2])};
+    const T P[3] = {T(v.cam_pos[0]), T(v.cam_pos[1]), T(v.cam_pos[2])};
+    const T dr = R[0] * P[0] + R[1] * P[1] + R[2] * P[2];
+    const T du = U[0] * P[0] + U[1] * P[1] + U[2] * P[2];
+    const T df = F[0] * P[0] + F[1] * P[1] + F[2] * P[2];
+    const T z = T(0), one = T(1);
+    const T view[16] = {
+        R[0], U[0], F[0], z,
+        R[1], U[1], F[1], z,
+        R[2], U[2], F[2], z,
+        -dr,  -du,  -df,  one
     };
-    const float h = 1.0f / v.tan_half_fov;
-    const float w = h / (v.aspect > 0.0f ? v.aspect : 1.0f);
-    const float n = kNearPlane, f = kFarPlane;
-    const float proj[16] = {
-        w,    0.0f, 0.0f,             0.0f,
-        0.0f, h,    0.0f,             0.0f,
-        0.0f, 0.0f, f / (f - n),      1.0f,
-        0.0f, 0.0f, -n * f / (f - n), 0.0f
+    const T h = one / T(v.tan_half_fov);
+    const T w = h / T(v.aspect > 0.0f ? v.aspect : 1.0f);
+    const T n = T(kNearPlane), f = T(kFarPlane);
+    const T proj[16] = {
+        w, z, z,                z,
+        z, h, z,                z,
+        z, z, f / (f - n),      one,
+        z, z, -n * f / (f - n), z
     };
     mat_mul(view, proj, out);
 }
@@ -2882,7 +2887,20 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     PostConstants pc = {};
     invert4(view_proj_, pc.inv_view_proj);
     std::memcpy(pc.view_proj, view_proj_, sizeof pc.view_proj);
-    std::memcpy(pc.prev_view_proj, prev_vp_, sizeof pc.prev_view_proj);
+    // TAA's reprojection as ONE matrix, this frame's unjittered clip space
+    // to last frame's, composed in double. In float, inverting a view-
+    // projection whose translation is kilometres from the origin left an
+    // error that changed with every frame's jitter: a still camera on the
+    // badlands hillside, 4 km out, shook by up to a pixel (--shake). Near
+    // the origin it was invisible, which is why it seemed to start late in
+    // a run. For a still camera this is the identity, whatever the position.
+    {
+        double inv[16], m[16];
+        if (invert4(vp_nj_d_, inv)) {
+            mat_mul(inv, prev_vp_d_, m);
+            for (int i = 0; i < 16; ++i) pc.prev_view_proj[i] = float(m[i]);
+        }
+    }
     for (int k = 0; k < 3; ++k) pc.cam_pos[k] = cur_cam_[k];
     for (int k = 0; k < 3; ++k) {
         pc.sun_dir[k] = sky_frame_.key_dir[k];          // contact shadows march towards the key light
@@ -3055,6 +3073,7 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     hist_valid_ = taa_on_ && !wire;
     hist_cur_ ^= 1u;
     std::memcpy(prev_vp_, view_proj_nj_, sizeof prev_vp_);
+    std::memcpy(prev_vp_d_, vp_nj_d_, sizeof prev_vp_d_);
     for (int k = 0; k < 3; ++k) prev_cam_[k] = cur_cam_[k];
     if (post_queries_) {
         cmd_->EndQuery(post_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q0 + 4);
@@ -3126,6 +3145,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
 
     MeshConstants mc = {};
     build_view_proj(view, mc.view_proj);
+    build_view_proj(view, vp_nj_d_);
     // TAA's sub-pixel jitter: Halton (2, 3) over 8 frames, as an NDC offset
     // added to clip x and y in proportion to w. The unjittered matrix is what
     // the next frame reprojects with.
@@ -3659,6 +3679,30 @@ void Renderer::render(const ViewConstants& view) {
     ++frame_index_;
 }
 
+// One frame off screen, as a still's warm-up records them: no readback,
+// history kept. --shake runs a session's worth of these before capturing.
+void Renderer::step_offscreen(const ViewConstants& view) {
+    allocators_[frame_]->Reset();
+    cmd_->Reset(allocators_[frame_].Get(), nullptr);
+    D3D12_RESOURCE_BARRIER wb = {};
+    wb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    wb.Transition.pResource = targets_[frame_].Get();
+    wb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    wb.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    wb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    cmd_->ResourceBarrier(1, &wb);
+    D3D12_CPU_DESCRIPTOR_HANDLE wrtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    wrtv.ptr += static_cast<SIZE_T>(frame_) * rtv_stride_;
+    record_scene(view, wrtv);
+    wb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    wb.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    cmd_->ResourceBarrier(1, &wb);
+    cmd_->Close();
+    ID3D12CommandList* wl[] = {cmd_.Get()};
+    queue_->ExecuteCommandLists(1, wl);
+    wait_for_gpu();
+}
+
 bool Renderer::capture(const ViewConstants& view, const char* path, std::string& error) {
     if (!ready_) { error = "renderer not initialised"; return false; }
 
@@ -3770,7 +3814,7 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
     // camera and the jitter walking, and captures the last. The ray-tracing
     // scene (L5) needs frames too, for its BLAS backlog: a still waits for
     // it, up to 400 frames, before counting down the sixteen.
-    const bool taa_warm = taa_on_ && mode_ != Mode::Wireframe;
+    const bool taa_warm = taa_on_ && mode_ != Mode::Wireframe && !capture_raw_;
     auto rt_behind = [&]() {
         return rt_ok_ && rt_active_ && (rt_.stats().pending > 0 || rt_.stats().drawn_without_blas > 0);
     };

@@ -855,7 +855,46 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         engine::ViewConstants v = {};
         fill_view(g_camera, 1280.0f, 720.0f, 0.0f, v);
 
-        const bool ok = g_renderer.capture(v, shot_path.c_str(), error);
+        bool ok = g_renderer.capture(v, shot_path.c_str(), error);
+        {
+            // --shake <frames>: a still camera through a session's worth of
+            // frames with the clock running, then eight consecutive raw
+            // frames, build/shake_0..7.bmp, to measure whether the image
+            // moves while the camera does not.
+            const std::string cl = cmdline ? cmdline : "";
+            const size_t sk = cl.find("--shake ");
+            if (ok && sk != std::string::npos) {
+                const int n = std::atoi(cl.c_str() + sk + 8);
+                float t = 0.0f;
+                // Per frame: what the streamer did with the camera still.
+                FILE* sl = std::fopen("build/shake.txt", "w");
+                if (sl) std::fprintf(sl, "frame meshed pending held fading_in resident free\n");
+                auto log_frame = [&](int i) {
+                    if (!sl) return;
+                    const engine::FrameStats s = g_renderer.stats();
+                    const engine::Streamer& sm = g_renderer.streamer();
+                    std::fprintf(sl, "%d %u %zu %zu %zu %zu %zu\n", i, s.meshed_this_frame, s.pending,
+                                 sm.held_count(), sm.fading_in_count(), s.resident, s.free_slots);
+                };
+                for (int i = 0; i < n; ++i) {
+                    t += 1.0f / 60.0f;
+                    fill_view(g_camera, 1280.0f, 720.0f, t, v);
+                    g_renderer.step_offscreen(v);
+                    log_frame(i);
+                }
+                g_renderer.set_capture_raw(true);
+                for (int i = 0; i < 8 && ok; ++i) {
+                    t += 1.0f / 60.0f;
+                    fill_view(g_camera, 1280.0f, 720.0f, t, v);
+                    char p[64];
+                    std::snprintf(p, sizeof p, "build/shake_%d.bmp", i);
+                    ok = g_renderer.capture(v, p, error);
+                    log_frame(n + i);
+                }
+                g_renderer.set_capture_raw(false);
+                if (sl) std::fclose(sl);
+            }
+        }
         const engine::FrameStats st = g_renderer.stats();
         float mx = 0.0f, mn = 0.0f;
         unsigned checked = 0;

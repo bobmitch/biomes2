@@ -63,7 +63,9 @@ pre-L2 sun), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
 takes `--lights <n>` (campfires round the camera) and `--ground` (the
 `--cam` x and z at eye height on the ground). `--flight` also takes `--settle`, `--holes` and
 `--flight-speed <m/s>` and `--flight-from x y z`; `--shot` takes
-`--slot-report`; every mode takes `--mesh-debug 1|2` (curtain, creases) and
+`--slot-report` and `--shake <frames>` (a still camera through that many
+frames with the clock running, then eight consecutive raw frames,
+`build/shake_0..7.bmp`, to measure whether the image moves); every mode takes `--mesh-debug 1|2` (curtain, creases) and
 the streaming A/B switches `--no-lod-align`,
 `--no-lod-hold`, `--no-prioritise`, `--adaptive-budget` and
 `--lod-fade <frames>`, and the tree switches `--tree-distance <m>`,
@@ -405,6 +407,22 @@ last run's.
   against 4096 vertices overflowed on chunks the vertex cap was happy with,
   and an overflow is dropped geometry, which is a hole.
   `--flight` prints what the worst chunk actually wanted.
+
+- **TAA shook the picture by up to a pixel, worst far from the origin.**
+  Two bugs in one reprojection. It rebuilt a pixel's world position with
+  the JITTERED inverse, so a still camera fetched history from
+  `uv - jitter` and the accumulated image moved by each frame's jitter. And
+  it inverted a float view-projection whose translation is kilometres from
+  the origin: the inverse's error changed with every jittered matrix, so
+  the shake grew as you travelled outward and "started late in a run". Now
+  the CPU composes ONE matrix in double, this frame's unjittered clip space
+  to last frame's (the identity for a still camera, wherever it is), and
+  `cs_taa` multiplies clip by it. `--shake` measured it with phase
+  correlation between consecutive raw frames: the badlands hillside, 4 km
+  out, moved up to 1.0 px a frame, more than the jitter itself (0.81 px);
+  now at most 0.014 px there and at spawn. The mist's own reprojection
+  (`fog.hlsl`) still goes through float world space; it is low-frequency
+  and has not shown it.
 
 ### Startup, shaders and the cache
 

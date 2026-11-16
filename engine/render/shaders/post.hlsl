@@ -30,7 +30,7 @@
 cbuffer PostConstants : register(b0) {
     row_major float4x4 inv_view_proj;    // this frame, jittered
     row_major float4x4 view_proj;        // this frame, jittered
-    row_major float4x4 prev_view_proj;   // last frame, unjittered
+    row_major float4x4 prev_view_proj;   // TAA: this frame's UNJITTERED clip space to last frame's (composed in double)
     float3 cam_pos;   float time;
     float3 sun_dir;   float near_plane;
     float  far_plane; float sharpen;
@@ -321,11 +321,16 @@ void cs_taa(uint3 id : SV_DispatchThreadID) {
     const float3 cur = cur4.rgb;
     float3 outc = cur;
     if ((flags & 1u) != 0u && (flags & 8u) != 0u) {
-        // Where this pixel's surface was last frame.
+        // Where this pixel's surface was last frame -- for the UNJITTERED
+        // pixel, straight from clip space to clip space. It went through
+        // world space with the JITTERED inverse once: a still camera then
+        // fetched history from uv - jitter, and every frame the accumulated
+        // image moved by that frame's jitter, a shake of up to a pixel left
+        // and right (--shake: 1.0 px between frames, more than the jitter).
         const float z = g_depth[p];
         const float2 uv = (float2(p) + 0.5f) * inv_size;
-        const float3 P = world_at(uv, z >= 1.0f ? 0.99999f : z);
-        const float4 pc = mul(float4(P, 1.0f), prev_view_proj);
+        const float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+        const float4 pc = mul(float4(ndc, z >= 1.0f ? 0.99999f : z, 1.0f), prev_view_proj);
         const float2 pndc = pc.xy / pc.w;
         const float2 puv = float2(pndc.x * 0.5f + 0.5f, 0.5f - pndc.y * 0.5f);
         if (all(puv >= 0.0f) && all(puv <= 1.0f) && pc.w > 0.0f) {

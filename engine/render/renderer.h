@@ -121,6 +121,10 @@ public:
     void dump_draw_args(const char* path);
     void render(const ViewConstants& view);
     bool capture(const ViewConstants& view, const char* path, std::string& error);
+    // --shake: frames recorded off screen with TAA history kept, then raw
+    // captures (no warm-up, no history reset) of consecutive frames.
+    void step_offscreen(const ViewConstants& view);
+    void set_capture_raw(bool on) { capture_raw_ = on; }
     void resize(UINT width, UINT height);
     void shutdown();
 
@@ -488,6 +492,7 @@ private:
     // The ray-tracing scene (ADR-004 L5).
     bool create_rt(std::string& error);
     void record_rt_trace();
+    bool capture_raw_ = false;
     RtScene rt_;
     CanopyMap canopy_;
     bool canopy_on_ = true, canopy_built_ = false;
@@ -562,6 +567,7 @@ private:
     float view_proj_[16] = {};      // this frame, jittered
     float view_proj_nj_[16] = {};   // this frame, unjittered
     float prev_vp_[16] = {};        // last frame, unjittered
+    double vp_nj_d_[16] = {}, prev_vp_d_[16] = {};   // the same in double, for TAA's reprojection
     float prev_cam_[3] = {0, 0, 0};
     float cur_cam_[3] = {0, 0, 0};
     // The camera's basis this frame, for the mist's froxels (L4).
