@@ -170,6 +170,7 @@ struct MeshOut {
     nointerpolation float tint : TEXCOORD11;
     nointerpolation float scale : TEXCOORD12;
     nointerpolation float narrow : TEXCOORD13;
+    float  sky   : TEXCOORD14;   // the canopy map's sky visibility, per vertex (canopy.hlsli)
 };
 
 MeshOut degenerate() {
@@ -178,7 +179,9 @@ MeshOut degenerate() {
     return o;
 }
 
-MeshOut vs_mesh(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
+// `lit`: the camera's pass, which reads the canopy map; the shadow passes
+// bind other constants where the map's would be and need no sky.
+MeshOut mesh_vertex(uint vid, uint iid, bool lit) {
     const uint packed = g_visible[g_list_offset + iid];
     const TreeInstance inst = g_instances[packed & 0xFFFFFu];
     const TreeVertex v = g_verts[vid];
@@ -232,8 +235,12 @@ MeshOut vs_mesh(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     o.tint = hash11(float(inst.id) * 0.013f);
     o.scale = inst.scale;
     o.narrow = lk.leaf_kind;
+    o.sky = lit ? canopy_visibility(world) : 1.0f;
     return o;
 }
+
+MeshOut vs_mesh(uint vid : SV_VertexID, uint iid : SV_InstanceID) { return mesh_vertex(vid, iid, true); }
+MeshOut vs_mesh_shadow(uint vid : SV_VertexID, uint iid : SV_InstanceID) { return mesh_vertex(vid, iid, false); }
 
 SceneOut ps_mesh(MeshOut i, bool front : SV_IsFrontFace) {
     if (!keep_pixel(i.clip.xy, i.packed)) discard;
@@ -273,6 +280,7 @@ SceneOut ps_mesh(MeshOut i, bool front : SV_IsFrontFace) {
         // 1: which level drew it -- LOD 0 red, LOD 1 green (packed bit 29).
         return scene_flat(((i.packed >> 29) & 1u) != 0u ? float3(0.2f, 0.8f, 0.2f) : float3(0.9f, 0.2f, 0.2f));
     }
+    g_canopy_vis = i.sky;
     return shade(albedo, n, ao, i.world, foliage, shadow_factor(i.world, n), i.clip);
 }
 
@@ -336,9 +344,10 @@ struct ImpOut {
     nointerpolation float2 yaw    : TEXCOORD4;   // cos, sin
     nointerpolation uint   packed : TEXCOORD5;
     nointerpolation float  tint   : TEXCOORD6;
+    float  sky    : TEXCOORD7;   // the canopy map's sky visibility, per corner
 };
 
-ImpOut vs_impostor(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
+ImpOut impostor_vertex(uint vid, uint iid, bool lit) {
     const uint packed = g_visible[g_list_offset + iid];
     const TreeInstance inst = g_instances[packed & 0xFFFFFu];
     const ModelInfo mi = g_models[inst.model];
@@ -360,8 +369,12 @@ ImpOut vs_impostor(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     o.yaw = float2(cos(yaw), sin(yaw));
     o.packed = packed;
     o.tint = hash11(float(inst.id) * 0.013f);
+    o.sky = lit ? canopy_visibility(o.world) : 1.0f;
     return o;
 }
+
+ImpOut vs_impostor(uint vid : SV_VertexID, uint iid : SV_InstanceID) { return impostor_vertex(vid, iid, true); }
+ImpOut vs_impostor_shadow(uint vid : SV_VertexID, uint iid : SV_InstanceID) { return impostor_vertex(vid, iid, false); }
 
 // World -> the model's own frame (undo the yaw) and back.
 float3 to_local(float3 v, float2 cs) { return float3(cs.x * v.x - cs.y * v.z, v.y, cs.y * v.x + cs.x * v.z); }
@@ -421,6 +434,7 @@ SceneOut ps_impostor(ImpOut i) {
     // Look from just outside its bound on the sun's side instead: hills and
     // other trees still shade it, its own crown does not.
     const float sh = shadow_factor(i.world + kSunDir * i.bound, kSunDir);
+    g_canopy_vis = i.sky;
     return shade(albedo, nw, 1.0f, i.world, true, sh, i.clip);
 }
 

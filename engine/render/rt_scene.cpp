@@ -174,10 +174,7 @@ bool RtScene::build_trees(ID3D12GraphicsCommandList4* cl, const std::vector<Tree
         const size_t species = m / kTreeVariants;
         if (species < looks.size()) {
             ti.narrow = looks[species].form == TreeForm::Weeping ? 1u : 0u;
-            // Beer-Lambert through a crown of randomly oriented leaves: the
-            // extinction is G * leaf area density, with G = 0.5 for a
-            // spherical leaf-angle distribution (Ross).
-            ti.bark[3] = 0.5f * looks[species].leaf_density;
+            ti.bark[3] = crown_volume(models[m], looks[species]).sigma;   // the crown's extinction
             for (int k = 0; k < 3; ++k) {
                 ti.bark[k] = srgb_lin(looks[species].bark[k]);
                 ti.leaf[k] = srgb_lin(looks[species].leaf[k]);
@@ -191,12 +188,11 @@ bool RtScene::build_trees(ID3D12GraphicsCommandList4* cl, const std::vector<Tree
         const size_t species = m / kTreeVariants;
         Crown& c = crowns_by_model_[m];
         c.cy = c.rh = c.rv = 0.0f;
-        if (species >= looks.size() || looks[species].leaf_density <= 0.0f) continue;
-        const TreeModel& tm = models[m];
-        c.rv = 0.5f * (tm.top - tm.crown_base);
-        c.cy = tm.crown_base + c.rv;
-        c.rh = 0.9f * tm.radius;
-        if (c.rv < 0.25f || c.rh < 0.25f) c.rh = c.rv = 0.0f;
+        if (species >= looks.size()) continue;
+        const CrownVolume v = crown_volume(models[m], looks[species]);
+        c.cy = v.cy;
+        c.rh = v.rh;
+        c.rv = v.rv;
     }
     if (pos.empty() || idx.empty()) return false;
     auto upload = [&](const void* src, UINT64 bytes, ComPtr<ID3D12Resource>& out) -> bool {

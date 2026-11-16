@@ -22,6 +22,7 @@
 #include "engine/render/local_lights.h"
 #include "engine/render/fog.h"
 #include "engine/render/rt_scene.h"
+#include "engine/render/canopy.h"
 
 #include <unordered_map>
 #include <vector>
@@ -286,6 +287,12 @@ public:
     bool rt_sky() const { return rt_sky_; }
     void set_rt_sky_mask(unsigned mask);
     void set_rt_sky_rays(int n) { rt_sky_rays_ = n < 1 ? 1 : (n > 16 ? 16 : n); }
+    // L6's no-RT canopy shade: the canopy map (canopy.h) in gi_sky_visibility.
+    // On by default; the traced sky takes over while --rt-sky is on.
+    void set_canopy(bool on) { canopy_on_ = on; }
+    bool canopy() const { return canopy_on_; }
+    unsigned canopy_trees() const { return canopy_.trees_last_frame(); }
+    unsigned long long canopy_builds() const { return canopy_.builds(); }
     const RtScene::Stats& rt_scene_stats() const { return rt_.stats(); }
     struct RtStats {
         uint32_t lit_lit = 0, shadow_shadow = 0, rt_only = 0, csm_only = 0;
@@ -293,6 +300,9 @@ public:
         float normal_err_deg = 0.0f;
         float sky_mean = 0.0f, sky_near_mean = 0.0f;   // L6: traced sky visibility, inside the cascades' reach / 60 m
         uint32_t sky_pixels = 0, sky_near_pixels = 0;
+        // The canopy map against the traced sky on the same terrain pixels.
+        float canopy_rt_mean = 0.0f, canopy_map_mean = 0.0f, canopy_mae = 0.0f;
+        uint32_t canopy_pixels = 0;
         float build_ms = 0.0f, trace_ms = 0.0f;   // GPU, smoothed
     };
     const RtStats& rt_stats() const { return rt_stats_; }
@@ -479,6 +489,10 @@ private:
     bool create_rt(std::string& error);
     void record_rt_trace();
     RtScene rt_;
+    CanopyMap canopy_;
+    bool canopy_on_ = true, canopy_built_ = false;
+    unsigned long long tree_list_version_ = 0;   // bumped whenever tree_all_ is rebuilt
+    float canopy_origin_[3] = {0.0f, 0.0f, 0.0f};
     bool rt_ok_ = false, rt_shadows_ = false, rt_active_ = false, rt_seed_ = false, rt_checks_ = false;
     bool rt_sky_ = false;
     unsigned rt_sky_mask_ = RtScene::kMaskTerrain | RtScene::kMaskTrees | RtScene::kMaskCrowns;

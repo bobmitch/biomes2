@@ -66,8 +66,9 @@ struct ShadowConstants {
     float res;
     float light[7][4];     // the frame's light (ADR-004 L2): Renderer::fill_light
     float cluster[3][4];   // local lights' clusters (ADR-004 L3): Renderer::record_lights
+    float canopy[4];       // the canopy map (ADR-004 L6): min corner x, z, reference height, 0 off / 1 built / 2 applied
 };
-static_assert(sizeof(ShadowConstants) == 416, "ShadowConstants must match shadow.hlsli");
+static_assert(sizeof(ShadowConstants) == 432, "ShadowConstants must match shadow.hlsli");
 
 // Matches cbuffer ClusterConstants in lights.hlsl.
 struct ClusterConstants {
@@ -711,7 +712,7 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         params[3].Descriptor.ShaderRegister = 2;
         // The shadow table: the sun's map at heap [0], and since ADR-004 L3
         // the local lights' buffers and atlas at [24..28] (t20..t24).
-        D3D12_DESCRIPTOR_RANGE sr[2] = {};
+        D3D12_DESCRIPTOR_RANGE sr[3] = {};
         sr[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr[0].NumDescriptors = 1;
         sr[0].BaseShaderRegister = 8;
@@ -719,9 +720,14 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         sr[1].NumDescriptors = 5;
         sr[1].BaseShaderRegister = 20;
         sr[1].OffsetInDescriptorsFromTableStart = 24;
+        // ADR-004 L6: the canopy map at [38] (t25).
+        sr[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[2].NumDescriptors = 1;
+        sr[2].BaseShaderRegister = 25;
+        sr[2].OffsetInDescriptorsFromTableStart = 38;
         params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        params[4].DescriptorTable.NumDescriptorRanges = 2;
+        params[4].DescriptorTable.NumDescriptorRanges = 3;
         params[4].DescriptorTable.pDescriptorRanges = sr;
         // Each vertex's surface material (ADR-004 L1), parallel to t0.
         params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -1007,6 +1013,11 @@ void Renderer::record_shadows(const ViewConstants& view) {
     fill_light(sc.light);
     std::memcpy(sc.cluster, cluster_consts_, sizeof sc.cluster);
     sc.cluster[2][3] = (rt_shadows_ && rt_ok_ && mode_ != Mode::Wireframe) ? 1.0f : 0.0f;
+    // The canopy map darkens the sky term unless the traced sky (--rt-sky)
+    // is doing it; built either way so the RT instrument can compare.
+    for (int k = 0; k < 3; ++k) sc.canopy[k] = canopy_origin_[k];
+    sc.canopy[3] = !canopy_built_ ? 0.0f
+                 : ((rt_sky_ && rt_ok_) || !canopy_on_ || mode_ == Mode::Wireframe ? 1.0f : 2.0f);
     if (on) {
         compute_cascades(view);
         for (UINT c = 0; c < kCascades; ++c) {
@@ -1148,9 +1159,9 @@ bool Renderer::create_rt(std::string& error) {
         bd.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
         return SUCCEEDED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, st, nullptr, IID_PPV_ARGS(&out)));
     };
-    if (!buffer(rt_stats_buf_, D3D12_HEAP_TYPE_DEFAULT, 64, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) { error = "rt stats"; return false; }
+    if (!buffer(rt_stats_buf_, D3D12_HEAP_TYPE_DEFAULT, 128, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) { error = "rt stats"; return false; }
     for (UINT f = 0; f < kFrameCount; ++f) {
-        if (!buffer(rt_stats_rb_[f], D3D12_HEAP_TYPE_READBACK, 64, false, D3D12_RESOURCE_STATE_COPY_DEST) ||
+        if (!buffer(rt_stats_rb_[f], D3D12_HEAP_TYPE_READBACK, 128, false, D3D12_RESOURCE_STATE_COPY_DEST) ||
             !buffer(rt_cb_[f], D3D12_HEAP_TYPE_UPLOAD, 256, false, D3D12_RESOURCE_STATE_GENERIC_READ)) { error = "rt buffers"; return false; }
         rt_cb_[f]->Map(0, nullptr, &rt_cb_cpu_[f]);
     }
@@ -1184,8 +1195,12 @@ bool Renderer::create_rt(std::string& error) {
     // map, depth, the six geometry buffers gi_trace reads, the visibility
     // UAV, the stats.
     {
-        D3D12_DESCRIPTOR_RANGE r_shadow = {}, r_depth = {}, r_vis = {};
+        D3D12_DESCRIPTOR_RANGE r_shadow2[2] = {}, r_depth = {}, r_vis = {};
+        D3D12_DESCRIPTOR_RANGE& r_shadow = r_shadow2[0];
         r_shadow.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r_shadow.NumDescriptors = 1; r_shadow.BaseShaderRegister = 8;
+        // The canopy map (L6), which the instrument compares with the traced sky.
+        r_shadow2[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r_shadow2[1].NumDescriptors = 1;
+        r_shadow2[1].BaseShaderRegister = 25; r_shadow2[1].OffsetInDescriptorsFromTableStart = 38;
         r_depth.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;  r_depth.NumDescriptors = 1;  r_depth.BaseShaderRegister = 0;
         r_vis.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;    r_vis.NumDescriptors = 1;    r_vis.BaseShaderRegister = 0;
         D3D12_ROOT_PARAMETER p[14] = {};
@@ -1193,7 +1208,7 @@ bool Renderer::create_rt(std::string& error) {
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[2].Descriptor.ShaderRegister = 30;
         p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[3].DescriptorTable.NumDescriptorRanges = 1; p[3].DescriptorTable.pDescriptorRanges = &r_shadow;
+        p[3].DescriptorTable.NumDescriptorRanges = 2; p[3].DescriptorTable.pDescriptorRanges = r_shadow2;
         p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[4].DescriptorTable.NumDescriptorRanges = 1; p[4].DescriptorTable.pDescriptorRanges = &r_depth;
         for (int k = 0; k < 6; ++k) {
@@ -1263,7 +1278,7 @@ void Renderer::record_rt_trace() {
     // Last time this frame index ran: its stats and stamps have landed.
     if (rt_stats_pending_[frame_]) {
         UINT* s = nullptr;
-        D3D12_RANGE rr = {0, 64};
+        D3D12_RANGE rr = {0, 128};
         if (SUCCEEDED(rt_stats_rb_[frame_]->Map(0, &rr, reinterpret_cast<void**>(&s)))) {
             rt_stats_.lit_lit = s[0];
             rt_stats_.shadow_shadow = s[1];
@@ -1277,6 +1292,10 @@ void Renderer::record_rt_trace() {
             rt_stats_.sky_near_mean = s[12] ? float(double(s[11]) / 1000.0 / double(s[12])) : 0.0f;
             rt_stats_.sky_pixels = s[10];
             rt_stats_.sky_near_pixels = s[12];
+            rt_stats_.canopy_pixels = s[15];
+            rt_stats_.canopy_rt_mean = s[15] ? float(double(s[13]) / 1000.0 / double(s[15])) : 0.0f;
+            rt_stats_.canopy_map_mean = s[15] ? float(double(s[14]) / 1000.0 / double(s[15])) : 0.0f;
+            rt_stats_.canopy_mae = s[15] ? float(double(s[16]) / 1000.0 / double(s[15])) : 0.0f;
             D3D12_RANGE nr = {0, 0};
             rt_stats_rb_[frame_]->Unmap(0, &nr);
         }
@@ -1346,7 +1365,7 @@ void Renderer::record_rt_trace() {
     cmd_->SetComputeRootUnorderedAccessView(12, rt_stats_buf_->GetGPUVirtualAddress());
     cmd_->SetComputeRootShaderResourceView(13, rt_.tree_attributes() ? rt_.tree_attributes()->GetGPUVirtualAddress() : any);
     cmd_->SetPipelineState(rt_clear_pso_.Get());
-    cmd_->Dispatch(2, 1, 1);
+    cmd_->Dispatch(4, 1, 1);
     {
         D3D12_RESOURCE_BARRIER u = {};
         u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -1361,7 +1380,7 @@ void Renderer::record_rt_trace() {
     cmd_->ResolveQueryData(rt_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q, 4, rt_query_rb_.Get(), UINT64(q) * 8);
     rt_query_pending_[frame_] = true;
     tr(rt_stats_buf_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    cmd_->CopyBufferRegion(rt_stats_rb_[frame_].Get(), 0, rt_stats_buf_.Get(), 0, 64);
+    cmd_->CopyBufferRegion(rt_stats_rb_[frame_].Get(), 0, rt_stats_buf_.Get(), 0, 128);
     tr(rt_stats_buf_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     rt_stats_pending_[frame_] = true;
     tr(shadow_map_.Get(), ps | nps, ps);
@@ -2501,6 +2520,9 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         std::vector<TreeLook> looks;
         if (!load_tree_looks(world_.table(), "worldgen/data/archetypes.json", looks, error)) return false;
         if (!trees_.init(device_.Get(), queue_.Get(), looks, srv_heap_.Get(), 1, error)) return false;
+        // The canopy map (ADR-004 L6) from the same models' crowns.
+        if (!canopy_.init(device_.Get(), srv_heap_.Get(), error)) return false;
+        canopy_.set_models(trees_.models(), trees_.looks());
         // Three workers: the first fill of a 500 m radius is ~300 tiles, and
         // the frame loop never waits on them.
         tree_field_.init(&world_, 3);
@@ -2554,6 +2576,7 @@ void Renderer::update_trees(const ViewConstants& view, bool settle) {
     }
     tree_all_.insert(tree_all_.end(), tree_extras_.begin(), tree_extras_.end());
     trees_.set_instances(tree_all_);
+    ++tree_list_version_;
 }
 
 void Renderer::wait_for_gpu() {
@@ -3068,6 +3091,12 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         if (!(rt_.debug_ & 8u)) rt_.record(cmd_.Get(), UINT(frame_), streamer_, mesher_, trees_.models(), trees_.looks(),
                    trees_.instance_list(), view.cam_pos, tree_settings_.max_dist);
         if (rt_queries_) cmd_->EndQuery(rt_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q + 1);
+    }
+    // The canopy map (ADR-004 L6): before anything lit reads it.
+    canopy_built_ = false;
+    if (canopy_.ready() && (canopy_on_ || (rt_sky_ && rt_ok_))) {
+        canopy_.record(cmd_.Get(), UINT(frame_), view.cam_pos, trees_.instance_list(), tree_list_version_, canopy_origin_);
+        canopy_built_ = true;
     }
     // Local lights (ADR-004 L3): their list, their clusters and their shadow
     // faces, before anything is shaded with them.

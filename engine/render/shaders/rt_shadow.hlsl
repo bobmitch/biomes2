@@ -36,6 +36,8 @@ RWTexture2D<unorm float2> u_vis   : register(u0);   // x the key light's visibil
 // over [8] near, non-grazing agreeing pixels
 // [9] sky visibility x 1000, summed over [10] surface pixels inside csm_reach;
 // [11] and [12] the same inside 60 m
+// [13] traced sky x 1000, [14] the canopy map's x 1000, summed over [15]
+// terrain pixels inside 200 m; [16] their absolute difference x 1000
 RWStructuredBuffer<uint>  u_stats : register(u1);
 
 uint pcg_hash(uint v) {
@@ -150,6 +152,16 @@ void cs_rt_shadow(uint3 id : SV_DispatchThreadID) {
     u_vis[p] = float2(vis, sky);
 
     if (checks == 0u) return;
+    // The canopy map (L6's no-RT path) against the traced sky, on terrain,
+    // where both describe the same thing: the sky over a point on the ground.
+    // Inside 200 m: the map reaches 256 m from the camera and fades out.
+    if (sky_rays > 0u && on_terrain && d < 200.0f) {
+        const float cm = canopy_visibility_raw(lifted);
+        InterlockedAdd(u_stats[13], uint(sky * 1000.0f + 0.5f));
+        InterlockedAdd(u_stats[14], uint(cm * 1000.0f + 0.5f));
+        InterlockedAdd(u_stats[15], 1u);
+        InterlockedAdd(u_stats[16], uint(abs(cm - sky) * 1000.0f + 0.5f));
+    }
     if (d < csm_reach) {
         InterlockedAdd(u_stats[9], uint(sky * 1000.0f + 0.5f));
         InterlockedAdd(u_stats[10], 1u);

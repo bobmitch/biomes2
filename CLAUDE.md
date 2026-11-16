@@ -797,6 +797,41 @@ only, for A/B; `--rt-sky-rays <n>` traces more.
   full resolution. The ambient target also holds LOCAL light, which this
   dims too until DDGI separates them.
 
+### Canopy shade without RT: the canopy map (ADR-004 L6, step 2)
+
+On by default (`--no-canopy`, `B` for A/B); the traced sky replaces it
+under `--rt-sky`. `engine/render/canopy.{h,cpp}` splats every standing
+tree's crown ellipsoid (`crown_volume` in `tree_mesh.h`, the same volumes
+the RT scene traces) into a 512 m camera-centred map of 1 m texels on the
+GPU -- vertical optical depth, tau-weighted crown bottom and top, vertical
+transmittance -- then blurs it a-trous into five wider slices
+(`canopy.hlsl`). `canopy.hlsli`, included by `shadow.hlsli`, reads it in
+`gi_sky_visibility`, so it darkens the SKY term of `gi_diffuse` and
+`gi_specular` only: bounce and local lights are untouched. The map is at
+heap [38] (t25), a THIRD range of every lit pipeline's shadow table; its
+corner and reference height ride in `l_canopy` (ShadowConstants, 432 bytes).
+
+- **It is judged against the traced crowns.** `--rt-report` traces 16
+  crowns-only rays a pixel and compares terrain pixels inside 200 m: wood
+  0.32 traced / 0.37 map (mean per-pixel error 0.066), spawn 0.51 / 0.48
+  (0.077), bare hillside 1.00 / 1.00. One ray a pixel made the "error"
+  mostly the reference's own noise (0.31), and pixels past the map's reach
+  made it look 0.10 too bright.
+- **Neither obvious model is right.** Averaging transmittance over the
+  footprint left a dense wood 0.10 too bright; averaging optical depth first
+  matched the wood and smeared its dark into clearings. The shipped one
+  mixes them 1:3 in log space (`kCanopyMix`), with the slab's 2E3 fit
+  (`kCanopyPath` 1.5) for the diffuse path.
+- **Cost is the trees' leaf cards, not the map.** Building every frame was
+  ~0.15 ms, so it rebuilds only when the tree list changes or the camera
+  moves 16 m (39 builds in a 6,000-frame walk). Read per PIXEL, the leaf
+  cards' overdraw cost 0.1 ms against 0.02 ms for all the terrain, so trees
+  read it per VERTEX (`vs_mesh` / `vs_impostor`; the shadow passes have
+  their own entry points, `vs_*_shadow`, because they bind the frame's
+  constants where the map's corner would be). Net: +0.06 ms walking.
+- At EV100 13 the shaded half of the woodland floor goes from luma 82.6 to
+  62.2 (the traced sky: 58.5); crowns seen from above keep their tops.
+
 - **Cracks are counted in the engine, as UNDRAWN pixels** (ADR-004 L0):
   below the horizon, far depth, and both HDR scene targets still at their
   clear values -- read before TAA and the tonemap, so neither can hide a

@@ -47,6 +47,7 @@ of having them.
 | Cracks | `engine --shot ... ` then `<shot>.txt` | default view 0 undrawn; rough hillside `--cam 2420 118 3390 0.6 -0.25` 0 (was 49: a skirt edge-on to a wall, fixed by leaning it outward); 1400 m vista ~73,800 (the void past the world's rim) |
 | Ray tracing | `engine --check-rt` | DXR 1.1, SM 6.5, DXC 1.6; 64 rays, 0 disagreements with the CPU |
 | Ray tracing (L5) | `engine --rt-report`; `--shot ... --rt-shadows` | hillside: primary vs depth 93.1% agree, 0.5% nearer; shadow vs CSM 94.4%; woods 76-79%; normals 2.5-3.2 deg near; BLAS+TLAS 0.2 ms, shadow 0.29-1.4 ms |
+| Canopy map (L6.2) | `engine --rt-report` (canopy line); `--shot ... [--no-canopy]` | map vs traced crowns: wood 0.37/0.32 (err 0.066), spawn 0.48/0.51 (0.077), bare 1.00/1.00; shaded woodland floor 82.6 -> 62.2 at EV100 13; +0.06 ms walking |
 | Canopy shade (L6.1) | `engine --rt-report` (sky lines); `--shot ... --rt-sky [--no-crowns]` | sky visibility wood 0.90 -> 0.50 with crowns, spawn 0.93 -> 0.59, hillside 0.86 unchanged; shaded woodland floor luma 82.6 -> 58.5 at EV100 13; +1.5 ms in a dense wood |
 | Mist (L4) | `engine --shot ... [--time h] [--no-fog]` then `<shot>.txt` | gpu line: inject 0.095 ms day, 0.142 night with lights; integrate ~0.02; shafts A/B at --ev100 13: luma 152 / 176 / 195 (none / shadowed / unshadowed) |
 | Local lights (L3) | `engine --lights-report` | night, ground: none 2.33 ms; torch carried walking 2.51; 64 campfires 2.98 / 3.55 shadowed; 255 campfires 4.42, 46.5 per lit cluster, 0 overflowed |

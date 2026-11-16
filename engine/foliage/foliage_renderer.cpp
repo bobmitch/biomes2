@@ -183,7 +183,7 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         // segment count. 8 DWORDs.
         // The shadow table: the sun's map at heap [0], and since ADR-004 L3
         // the local lights' buffers and atlas at [24..28] (t20..t24).
-        D3D12_DESCRIPTOR_RANGE sr[2] = {};
+        D3D12_DESCRIPTOR_RANGE sr[3] = {};
         sr[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr[0].NumDescriptors = 1;
         sr[0].BaseShaderRegister = 8;
@@ -191,12 +191,17 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         sr[1].NumDescriptors = 5;
         sr[1].BaseShaderRegister = 20;
         sr[1].OffsetInDescriptorsFromTableStart = 24;
+        // ADR-004 L6: the canopy map at [38] (t25).
+        sr[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[2].NumDescriptors = 1;
+        sr[2].BaseShaderRegister = 25;
+        sr[2].OffsetInDescriptorsFromTableStart = 38;
         D3D12_ROOT_PARAMETER p[5] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[2].Descriptor.ShaderRegister = 4;
         p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[3].DescriptorTable.NumDescriptorRanges = 2;
+        p[3].DescriptorTable.NumDescriptorRanges = 3;
         p[3].DescriptorTable.pDescriptorRanges = sr;
         p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         p[4].Constants.ShaderRegister = 3;

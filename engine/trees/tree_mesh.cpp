@@ -545,4 +545,17 @@ TreeModel build_tree_model(const TreeLook& look, uint32_t species, uint32_t vari
     return tm;
 }
 
+CrownVolume crown_volume(const TreeModel& tm, const TreeLook& look) {
+    CrownVolume c;
+    if (look.leaf_density <= 0.0f) return c;
+    c.rv = 0.5f * (tm.top - tm.crown_base);
+    c.cy = tm.crown_base + c.rv;
+    c.rh = 0.9f * tm.radius;
+    // Beer-Lambert through randomly oriented leaves: extinction G x leaf
+    // area density, G = 0.5 for a spherical leaf-angle distribution (Ross).
+    c.sigma = 0.5f * look.leaf_density;
+    if (c.rv < 0.25f || c.rh < 0.25f) c = CrownVolume();
+    return c;
+}
+
 }  // namespace engine

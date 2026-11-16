@@ -353,6 +353,32 @@ the day it does not.
   and light shafts through the haze (L4's froxels). The sea is still the
   weakest surface.
 
+## L6, step 2 — the canopy map, 2026-11-15
+
+The no-RT tier's canopy shade, and the default wherever the traced sky is
+off.
+
+- **The map:** 512 m round the camera at 1 m, splatted on the GPU from the
+  same crown ellipsoids the RT scene traces (`crown_volume`): optical depth,
+  tau-weighted crown bottom and top, and transmittance; five a-trous blurs
+  for footprints out to ~26 m. `gi_sky_visibility` reads it -- the
+  interface the ADR fixed at L1 -- so the sky term dims and the bounce and
+  local lights do not, which is better than step 1's RT path manages.
+- **The footprint** grows with the canopy's height above the point (the
+  sky a point sees through a canopy dz above spreads over a disc of radius
+  ~dz); a point inside the crowns sees only the share above it.
+- **Tuned against the traced crowns, not by eye.** `--rt-report` compares
+  the two on terrain pixels inside 200 m with 16 rays a pixel: mean
+  per-pixel error 0.066 in the wood, 0.077 at spawn, 0.001 on bare ground,
+  means within 0.05. Averaging transmittance (one column of crowns per ray)
+  and averaging depth (all of them) err in opposite directions by view; a
+  1:3 log-space mix of the two holds in both.
+- **Cost:** +0.06 ms walking. The build is cached (16 m or a changed tree
+  list); trees read the map per vertex because their cards' overdraw made
+  a per-pixel read 0.1 ms.
+- **Not done:** terrain horizons and caves (the probes); tilt of a tree's
+  crown in the map; anything past 256 m.
+
 ## L6, step 1 — crown volumes and a traced sky, 2026-11-15
 
 The first piece of L6 is the shade under a canopy, because it is the one

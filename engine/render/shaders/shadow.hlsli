@@ -31,6 +31,9 @@ cbuffer ShadowConstants : register(b2) {
     float4 l_cluster;          // tiles x, tiles y, slices, lights this frame
     float4 l_cluster2;         // near, slices / ln(far / near), screen width, screen height
     float4 l_cam_fwd;          // the camera's forward, for a pixel's view depth
+    // The canopy map (ADR-004 L6, canopy.hlsli): its min corner x, z, the
+    // height its crown heights are relative to; w 0 none, 1 built, 2 applied.
+    float4 l_canopy;
 };
 
 Texture2DArray<float>  g_shadow     : register(t8);
@@ -71,5 +74,7 @@ float shadow_factor(float3 world, float3 n) {
     if (l_cam_fwd.w > 0.5f) return 1.0f;
     return cascade_visibility(world, n);
 }
+
+#include "engine/render/shaders/canopy.hlsli"
 
 #endif

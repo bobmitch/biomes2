@@ -278,6 +278,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 else g_renderer.set_rt_shadows(!g_renderer.rt_shadows());
                 return 0;
             }
+            // The canopy map's shade, the no-RT path (L6), for A/B.
+            if (wp == 'B') { g_renderer.set_canopy(!g_renderer.canopy()); return 0; }
             if (wp == 'H') { g_time_lapse = !g_time_lapse; return 0; }
             if (wp == VK_OEM_COMMA || wp == VK_OEM_PERIOD) {
                 g_renderer.set_ev_comp(g_renderer.ev_comp() + (wp == VK_OEM_PERIOD ? 0.5f : -0.5f));
@@ -744,6 +746,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             const size_t k = c2.find("--rt-sky-rays ");
             if (k != std::string::npos) g_renderer.set_rt_sky_rays(std::atoi(c2.c_str() + k + 14));
         }
+        if (c2.find("--no-canopy") != std::string::npos) g_renderer.set_canopy(false);
         if (c2.find("--no-crowns") != std::string::npos)
             g_renderer.set_rt_sky_mask(engine::RtScene::kMaskTerrain | engine::RtScene::kMaskTrees);
         if (c2.find("--rt-report") != std::string::npos) { g_renderer.set_rt_active(true); g_renderer.set_rt_checks(true); }
@@ -2299,8 +2302,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 {"off (key light only)", false, 0x7u},
                 {"terrain + trunks", true, 0x3u},
                 {"terrain + trunks + crowns", true, 0x7u},
+                {"crowns only", true, 0x4u},
             };
             for (const SkyCfg& c : cfgs) {
+                // The map is compared per pixel, so the traced side needs
+                // enough rays to be an answer rather than a sample.
+                g_renderer.set_rt_sky_rays(c.mask == 0x4u ? 16 : 1);
                 g_renderer.set_rt_sky_mask(c.mask);
                 g_renderer.set_rt_sky(c.on);
                 for (int i = 0; i < 240; ++i) frame();
@@ -2313,8 +2320,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                  s2.trace_ms, s2.build_ms, r2.instances_crowns);
                 else
                     std::fprintf(f, "  sky %-26s trace %.3f ms, build %.3f ms\n", c.name, s2.trace_ms, s2.build_ms);
+                // The canopy map (L6's no-RT path) is judged against crowns
+                // alone: terrain horizons and trunks are not what it models.
+                if (c.on && c.mask == 0x4u)
+                    std::fprintf(f, "  canopy map vs traced crowns (16 rays), %u terrain px inside 200 m: traced %.3f, map %.3f, mean |difference| %.3f; "
+                                    "%u trees in the map\n",
+                                 s2.canopy_pixels, s2.canopy_rt_mean, s2.canopy_map_mean, s2.canopy_mae,
+                                 g_renderer.canopy_trees());
             }
             g_renderer.set_rt_sky(false);
+            g_renderer.set_rt_sky_rays(1);
+            g_renderer.set_rt_sky_mask(0x7u);
             std::fprintf(f, "\n");
         }
         std::fclose(f);
@@ -3220,6 +3236,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                              sm[size_t(sm.size() * 0.99)]);
             }
             std::fprintf(f, "frames %llu, travelled %.0f m\n", frames, travelled);
+            std::fprintf(f, "canopy map: %s, %llu builds, %u trees in the last\n",
+                         g_renderer.canopy() ? "on" : "off", g_renderer.canopy_builds(), g_renderer.canopy_trees());
             // Jolt cannot tell "in the air" from "that chunk has not arrived":
             // in both cases nothing is underneath. One number, not two labels
             // for the same count.

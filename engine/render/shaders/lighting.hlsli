@@ -62,11 +62,14 @@ float3 sky_radiance(float3 dir) {
 
 // Irradiance (lux) arriving at a surface with this normal, from everything
 // but the sun's direct beam.
+float gi_sky_visibility(float3 world, float3 n);
+
 float3 gi_diffuse(float3 world, float3 n, float3 view) {
     // Two uniform hemispheres, sky above and ground below: integrated against
-    // the cosine lobe this is exact, not a fit.
+    // the cosine lobe this is exact, not a fit. The sky's share is what the
+    // canopy leaves; the ground's bounce and local light are not touched.
     const float up = 0.5f + 0.5f * n.y;
-    return kPi * (kSkyMean * up + kGroundRadiance * (1.0f - up));
+    return kPi * (kSkyMean * (up * gi_sky_visibility(world, n)) + kGroundRadiance * (1.0f - up));
 }
 
 // Radiance (nits) arriving along the mirror direction, prefiltered by
@@ -74,15 +77,22 @@ float3 gi_diffuse(float3 world, float3 n, float3 view) {
 // a rough one sees the hemisphere's average.
 float3 gi_specular(float3 world, float3 n, float3 view, float roughness) {
     const float3 r = reflect(-view, n);
-    const float3 sharp = lerp(kGroundRadiance, sky_radiance(r), smoothstep(-0.15f, 0.15f, r.y));
-    const float3 broad = lerp(kGroundRadiance, kSkyMean, 0.5f + 0.5f * n.y);
+    const float sv = gi_sky_visibility(world, n);
+    const float3 sharp = lerp(kGroundRadiance, sky_radiance(r) * sv, smoothstep(-0.15f, 0.15f, r.y));
+    const float3 broad = lerp(kGroundRadiance, kSkyMean * sv, 0.5f + 0.5f * n.y);
     return lerp(sharp, broad, roughness * roughness);
 }
 
-// How much of the sky a point sees: 0 in a sealed cave. Without GI nothing
-// knows, so everything sees all of it -- which is the problem L6 exists for.
+// How much of the sky a point sees: 0 in a sealed cave. Since L6 the crowns
+// overhead count, through the canopy map (canopy.hlsli) wherever the
+// includer binds it -- the shadow table's third range; the sea does not.
+// Caves and terrain horizons still see all of it until the probes.
 float gi_sky_visibility(float3 world, float3 n) {
+#ifdef ENGINE_CANOPY_HLSLI
+    return canopy_visibility(world);
+#else
     return 1.0f;
+#endif
 }
 
 // --- BRDF -----------------------------------------------------------------

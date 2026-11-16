@@ -184,7 +184,7 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         range.BaseShaderRegister = 5;
         // The shadow table: the sun's map at heap [0], and since ADR-004 L3
         // the local lights' buffers and atlas at [24..28] (t20..t24).
-        D3D12_DESCRIPTOR_RANGE srange[2] = {};
+        D3D12_DESCRIPTOR_RANGE srange[3] = {};
         srange[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         srange[0].NumDescriptors = 1;
         srange[0].BaseShaderRegister = 8;
@@ -192,6 +192,11 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         srange[1].NumDescriptors = 5;
         srange[1].BaseShaderRegister = 20;
         srange[1].OffsetInDescriptorsFromTableStart = 24;
+        // ADR-004 L6: the canopy map at [38] (t25).
+        srange[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srange[2].NumDescriptors = 1;
+        srange[2].BaseShaderRegister = 25;
+        srange[2].OffsetInDescriptorsFromTableStart = 38;
         D3D12_ROOT_PARAMETER p[10] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         p[0].Constants.ShaderRegister = 1;
@@ -208,7 +213,7 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         p[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[8].Descriptor.ShaderRegister = 2;
         p[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[9].DescriptorTable.NumDescriptorRanges = 2;
+        p[9].DescriptorTable.NumDescriptorRanges = 3;
         p[9].DescriptorTable.pDescriptorRanges = srange;
         for (int k = 0; k < 10; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
@@ -338,8 +343,8 @@ bool TreeRenderer::create_pipelines(std::string& error) {
     if (!make_pso("vs_mesh", "ps_mesh", 2, mesh_pso_)) return false;
     if (!make_pso("vs_impostor", "ps_impostor", 2, imp_pso_)) return false;
     if (!make_pso("vs_bake", "ps_bake", 2, bake_pso_, false, DXGI_FORMAT_R8G8B8A8_UNORM)) return false;
-    if (!make_pso("vs_mesh", "ps_mesh_shadow", 0, mesh_shadow_pso_, true)) return false;
-    if (!make_pso("vs_impostor", "ps_impostor_shadow", 0, imp_shadow_pso_, true)) return false;
+    if (!make_pso("vs_mesh_shadow", "ps_mesh_shadow", 0, mesh_shadow_pso_, true)) return false;
+    if (!make_pso("vs_impostor_shadow", "ps_impostor_shadow", 0, imp_shadow_pso_, true)) return false;
     return true;
 }
 

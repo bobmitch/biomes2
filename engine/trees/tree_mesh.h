@@ -49,6 +49,14 @@ struct TreeLook {
     float nominal_height = 15.0f; // metres the mesh is built at
 };
 
+// A model's crown as an ellipsoid about the trunk axis, in model metres:
+// centre height, horizontal and vertical radii, and the extinction through
+// it (1/m). From where the crown starts to the top, 0.9 of the leaves'
+// reach across. rh == 0: no crown (a snag). The RT scene's crown volumes
+// and the canopy map (ADR-004 L6) both read it.
+struct CrownVolume { float cy = 0.0f, rh = 0.0f, rv = 0.0f, sigma = 0.0f; };
+CrownVolume crown_volume(const struct TreeModel& model, const TreeLook& look);
+
 // One per species, in TreeTable order. Throws nothing; fills `error`.
 bool load_tree_looks(const worldgen::ArchetypeTable& table, const char* json_path,
                      std::vector<TreeLook>& out, std::string& error);
