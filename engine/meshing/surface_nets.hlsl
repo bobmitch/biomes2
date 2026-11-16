@@ -77,6 +77,12 @@ RWStructuredBuffer<uint>   g_brick_mask  : register(u10);  // kBrickMaskWords pe
 // Vertex, so nothing that reads vertices -- physics, the shadow pass, the
 // readbacks -- changes stride.
 RWStructuredBuffer<uint2>  g_vertex_mat  : register(u21);
+// Each vertex's share of every biome's material, 8 bits each, biome index
+// order, the seabed after the last biome: 12 in all. The terrain shader
+// texture-blends by them (scan_library.h); g_vertex_mat keeps the blended
+// COLOURS, which lighting reads.
+RWStructuredBuffer<uint3>  g_vertex_wts  : register(u22);
+static const uint kMaxMaterials = 12u;
 
 // A column with no surface in it. Jolt spells its equivalent
 // HeightFieldShapeConstants::cNoCollisionValue; the conversion happens on the
@@ -258,7 +264,7 @@ uint pack_material(float4 m) {
     return q.x | (q.y << 8) | (q.z << 16) | (q.w << 24);
 }
 
-uint2 terrain_material(float x, float z) {
+uint2 terrain_material(float x, float z, out uint3 wts) {
     const float wx = x + w_warp_amp * fbm(x * w_warp_freq, z * w_warp_freq, 2, 2.0f, 0.5f, w_s_wx);
     const float wz = z + w_warp_amp * fbm(x * w_warp_freq, z * w_warp_freq, 2, 2.0f, 0.5f, w_s_wz);
     int4 idx; float4 dist; float d5;
@@ -267,6 +273,8 @@ uint2 terrain_material(float x, float z) {
     const float ds[4] = {dist.x, dist.y, dist.z, dist.w};
     float4 ground = 0.0f, rock = 0.0f;
     float wl = 0.0f, wall = 0.0f;
+    float acc[kMaxMaterials];
+    [unroll] for (uint q = 0u; q < kMaxMaterials; ++q) acc[q] = 0.0f;
     [unroll] for (int k = 0; k < 4; ++k) {
         if (k >= found || ids[k] < 0) continue;
         const float wk = blend_weight(ds[k], ds[0], d5, w_blend_width);
@@ -276,11 +284,19 @@ uint2 terrain_material(float x, float z) {
         ground += wk * g_arch[b * kArchRows + 3];
         rock += wk * g_arch[b * kArchRows + 4];
         wl += wk;
+        acc[min(uint(b), kMaxMaterials - 2u)] += wk;
     }
     const float4 sea_g = g_arch[w_biome_count * kArchRows + 3];
     const float4 sea_r = g_arch[w_biome_count * kArchRows + 4];
     const float ocean = wall > 0.0f ? saturate(1.0f - wl / wall) : 1.0f;
     if (wl > 0.0f) { ground /= wl; rock /= wl; } else { ground = sea_g; rock = sea_r; }
+    const float land = wl > 0.0f ? (1.0f - ocean) / wl : 0.0f;
+    const uint sea = min(uint(w_biome_count), kMaxMaterials - 1u);
+    wts = uint3(0u, 0u, 0u);
+    [unroll] for (uint m = 0u; m < kMaxMaterials; ++m) {
+        const float w = acc[m] * land + (m == sea ? ocean : 0.0f);
+        wts[m >> 2] |= uint(saturate(w) * 255.0f + 0.5f) << ((m & 3u) * 8u);
+    }
     return uint2(pack_material(lerp(ground, sea_g, ocean)), pack_material(lerp(rock, sea_r, ocean)));
 }
 
@@ -404,8 +420,10 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
     v.pos = world;
     v.nrm = nrm;
     g_vertices[vbase + local_slot] = v;
-    const uint2 mat = terrain_material(world.x, world.z);
+    uint3 wts;
+    const uint2 mat = terrain_material(world.x, world.z, wts);
     g_vertex_mat[vbase + local_slot] = mat;
+    g_vertex_wts[vbase + local_slot] = wts;
     // Slot-relative, so the draw's BaseVertexLocation does the rebasing and an
     // index never has to be rewritten when a chunk moves slot. Packed: the
     // surface vertex in the low 16 bits, the skirt vertex (or 0xFFFF) in the
@@ -443,6 +461,7 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
         skirt_slot = local_slot + 1u;
         g_vertices[vbase + skirt_slot] = s;
         g_vertex_mat[vbase + skirt_slot] = mat;
+        g_vertex_wts[vbase + skirt_slot] = wts;
     }
     g_cell_vertex[ci] = (local_slot & 0xFFFFu) | (skirt_slot << 16);
 }

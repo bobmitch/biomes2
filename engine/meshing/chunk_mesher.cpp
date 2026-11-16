@@ -117,7 +117,7 @@ bool ChunkMesher::init(ID3D12Device* device, UINT64 timestamp_freq, std::string&
 
     // One root parameter for the chunk constants and six root UAVs. No
     // descriptor heap: root descriptors are enough for plain buffers.
-    D3D12_ROOT_PARAMETER params[24] = {};
+    D3D12_ROOT_PARAMETER params[25] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
     params[0].Constants.Num32BitValues = sizeof(ChunkConstants) / 4;
@@ -138,9 +138,12 @@ bool ChunkMesher::init(ID3D12Device* device, UINT64 timestamp_freq, std::string&
     // pool. 12 + 11x2 + 2 + 10x2 + 2 = 58 of the 64 DWORDs.
     params[23].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     params[23].Descriptor.ShaderRegister = 21;
+    // Each vertex's material weights (the terrain's scans), parallel too: 60.
+    params[24].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[24].Descriptor.ShaderRegister = 22;
 
     D3D12_ROOT_SIGNATURE_DESC rsd = {};
-    rsd.NumParameters = 24;
+    rsd.NumParameters = 25;
     rsd.pParameters = params;
 
     ComPtr<ID3DBlob> sig, sig_err;
@@ -168,6 +171,8 @@ bool ChunkMesher::init(ID3D12Device* device, UINT64 timestamp_freq, std::string&
                      ua, vertices_, error, "vertex pool")) return false;
     if (!make_buffer(device, UINT64(kSlots) * kSlotVertices * 8,
                      ua, vertex_mat_, error, "vertex material pool")) return false;
+    if (!make_buffer(device, UINT64(kSlots) * kSlotVertices * 12,
+                     ua, vertex_wts_, error, "vertex material weights")) return false;
     if (!make_buffer(device, UINT64(kSlots) * kSlotIndices * 4,
                      ua, indices_, error, "index pool")) return false;
     if (!make_buffer(device, UINT64(kSlots) * 2 * 4, ua, counters_, error,
@@ -270,7 +275,7 @@ void bind_pool(ID3D12GraphicsCommandList* cmd, ID3D12RootSignature* root,
                ID3D12Resource* counters, ID3D12Resource* args,
                ID3D12Resource* heights, ID3D12Resource* flags,
                ID3D12Resource* bhdr, ID3D12Resource* bden, ID3D12Resource* bmask,
-               ID3D12Resource* vmat) {
+               ID3D12Resource* vmat, ID3D12Resource* vwts) {
     cmd->SetComputeRootSignature(root);
     cmd->SetComputeRoot32BitConstants(0, sizeof(ChunkConstants) / 4, &c, 0);
     cmd->SetComputeRootUnorderedAccessView(1, density->GetGPUVirtualAddress());
@@ -285,6 +290,7 @@ void bind_pool(ID3D12GraphicsCommandList* cmd, ID3D12RootSignature* root,
     cmd->SetComputeRootUnorderedAccessView(10, bden->GetGPUVirtualAddress());
     cmd->SetComputeRootUnorderedAccessView(11, bmask->GetGPUVirtualAddress());
     cmd->SetComputeRootUnorderedAccessView(23, vmat->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(24, vwts->GetGPUVirtualAddress());
 }
 
 void bind_world(ID3D12GraphicsCommandList* cmd, const WorldGpu* w) {
@@ -368,7 +374,7 @@ void ChunkMesher::record_mesh(ID3D12GraphicsCommandList* cmd, UINT slot,
     bind_pool(cmd, root_.Get(), c, density_.Get(), cell_vertex_.Get(),
               vertices_.Get(), indices_.Get(), counters_.Get(), draw_args_.Get(),
               heights_.Get(), chunk_flags_.Get(), brick_hdr_.Get(),
-              brick_den_.Get(), brick_mask_.Get(), vertex_mat_.Get());
+              brick_den_.Get(), brick_mask_.Get(), vertex_mat_.Get(), vertex_wts_.Get());
     bind_world(cmd, world_);
 
     cmd->SetPipelineState(pso_clear_.Get());
@@ -411,7 +417,7 @@ void ChunkMesher::record_retire(ID3D12GraphicsCommandList* cmd, UINT slot) {
     bind_pool(cmd, root_.Get(), c, density_.Get(), cell_vertex_.Get(),
               vertices_.Get(), indices_.Get(), counters_.Get(), draw_args_.Get(),
               heights_.Get(), chunk_flags_.Get(), brick_hdr_.Get(),
-              brick_den_.Get(), brick_mask_.Get(), vertex_mat_.Get());
+              brick_den_.Get(), brick_mask_.Get(), vertex_mat_.Get(), vertex_wts_.Get());
     bind_world(cmd, world_);
     cmd->SetPipelineState(pso_retire_.Get());
     cmd->Dispatch(1, 1, 1);
@@ -425,6 +431,7 @@ void ChunkMesher::record_to_draw(ID3D12GraphicsCommandList* cmd) {
     // already the resolved vertex, so there is no input layout to keep in sync.
     transition(cmd, vertices_.Get(), ua, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     transition(cmd, vertex_mat_.Get(), ua, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(cmd, vertex_wts_.Get(), ua, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     transition(cmd, indices_.Get(), ua, D3D12_RESOURCE_STATE_INDEX_BUFFER);
     transition(cmd, draw_args_.Get(), ua, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
 }
@@ -433,6 +440,7 @@ void ChunkMesher::record_to_compute(ID3D12GraphicsCommandList* cmd) {
     const D3D12_RESOURCE_STATES ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     transition(cmd, vertices_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, ua);
     transition(cmd, vertex_mat_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, ua);
+    transition(cmd, vertex_wts_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, ua);
     transition(cmd, indices_.Get(), D3D12_RESOURCE_STATE_INDEX_BUFFER, ua);
     transition(cmd, draw_args_.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, ua);
 }

@@ -162,7 +162,8 @@ if(BIOMES2_ENGINE)
     engine/render/canopy.cpp
     engine/render/ddgi.cpp
     engine/render/height_gi.cpp
-    engine/render/far_shadow.cpp)
+    engine/render/far_shadow.cpp
+    engine/render/scan_library.cpp)
   target_include_directories(engine PRIVATE ${PROJECT_SOURCE_DIR})
   # M1: the engine links the generator now. Track B was built against the
   # trivial field precisely so a pipeline bug could never be confused with a

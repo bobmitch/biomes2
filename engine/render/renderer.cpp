@@ -714,9 +714,9 @@ bool Renderer::create_water_pipeline(std::string& error) {
 
 bool Renderer::create_mesh_pipeline(std::string& error) {
     if (!mesh_root_) {
-        // 24 DWORDs of constants + three root SRVs at 2 each + the shadow CBV
-        // (2) and its table (1) = 33 of the 64.
-        D3D12_ROOT_PARAMETER params[6] = {};
+        // 24 DWORDs of constants + four root SRVs at 2 each + the shadow CBV
+        // (2) and its table (1) = 35 of the 64.
+        D3D12_ROOT_PARAMETER params[7] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         params[0].Constants.ShaderRegister = 0;
@@ -733,10 +733,16 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         params[3].Descriptor.ShaderRegister = 2;
         // The shadow table: the sun's map at heap [0], and since ADR-004 L3
         // the local lights' buffers and atlas at [24..28] (t20..t24).
-        D3D12_DESCRIPTOR_RANGE sr[7] = {};
+        D3D12_DESCRIPTOR_RANGE sr[8] = {};
         sr[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr[0].NumDescriptors = 1;
         sr[0].BaseShaderRegister = 8;
+        // The terrain's scans at [67..69] (t44..t46): the two arrays and the
+        // per-biome table. The terrain's table only.
+        sr[7].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[7].NumDescriptors = 3;
+        sr[7].BaseShaderRegister = 44;
+        sr[7].OffsetInDescriptorsFromTableStart = ScanLibrary::kSrvAlbedo;
         sr[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr[1].NumDescriptors = 5;
         sr[1].BaseShaderRegister = 20;
@@ -768,12 +774,16 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         sr[6].OffsetInDescriptorsFromTableStart = 65;
         params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        params[4].DescriptorTable.NumDescriptorRanges = 7;
+        params[4].DescriptorTable.NumDescriptorRanges = 8;
         params[4].DescriptorTable.pDescriptorRanges = sr;
         // Each vertex's surface material (ADR-004 L1), parallel to t0.
         params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
         params[5].Descriptor.ShaderRegister = 2;
+        // Each vertex's material weights, for the scans (scan_library.h).
+        params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        params[6].Descriptor.ShaderRegister = 3;
         D3D12_STATIC_SAMPLER_DESC cmp = {};
         cmp.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
         cmp.AddressU = cmp.AddressV = cmp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
@@ -798,12 +808,20 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         pt.MaxLOD = D3D12_FLOAT32_MAX;
         pt.ShaderRegister = 4;
         pt.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        const D3D12_STATIC_SAMPLER_DESC samplers[3] = {cmp, lin, pt};
+        // s5: the scans, anisotropic and wrapping.
+        D3D12_STATIC_SAMPLER_DESC an = {};
+        an.Filter = D3D12_FILTER_ANISOTROPIC;
+        an.MaxAnisotropy = 8;
+        an.AddressU = an.AddressV = an.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        an.MaxLOD = D3D12_FLOAT32_MAX;
+        an.ShaderRegister = 5;
+        an.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        const D3D12_STATIC_SAMPLER_DESC samplers[4] = {cmp, lin, pt, an};
 
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 6;
+        rsd.NumParameters = 7;
         rsd.pParameters = params;
-        rsd.NumStaticSamplers = 3;
+        rsd.NumStaticSamplers = 4;
         rsd.pStaticSamplers = samplers;
         rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
@@ -1186,7 +1204,7 @@ void Renderer::record_shadows(const ViewConstants& view) {
         cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
         cmd_->SetGraphicsRootShaderResourceView(1, mesher_.vertices()->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
-        cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress());
+        cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress()); cmd_->SetGraphicsRootShaderResourceView(6, mesher_.vertex_weights()->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootConstantBufferView(3, shadow_cb_[frame_]->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootDescriptorTable(4, srv_heap_->GetGPUDescriptorHandleForHeapStart());
         cmd_->IASetIndexBuffer(&ibv);
@@ -1451,7 +1469,7 @@ void Renderer::record_far(const float vp[16]) {
     cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
     cmd_->SetGraphicsRootShaderResourceView(1, mesher_.vertices()->GetGPUVirtualAddress());
     cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
-    cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress());
+    cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress()); cmd_->SetGraphicsRootShaderResourceView(6, mesher_.vertex_weights()->GetGPUVirtualAddress());
     cmd_->SetGraphicsRootConstantBufferView(3, shadow_cb_[frame_]->GetGPUVirtualAddress());
     cmd_->SetGraphicsRootDescriptorTable(4, srv_heap_->GetGPUDescriptorHandleForHeapStart());
     D3D12_INDEX_BUFFER_VIEW ibv = {};
@@ -1498,7 +1516,7 @@ void Renderer::record_hfgi(const float vp[16]) {
     cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
     cmd_->SetGraphicsRootShaderResourceView(1, mesher_.vertices()->GetGPUVirtualAddress());
     cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
-    cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress());
+    cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress()); cmd_->SetGraphicsRootShaderResourceView(6, mesher_.vertex_weights()->GetGPUVirtualAddress());
     cmd_->SetGraphicsRootConstantBufferView(3, shadow_cb_[frame_]->GetGPUVirtualAddress());
     cmd_->SetGraphicsRootDescriptorTable(4, srv_heap_->GetGPUDescriptorHandleForHeapStart());
     D3D12_INDEX_BUFFER_VIEW ibv = {};
@@ -2457,7 +2475,7 @@ void Renderer::record_lights(const ViewConstants& view) {
         cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
         cmd_->SetGraphicsRootShaderResourceView(1, mesher_.vertices()->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
-        cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress());
+        cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress()); cmd_->SetGraphicsRootShaderResourceView(6, mesher_.vertex_weights()->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootConstantBufferView(3, shadow_cb_[frame_]->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootDescriptorTable(4, srv_heap_->GetGPUDescriptorHandleForHeapStart());
         cmd_->IASetIndexBuffer(&ibv);
@@ -2841,6 +2859,20 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     {
         std::vector<TreeLook> looks;
         if (!load_tree_looks(world_.table(), "worldgen/data/archetypes.json", looks, error)) return false;
+        // The CC0 scans: the terrain's materials and the species' bark.
+        // Missing packs are not an error: the terrain keeps its noise detail,
+        // the bark its procedural fissures, and startup.txt says what to run.
+        {
+            const double ts = startup_now_ms();
+            std::vector<uint32_t> mids;
+            for (const auto& b : world_.table().biomes) mids.push_back(b.material_id);
+            std::vector<std::string> bark;
+            for (const TreeLook& l : looks) if (!l.bark_scan.empty()) bark.push_back(l.bark_scan);
+            if (!scans_.init(device_.Get(), queue_.Get(), srv_heap_.Get(), mids, bark, error)) return false;
+            for (TreeLook& l : looks)
+                if (!l.bark_scan.empty()) scans_.lookup(l.bark_scan, l.bark, l.bark_layer, l.bark_inv_tile, l.bark_tint);
+            startup_log().push_back(std::make_pair("phase: scans -- " + scans_.note(), startup_now_ms() - ts));
+        }
         if (!trees_.init(device_.Get(), queue_.Get(), looks, srv_heap_.Get(), 1, error)) return false;
         // The canopy map (ADR-004 L6) from the same models' crowns.
         if (!canopy_.init(device_.Get(), srv_heap_.Get(), error)) return false;
@@ -3585,7 +3617,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         cmd_->SetGraphicsRootShaderResourceView(
             1, mesher_.vertices()->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
-        cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress());
+        cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress()); cmd_->SetGraphicsRootShaderResourceView(6, mesher_.vertex_weights()->GetGPUVirtualAddress());
         {
             ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
             cmd_->SetDescriptorHeaps(1, heaps);

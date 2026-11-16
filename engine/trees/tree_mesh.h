@@ -47,6 +47,11 @@ struct TreeLook {
     int   limbs = 6;
     float leaf_density = 0.5f;    // leaf area density in the crown, m^2/m^3: the RT crown volume's extinction
     float nominal_height = 15.0f; // metres the mesh is built at
+    // A CC0 bark scan (assets/textures/scans.json), retinted to `bark`;
+    // empty keeps the procedural bark. The renderer fills the rest from the
+    // scan library before the trees initialise.
+    std::string bark_scan;
+    float bark_layer = -1.0f, bark_inv_tile = 1.0f, bark_tint[3] = {1.0f, 1.0f, 1.0f};
 };
 
 // A model's crown as an ellipsoid about the trunk axis, in model metres:

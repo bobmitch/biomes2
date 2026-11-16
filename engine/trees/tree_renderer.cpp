@@ -65,8 +65,10 @@ static_assert(sizeof(ModelInfoGpu) == 48, "ModelInfo must match the HLSL struct"
 
 struct LookGpu {
     float bark[3]; float leaf_kind;
-    float leaf[3]; float pad;
+    float leaf[3]; float bark_layer;   // the bark scan's layer, -1 procedural
+    float bark_tint[3]; float bark_inv_tile;
 };
+static_assert(sizeof(LookGpu) == 48, "SpeciesLook must match trees.hlsl");
 
 std::string hr_text(const char* what, HRESULT hr) {
     char buf[256];
@@ -185,7 +187,7 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         range.BaseShaderRegister = 5;
         // The shadow table: the sun's map at heap [0], and since ADR-004 L3
         // the local lights' buffers and atlas at [24..28] (t20..t24).
-        D3D12_DESCRIPTOR_RANGE srange[7] = {};
+        D3D12_DESCRIPTOR_RANGE srange[8] = {};
         srange[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         srange[0].NumDescriptors = 1;
         srange[0].BaseShaderRegister = 8;
@@ -218,6 +220,11 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         srange[6].NumDescriptors = 1;
         srange[6].BaseShaderRegister = 43;
         srange[6].OffsetInDescriptorsFromTableStart = 65;
+        // The CC0 scan arrays at [67..68] (t44..t45): bark.
+        srange[7].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srange[7].NumDescriptors = 2;
+        srange[7].BaseShaderRegister = 44;
+        srange[7].OffsetInDescriptorsFromTableStart = 67;
         D3D12_ROOT_PARAMETER p[10] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         p[0].Constants.ShaderRegister = 1;
@@ -234,7 +241,7 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         p[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[8].Descriptor.ShaderRegister = 2;
         p[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[9].DescriptorTable.NumDescriptorRanges = 7;
+        p[9].DescriptorTable.NumDescriptorRanges = 8;
         p[9].DescriptorTable.pDescriptorRanges = srange;
         for (int k = 0; k < 10; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
@@ -271,10 +278,18 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         pt.MaxLOD = D3D12_FLOAT32_MAX;
         pt.ShaderRegister = 4;
         pt.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        const D3D12_STATIC_SAMPLER_DESC samplers[4] = {ssa[0], ssa[1], lin, pt};
+        // s5: the scans, anisotropic and wrapping (bark).
+        D3D12_STATIC_SAMPLER_DESC an = {};
+        an.Filter = D3D12_FILTER_ANISOTROPIC;
+        an.MaxAnisotropy = 8;
+        an.AddressU = an.AddressV = an.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        an.MaxLOD = D3D12_FLOAT32_MAX;
+        an.ShaderRegister = 5;
+        an.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        const D3D12_STATIC_SAMPLER_DESC samplers[5] = {ssa[0], ssa[1], lin, pt, an};
         rsd.NumParameters = 10;
         rsd.pParameters = p;
-        rsd.NumStaticSamplers = 4;
+        rsd.NumStaticSamplers = 5;
         rsd.pStaticSamplers = samplers;
         ComPtr<ID3DBlob> sig, err;
         HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
@@ -486,6 +501,9 @@ bool TreeRenderer::init(ID3D12Device* device, ID3D12CommandQueue* queue,
         // Narrow leaves for the weeping form; the shader reads this, the
         // generator chose the form.
         lk[s].leaf_kind = looks_[s].form == TreeForm::Weeping ? 1.0f : 0.0f;
+        lk[s].bark_layer = looks_[s].bark_layer;
+        lk[s].bark_inv_tile = looks_[s].bark_inv_tile;
+        for (int k = 0; k < 3; ++k) lk[s].bark_tint[k] = looks_[s].bark_tint[k];
     }
 
     // Draw slots: per model LOD 0 and LOD 1, then the impostor draw.

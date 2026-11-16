@@ -42,3 +42,7 @@ tools/mapview/src/generated/
 # Claude Code personal settings (permission rules), not team-wide
 .claude/settings.local.json
 build/edits.bin
+
+# CC0 scans: fetched and packed by tools/textures/fetch_scans.py, never committed
+assets/textures/download/
+assets/textures/packed/

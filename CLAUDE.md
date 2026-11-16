@@ -17,6 +17,8 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32). Debug tool, Windows only. |
 | `tools/shared/` | Presentation, shared by the harness and the viewer. |
+| `assets/textures/` | `scans.json`, the CC0 surface scans' manifest. Downloads and packs are fetched, never committed. |
+| `tools/textures/` | `fetch_scans.py`: downloads the scans and packs them for the engine. |
 | `engine/` | Track B runtime (D3D12, `docs/adr-003-*`). Since M1 it evaluates the REAL field: `engine/field/real_field.hlsl` is the caller's side of ADR-001's line (which cells, rivers and shafts are near a point), and `world_gpu.{h,cpp}` uploads them. |
 
 **`worldgen/` is everything upstream of the golden hash; `tools/` is
@@ -31,6 +33,14 @@ tools\validate\build.bat && build\validate.exe
 
 ```bash
 build\view.exe
+```
+
+The engine's surface scans are not in git; fetch them once (about 180 MB from
+ambientCG, checked against the manifest's sha256). Without them the terrain
+and bark fall back to their procedural detail.
+
+```bash
+python -I tools/textures/fetch_scans.py
 ```
 
 ```bash
@@ -458,11 +468,51 @@ last run's.
 
 ### Surface texture
 
-`T` in the window, or `--texture 0|1|2|3`: flat, noise detail (default), a
-metric grid (1 m lines, heavier every 10 m), both. Procedural and
-triplanar, in `mesh.hlsl`, antialiased with `fwidth` and faded where a pixel
-covers the pattern. It costs ~0.1 ms of a 0.3 ms uncapped frame. `M` toggles
+`T` in the window, or `--texture 0|1|2|3`: flat, the scans (default), a
+metric grid (1 m lines, heavier every 10 m), scans and grid. `M` toggles
 wireframe. The window title shows both.
+
+**The scans** are CC0 PBR sets from ambientCG -- albedo, normal, roughness,
+occlusion, height -- listed in `assets/textures/scans.json` and fetched and
+packed by `tools/textures/fetch_scans.py` (1K, mips built in linear light,
+normals renormalised). `engine/render/scan_library.{h,cpp}` uploads them as
+two Texture2DArrays (heap [67..68]) with a per-biome table at [69].
+archetypes.json chooses them: each material's `ground_scan` and `rock_scan`,
+each species' `shape.bark_scan`. Presentation only; the golden gate
+confirmed it twice.
+
+- **The authored colour stays.** A scan's albedo is RETINTED by authored /
+  scan mean (both linear), and its roughness scaled to the authored value,
+  so a biome looks the colour it was tuned to and the GI, the RT scene and
+  the heightfield's top-down pass -- which still read the per-vertex
+  blended colour -- see the same mean. The scan brings structure only.
+- **Per-vertex material WEIGHTS**, not colours, drive it: the mesher writes
+  a second parallel buffer, `g_vertex_wts`, one byte per biome and one for
+  the seabed (12 at most), from the same four-cell `blend_weight` as the
+  colours. Interpolating material ids across a triangle is meaningless;
+  interpolating weights is not. +113 MB of pool.
+- **The terrain shader** takes the two heaviest biomes, each its ground
+  and its rock by slope (up to four candidates), samples each triplanar
+  (whiteout normal blend, u mirrored on back faces, a plane under 1% skipped)
+  and blends them by HEIGHT as well as weight (`kScanBlendDepth` 0.2), so
+  rock breaks through sand at a slope change instead of cross-fading. The
+  scan's normal shades; the geometric normal still decides and offsets the
+  shadow lookup. Its occlusion multiplies ambient only.
+- **Bark** uses the trunk's uv, which is already in metres (around, along),
+  with a tangent frame from screen-space derivatives -- the tree vertex has
+  none. The birch keeps its procedural bark: no scan in the set reads as
+  birch, and a generic cracked bark lost the dark dashes that make one.
+  Impostors keep the procedural bark; the retint keeps their mean equal.
+- **A material with no scan falls back** to the old noise detail, per
+  material; a checkout with no packs renders exactly as before. startup.txt
+  says how many sets loaded and what to run if any are missing.
+- **Cost**, walking (`--walk 15 --uncapped`, packs present vs moved aside):
+  2.75 / 2.89 ms against 2.69 / 2.72; startup +132 ms; 247 MB of textures
+  at 1K. The flight's median rose to 2.50 ms with far more terrain on screen.
+- **Not done**: parallax occlusion mapping (the height channel is already
+  packed for it), anti-tiling beyond what the mips and the retint give (no
+  repetition shows from 160 m up on the badlands), BC compression (4x less
+  memory), scans for the grass, leaves and placed rocks.
 
 ### Trees
 

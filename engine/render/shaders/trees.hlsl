@@ -47,8 +47,16 @@ struct SpeciesLook {
     float3 bark;
     float  leaf_kind;
     float3 leaf;
-    float  pad;
+    float  bark_layer;      // the CC0 bark scan's layer (scan_library.h); -1 procedural
+    float3 bark_tint;       // authored / scan mean, linear
+    float  bark_inv_tile;   // 1 / the scan's tile in metres
 };
+
+// The CC0 scans (scan_library.h): A sRGB albedo + height, B normal xy,
+// roughness, occlusion.
+Texture2DArray<float4> g_scan_a    : register(t44);
+Texture2DArray<float4> g_scan_b    : register(t45);
+SamplerState           g_scan_samp : register(s5);
 
 cbuffer DrawOffset : register(b1) { uint g_list_offset; };
 
@@ -104,6 +112,35 @@ bool keep_pixel(float2 px, uint packed) {
 }
 
 // --- shading ----------------------------------------------------------------
+
+float3 linear_to_srgb_bark(float3 c) {
+    c = saturate(c);
+    return c <= 0.0031308f ? c * 12.92f : 1.055f * pow(c, 1.0f / 2.4f) - 0.055f;
+}
+
+// The bark scan on a trunk: uv is in metres (around, along), so the scan's
+// own tile applies directly. No tangents in the vertex: the frame comes from
+// the screen-space derivatives of position and uv (Schueler, "Normal
+// Mapping without Precomputed Tangents"). Returns sRGB albedo, as shade()
+// takes, and the perturbed normal.
+float3 bark_scan(float3 n, float3 world, float2 uv, float layer, float inv_tile, float3 tint,
+                 out float3 nout, out float ao) {
+    const float2 t = uv * inv_tile;
+    const float4 a = g_scan_a.Sample(g_scan_samp, float3(t, layer));
+    const float4 b = g_scan_b.Sample(g_scan_samp, float3(t, layer));
+    const float3 dp1 = ddx(world), dp2 = ddy(world);
+    const float2 du1 = ddx(t), du2 = ddy(t);
+    const float3 dp2perp = cross(dp2, n), dp1perp = cross(n, dp1);
+    const float3 T = dp2perp * du1.x + dp1perp * du2.x;
+    const float3 B = dp2perp * du1.y + dp1perp * du2.y;
+    const float inv = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-20f));
+    float2 tn = b.xy * 2.0f - 1.0f;
+    const float tz = sqrt(saturate(1.0f - dot(tn, tn)));
+    const float3 p = T * inv * tn.x + B * inv * tn.y + n * tz;
+    nout = dot(p, p) > 1e-8f ? normalize(p) : n;
+    ao = b.w;
+    return linear_to_srgb_bark(a.rgb * tint);
+}
 
 // Bark: vertical fissures for dark bark; for pale bark (a birch's), dark
 // horizontal dashes instead. Chosen by the albedo's brightness, not by name.
@@ -171,6 +208,8 @@ struct MeshOut {
     nointerpolation float tint : TEXCOORD11;
     nointerpolation float scale : TEXCOORD12;
     nointerpolation float narrow : TEXCOORD13;
+    nointerpolation float4 bscan : TEXCOORD15;      // the bark scan: tint rgb, layer (-1 none)
+    nointerpolation float bscan_tile : TEXCOORD16;  // 1 / its tile, metres
     float4 gi    : TEXCOORD14;   // gi_diffuse per vertex: irradiance, and its scale for specular (lighting.hlsli)
 };
 
@@ -236,6 +275,8 @@ MeshOut mesh_vertex(uint vid, uint iid, bool lit) {
     o.tint = hash11(float(inst.id) * 0.013f);
     o.scale = inst.scale;
     o.narrow = lk.leaf_kind;
+    o.bscan = float4(lk.bark_tint, lk.bark_layer);
+    o.bscan_tile = lk.bark_inv_tile;
     o.gi = float4(0.0f, 0.0f, 0.0f, 1.0f);
     if (lit) {
         o.gi.rgb = gi_diffuse(world, normalize(o.nrm), normalize(cam_pos - world));
@@ -260,7 +301,13 @@ SceneOut ps_mesh(MeshOut i, bool front : SV_IsFrontFace) {
     float ao = i.ao;
     if (i.kind < 0.5f) {
         if (!front) n = -n;
-        albedo = bark_albedo(i.bark, i.uv * i.scale, length(fwidth(i.uv)));
+        if (i.bscan.w >= 0.0f) {
+            float bao;
+            albedo = bark_scan(n, i.world, i.uv * i.scale, i.bscan.w, i.bscan_tile, i.bscan.rgb, n, bao);
+            ao *= bao;
+        } else {
+            albedo = bark_albedo(i.bark, i.uv * i.scale, length(fwidth(i.uv)));
+        }
     } else if (i.kind < 2.5f) {
         foliage = true;
         const float blur = length(fwidth(i.uv));

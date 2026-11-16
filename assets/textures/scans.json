@@ -1,0 +1,117 @@
+{
+  "_note": "CC0 PBR scans from ambientCG (https://ambientcg.com, CC0 1.0: no attribution required, kept here anyway). Presentation only: nothing here reaches worldgen or the golden hash. `tools/textures/fetch_scans.py` downloads each set at `resolution`, checks it against `sha256` when one is recorded, and packs it into assets/textures/packed/<id>.bin, which the engine reads. Downloads and packs are not in git. `tile_m` is how many metres one repeat of the texture covers in the world. Which biome uses which set is archetypes.json's `materials` block (`ground_scan`, `rock_scan`); which species uses which bark is the `trees` block (`bark_scan`).",
+  "source": "ambientCG",
+  "resolution": "1K",
+  "sets": {
+    "Ground037": {
+      "tile_m": 2.5,
+      "use": "meadows ground: grassy damp earth",
+      "sha256": "4e69db2b7251b1736fa70fe6fe4ab80d64bd220117dd5dd4c7caaead51c2574e"
+    },
+    "Ground078": {
+      "tile_m": 2.5,
+      "use": "forest ground: leaf litter",
+      "sha256": "ab21b8c558be116bfc462124bc0e93919901882dae48ea57e5bffac0aedd8e4f"
+    },
+    "Ground036": {
+      "tile_m": 2.5,
+      "use": "wetland ground: mud",
+      "sha256": "d0f3e5356f06fddfeeef20492d0163e728939caedd72b0576e42e85b90913d62"
+    },
+    "Ground023": {
+      "tile_m": 2.5,
+      "use": "highland ground: gravelly dirt",
+      "sha256": "ba1b8ccaf4558b6f72e3e6af98189f33a35e9757e721ef20eaec1297f306ddc2"
+    },
+    "Ground054": {
+      "tile_m": 3.0,
+      "use": "badlands ground: pitted dry sand",
+      "sha256": "b325ec2f167dce95a0fabc61a2104641288cf20915419578c3efdb46200c563e"
+    },
+    "Ground068": {
+      "tile_m": 2.5,
+      "use": "taiga ground: moss and dirt",
+      "sha256": "f2404d148ba3fd04c753bd84e2c5bfd1743bf439ae147d8114308ce96336d91d"
+    },
+    "Gravel040": {
+      "tile_m": 2.0,
+      "use": "ashlands ground: dark gravel",
+      "sha256": "021c19ca1b6c0eefe3b6b55d33eb3af2d4d74ccb91255762ad3feb528a906c74"
+    },
+    "Snow010A": {
+      "tile_m": 3.0,
+      "use": "glacier ground: snow",
+      "sha256": "06852017cc69c885b4ee375f4dc8cf16184456b7f6f02de821fb7d2f3cbe8768"
+    },
+    "Ground110": {
+      "tile_m": 2.5,
+      "use": "rift ground: dry debris",
+      "sha256": "5c4ba182af130afbf297bc167205c2640f3ea9e0df921fbe0c423ac68004f356"
+    },
+    "Ground093A": {
+      "tile_m": 3.0,
+      "use": "seabed: rippled sand",
+      "sha256": "c179447baf185c4ae749f1879c05f7991c8892aeb3d4d67c8e41e447d7267bd2"
+    },
+    "Rock030": {
+      "tile_m": 5.0,
+      "use": "meadows rock: grey",
+      "sha256": "2fd0bc2d214e2487c19062ed0798a85dd135b41cfc12bbaed42d5acae238f989"
+    },
+    "Rock051": {
+      "tile_m": 5.0,
+      "use": "forest rock: layered, mossy",
+      "sha256": "036c5c18beb3c63cca9411c898d3a42a6a0dd923b5672ee35b021cd81b888aa9"
+    },
+    "Rock059": {
+      "tile_m": 5.0,
+      "use": "wetland rock: green, mossy",
+      "sha256": "9d7862a91ee89d225960eee89e43a7bd0268d260b55d1489787163ae8b7519d2"
+    },
+    "Rock058": {
+      "tile_m": 5.0,
+      "use": "highland and glacier rock: blue-grey cliff",
+      "sha256": "4d47ea9579507e4a410d87a78037d0b9c1fb5ecb6cbeba073f5ea0e13b95aa22"
+    },
+    "Rock029": {
+      "tile_m": 5.0,
+      "use": "badlands rock: desert cliff",
+      "sha256": "cd6e8a6820136cde7414671f64d328717fa12fd74927378094bc110f41f87568"
+    },
+    "Rock062": {
+      "tile_m": 5.0,
+      "use": "taiga rock: eroded",
+      "sha256": "7a98f755a040bfbdae634b2b610f0d91cbb243e8e961e6eb3340b6b96ee1887c"
+    },
+    "Rock035": {
+      "tile_m": 5.0,
+      "use": "ashlands rock: black cliff",
+      "sha256": "c5e4dbd7d5555734498834c1e09b799ef3d1f00c61fe08c0d953b93a8fb1bb95"
+    },
+    "Rock061": {
+      "tile_m": 5.0,
+      "use": "rift rock: layered cliff",
+      "sha256": "97cb3bc4ad521355fccc4145241b318e38f5f3c66cd287591dbe5d0b9591886e"
+    },
+    "Rock060": {
+      "tile_m": 5.0,
+      "use": "seabed rock",
+      "sha256": "8980f46548861525b17102ad38cbcd568eaf97faed4975ee48c7eb4cac718cc4"
+    },
+    "Bark014": {
+      "tile_m": 1.0,
+      "use": "bark: fir",
+      "sha256": "c73728c32d6f0f3610f9db204448eff7e3acc74da0f8c1878920419772397670"
+    },
+    "Bark012": {
+      "tile_m": 1.0,
+      "use": "bark: oak",
+      "sha256": "6e26e4c24fe53cf564909b371afbfc84041d9077f39bf8eb4ae16951df1c4763"
+    },
+    "Bark011": {
+      "tile_m": 1.0,
+      "use": "bark: grey-green",
+      "sha256": "5f43d90d15833646f996a76b6104af2ea7b1b6e020e0ab73d1195d752310ea88"
+    }
+  }
+}

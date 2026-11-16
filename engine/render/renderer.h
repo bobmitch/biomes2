@@ -26,6 +26,7 @@
 #include "engine/render/ddgi.h"
 #include "engine/render/height_gi.h"
 #include "engine/render/far_shadow.h"
+#include "engine/render/scan_library.h"
 
 #include <unordered_map>
 #include <vector>
@@ -518,6 +519,7 @@ private:
     ComPtr<ID3D12Resource> ssgi_;              // the screen-space bounce (L6): irradiance, distance
     HeightGi hfgi_;
     FarShadow far_;
+    ScanLibrary scans_;
     bool far_on_ = true;
     void record_far(const float vp[16]);
     bool hfgi_on_ = true;

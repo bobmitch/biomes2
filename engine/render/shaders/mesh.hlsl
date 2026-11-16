@@ -25,6 +25,23 @@ StructuredBuffer<float2> g_fade : register(t1);
 // terrain_material). (ground, rock): sqrt(linear albedo) in RGB, roughness in
 // A, 8 bits each.
 StructuredBuffer<uint2> g_vertex_mat : register(t2);
+// Each vertex's share of every biome's material, 8 bits x 12 (surface_nets.hlsl
+// g_vertex_wts): biome index order, the seabed after the last biome.
+StructuredBuffer<uint3> g_vertex_wts : register(t3);
+
+// The CC0 scans (scan_library.h): A sRGB albedo + height, B normal xy,
+// roughness, occlusion; one layer per set. And per biome, which layers its
+// ground and rock take and how to retint them.
+struct ScanMaterial {
+    float ground_layer, rock_layer, ground_inv_tile, rock_inv_tile;
+    float3 ground_tint; float ground_rough;
+    float3 rock_tint;   float rock_rough;
+    float ground_scan_rough, rock_scan_rough, pad0, pad1;
+};
+Texture2DArray<float4>         g_scan_a    : register(t44);
+Texture2DArray<float4>         g_scan_b    : register(t45);
+StructuredBuffer<ScanMaterial> g_scan_mat  : register(t46);
+SamplerState                   g_scan_samp : register(s5);   // anisotropic, wrap
 
 cbuffer MeshConstants : register(b0) {
     row_major float4x4 view_proj;
@@ -47,7 +64,14 @@ struct VSOut {
     float  skirt : TEXCOORD3;   // 1 at a skirt vertex, 0 at a surface vertex
     float4 ground : TEXCOORD4;  // linear albedo, roughness
     float4 rock   : TEXCOORD5;
+    float4 w0 : TEXCOORD6;     // material weights 0..3, 4..7, 8..11
+    float4 w1 : TEXCOORD7;
+    float4 w2 : TEXCOORD8;
 };
+
+float4 unpack_weights(uint u) {
+    return float4(u & 0xFFu, (u >> 8) & 0xFFu, (u >> 16) & 0xFFu, u >> 24) / 255.0f;
+}
 
 float4 unpack_material(uint m) {
     const float4 q = float4(m & 0xFFu, (m >> 8) & 0xFFu, (m >> 16) & 0xFFu, m >> 24) / 255.0f;
@@ -72,6 +96,10 @@ VSOut vs_main(uint vid : SV_VertexID) {
     const uint2 m = g_vertex_mat[vid];
     o.ground = unpack_material(m.x);
     o.rock = unpack_material(m.y);
+    const uint3 w = g_vertex_wts[vid];
+    o.w0 = unpack_weights(w.x);
+    o.w1 = unpack_weights(w.y);
+    o.w2 = unpack_weights(w.z);
     return o;
 }
 
@@ -160,6 +188,121 @@ float3 apply_surface_texture(float3 albedo, float3 p, float3 n) {
     return albedo * shade;
 }
 
+// ---------------------------------------------------------------------------
+// The scans. Triplanar, because the voxel mesh has no uvs: three planar
+// projections weighted by the normal, each plane's tangent normal folded
+// into world space by the whiteout blend, with the u axis mirrored on the
+// back faces so a scan is not reversed on them (Golus, Normal Mapping for a
+// Triplanar Shader). A plane under 1% weight is not sampled.
+// ---------------------------------------------------------------------------
+struct ScanSample {
+    float3 albedo;   // linear, before the tint
+    float  height;
+    float3 n;        // world, unnormalised sum
+    float  rough;
+    float  ao;
+};
+
+ScanSample scan_triplanar(float layer, float inv_tile, float3 p, float3 n, float3 bw) {
+    ScanSample o = (ScanSample)0;
+    const float3 sg = float3(n.x < 0.0f ? -1.0f : 1.0f, n.y < 0.0f ? -1.0f : 1.0f, n.z < 0.0f ? -1.0f : 1.0f);
+    float3 nsum = 0.0f;
+    [unroll] for (int k = 0; k < 3; ++k) {
+        const float w = bw[k];
+        if (w < 0.01f) continue;
+        float2 uv = k == 0 ? p.zy : (k == 1 ? p.xz : p.xy);
+        const float flip = k == 0 ? sg.x : (k == 1 ? sg.y : -sg.z);
+        uv.x *= flip;
+        uv *= inv_tile;
+        const float4 a = g_scan_a.Sample(g_scan_samp, float3(uv, layer));
+        const float4 b = g_scan_b.Sample(g_scan_samp, float3(uv, layer));
+        float2 t = b.xy * 2.0f - 1.0f;
+        t.x *= flip;
+        const float tz = sqrt(saturate(1.0f - dot(t, t)));
+        float3 wn;
+        if (k == 0)      { const float3 q = float3(t + n.zy, tz * abs(n.x)); wn = float3(q.z * sg.x, q.y, q.x); }
+        else if (k == 1) { const float3 q = float3(t + n.xz, tz * abs(n.y)); wn = float3(q.x, q.z * sg.y, q.y); }
+        else             { const float3 q = float3(t + n.xy, tz * abs(n.z)); wn = float3(q.x, q.y, q.z * sg.z); }
+        o.albedo += w * a.rgb;
+        o.height += w * a.a;
+        nsum += w * wn;
+        o.rough += w * b.z;
+        o.ao += w * b.w;
+    }
+    o.n = nsum;
+    return o;
+}
+
+// Up to four candidates -- the two heaviest biomes, each its ground and its
+// rock -- blended by HEIGHT as well as weight: where two meet, the higher
+// texel wins (stones through sand) instead of both fading through each
+// other. kScanBlendDepth is how far below the top a candidate still shows.
+static const float kScanBlendDepth = 0.2f;
+static const float kScanHeightGain = 0.6f;
+
+struct ScanResult { float3 albedo; float rough; float3 n; float ao; bool ok; };
+
+ScanResult scan_surface(VSOut i, float3 n, float level) {
+    ScanResult r = (ScanResult)0;
+    const float wts[12] = {i.w0.x, i.w0.y, i.w0.z, i.w0.w, i.w1.x, i.w1.y, i.w1.z, i.w1.w,
+                           i.w2.x, i.w2.y, i.w2.z, i.w2.w};
+    uint m0 = 0u, m1 = 0u;
+    float b0 = -1.0f, b1 = -1.0f;
+    [unroll] for (uint m = 0u; m < 12u; ++m) {
+        const float w = wts[m];
+        if (w > b0) { m1 = m0; b1 = b0; m0 = m; b0 = w; }
+        else if (w > b1) { m1 = m; b1 = w; }
+    }
+    if (b1 < 0.02f) b1 = 0.0f;
+    const float tot = b0 + b1;
+    if (tot <= 0.0f) return r;
+    const ScanMaterial M0 = g_scan_mat[m0], M1 = g_scan_mat[m1];
+    if (M0.ground_layer < 0.0f || M0.rock_layer < 0.0f || (b1 > 0.0f && (M1.ground_layer < 0.0f || M1.rock_layer < 0.0f)))
+        return r;   // no scan for this material: the caller keeps the old path
+
+    float3 bw = abs(n);
+    bw = bw * bw * bw * bw;
+    bw /= (bw.x + bw.y + bw.z);
+    const float3 p = i.world;
+
+    float wc[4] = {b0 / tot * level, b0 / tot * (1.0f - level), b1 / tot * level, b1 / tot * (1.0f - level)};
+    ScanSample sc[4];
+    float3 tint[4];
+    float rscale[4];
+    [unroll] for (int c = 0; c < 4; ++c) {
+        ScanMaterial M = M1;   // FXC takes no ternary on a struct
+        if (c < 2) M = M0;
+        const bool ground = (c & 1) == 0;
+        sc[c] = (ScanSample)0;
+        tint[c] = ground ? M.ground_tint : M.rock_tint;
+        rscale[c] = ground ? M.ground_rough / M.ground_scan_rough : M.rock_rough / M.rock_scan_rough;
+        if (wc[c] < 0.005f) { wc[c] = 0.0f; continue; }
+        sc[c] = scan_triplanar(ground ? M.ground_layer : M.rock_layer,
+                               ground ? M.ground_inv_tile : M.rock_inv_tile, p, n, bw);
+    }
+    float top = -1e9f;
+    [unroll] for (int c2 = 0; c2 < 4; ++c2)
+        if (wc[c2] > 0.0f) top = max(top, sc[c2].height * kScanHeightGain + wc[c2]);
+    float wsum = 0.0f;
+    float3 nsum = 0.0f;
+    [unroll] for (int c3 = 0; c3 < 4; ++c3) {
+        if (wc[c3] <= 0.0f) continue;
+        const float hb = max(sc[c3].height * kScanHeightGain + wc[c3] - top + kScanBlendDepth, 0.0f);
+        wsum += hb;
+        r.albedo += hb * sc[c3].albedo * tint[c3];
+        r.rough += hb * saturate(sc[c3].rough * rscale[c3]);
+        r.ao += hb * sc[c3].ao;
+        nsum += hb * sc[c3].n;
+    }
+    if (wsum <= 0.0f) return r;
+    r.albedo /= wsum;
+    r.rough /= wsum;
+    r.ao /= wsum;
+    r.n = normalize(nsum);
+    r.ok = true;
+    return r;
+}
+
 // The heightfield GI's top-down view (height_gi.h): the terrain's albedo as
 // lighting sees it, ground or rock by slope. Fades and skirts do not matter
 // from above: the depth test keeps the top.
@@ -192,14 +335,33 @@ SceneOut ps_main(VSOut i) {
     // one green, blended by n.y squared, in every biome alike.
     const float level = smoothstep(0.62f, 0.86f, n.y);
     const float4 mat = lerp(i.rock, i.ground, level);
-    float3 albedo = apply_surface_texture(mat.rgb, i.world, n);
+    float3 albedo = mat.rgb;
+    float rough = mat.a;
+    float3 ns = n;
+    float ao = 1.0f;
+    // T: 0 flat, 1 the scans (noise detail where a material has none), 2 the
+    // metric grid, 3 scans and grid.
+    const bool scans = (texture_mode > 0.5f && texture_mode < 1.5f) || texture_mode > 2.5f;
+    ScanResult sr = (ScanResult)0;
+    if (scans) sr = scan_surface(i, n, level);
+    if (sr.ok) {
+        albedo = sr.albedo;
+        rough = sr.rough;
+        ns = sr.n;
+        ao = sr.ao;
+        if (texture_mode > 2.5f) albedo = apply_surface_texture(albedo, i.world, n);
+    } else {
+        albedo = apply_surface_texture(mat.rgb, i.world, n);
+    }
 
     // Sun shadow: from the terrain itself and from the trees (shadow.hlsli).
+    // The geometric normal decides it and offsets the lookup; the scan's
+    // normal shades.
     const float lam = dot(n, kSunDir);
     const float sh = lam > 0.0f ? shadow_factor(i.world, n) : 1.0f;
-    const Surface s = make_surface(albedo, mat.a, n, v);
+    const Surface s = make_surface(albedo, rough, ns, v);
     // Direct and ambient apart (scene_out.hlsli): the post chain shades
-    // each with its own occlusion.
-    return scene_out(sun_light(s, sh), ambient_light(s, i.world) + local_lights(s, i.world, i.clip),
+    // each with its own occlusion. The scan's occlusion is ambient only.
+    return scene_out(sun_light(s, sh), ambient_light(s, i.world) * ao + local_lights(s, i.world, i.clip),
                      i.world, cam_pos, far_plane);
 }
