@@ -91,12 +91,12 @@ float hg_phase(float c, float g) {
 // The key light's visibility: one comparison tap. The volume and its
 // temporal blend do the filtering a surface's PCF does.
 float key_visibility(float3 p) {
-    if (shadow_split.w < 0.5f) return 1.0f;
+    if (shadow_res < 0.0f) return 1.0f;
     const float d = length(p - shadow_cam);
-    if (d >= shadow_split.z) return 1.0f;
-    const uint c = d < shadow_split.x ? 0u : (d < shadow_split.y ? 1u : 2u);
+    if (d >= shadow_split.w) return 1.0f;
+    const uint c = d < shadow_split.x ? 0u : (d < shadow_split.y ? 1u : (d < shadow_split.z ? 2u : 3u));
     const float4 lp = mul(float4(p, 1.0f), light_vp[c]);
-    const float2 uv = float2(lp.x * 0.5f + 0.5f, 0.5f - lp.y * 0.5f);
+    const float2 uv = float2(lp.x * 0.5f + 0.5f, 0.5f - lp.y * 0.5f) * shadow_scale[c];
     return g_shadow.SampleCmpLevelZero(g_shadow_cmp, float3(uv, float(c)), lp.z - 0.12f / shadow_depth_range[c]);
 }
 

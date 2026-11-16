@@ -13,11 +13,11 @@
 #define ENGINE_SHADOW_HLSLI
 
 cbuffer ShadowConstants : register(b2) {
-    row_major float4x4 light_vp[3];
-    float4 shadow_split;       // far edge of each cascade, metres from the camera; w = on
+    row_major float4x4 light_vp[4];
+    float4 shadow_split;       // far edge of each cascade, metres from the camera
     float4 shadow_texel;       // world metres per shadow texel, per cascade
     float4 shadow_depth_range; // metres of light-space depth per cascade
-    float3 shadow_cam;         float shadow_res;
+    float3 shadow_cam;         float shadow_res;   // negative when shadows are off
     // The frame's light (ADR-004 L2), read through lighting.hlsli. Here
     // because every lit shader already binds this buffer for its shadows.
     float4 l_sun_dir;          // the key light -- sun, or the moon at night -- towards it
@@ -46,37 +46,123 @@ cbuffer ShadowConstants : register(b2) {
     float4 l_prev_cam;
     // The heightfield GI (hfgi.hlsli): the map's min corner x, z; w on.
     float4 l_hf;
+    // The shadow filter's frame (x), for its rotation to walk under TAA.
+    float4 l_shadow_frame;
+    // Each cascade's corner of its slice: its resolution over the slice's.
+    float4 shadow_scale;
+    // The far terrain shadow (far_shadow.h): map corner x, z, extent; w on.
+    float4 l_far;
 };
 
 Texture2DArray<float>  g_shadow     : register(t8);
 SamplerComparisonState g_shadow_cmp : register(s1);
+SamplerState           g_shadow_point : register(s4);   // the blocker search reads raw depths
+Texture2D<float>       g_far_shadow   : register(t43);  // the far terrain shadow, 1024^2 over 8 km
+
+// Past the cascades: the terrain's own shadow from a coarse map marched
+// towards the key light (far_shadow.hlsl). Bilinear by four loads -- every
+// pipeline that filters shadows binds the point sampler, not all a linear
+// one -- and faded to lit over the map's last tenth.
+float far_shadow(float3 world) {
+    if (l_far.w < 0.5f) return 1.0f;
+    const float2 uv = float2((world.x - l_far.x) / l_far.z, 1.0f - (world.z - l_far.y) / l_far.z);
+    const float2 e = min(uv, 1.0f - uv);
+    if (min(e.x, e.y) <= 0.0f) return 1.0f;
+    const float2 g = uv * 1024.0f - 0.5f;
+    const float2 fl = floor(g);
+    const float2 f = g - fl;
+    const int2 i0 = clamp(int2(fl), 0, 1023), i1 = clamp(int2(fl) + 1, 0, 1023);
+    const float a = g_far_shadow.Load(int3(i0.x, i0.y, 0)), b = g_far_shadow.Load(int3(i1.x, i0.y, 0));
+    const float c = g_far_shadow.Load(int3(i0.x, i1.y, 0)), d = g_far_shadow.Load(int3(i1.x, i1.y, 0));
+    const float v = lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+    return lerp(1.0f, v, saturate(min(e.x, e.y) * 10.0f));
+}
+
+static const float2 kShadowDisk[16] = {
+    float2(-0.94201624f, -0.39906216f), float2(0.94558609f, -0.76890725f), float2(-0.09418410f, -0.92938870f),
+    float2(0.34495938f, 0.29387760f),   float2(-0.91588581f, 0.45771432f), float2(-0.81544232f, -0.87912464f),
+    float2(-0.38277543f, 0.27676845f),  float2(0.97484398f, 0.75648379f),  float2(0.44323325f, -0.97511554f),
+    float2(0.53742981f, -0.47373420f),  float2(-0.26496911f, -0.41893023f), float2(0.79197514f, 0.19090188f),
+    float2(-0.24188840f, 0.99706507f),  float2(-0.81409955f, 0.91437590f), float2(0.19984126f, 0.78641367f),
+    float2(0.14383161f, -0.14100790f)};
+
+// The key light's angular diameter in radians: the sun's 0.53 degrees (the
+// moon's is within 3% of it). A penumbra is this times the distance from
+// the caster to the receiver.
+static const float kKeyLightDiameter = 0.0093f;
+
+// One cascade, filtered by contact hardening (PCSS): a blocker search for
+// how far above the receiver the caster is, then a Poisson PCF as wide as
+// the sun makes that penumbra -- never under 1.5 texels, which is the
+// filtering a cascade needs whatever the sun says. A pixel the search
+// finds wholly lit or wholly shadowed stops there, which is most of them.
+float cascade_pcss(float3 world, float3 n, uint c) {
+    const float texel = shadow_texel[c];
+    // Offset along the normal by a texel and a half: the cheapest cure for
+    // acne that does not detach shadows from their casters.
+    const float3 p = world + n * (texel * 1.5f);
+    const float4 lp = mul(float4(p, 1.0f), light_vp[c]);
+    const float2 uv = float2(lp.x * 0.5f + 0.5f, 0.5f - lp.y * 0.5f) * shadow_scale[c];
+    const float range = shadow_depth_range[c];
+    // 0.12 m of constant bias, in this cascade's depth units.
+    const float zr = lp.z - 0.12f / range;
+    const float res = abs(shadow_res);
+    const float uv_per_m = 1.0f / (texel * res);
+    // A rotation per shadow texel that also walks frame to frame: fixed, the
+    // 16 taps left a speckle of dark dots in every penumbra that TAA could
+    // not average; walking, TAA integrates them into a smooth edge.
+    const float2 st = floor(uv * res);
+    const float ang = 6.2831853f * frac(52.9829189f * frac(dot(st, float2(0.06711056f, 0.00583715f))) +
+                                        0.618034f * l_shadow_frame.x);
+    const float ca = cos(ang), sa = sin(ang);
+    // Blocker search: casters up to ~30 m above, whose penumbra is ~0.28 m.
+    const float search = clamp(30.0f * kKeyLightDiameter, 2.0f * texel, 48.0f * texel) * uv_per_m;
+    // The NEAREST blocker sets the penumbra, not the average: at a trunk's
+    // foot the search also finds the crown 15 m up, and averaging the two
+    // blurred the trunk's shadow where it should be sharpest.
+    float znear = 0.0f, nb = 0.0f;
+    [unroll] for (int k = 0; k < 12; ++k) {
+        const float2 o = kShadowDisk[k];
+        const float2 q = uv + float2(o.x * ca - o.y * sa, o.x * sa + o.y * ca) * search;
+        const float zb = g_shadow.SampleLevel(g_shadow_point, float3(q, float(c)), 0.0f);
+        if (zb < zr) { znear = max(znear, zb); nb += 1.0f; }
+    }
+    if (nb < 0.5f) return 1.0f;
+    const float zb = znear;
+    const float penumbra = max((zr - zb) * range * kKeyLightDiameter, 1.5f * texel);
+    const float radius = penumbra * uv_per_m;
+    // Wholly inside an umbra wider than the filter: no PCF to do.
+    if (nb > 11.5f && radius < search) return 0.0f;
+    float s = 0.0f;
+    [unroll] for (int k2 = 0; k2 < 16; ++k2) {
+        const float2 o = kShadowDisk[k2];
+        const float2 q = uv + float2(o.x * ca - o.y * sa, o.x * sa + o.y * ca) * radius;
+        s += g_shadow.SampleCmpLevelZero(g_shadow_cmp, float3(q, float(c)), zr);
+    }
+    return s * (1.0f / 16.0f);
+}
 
 // 1 lit, 0 in shadow, by the cascades. `n` is the surface normal used for
 // the offset; pass the geometric one where there is one, a crown's for
-// foliage.
+// foliage. Each cascade blends into the next over its last 12%, so their
+// seams do not show; the last blends into the far terrain shadow over its
+// last 20% -- 1.36 to 1.6 km. (It used to end at 520 m with a 52 m fade, and
+// shadows switched on in front of the player as they walked.)
 float cascade_visibility(float3 world, float3 n) {
-    if (shadow_split.w < 0.5f) return 1.0f;
+    if (shadow_res < 0.0f) return 1.0f;
     const float d = length(world - shadow_cam);
-    if (d >= shadow_split.z) return 1.0f;
-    uint c = d < shadow_split.x ? 0u : (d < shadow_split.y ? 1u : 2u);
-    // Offset along the normal by a couple of texels: the cheapest cure for
-    // acne that does not detach shadows from their casters.
-    const float3 p = world + n * (shadow_texel[c] * 1.5f);
-    const float4 lp = mul(float4(p, 1.0f), light_vp[c]);
-    const float2 uv = float2(lp.x * 0.5f + 0.5f, 0.5f - lp.y * 0.5f);
-    // 0.12 m of constant bias, in this cascade's depth units.
-    const float z = lp.z - 0.12f / shadow_depth_range[c];
-    const float t = 1.0f / shadow_res;
-    float s = 0.0f;
-    [unroll] for (int j = -1; j <= 1; ++j) {
-        [unroll] for (int i = -1; i <= 1; ++i) {
-            s += g_shadow.SampleCmpLevelZero(g_shadow_cmp, float3(uv + float2(i, j) * t, float(c)), z);
-        }
+    if (d >= shadow_split.w || l_far.w > 1.5f) return far_shadow(world);   // w 2: the far map everywhere (BIOMES_FAR_DBG)
+    const uint c = d < shadow_split.x ? 0u : (d < shadow_split.y ? 1u : (d < shadow_split.z ? 2u : 3u));
+    const float lo = c == 0u ? 0.0f : shadow_split[c - 1u];
+    const float hi = shadow_split[c];
+    const float band = (c == 3u ? 0.2f : 0.12f) * (hi - lo);
+    const float t = saturate((d - (hi - band)) / band);
+    float s = cascade_pcss(world, n, c);
+    if (t > 0.0f) {
+        if (c == 3u) s = lerp(s, far_shadow(world), t);   // into the far terrain shadow
+        else s = lerp(s, cascade_pcss(world, n, c + 1u), t);
     }
-    s *= (1.0f / 9.0f);
-    // Fade over the last 10% of the last cascade.
-    const float fade = saturate((shadow_split.z - d) / (0.1f * shadow_split.z));
-    return lerp(1.0f, s, fade);
+    return s;
 }
 
 // What a surface shader multiplies its key light by. Under --rt-shadows

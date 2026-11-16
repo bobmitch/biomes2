@@ -764,6 +764,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if ((" " + c2 + " ").find(" --ssgi ") != std::string::npos) g_renderer.set_ssgi(true);
         if (c2.find("--no-ssgi") != std::string::npos) g_renderer.set_ssgi(false);
         if (c2.find("--no-hfgi") != std::string::npos) g_renderer.set_hfgi(false);
+        if (c2.find("--no-far-shadow") != std::string::npos) g_renderer.set_far_shadow(false);
         if (c2.find("--no-crowns") != std::string::npos)
             g_renderer.set_rt_sky_mask(engine::RtScene::kMaskTerrain | engine::RtScene::kMaskTrees);
         if (c2.find("--rt-report") != std::string::npos) { g_renderer.set_rt_active(true); g_renderer.set_rt_checks(true); }

@@ -183,7 +183,7 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         // segment count. 8 DWORDs.
         // The shadow table: the sun's map at heap [0], and since ADR-004 L3
         // the local lights' buffers and atlas at [24..28] (t20..t24).
-        D3D12_DESCRIPTOR_RANGE sr[6] = {};
+        D3D12_DESCRIPTOR_RANGE sr[7] = {};
         sr[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr[0].NumDescriptors = 1;
         sr[0].BaseShaderRegister = 8;
@@ -211,12 +211,17 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         sr[5].NumDescriptors = 5;
         sr[5].BaseShaderRegister = 38;
         sr[5].OffsetInDescriptorsFromTableStart = 48;
+        // The far terrain shadow at [65] (t43).
+        sr[6].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[6].NumDescriptors = 1;
+        sr[6].BaseShaderRegister = 43;
+        sr[6].OffsetInDescriptorsFromTableStart = 65;
         D3D12_ROOT_PARAMETER p[5] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[2].Descriptor.ShaderRegister = 4;
         p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[3].DescriptorTable.NumDescriptorRanges = 6;
+        p[3].DescriptorTable.NumDescriptorRanges = 7;
         p[3].DescriptorTable.pDescriptorRanges = sr;
         p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         p[4].Constants.ShaderRegister = 3;
@@ -238,11 +243,19 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         lin.MaxLOD = D3D12_FLOAT32_MAX;
         lin.ShaderRegister = 3;
         lin.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        const D3D12_STATIC_SAMPLER_DESC samplers[2] = {cmp, lin};
+        // s4: the shadow filter's blocker search reads raw depths (shadow.hlsli).
+        D3D12_STATIC_SAMPLER_DESC pt = {};
+        pt.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        pt.AddressU = pt.AddressV = pt.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        pt.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+        pt.MaxLOD = D3D12_FLOAT32_MAX;
+        pt.ShaderRegister = 4;
+        pt.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        const D3D12_STATIC_SAMPLER_DESC samplers[3] = {cmp, lin, pt};
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
         rsd.NumParameters = 5;
         rsd.pParameters = p;
-        rsd.NumStaticSamplers = 2;
+        rsd.NumStaticSamplers = 3;
         rsd.pStaticSamplers = samplers;
         ComPtr<ID3DBlob> sig, err;
         HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);

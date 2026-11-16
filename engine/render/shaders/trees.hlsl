@@ -290,6 +290,14 @@ SceneOut ps_mesh(MeshOut i, bool front : SV_IsFrontFace) {
     return shade(albedo, n, ao, i.world, foliage, shadow_factor(i.world, n), i.clip);
 }
 
+// What the coarse shadow casters let through, matched to the real leaves'
+// shadow on a woodland floor (cascade 0 drawn with each cascade's path in
+// turn, BIOMES_TREE_SHADOW_PATH=1|2): mean floor luma 81.3 real, 79.5 cards,
+// 82.2 impostors. Before: 100 (cards, every card keeping the same texels)
+// and 54 (impostors, solid).
+static const float kCardShadowCover = 0.25f;
+static const float kImpostorShadowOpacity = 0.78f;
+
 // The mesh as a shadow caster: the same cut, the same leaf coverage, no
 // colour. Without the leaf test every card would cast a solid square.
 void ps_mesh_shadow(MeshOut i) {
@@ -300,9 +308,14 @@ void ps_mesh_shadow(MeshOut i) {
         if (shadow_pass > 1.5f) {
             // Past the first cascade a texel is 10 cm or more: a leaf is
             // sub-texel, so test the card's round outline at its average
-            // coverage instead of evaluating every leaf.
+            // coverage instead of evaluating every leaf. The dither is
+            // offset PER CARD: keyed on the texel alone, every card in a
+            // crown kept the same texels, so a crown could never block more
+            // than one card's coverage and the second cascade's tree
+            // shadows were the faintest of the four.
             const float rim = 1.0f - saturate((length(i.uv - 0.5f) - 0.40f) / 0.1f);
-            if (rim * 0.6f < dither(i.clip.xy)) discard;
+            const float card = hash11(i.seed * 977.0f + float(i.packed & 0xFFFFFu));
+            if (rim * kCardShadowCover < frac(dither(i.clip.xy) + card)) discard;
             return;
         }
         const float blur = length(fwidth(i.uv));
@@ -470,7 +483,13 @@ void ps_impostor_shadow(ImpOut i) {
     const float2 q = float2(dot(hl, rl), dot(hl, ul)) / i.bound;
     if (any(abs(q) > 1.0f)) discard;
     const float2 auv = (fr + float2(q.x * 0.5f + 0.5f, 0.5f - q.y * 0.5f)) / n;
-    if (g_imp_albedo.SampleLevel(g_linear, float3(auv, i.slice), 1.0f).a < 0.45f) discard;
+    const float a = g_imp_albedo.SampleLevel(g_linear, float3(auv, i.slice), 1.0f).a;
+    if (a < 0.45f) discard;
+    // A crown lets light through: a solid silhouette drew the far cascades'
+    // tree shadows darker than the real leaves'. Opacity per tree, dithered
+    // with an offset per tree so overlapping crowns stack.
+    const float tree = hash11(float(i.packed & 0xFFFFFu) * 0.731f + 0.37f);
+    if (kImpostorShadowOpacity < frac(dither(i.clip.xy) + tree)) discard;
 }
 
 // --- the bake ---------------------------------------------------------------

@@ -61,7 +61,7 @@ fallback), `--gi-report` (DDGI at three views), `--lights-report` (ADR-004 L3: l
 configurations timed) and `--fell` (with `--fell-save` / `--fell-verify`).
 Every mode takes `--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
-`--fog-density <k>` (a multiplier on the authored mist); `--shot` also
+`--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`; `--shot` also
 takes `--lights <n>` (campfires round the camera) and `--ground` (the
 `--cam` x and z at eye height on the ground). `--flight` also takes `--settle`, `--holes` and
 `--flight-speed <m/s>` and `--flight-from x y z`; `--shot` takes
@@ -1056,27 +1056,91 @@ lit tables), [46] UAV; `--post-debug 3` shows it.
 
 ### Shadows
 
-Sun shadows, three cascades of 2048^2 out to 35, 140 and 520 m, cast by the
-terrain and the trees and received by both through one function,
-`shadow_factor` in `engine/render/shaders/shadow.hlsli`. Each cascade is an
-orthographic view down the sun fitted to a sphere round its slice of the
-view frustum -- a radius that depends only on the splits and the lens, so it
-never changes size -- with its centre snapped to whole texels, so edges do
-not crawl as the camera moves. 3x3 PCF, a normal offset of 1.5 texels and
-0.12 m of constant bias; past 520 m the shadow fades out under the fog.
-`L` in the window, `--no-shadows` for A/B.
+Sun shadows, **four cascades out to 28, 100, 380 m and 1.6 km**, cast by
+the terrain and the trees and received by both through one function,
+`shadow_factor` in `engine/render/shaders/shadow.hlsli`. `L` in the window,
+`--no-shadows` for A/B.
+
+- **Fitting.** The near two are fitted to a sphere round their slice of the
+  view frustum (a radius that depends only on the splits and the lens, so
+  it never changes size); the far two to a sphere round the CAMERA, so a
+  turn between their redraws cannot leave the view outside them. Centres
+  snapped to whole texels, so edges do not crawl.
+- **Resolution per cascade, in one 4096^2 x 4 array**: each draws into a
+  corner of its slice at its own size (`kCascadeRes` = 2048, 2048, 4096,
+  4096; `shadow_scale` maps uv). The near two at 2048 are already 1.8 and
+  4.9 cm a texel, about the sun's own penumbra; the far two at 2048 were
+  38 cm and 1.6 m. 4096 everywhere cost +0.65 ms walking, nearly all of it
+  the near cascades' leaf cards.
+- **Time-sliced** (`cascades_due`): cascade 0 every frame, 1 every second,
+  2 and 3 every fourth, interleaved -- two drawn a frame. Each keeps the
+  matrix its map was drawn with. Four cascades every frame at 4096 was +1.4
+  ms walking; sliced at 4096, +0.7; with the per-cascade sizes, **+0.1**
+  (2.41 -> 2.51 ms) for four times the reach.
+- **Filtering (PCSS)**: a 12-tap blocker search, the penumbra from the
+  NEAREST blocker times the sun's angular diameter (0.53 degrees), never
+  under 1.5 texels, then a 16-tap Poisson PCF. Pixels the search finds
+  wholly lit or wholly shadowed stop there. The rotation is per shadow
+  texel AND walks per frame (`l_shadow_frame`): fixed, it left a speckle of
+  dark dots in every penumbra that TAA could not average. The average
+  blocker (textbook PCSS) blurred a trunk's shadow at its foot with the
+  crown 15 m up; the nearest one keeps contact hard. Sunflecks now read as
+  the soft discs the sun makes, not the pixel-sharp mottling 3x3 PCF drew.
+- **Seams and the far end**: each cascade blends into the next over its
+  last 12%; the last blends into the far terrain shadow over its last
+  20%, 1.36-1.6 km. It used to end at 520 m with a 52 m fade, and shadows
+  switched on in front of the player as they walked -- the "sudden
+  appearance".
+- Normal offset 1.5 texels, 0.12 m constant bias, as before. The mist's
+  `key_visibility` takes one tap of the same four cascades.
+- **Past 1.6 km: the far terrain shadow** (`engine/render/far_shadow.{h,cpp}`,
+  `shaders/far_shadow.hlsl`; `--no-far-shadow`). The resident clipmap drawn
+  depth-only from above into 1024^2 texels of 8 m, 8 km round the camera
+  (heap [64]); `cs_far_march` walks each texel towards the key light, 50
+  taps growing 13% a step out to ~3.6 km, and keeps the least clearance
+  over a penumbra of 0.0093 x distance + a texel -- a visibility map, R16F
+  at [65] (t43, a seventh range of every lit table). `far_shadow` in
+  `shadow.hlsli` reads it bilinearly by four loads and fades it out over the
+  map's last tenth. Rebuilt when the camera moves 256 m, the light a
+  quarter of a degree, or every 600 frames. Terrain only: trees past the
+  draw distance are not drawn anyway. Cost: walking within noise (2.63 /
+  2.65 against 2.64 / 2.65 ms), the 60 m/s flight's median unchanged and
+  its worst frame +0.15-0.3 ms -- a rebuild. It shows on far plateaus and
+  valleys with the sun behind the camera; looking into the sun, far land is
+  backlit already and the A/B is pixel-identical.
+  **`BIOMES_FAR_DBG=1` uses the map at every distance**, which is how it is
+  judged: its shadows land where the cascades' do, blurred to 8 m.
+  EVSM for the far cascade remains the alternative if a prefiltered soft
+  far cascade is ever wanted; its light bleeding where terrain and trees
+  overlap, and 2-4x the memory, are why it was not the first choice.
 
 The terrain casts with the depth-only draw of every resident chunk (~0.2
 ms). Trees re-run their GPU cull per cascade, levelled by the CAMERA's
 distance so a shadow matches its tree, with a floor per cascade: the first
 keeps LOD 0 and the real leaf pattern (dappled light), the second never
 goes finer than LOD 1 and tests cards at their average coverage, the third
-is impostors only, each fetching one baked view's alpha along the sun. At
+and fourth are impostors only (the tree renderer's constant slots are
+1 + 4 cascades + the light faces), each fetching one baked view's alpha along the sun. At
 full detail in every cascade with four blended views per impostor pixel,
 shadows cost 3.1 ms over the densest forest; with the floors, 1.7 ms. An
 impostor RECEIVES its shadow from a point just outside its bound on the sun
 side: its card runs through its own crown and would otherwise sit in its own
 shadow. The sea neither casts nor receives.
+
+**The coarse casters were the wrong darkness, and it showed as a band.**
+The second cascade (28-100 m) drew tree shadows visibly lighter than the
+cascades either side of it. Its cards kept their average coverage by a
+dither keyed on the shadow-map TEXEL alone, so every card in a crown kept
+the same texels and a crown could never block more than one card's worth:
+the floor under a wood read luma 100 against the real leaves' 81. The
+impostors in the third and fourth were solid silhouettes, 54. Now the
+dither is offset per card (per tree for an impostor), so layers stack, and
+the two constants in `trees.hlsl` (`kCardShadowCover` 0.25,
+`kImpostorShadowOpacity` 0.78) are matched to the real leaves: 81.3 real,
+79.5 cards, 82.2 impostors, mean floor luma at EV100 13.
+`BIOMES_TREE_SHADOW_PATH=1|2` draws cascade 0's trees by cascade 1's or
+2's path, which is the instrument: one view, one cascade, only the caster
+path changes. Walking cost unchanged.
 
 The renderer owns the one shader-visible descriptor heap -- [0] the shadow
 map, [1..2] the impostor atlases -- because only one can be bound at a

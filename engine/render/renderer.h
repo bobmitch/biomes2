@@ -25,6 +25,7 @@
 #include "engine/render/canopy.h"
 #include "engine/render/ddgi.h"
 #include "engine/render/height_gi.h"
+#include "engine/render/far_shadow.h"
 
 #include <unordered_map>
 #include <vector>
@@ -316,6 +317,8 @@ public:
     void set_hfgi(bool on) { hfgi_on_ = on; }
     bool hfgi() const { return hfgi_on_; }
     unsigned long long hfgi_rebuilds() const { return hfgi_.rebuilds(); }
+    // The far terrain shadow past the cascades (far_shadow.h; --no-far-shadow).
+    void set_far_shadow(bool on) { far_on_ = on; }
     bool ssgi() const { return ssgi_on_; }
     float gi_ms() const { return ddgi_ms_; }
     // Whether the probes see local lights (--leak-test's A/B: the torch's
@@ -473,8 +476,10 @@ private:
     void update_trees(const ViewConstants& view, bool settle);
 
     // --- sun shadows ---
-    static const UINT kShadowRes = 2048;
-    static const UINT kCascades = 3;
+    // 4096: twice the old resolution in each axis. Four cascades: the fourth
+    // reaches 1.6 km, where shadows used to stop at 520 m.
+    static const UINT kShadowRes = 4096;
+    static const UINT kCascades = 4;
     struct Cascade {
         float vp[16];
         float planes[6][4];
@@ -482,7 +487,13 @@ private:
         float texel, depth_range;
     };
     bool create_shadow_resources(std::string& error);
-    void compute_cascades(const ViewConstants& view);
+    // Fits the cascades `due` marks (the rest keep the matrix their map was
+    // drawn with).
+    void compute_cascades(const ViewConstants& view, const bool due[]);
+    bool cascade_valid_[4] = {false, false, false, false};
+    // Which cascades are redrawn this frame: 0 every frame, 1 every second,
+    // 2 and 3 every fourth, interleaved -- two a frame, not four.
+    void cascades_due(bool due[]) const;
     void record_shadows(const ViewConstants& view);
     Cascade cascades_[kCascades];
     ComPtr<ID3D12Resource>       shadow_map_;
@@ -506,6 +517,9 @@ private:
     ComPtr<ID3D12PipelineState> ao_pso_, composite_pso_, taa_pso_, final_pso_, ssgi_pso_;
     ComPtr<ID3D12Resource> ssgi_;              // the screen-space bounce (L6): irradiance, distance
     HeightGi hfgi_;
+    FarShadow far_;
+    bool far_on_ = true;
+    void record_far(const float vp[16]);
     bool hfgi_on_ = true;
     ComPtr<ID3D12PipelineState> mesh_top_pso_;
     void record_hfgi(const float vp[16]);
