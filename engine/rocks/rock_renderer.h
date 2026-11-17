@@ -63,12 +63,17 @@ public:
     // The sun's list into the current cascade (its matrix already in the
     // root constants).
     void record_shadow(ID3D12GraphicsCommandList* cmd, UINT frame);
+    // The sun's list again, into the heightfield GI's top-down albedo map
+    // (its matrix in the root constants). Also what a local light's shadow
+    // face draws, through record_shadow.
+    void record_top(ID3D12GraphicsCommandList* cmd, UINT frame);
 
     void sync_colliders(PhysicsWorld* physics, const std::vector<worldgen::RockInstance>& rocks,
                         unsigned long long version, float x, float z);
 
     // The model a rock draws and collides with (rock_model), for probes.
     const RockModel& model(uint32_t m) const { return meshes_.models[m]; }
+    const RockMeshes& meshes() const { return meshes_; }
     size_t drawn() const { return drawn_; }
     size_t triangles() const { return triangles_; }
     size_t colliders() const { return colliders_.size(); }
@@ -87,7 +92,7 @@ private:
     RockGpu* inst_cpu_[kFrames] = {};
     D3D12_VERTEX_BUFFER_VIEW vbv_ = {};
     D3D12_INDEX_BUFFER_VIEW ibv_ = {};
-    ComPtr<ID3D12PipelineState> pso_, shadow_pso_;
+    ComPtr<ID3D12PipelineState> pso_, shadow_pso_, top_pso_;
     std::vector<Group> main_[kFrames], shadow_[kFrames];
     size_t drawn_ = 0, triangles_ = 0;
 

@@ -138,6 +138,9 @@ bool ScanLibrary::init(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12De
         info_[kv.first] = Info{kv.second, {p.mean[0], p.mean[1], p.mean[2]}, p.tile, depth(kv.first)};
     }
 
+    rock_albedo_.clear();
+    for (const Row& r : rows) for (int k = 0; k < 3; ++k) rock_albedo_.push_back(r.r[k]);
+
     // --- the table ---------------------------------------------------------
     std::vector<ScanMaterialGpu> table(rows.size());
     for (size_t i = 0; i < rows.size(); ++i) {

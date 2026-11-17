@@ -419,7 +419,8 @@ bool tree_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTabl
 // (kind 0) on small cells, outcrops (kind 1) on large ones that want a slope.
 // The engine draws, textures (by `biome`'s rock scan) and collides them.
 struct RockInstance {
-    float    x, y, z;        // the rock's origin: centre of its base, set `sink` below the ground
+    float    x, y, z;        // the rock's origin: centre of its base, set `sink` below its footprint's lowest ground
+    float    ground;         // the real surface at (x, z)
     float    size;           // metres across
     float    yaw01;          // [0, 1) of a full turn
     float    tilt01;         // [0, 1), the engine's to interpret

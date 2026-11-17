@@ -589,7 +589,8 @@ process checks the log is where it rested and the tree does not stand.
 
 ### Rocks
 
-**Placement is layer 9, in `worldgen/`, under the golden hash (v14)**, in
+**Placement is layer 9, in `worldgen/`, under the golden hash (v14, set
+into the ground in v15)**, in
 layer 8's shape: two classes on their own candidate grids -- boulders on
 8 m cells (0.4-4 m across) and outcrops on 48 m cells (4-10 m) -- each a
 pure function of its cell, `rock_id(kind, i, j)` its save identity. A
@@ -599,17 +600,26 @@ biome that is patch); the top-level `rocks` block the classes. Sizes are
 skewed to the small end by a cube (invariant 9: no pow). Outcrops are kept
 with a chance rising with slope, so they stand in hillsides. A rock stands
 on the real surface -- layer 8's bisection, moved into `real_ground` and
-proved bit-identical by the golden gate before any rock existed -- sunk by
-`sink` x its size, and keeps clear of rivers, the shore, every tree trunk
+proved bit-identical by the golden gate before any rock existed -- and is
+set `sink` x its size below the LOWEST of four heights at its footprint's
+edge, not below its centre (v15): set from the centre, an outcrop on a
+slope or a crest showed its whole face where the ground fell away and read
+as a block standing on the hill. It keeps clear of rivers, the shore, every tree trunk
 (trees are pinned, so rocks give way) and, for a boulder, every outcrop. Its
 `biome` is the dominant one where it stands, which picks its rock scan.
 
 **Engine** (`engine/rocks/`): `RockField` streams 64 m tiles of boulder
 cells on two workers, each tile also owning the outcrops whose CELL ORIGIN
 falls in it, so none is in two tiles. `rock_mesh` builds 8 boulder and 4
-outcrop models at startup -- icospheres cut by random planes into facets,
-flattened, outcrops elongated and banded by a sawtooth of strata -- in unit
-size with the origin at the base, two levels each, absolute indices.
+outcrop models at startup, in unit size with the origin at the base, two
+levels each, absolute indices. Boulders are icospheres cut by random planes
+into facets, flattened. **Outcrops are bedrock**: a wide, low rounded box
+(superellipse), cut by vertical joints, its top pressed flat, and banded
+into beds each inset by its own amount and undercut at its base, so the
+face steps in ledges that slightly overhang -- the first version, a
+stretched sphere with a faint sawtooth, read as a giant boulder. Outcrops
+are one subdivision finer than boulders (20k / 1.3k triangles a level) so
+the ledges resolve.
 `RockRenderer` culls on the CPU into two lists per frame in an upload buffer
 -- the camera's (frustum, 700 m, near level inside 30 + 12 x size m) and the
 sun's (boulders within 200 m, outcrops within 600 m) -- grouped by model and
@@ -644,12 +654,27 @@ level's top.
   rock's ground is air over rock. Measured per hectare (boulders/outcrops):
   highland 14.7 / 0.48, rift 9.0 / 0.50, ashlands 9.9 / 0.28, badlands 7.5 /
   0.17, meadows 1.4 / 0.01.
-- **Not done**: grass grows through a rock's footprint (`cs_bake` does not
-  know about them); the RT scene, DDGI, the heightfield GI's top-down pass,
-  the far shadow and local-light shadow faces ignore rocks; the LOD switch
-  pops (no cross-fade); outcrops read more as big boulders than as bedrock
-  -- a stronger strata pass or a flatter, more deeply set shape is the
-  next tuning. Shots do not run physics: the collision probe is in `--walk`.
+- **In every lighting system but one.** The sun's list also draws into
+  every local light's shadow faces (the GPU culls it per face; +0.03-0.07
+  ms in `--lights-report`) and the heightfield GI's top-down pass, with
+  `ps_rock_top`'s albedo -- the scan's smallest mip times the retint, the
+  authored rock colour exactly. **The RT scene** has a BLAS per model from
+  its far level, appended to the tree buffers with its info at
+  `kRockInfoBase` (1024) + model, and an instance per rock within 300 m in
+  the trees' mask: InstanceID `0x200000 | rgb565(sqrt(albedo)) << 4 |
+  model`, so `gi_trace` decodes the biome's rock colour and the face normal
+  with no new binding. RT shadows and DDGI see rocks; `--rt-report` counts
+  them. **The far shadow does not**: it applies past 1.36 km at 8 m texels,
+  and rocks stream to ~760 m.
+- **Not done**: grass grows through a rock's footprint -- the bake would
+  need the rocks bound and its cached tiles re-baked when rocks stream in
+  after them, so it waits; the LOD switch pops (no cross-fade, by choice
+  for now). Shots do not run physics: the collision probe is in `--walk`.
+- **A pre-existing cascade artifact** turned up beside a badlands boulder:
+  blocky texel-sized squares of shadow on gently sloped sand at 16:00
+  (`--cam 2452 123 3366 0.99 -0.2 --time 16`), there with rocks and
+  parallax off and gone under `--rt-shadows` -- shadow acne in a middle
+  cascade, not investigated.
 
 ### Ground cover
 

@@ -713,7 +713,7 @@ static SeedResult eval_seed(uint64_t world_seed,
                             static_cast<uint64_t>(static_cast<int64_t>(rk.size * 64.0f))};
                         for (int k = 0; k < 6; ++k) { h = fnv1a(h, q[k]); lh[4] = fnv1a(lh[4], q[k]); }
                         h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(rk.yaw01 * 4096.0f)));
-                        const float gy = rk.y + rc.sink * rk.size;
+                        const float gy = rk.ground;
                         if (terrain_density(w, wp, table, rk.x, gy + 0.05f, rk.z) > 0.0f ||
                             terrain_density(w, wp, table, rk.x, gy - 0.05f, rk.z) <= 0.0f) ++out.rocks_unseated;
                     }

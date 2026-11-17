@@ -2661,8 +2661,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(f, "  BLAS: %u terrain, %u tree models; %.1f MB, TLAS %.1f MB (two), scratch %.1f MB\n",
                          rs.terrain_blas, rs.tree_blas, rs.blas_bytes / 1048576.0, rs.tlas_bytes / 1048576.0,
                          rs.scratch_bytes / 1048576.0);
-            std::fprintf(f, "  TLAS: %u chunk instances, %u trees, %u crowns; %u drawn LOD 0-3 chunks without a BLAS; %u pending\n",
-                         rs.instances_terrain, rs.instances_trees, rs.instances_crowns, rs.drawn_without_blas, rs.pending);
+            std::fprintf(f, "  TLAS: %u chunk instances, %u trees, %u crowns, %u rocks; %u drawn LOD 0-3 chunks without a BLAS; %u pending\n",
+                         rs.instances_terrain, rs.instances_trees, rs.instances_crowns, rs.instances_rocks,
+                         rs.drawn_without_blas, rs.pending);
             std::fprintf(f, "  GPU: BLAS + TLAS build %.3f ms a frame (steady), shadow trace and checks %.3f ms\n",
                          st.build_ms, st.trace_ms);
             if (prim > 0)

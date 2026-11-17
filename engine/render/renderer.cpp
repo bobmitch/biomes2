@@ -1528,6 +1528,8 @@ void Renderer::record_hfgi(const float vp[16]) {
     ibv.Format = DXGI_FORMAT_R32_UINT;
     cmd_->IASetIndexBuffer(&ibv);
     cmd_->ExecuteIndirect(cmd_sig_.Get(), kSlots, mesher_.draw_args(), 0, nullptr, 0);
+    // Rocks on the map too: an outcrop shades and bounces like terrain.
+    if (rocks_on_ && rocks_.ready()) rocks_.record_top(cmd_.Get(), UINT(frame_));
     hfgi_.record(cmd_.Get(), UINT(frame_), shadow_cb_[frame_]->GetGPUVirtualAddress());
 }
 
@@ -2487,6 +2489,8 @@ void Renderer::record_lights(const ViewConstants& view) {
             cmd_->ExecuteIndirect(cmd_sig_.Get(), 1, mesher_.draw_args(),
                                   UINT64(slots[k]) * sizeof(D3D12_DRAW_INDEXED_ARGUMENTS), nullptr, 0);
         light_stats_.chunk_draws += UINT(slots.size());
+        // Rocks: the sun's list, culled by the face's own frustum on the GPU.
+        if (rocks_on_ && rocks_.ready() && mode_ != Mode::Wireframe) rocks_.record_shadow(cmd_.Get(), UINT(frame_));
         if (trees_on_ && trees_.ready()) {
             TreeShadowInputs si = {};
             std::memcpy(si.view_proj, d.vp, sizeof si.view_proj);
@@ -2891,6 +2895,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         // two placement workers.
         if (!rocks_.init(device_.Get(), queue_.Get(), mesh_root_.Get(), error)) return false;
         rock_field_.init(&world_, 2);
+        rt_.set_rock_meshes(&rocks_.meshes(), scans_.rock_albedo());
     }
     startup_log().push_back(std::make_pair(std::string("phase: tree models + impostor bake"), startup_now_ms() - t0));
     t0 = startup_now_ms();
@@ -3512,6 +3517,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         rt_.note_meshed(streamer_.last_meshed());
         const UINT q = UINT(frame_) * 4;
         if (rt_queries_) cmd_->EndQuery(rt_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q + 0);
+        rt_.set_rocks(rocks_on_ ? &rock_field_.rocks() : nullptr, 300.0f);
         if (!(rt_.debug_ & 8u)) rt_.record(cmd_.Get(), UINT(frame_), streamer_, mesher_, trees_.models(), trees_.looks(),
                    trees_.instance_list(), view.cam_pos, tree_settings_.max_dist);
         if (rt_queries_) cmd_->EndQuery(rt_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q + 1);
@@ -3521,6 +3527,13 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     if (canopy_.ready() && (canopy_on_ || (rt_sky_ && rt_ok_))) {
         canopy_.record(cmd_.Get(), UINT(frame_), view.cam_pos, trees_.instance_list(), tree_list_version_, canopy_origin_);
         canopy_built_ = true;
+    }
+    // The rocks' lists for this frame: the sun's list is drawn by the light
+    // faces, the heightfield's top-down pass and the cascades, all below.
+    if (rocks_on_ && rocks_.ready() && mode_ != Mode::Wireframe) {
+        float rvp[16];
+        build_view_proj(view, rvp);
+        rocks_.prepare(UINT(frame_), rock_field_.rocks(), view.cam_pos, rvp);
     }
     // Local lights (ADR-004 L3): their list, their clusters and their shadow
     // faces, before anything is shaded with them.
@@ -3541,12 +3554,6 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     }
     // DDGI's cascades follow the camera; the shadow constants carry them.
     ddgi_.begin_frame(view.cam_pos);
-    // The rocks' lists for this frame -- the sun's is drawn by the cascades.
-    if (rocks_on_ && rocks_.ready() && mode_ != Mode::Wireframe) {
-        float rvp[16];
-        build_view_proj(view, rvp);
-        rocks_.prepare(UINT(frame_), rock_field_.rocks(), view.cam_pos, rvp);
-    }
     record_shadows(view);
     // The heightfield's sky share at the eye, for the haze and the mist.
     if (hfgi_on_ && !gi_active() && mode_ != Mode::Wireframe)

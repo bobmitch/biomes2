@@ -120,7 +120,8 @@ bool RockRenderer::init(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12R
     }
 
     // --- pipelines, on the terrain's root signature -------------------------
-    ComPtr<ID3DBlob> vs, ps, vss;
+    ComPtr<ID3DBlob> vs, ps, vss, pst;
+    if (!compile_shader(kRockShader, "ps_rock_top", "ps_5_1", pst, error)) return false;
     if (!compile_shader(kRockShader, "vs_rock", "vs_5_1", vs, error)) return false;
     if (!compile_shader(kRockShader, "ps_rock", "ps_5_1", ps, error)) return false;
     if (!compile_shader(kRockShader, "vs_rock_shadow", "vs_5_1", vss, error)) return false;
@@ -150,6 +151,17 @@ bool RockRenderer::init(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12R
     pd.SampleDesc.Count = 1;
     HRESULT hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso_));
     if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (rocks)", hr); return false; }
+    // From above, for the heightfield GI: one RGBA16F target, no culling
+    // (the top-down matrix mirrors one axis), as the terrain's.
+    pd.PS = {pst->GetBufferPointer(), pst->GetBufferSize()};
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[1] = DXGI_FORMAT_UNKNOWN;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&top_pso_));
+    if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (rocks top-down)", hr); return false; }
+    pd.NumRenderTargets = 2;
+    pd.RTVFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
     // Under the sun: depth only, both faces (a thin edge seen from the sun
     // must still cast), the terrain caster's slope bias.
     pd.VS = {vss->GetBufferPointer(), vss->GetBufferSize()};
@@ -249,6 +261,13 @@ void RockRenderer::record(ID3D12GraphicsCommandList* cmd, UINT frame) {
 void RockRenderer::record_shadow(ID3D12GraphicsCommandList* cmd, UINT frame) {
     if (!ready_ || shadow_[frame].empty()) return;
     cmd->SetPipelineState(shadow_pso_.Get());
+    bind_mesh(cmd);
+    draw_groups(cmd, frame, shadow_[frame], kMaxMain);
+}
+
+void RockRenderer::record_top(ID3D12GraphicsCommandList* cmd, UINT frame) {
+    if (!ready_ || shadow_[frame].empty()) return;
+    cmd->SetPipelineState(top_pso_.Get());
     bind_mesh(cmd);
     draw_groups(cmd, frame, shadow_[frame], kMaxMain);
 }

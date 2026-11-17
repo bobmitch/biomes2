@@ -37,6 +37,8 @@
 #include "engine/streaming/streamer.h"
 #include "engine/trees/tree_field.h"
 #include "engine/trees/tree_mesh.h"
+#include "engine/rocks/rock_mesh.h"
+#include "worldgen/world.h"
 
 namespace engine {
 
@@ -48,6 +50,11 @@ public:
     static const UINT kMaxTreeInstances = 65536;
     static const UINT kTreeFlag = 0x800000u;
     static const UINT kCrownFlag = 0x400000u;   // InstanceID of a crown: kCrownFlag | model
+    // A rock (layer 9): kRockFlag | albedo as RGB565 of sqrt(linear) << 4 |
+    // model. Its geometry's info sits at kRockInfoBase + model in the tree
+    // info buffer, so gi_trace needs no new binding.
+    static const UINT kRockFlag = 0x200000u;
+    static const UINT kRockInfoBase = 1024u;
     static const UINT kMaskTerrain = 0x1u, kMaskTrees = 0x2u, kMaskCrowns = 0x4u;
     static const int  kMaxLod = 3;
 
@@ -74,6 +81,17 @@ public:
                 const std::vector<TreeModel>& models, const std::vector<TreeLook>& looks,
                 const std::vector<TreeGpuInstance>& trees, const float cam[3], float tree_range);
 
+    // Rocks: their meshes and each biome's rock albedo (linear rgb per
+    // biome), once before the first record; the resident rocks each frame.
+    void set_rock_meshes(const RockMeshes* meshes, const std::vector<float>& albedo) {
+        rock_meshes_ = meshes;
+        rock_albedo_ = albedo;
+    }
+    void set_rocks(const std::vector<worldgen::RockInstance>* rocks, float range) {
+        rocks_ = rocks;
+        rock_range_ = range;
+    }
+
     D3D12_GPU_VIRTUAL_ADDRESS tlas() const;
     ID3D12Resource* tree_positions() const { return tree_pos_.Get(); }
     ID3D12Resource* tree_indices() const { return tree_idx_.Get(); }
@@ -84,7 +102,7 @@ public:
         UINT terrain_blas = 0, tree_blas = 0;
         UINT64 blas_bytes = 0, tlas_bytes = 0, scratch_bytes = 0;
         UINT built_this_frame = 0, pending = 0;
-        UINT instances_terrain = 0, instances_trees = 0, instances_crowns = 0;
+        UINT instances_terrain = 0, instances_trees = 0, instances_crowns = 0, instances_rocks = 0;
         UINT drawn_without_blas = 0;     // drawn LOD 0-3 chunks not (yet) in the TLAS
         // Where queued chunks went, since start: the queue's own accounts.
         UINT64 noted = 0, dropped_remeshed = 0, dropped_moved = 0, empty = 0, built_total = 0;
@@ -122,6 +140,11 @@ private:
     // Trees: positions (float3), indices, and per-model info for gi_trace.
     ComPtr<ID3D12Resource> tree_pos_, tree_idx_, tree_info_, tree_attr_;
     std::vector<ComPtr<ID3D12Resource> > tree_blas_;
+    std::vector<ComPtr<ID3D12Resource> > rock_blas_;
+    const RockMeshes* rock_meshes_ = nullptr;
+    std::vector<float> rock_albedo_;
+    const std::vector<worldgen::RockInstance>* rocks_ = nullptr;
+    float rock_range_ = 300.0f;
     // Crowns: the unit AABB, its BLAS, and per model the ellipsoid in model
     // space (centre height, horizontal and vertical radii); radius 0 = none.
     ComPtr<ID3D12Resource> crown_aabb_, crown_blas_;

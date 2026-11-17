@@ -58,6 +58,9 @@ public:
     bool lookup(const std::string& name, const float authored_srgb[3], float& layer, float& inv_tile,
                 float tint[3], float& depth_m) const;
     bool ready() const { return layers_ > 0; }
+    // Each biome's authored rock albedo, linear, rgb per biome (the seabed
+    // last): what a ray hitting a rock of that biome sees (rt_scene.h).
+    const std::vector<float>& rock_albedo() const { return rock_albedo_; }
     UINT layers() const { return layers_; }
     // What init found, for startup.txt: sets loaded, missing, MB uploaded.
     const std::string& note() const { return note_; }
@@ -68,6 +71,7 @@ private:
     std::string note_;
     struct Info { int layer; float mean[3]; float tile; float depth; };
     std::map<std::string, Info> info_;
+    std::vector<float> rock_albedo_;
     ComPtr<ID3D12Resource> albedo_, nra_, table_;
 };
 

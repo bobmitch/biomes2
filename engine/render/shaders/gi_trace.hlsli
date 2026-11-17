@@ -40,6 +40,25 @@ StructuredBuffer<float4>     g_rt_tree_attr : register(t37);   // per vertex: u,
 static const uint  kRtSlotIndices = 36864;     // chunk_mesher.h kSlotIndices
 static const uint  kRtTreeFlag = 0x800000u;    // rt_scene.h
 static const uint  kRtCrownFlag = 0x400000u;   // rt_scene.h: a crown volume, kRtCrownFlag | model
+static const uint  kRtRockFlag = 0x200000u;    // rt_scene.h: a rock, kRtRockFlag | rgb565 << 4 | model
+static const uint  kRtRockInfoBase = 1024u;
+
+// A rock's albedo from its InstanceID: sqrt(linear) as RGB565.
+float3 rt_rock_albedo(uint inst) {
+    const uint c = (inst >> 4) & 0xFFFFu;
+    const float3 s = float3(float(c >> 11) / 31.0f, float((c >> 5) & 63u) / 63.0f, float(c & 31u) / 31.0f);
+    return s * s;
+}
+
+// A rock hit's face normal, from its geometry in the tree buffers.
+float3 rt_rock_normal(uint inst, uint prim, float3x4 m) {
+    const TreeRtInfo ti = g_rt_tree_info[kRtRockInfoBase + (inst & 0xFu)];
+    const uint ib = ti.ibase_bark + 3u * prim;
+    const float3 p0 = g_rt_tree_pos[ti.vbase + g_rt_tree_idx[ib + 0u]];
+    const float3 p1 = g_rt_tree_pos[ti.vbase + g_rt_tree_idx[ib + 1u]];
+    const float3 p2 = g_rt_tree_pos[ti.vbase + g_rt_tree_idx[ib + 2u]];
+    return normalize(mul(m, float4(cross(p1 - p0, p2 - p0), 0.0f)));
+}
 static const uint  kRtMaskTerrain = 0x1u, kRtMaskTrees = 0x2u, kRtMaskCrowns = 0x4u;
 // What the surface rays see: terrain and the trees' own geometry. Crowns are
 // a volume for diffuse rays only (gi_transmittance) -- a shadow ray through
@@ -145,7 +164,11 @@ GiHit gi_trace_masked(GiRay r, uint mask) {
     const uint prim = q.CommittedPrimitiveIndex();
     const float2 b = q.CommittedTriangleBarycentrics();
     const float3 w = float3(1.0f - b.x - b.y, b.x, b.y);
-    if ((inst & kRtTreeFlag) != 0u) {
+    if ((inst & 0xE00000u) == kRtRockFlag) {
+        h.normal = rt_rock_normal(inst, prim, q.CommittedObjectToWorld3x4());
+        h.albedo = rt_rock_albedo(inst);
+        h.material = 0u;
+    } else if ((inst & kRtTreeFlag) != 0u) {
         const TreeRtInfo ti = g_rt_tree_info[inst & 0x3FFFFFu];
         const uint geom = q.CommittedGeometryIndex();
         const uint ib = (geom == 0u ? ti.ibase_bark : ti.ibase_leaf) + 3u * prim;
@@ -218,7 +241,11 @@ GiHit gi_trace_probe(GiRay r, out float tau, out bool back) {
         const uint prim = q.CommittedPrimitiveIndex();
         const float2 bc = q.CommittedTriangleBarycentrics();
         const float3 w = float3(1.0f - bc.x - bc.y, bc.x, bc.y);
-        if ((inst & kRtTreeFlag) != 0u) {
+        if ((inst & 0xE00000u) == kRtRockFlag) {
+            h.normal = rt_rock_normal(inst, prim, q.CommittedObjectToWorld3x4());
+            h.albedo = rt_rock_albedo(inst);
+            h.material = 0u;
+        } else if ((inst & kRtTreeFlag) != 0u) {
             const TreeRtInfo ti = g_rt_tree_info[inst & 0x3FFFFFu];
             const uint ib = ti.ibase_bark + 3u * prim;
             const float3 p0 = g_rt_tree_pos[ti.vbase + g_rt_tree_idx[ib + 0u]];

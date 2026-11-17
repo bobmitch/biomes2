@@ -2,6 +2,7 @@
 #define NOMINMAX   // windows.h, via d3d12.h, would turn worldgen's std::min into a macro
 #endif
 #include "engine/render/rt_scene.h"
+#include "engine/rocks/rock_field.h"
 #include "engine/meshing/chunk_mesher.h"
 
 #include <algorithm>
@@ -181,6 +182,33 @@ bool RtScene::build_trees(ID3D12GraphicsCommandList4* cl, const std::vector<Tree
             }
         }
     }
+    // Rocks (layer 9): each model's far level after the trees, one opaque
+    // geometry, its info at kRockInfoBase + model so a hit finds it.
+    struct RockRange { UINT vbase, vcount, first, count; };
+    std::vector<RockRange> rranges;
+    if (rock_meshes_) {
+        info.resize(kRockInfoBase + rock_meshes_->models.size());
+        for (size_t m = 0; m < rock_meshes_->models.size(); ++m) {
+            const RockModel& rm = rock_meshes_->models[m];
+            RockRange rr;
+            rr.vbase = UINT(pos.size() / 3);
+            rr.vcount = rm.vcount[1];
+            for (UINT i = 0; i < rm.vcount[1]; ++i) {
+                const RockVertex& v = rock_meshes_->v[rm.vfirst[1] + i];
+                for (int k = 0; k < 3; ++k) pos.push_back(v.pos[k]);
+                for (int k = 0; k < 4; ++k) attr.push_back(0.0f);
+            }
+            rr.first = UINT(idx.size());
+            for (UINT i = 0; i < rm.count[1]; ++i) idx.push_back(rock_meshes_->idx[rm.first[1] + i] - rm.vfirst[1]);
+            rr.count = rm.count[1];
+            TreeRtInfo& ti = info[kRockInfoBase + m];
+            ti = TreeRtInfo();
+            ti.vbase = rr.vbase;
+            ti.ibase_bark = rr.first;
+            ti.ibase_leaf = rr.first;
+            rranges.push_back(rr);
+        }
+    }
     // Each model's crown as an ellipsoid: from where the crown starts to the
     // top, as wide as the leaves reach. A tree with no leaves has none.
     crowns_by_model_.assign(models.size(), Crown());
@@ -209,7 +237,7 @@ bool RtScene::build_trees(ID3D12GraphicsCommandList4* cl, const std::vector<Tree
 
     // One BLAS per model, each with its own scratch: forty-odd, once.
     tree_blas_.assign(models.size(), ComPtr<ID3D12Resource>());
-    std::vector<ComPtr<ID3D12Resource> > scratch(models.size() + 1);
+    std::vector<ComPtr<ID3D12Resource> > scratch(models.size() + 1 + rranges.size());
     // The crowns' one BLAS: a unit AABB; gi_trace intersects the sphere in it.
     // OPAQUE, so a ray that culls non-opaque geometry -- the sky ray, which
     // takes crowns as a volume and so skips the cards -- still meets it.
@@ -286,6 +314,39 @@ bool RtScene::build_trees(ID3D12GraphicsCommandList4* cl, const std::vector<Tree
         cl->BuildRaytracingAccelerationStructure(&bd, 0, nullptr);
         stats_.blas_bytes += pi.ResultDataMaxSizeInBytes;
         ++stats_.tree_blas;
+    }
+    rock_blas_.assign(rranges.size(), ComPtr<ID3D12Resource>());
+    for (size_t m = 0; m < rranges.size(); ++m) {
+        const RockRange& rr = rranges[m];
+        D3D12_RAYTRACING_GEOMETRY_DESC g = {};
+        g.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+        g.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+        g.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+        g.Triangles.VertexBuffer.StartAddress = tree_pos_->GetGPUVirtualAddress() + UINT64(rr.vbase) * 12;
+        g.Triangles.VertexBuffer.StrideInBytes = 12;
+        g.Triangles.VertexCount = rr.vcount;
+        g.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+        g.Triangles.IndexBuffer = tree_idx_->GetGPUVirtualAddress() + UINT64(rr.first) * 4;
+        g.Triangles.IndexCount = rr.count;
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in = {};
+        in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+        in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+        in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        in.NumDescs = 1;
+        in.pGeometryDescs = &g;
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pi = {};
+        dev_->GetRaytracingAccelerationStructurePrebuildInfo(&in, &pi);
+        ComPtr<ID3D12Resource>& sc = scratch[models.size() + 1 + m];
+        if (!make_buffer(pi.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+                         D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true, rock_blas_[m]) ||
+            !make_buffer(pi.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                         true, sc)) return false;
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bd = {};
+        bd.Inputs = in;
+        bd.DestAccelerationStructureData = rock_blas_[m]->GetGPUVirtualAddress();
+        bd.ScratchAccelerationStructureData = sc->GetGPUVirtualAddress();
+        cl->BuildRaytracingAccelerationStructure(&bd, 0, nullptr);
+        stats_.blas_bytes += pi.ResultDataMaxSizeInBytes;
     }
     // The scratch must outlive the GPU's use of it: into the graveyard,
     // stamped NOW. It was stamped 0 for "not seen yet" once, and the release
@@ -480,6 +541,44 @@ void RtScene::record(ID3D12GraphicsCommandList* cmd, UINT frame,
         e.InstanceMask = kMaskCrowns;
         e.AccelerationStructure = crown_blas_->GetGPUVirtualAddress();
         ++stats_.instances_crowns;
+    }
+    // Rocks within range, in the trees' mask: opaque surfaces for every ray.
+    stats_.instances_rocks = 0;
+    if (rocks_ && !rock_blas_.empty()) {
+        const float rr2 = rock_range_ * rock_range_;
+        for (size_t i = 0; i < rocks_->size() && n < max_instances_; ++i) {
+            const worldgen::RockInstance& r = (*rocks_)[i];
+            const float dx = r.x - cam[0], dz = r.z - cam[2];
+            if (dx * dx + dz * dz > rr2) continue;
+            const uint32_t m = rock_model(r.kind, r.variant);
+            if (m >= rock_blas_.size() || !rock_blas_[m]) continue;
+            float q[4];
+            rock_rotation(r, q);
+            const float x = q[0], y = q[1], z = q[2], w = q[3], s = r.size;
+            const float R[3][3] = {{1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)},
+                                   {2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)},
+                                   {2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)}};
+            D3D12_RAYTRACING_INSTANCE_DESC& d = inst[n++];
+            std::memset(&d, 0, sizeof d);
+            const float pos[3] = {r.x, r.y, r.z};
+            for (int a = 0; a < 3; ++a) {
+                for (int c = 0; c < 3; ++c) d.Transform[a][c] = R[a][c] * s;
+                d.Transform[a][3] = pos[a];
+            }
+            // The biome's rock colour as sqrt(linear) in RGB565.
+            UINT rgb = 0;
+            if (size_t(r.biome) * 3 + 2 < rock_albedo_.size()) {
+                const float* c = &rock_albedo_[size_t(r.biome) * 3];
+                const UINT cr = UINT(std::sqrt((std::min)(c[0], 1.0f)) * 31.0f + 0.5f);
+                const UINT cg = UINT(std::sqrt((std::min)(c[1], 1.0f)) * 63.0f + 0.5f);
+                const UINT cb = UINT(std::sqrt((std::min)(c[2], 1.0f)) * 31.0f + 0.5f);
+                rgb = (cr << 11) | (cg << 5) | cb;
+            }
+            d.InstanceID = kRockFlag | (rgb << 4) | m;
+            d.InstanceMask = kMaskTrees;
+            d.AccelerationStructure = rock_blas_[m]->GetGPUVirtualAddress();
+            ++stats_.instances_rocks;
+        }
     }
     // Slots nobody has drawn for a while give their BLAS back.
     for (UINT s = 0; s < kSlots; ++s) {

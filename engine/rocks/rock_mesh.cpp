@@ -100,9 +100,56 @@ struct Shape {
         }
         stretch = kind == 0 ? V3{0.95f + 0.15f * next(), 0.62f + 0.18f * next(), 0.85f + 0.15f * next()}
                             : V3{1.0f, 0.7f + 0.15f * next(), 0.55f + 0.15f * next()};
+        if (kind == 1) {
+            // Bedrock: a wide, low rounded box, cut by vertical joints.
+            // Squarer in plan and low: set 0.3 x size under its lowest ground, about
+            // a fifth of the width shows on the level -- a shelf, not a pillar.
+            box = V3{0.5f, 0.27f + 0.05f * next(), 0.40f + 0.08f * next()};
+            joints.clear();
+            const int nj = 3 + int(next() * 2.0f);
+            for (int i = 0; i < nj; ++i) {
+                const float a = next() * 6.2831853f;
+                joints.push_back(std::make_pair(V3{std::cos(a), 0.0f, std::sin(a)}, 0.34f + 0.14f * next()));
+            }
+            bed = 0.06f + 0.025f * next();
+            dip = 0.15f * (next() * 2.0f - 1.0f);
+        }
+    }
+    V3 box = {0.5f, 0.4f, 0.35f};
+    std::vector<std::pair<V3, float> > joints;   // vertical joint planes: horizontal normal, distance
+    float bed = 0.07f, dip = 0.0f;                // stratum thickness, and its tilt along x
+
+    // An outcrop: rounded box (superellipse, p = 5), joints, a tabular top,
+    // and beds each inset by its own amount and undercut at their base, so
+    // the face steps in ledges that slightly overhang -- bedrock breaking
+    // the surface, not a boulder resting on it.
+    V3 outcrop_point(V3 d) const {
+        auto pw = [](float x) { const float x2 = x * x; return x2 * x2 * std::fabs(x); };
+        const float s = pw(d.x / box.x) + pw(d.y / box.y) + pw(d.z / box.z);
+        float r = std::pow(1.0f / std::max(s, 1e-12f), 0.2f);
+        for (const auto& j : joints) {
+            const float c = d.x * j.first.x + d.z * j.first.z;
+            if (c > 1e-3f) r = std::min(r, j.second / c);
+        }
+        V3 p = mul(d, r * (1.0f + 0.05f * fbm(mul(d, 2.0f), seed, 2)));
+        // Tabular top: everything above 70% of the height pressed flat.
+        const float top = 0.7f * box.y;
+        if (p.y > top) p.y = top + (p.y - top) * 0.35f;
+        // Beds: index by height (tilted a little), inset per bed, undercut.
+        const float u = (p.y + box.y + dip * p.x) / bed;
+        const float layer = std::floor(u);
+        const float in_bed = u - layer;
+        const float inset = 1.0f - 0.13f * unit(hash(uint32_t(int(layer) + 1000) * 0x9E3779B1u ^ seed));
+        const float under = 1.0f - 0.06f * (1.0f - in_bed) * (1.0f - in_bed);
+        const float k = inset * under;
+        p.x *= k;
+        p.z *= k;
+        const float rough = 1.0f + 0.03f * fbm(mul(p, 9.0f), seed + 31u, 3);
+        return mul(p, rough);
     }
 
     V3 point(V3 d) const {
+        if (kind == 1) return outcrop_point(d);
         float r = 0.5f * (1.0f + 0.12f * fbm(mul(d, 2.2f), seed, 3));
         for (const auto& pl : planes) {
             const float c = dot(d, pl.first);
@@ -110,14 +157,6 @@ struct Shape {
         }
         V3 p = mul(d, r);
         p = {p.x * stretch.x, p.y * stretch.y, p.z * stretch.z};
-        if (kind == 1) {
-            // Strata: a sawtooth of ledges up the face, slightly tilted.
-            const float s = (p.y + 0.08f * p.x) * 7.0f + 0.6f * fbm(mul(p, 3.0f), seed + 77u, 2);
-            const float saw = s - std::floor(s);
-            const float k = 1.0f + 0.07f * (saw - 0.5f);
-            p.x *= k;
-            p.z *= k;
-        }
         // Fine roughness, along the direction.
         const float rough = 1.0f + 0.035f * fbm(mul(p, 9.0f), seed + 31u, 3);
         return mul(p, rough);
@@ -173,8 +212,8 @@ void build_rock_meshes(RockMeshes& out) {
         const Shape sh(kind, 0xA5A5u + m * 7919u);
         RockModel rm = {};
         float base_y = 0.0f;
-        emit_level(sh, kind == 0 ? 3 : 4, out, rm.first[0], rm.count[0], rm.vfirst[0], rm.vcount[0], base_y, true);
-        emit_level(sh, 2, out, rm.first[1], rm.count[1], rm.vfirst[1], rm.vcount[1], base_y, false);
+        emit_level(sh, kind == 0 ? 3 : 5, out, rm.first[0], rm.count[0], rm.vfirst[0], rm.vcount[0], base_y, true);
+        emit_level(sh, kind == 0 ? 2 : 3, out, rm.first[1], rm.count[1], rm.vfirst[1], rm.vcount[1], base_y, false);
         float top = 0.0f, reach = 0.0f;
         for (uint32_t i = rm.vfirst[0]; i < rm.vfirst[0] + rm.vcount[0]; ++i) {
             const RockVertex& v = out.v[i];

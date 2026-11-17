@@ -69,6 +69,17 @@ float rock_dither(float2 px) {
     return (float(m[y * 4u + x]) + 0.5f) / 16.0f;
 }
 
+// The heightfield GI's top-down view (height_gi.h): the rock's albedo as
+// lighting sees it -- the scan's smallest mip, its mean, times the retint,
+// which is the authored rock colour exactly.
+float4 ps_rock_top(VSOut i) : SV_Target0 {
+    const ScanMaterial M = g_scan_mat[i.biome];
+    float3 albedo = float3(0.16f, 0.15f, 0.13f);
+    if (M.rock_layer >= 0.0f)
+        albedo = g_scan_a.SampleLevel(g_scan_samp, float3(0.5f, 0.5f, M.rock_layer), 16.0f).rgb * M.rock_tint;
+    return float4(albedo, 1.0f);
+}
+
 SceneOut ps_rock(VSOut i) {
     const float dist = length(cam_pos - i.world);
     // A dithered fade over the last 12% of the draw distance.

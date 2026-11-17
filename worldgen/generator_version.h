@@ -61,7 +61,12 @@ namespace worldgen {
 //      sunk by a share of their size, clear of rivers, the shore, every tree
 //      trunk and (boulders) every outcrop. A rock is a pure function of its
 //      cell; rock_id is its save identity. Terrain and trees are unchanged.
-static const int kGeneratorVersion = 14;
+//  15  layer 9 rocks are set below the lowest ground under their footprint
+//      (the lowest of four heights at its edge), and outcrops sink 0.30 of
+//      their size, not 0.40: set from the centre, an outcrop on a hillside
+//      showed its whole face downhill and read as a block standing on the
+//      slope rather than bedrock coming out of it.
+static const int kGeneratorVersion = 15;
 
 }  // namespace worldgen
 

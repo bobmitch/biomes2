@@ -527,9 +527,19 @@ bool rock_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTabl
     const float h = terrain_height(w, wp, table, x, z, r);
     if (h < table.sea_level + rt.shore) ROCK_NO(ROCK_SHORE);
     const float e = rad > 1.0f ? rad : 1.0f;
-    const float hx = terrain_height(w, wp, table, x + e, z, r) - terrain_height(w, wp, table, x - e, z, r);
-    const float hz = terrain_height(w, wp, table, x, z + e, r) - terrain_height(w, wp, table, x, z - e, r);
+    const float h_xp = terrain_height(w, wp, table, x + e, z, r), h_xm = terrain_height(w, wp, table, x - e, z, r);
+    const float h_zp = terrain_height(w, wp, table, x, z + e, r), h_zm = terrain_height(w, wp, table, x, z - e, r);
+    const float hx = h_xp - h_xm;
+    const float hz = h_zp - h_zm;
     const float slope = std::sqrt((hx * hx + hz * hz) / (4.0f * e * e));
+    // How far the ground falls below the centre at the footprint's edge: the
+    // lowest of the four, which a slope estimate misses on a crest, where
+    // opposite sides cancel and the ground still falls away all round.
+    float lowest = h_xp;
+    if (h_xm < lowest) lowest = h_xm;
+    if (h_zp < lowest) lowest = h_zp;
+    if (h_zm < lowest) lowest = h_zm;
+    const float drop = h > lowest ? h - lowest : 0.0f;
     if (slope > rc.max_slope) ROCK_NO(ROCK_SLOPE);
     if (rc.slope_hi > rc.slope_lo) {
         float want = (slope - rc.slope_lo) / (rc.slope_hi - rc.slope_lo);
@@ -582,9 +592,14 @@ bool rock_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTabl
         }
     }
 
+    // Set below the LOWEST ground under the footprint, not the centre's: on
+    // a slope or a crest the ground falls away at the edge, and a rock set
+    // from its centre showed its whole face there -- an outcrop read as a
+    // block standing on the hill, not bedrock coming out of it.
     out.x = x;
-    out.y = ground - rc.sink * size;
+    out.y = ground - drop - rc.sink * size;
     out.z = z;
+    out.ground = ground;
     out.size = size;
     out.yaw01 = tree_unit(tree_hash(i, j, w.s_rocks, k0 + 5u));
     out.tilt01 = tree_unit(tree_hash(i, j, w.s_rocks, k0 + 6u));
