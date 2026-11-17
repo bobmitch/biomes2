@@ -421,6 +421,23 @@ last run's.
   and an overflow is dropped geometry, which is a hole.
   `--flight` prints what the worst chunk actually wanted.
 
+- **A normal map must not light what the geometry turns away from the
+  sun.** Under a low sun, golden ovals of unshadowed light lay on a dark
+  forest floor in the cascades but not under `--rt-shadows`. The terrain
+  (and rock) shader skipped the shadow lookup where the GEOMETRIC N.L was
+  <= 0 and used visibility 1 -- harmless while the shading normal was the
+  mesh's, but the scans' normal map still caught a 6-degree sun on every
+  gentle dip facing away from it. Found with a temporary shadow-debug
+  view: the cascade index lit the ovals as "past the last cascade", and a
+  distance view showed them at "over 50 m" where the floor around was
+  20 -- both were the skip's 1, not a distance. Now no direct light where
+  the geometric N.L <= 0, faded in over its first six degrees
+  (`saturate(lam * 10)`). Daylight barely moves: the badlands at 14:00
+  differ on 1% of pixels, mean luma 98.46 -> 98.57.
+- **`--ground` can put the camera inside the terrain** where the 2.5D
+  height is not the real surface (overhangs, the badlands): 233k-520k
+  undrawn pixels in a still. Give the eye height explicitly -- `--shot ...
+  --pick 640 360` from above names the ground under the centre.
 - **TAA shook the picture by up to a pixel, worst far from the origin.**
   Two bugs in one reprojection. It rebuilt a pixel's world position with
   the JITTERED inverse, so a still camera fetched history from

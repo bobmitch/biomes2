@@ -109,7 +109,14 @@ SceneOut ps_rock(VSOut i) {
         ao = s.ao;
     }
     const float lam = dot(n, kSunDir);
-    const float sh = lam > 0.0f ? shadow_factor(i.world, n) * psh : 1.0f;
+    // No sun where the GEOMETRIC surface faces away from it, and a fade over
+    // the last six degrees before: the shading normal is the scan's, and on
+    // a slope turned a few degrees from a low sun it still caught the light.
+    // The lookup used to be skipped there with visibility 1 -- harmless while
+    // the shading normal was the mesh's, since N.L was <= 0 anyway -- so
+    // every gentle dip facing away from the sun lit up as a golden oval,
+    // unshadowed under a dark wood (fixed after the scans landed).
+    const float sh = lam > 0.0f ? shadow_factor(i.world, n) * psh * saturate(lam * 10.0f) : 0.0f;
     const Surface s = make_surface(albedo, rough, ns, v);
     return scene_out(sun_light(s, sh), ambient_light(s, i.world) * ao + local_lights(s, i.world, i.clip),
                      i.world, cam_pos, far_plane);
