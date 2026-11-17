@@ -75,6 +75,51 @@ const float kCapsuleRadius = 0.35f;
 const float kCapsuleHalf = 0.80f;
 const float kEyeAboveFeet = 1.60f;
 
+// Layer 9 in a report: what is resident and drawn, the largest outcrop, and
+// the nearest outcrop and boulder over 2 m to (x, z), for a --cam. With
+// `probe` (a mode where physics runs): colliders round each of those two and
+// a ray straight down its axis, which must hit a PROP near the mesh's top --
+// not the terrain under it, and not nothing.
+void write_rock_report(FILE* f, float x, float z, bool probe) {
+    const std::vector<worldgen::RockInstance>& rs = g_renderer.rock_field().rocks();
+    size_t outcrops = 0;
+    double big = 0.0;
+    for (const worldgen::RockInstance& r : rs) { outcrops += r.kind; big = (std::max)(big, double(r.size)); }
+    std::fprintf(f, "rocks: %zu resident (%zu outcrops, largest %.1f m), %zu drawn, %zu triangles, %zu colliders\n",
+                 rs.size(), outcrops, big, g_renderer.rocks().drawn(), g_renderer.rocks().triangles(),
+                 g_renderer.rocks().colliders());
+    const worldgen::RockInstance* lg = nullptr;
+    for (const worldgen::RockInstance& r : rs)
+        if (r.kind == 1 && (!lg || r.size > lg->size)) lg = &r;
+    if (lg) std::fprintf(f, "  largest outcrop: (%.1f, %.1f, %.1f) %.1f m across\n", lg->x, lg->y, lg->z, lg->size);
+    for (int kind = 0; kind < 2; ++kind) {
+        const worldgen::RockInstance* best = nullptr;
+        float bd = 1e30f;
+        for (const worldgen::RockInstance& r : rs) {
+            if (r.kind != kind || (kind == 0 && r.size < 2.0f)) continue;
+            const float dx = r.x - x, dz = r.z - z;
+            if (dx * dx + dz * dz < bd) { bd = dx * dx + dz * dz; best = &r; }
+        }
+        if (!best) continue;
+        std::fprintf(f, "  nearest %s: (%.1f, %.1f, %.1f) %.1f m across, %.0f m away\n",
+                     kind ? "outcrop" : "boulder >2 m", best->x, best->y, best->z, best->size, std::sqrt(bd));
+        if (!probe) continue;
+        g_renderer.rocks().sync_colliders(&g_physics, rs, g_renderer.rock_field().version() + 1000u + kind,
+                                          best->x, best->z);
+        const engine::RockModel& rm = g_renderer.rocks().model(engine::rock_model(best->kind, best->variant));
+        const float top = best->y + rm.height * best->size;
+        const float from[3] = {best->x, top + 30.0f, best->z};
+        const float down[3] = {0.0f, -1.0f, 0.0f};
+        int prop = 0;
+        const float hit = g_physics.probe_ray(from, down, 80.0f, prop);
+        std::fprintf(f, "    collision: ray down its axis hits %s at y %.2f; mesh top %.2f (tilted up to 8 deg); "
+                        "%zu rock colliders, %d shapes%s%s\n",
+                     hit < 0.0f ? "NOTHING" : (prop ? "a prop" : "TERRAIN"), hit < 0.0f ? 0.0f : from[1] - hit, top,
+                     g_renderer.rocks().colliders(), g_renderer.rocks().shapes_built(),
+                     g_physics.prop_error().empty() ? "" : ", last shape error: ", g_physics.prop_error().c_str());
+    }
+}
+
 // Hand this frame's streamed height patches to physics, and drop the ones
 // whose chunk is gone. Called before the character moves, so it never steps on
 // terrain that was retired a frame ago.
@@ -767,6 +812,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (c2.find("--no-hfgi") != std::string::npos) g_renderer.set_hfgi(false);
         if (c2.find("--no-far-shadow") != std::string::npos) g_renderer.set_far_shadow(false);
         if (c2.find("--no-pom") != std::string::npos) g_renderer.set_pom(false);
+        if (c2.find("--no-rocks") != std::string::npos) g_renderer.set_rocks(false);
         if (c2.find("--no-crowns") != std::string::npos)
             g_renderer.set_rt_sky_mask(engine::RtScene::kMaskTerrain | engine::RtScene::kMaskTrees);
         if (c2.find("--rt-report") != std::string::npos) { g_renderer.set_rt_active(true); g_renderer.set_rt_checks(true); }
@@ -1119,6 +1165,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                          st.resident, st.pending, st.free_slots);
             std::fprintf(f, "vertices %u\nindices %u\ntriangles %u\nslots overflowed %u\n",
                          st.vertices, st.indices, st.indices / 3, st.overflowed);
+            write_rock_report(f, g_camera.x, g_camera.z, false);
             {
                 const engine::Renderer::CrackCount& cc = g_renderer.last_cracks();
                 std::fprintf(f, "cracks below the horizon: %zu undrawn (far depth, scene targets clear); "
@@ -3570,6 +3617,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                              walk_uncapped ? "uncapped" : "vsync", sum / sm.size(),
                              sm[size_t(sm.size() * 0.99)]);
             }
+            write_rock_report(f, g_feet[0], g_feet[2], true);
             std::fprintf(f, "frames %llu, travelled %.0f m\n", frames, travelled);
             std::fprintf(f, "canopy map: %s, %llu builds, %u trees in the last\n",
                          g_renderer.canopy() ? "on" : "off", g_renderer.canopy_builds(), g_renderer.canopy_trees());

@@ -29,21 +29,7 @@ StructuredBuffer<uint2> g_vertex_mat : register(t2);
 // g_vertex_wts): biome index order, the seabed after the last biome.
 StructuredBuffer<uint3> g_vertex_wts : register(t3);
 
-// The CC0 scans (scan_library.h): A sRGB albedo + height, B normal xy,
-// roughness, occlusion; one layer per set. And per biome, which layers its
-// ground and rock take and how to retint them.
-struct ScanMaterial {
-    float ground_layer, rock_layer, ground_inv_tile, rock_inv_tile;
-    float3 ground_tint; float ground_rough;
-    float3 rock_tint;   float rock_rough;
-    float ground_scan_rough, rock_scan_rough;
-    float ground_depth, rock_depth;   // parallax depth, metres (pom.hlsli)
-};
-Texture2DArray<float4>         g_scan_a    : register(t44);
-Texture2DArray<float4>         g_scan_b    : register(t45);
-StructuredBuffer<ScanMaterial> g_scan_mat  : register(t46);
-SamplerState                   g_scan_samp : register(s5);   // anisotropic, wrap
-#include "engine/render/shaders/pom.hlsli"
+#include "engine/render/shaders/scan.hlsli"
 
 cbuffer MeshConstants : register(b0) {
     row_major float4x4 view_proj;
@@ -190,59 +176,6 @@ float3 apply_surface_texture(float3 albedo, float3 p, float3 n) {
     return albedo * shade;
 }
 
-// ---------------------------------------------------------------------------
-// The scans. Triplanar, because the voxel mesh has no uvs: three planar
-// projections weighted by the normal, each plane's tangent normal folded
-// into world space by the whiteout blend, with the u axis mirrored on the
-// back faces so a scan is not reversed on them (Golus, Normal Mapping for a
-// Triplanar Shader). A plane under 1% weight is not sampled.
-// ---------------------------------------------------------------------------
-struct ScanSample {
-    float3 albedo;   // linear, before the tint
-    float  height;
-    float3 n;        // world, unnormalised sum
-    float  rough;
-    float  ao;
-};
-
-ScanSample scan_triplanar(float layer, float inv_tile, float3 p, float3 n, float3 bw, float3 dpx, float3 dpy) {
-    ScanSample o = (ScanSample)0;
-    const float3 sg = float3(n.x < 0.0f ? -1.0f : 1.0f, n.y < 0.0f ? -1.0f : 1.0f, n.z < 0.0f ? -1.0f : 1.0f);
-    float3 nsum = 0.0f;
-    [unroll] for (int k = 0; k < 3; ++k) {
-        const float w = bw[k];
-        if (w < 0.01f) continue;
-        float2 uv = k == 0 ? p.zy : (k == 1 ? p.xz : p.xy);
-        float2 gx = k == 0 ? dpx.zy : (k == 1 ? dpx.xz : dpx.xy);
-        float2 gy = k == 0 ? dpy.zy : (k == 1 ? dpy.xz : dpy.xy);
-        const float flip = k == 0 ? sg.x : (k == 1 ? sg.y : -sg.z);
-        uv.x *= flip;
-        gx.x *= flip;
-        gy.x *= flip;
-        uv *= inv_tile;
-        gx *= inv_tile;
-        gy *= inv_tile;
-        // Explicit gradients: the parallax shift is discontinuous, and its
-        // derivatives would pick wild mips along every step it takes.
-        const float4 a = g_scan_a.SampleGrad(g_scan_samp, float3(uv, layer), gx, gy);
-        const float4 b = g_scan_b.SampleGrad(g_scan_samp, float3(uv, layer), gx, gy);
-        float2 t = b.xy * 2.0f - 1.0f;
-        t.x *= flip;
-        const float tz = sqrt(saturate(1.0f - dot(t, t)));
-        float3 wn;
-        if (k == 0)      { const float3 q = float3(t + n.zy, tz * abs(n.x)); wn = float3(q.z * sg.x, q.y, q.x); }
-        else if (k == 1) { const float3 q = float3(t + n.xz, tz * abs(n.y)); wn = float3(q.x, q.z * sg.y, q.y); }
-        else             { const float3 q = float3(t + n.xy, tz * abs(n.z)); wn = float3(q.x, q.y, q.z * sg.z); }
-        o.albedo += w * a.rgb;
-        o.height += w * a.a;
-        nsum += w * wn;
-        o.rough += w * b.z;
-        o.ao += w * b.w;
-    }
-    o.n = nsum;
-    return o;
-}
-
 // Up to four candidates -- the two heaviest biomes, each its ground and its
 // rock -- blended by HEIGHT as well as weight: where two meet, the higher
 // texel wins (stones through sand) instead of both fading through each
@@ -293,49 +226,15 @@ ScanResult scan_surface(VSOut i, float3 n, float level, float3 v, out float psh)
     // Parallax (pom.hlsli): the heaviest candidate's height map, in the
     // plane the normal faces most; its shift moves every candidate's sample
     // point, and its self-shadow darkens the key light.
-    const float pom_dist = length(cam_pos - i.world);
-    if (l_shadow_frame.y > 0.5f && pom_dist < 45.0f) {
+    {
         int cd = 0;
         [unroll] for (int c4 = 1; c4 < 4; ++c4) if (wc[c4] > wc[cd]) cd = c4;
         ScanMaterial MD = M1;
         if (cd < 2) MD = M0;
         const bool gd = (cd & 1) == 0;
-        const float layer = gd ? MD.ground_layer : MD.rock_layer;
-        const float inv_tile = gd ? MD.ground_inv_tile : MD.rock_inv_tile;
-        // Only where one plane clearly dominates: where two weigh alike the
-        // dominant one flips from pixel to pixel and the shift with it,
-        // which drew a dark seam along a cliff's crease.
-        const float dom = saturate((max(bw.x, max(bw.y, bw.z)) - 0.55f) / 0.3f);
-        const float depth_m = gd ? MD.ground_depth : MD.rock_depth;
-        const float depth = depth_m * pom_fade(pom_dist, depth_m) * dom;
-        const float3 sg = float3(n.x < 0.0f ? -1.0f : 1.0f, n.y < 0.0f ? -1.0f : 1.0f, n.z < 0.0f ? -1.0f : 1.0f);
-        float3 U, V, A;
-        float2 uv;
-        if (bw.y >= bw.x && bw.y >= bw.z) {
-            U = float3(sg.y, 0.0f, 0.0f); V = float3(0.0f, 0.0f, 1.0f); A = float3(0.0f, sg.y, 0.0f);
-            uv = float2(p.x * sg.y, p.z);
-        } else if (bw.x >= bw.z) {
-            U = float3(0.0f, 0.0f, sg.x); V = float3(0.0f, 1.0f, 0.0f); A = float3(sg.x, 0.0f, 0.0f);
-            uv = float2(p.z * sg.x, p.y);
-        } else {
-            U = float3(-sg.z, 0.0f, 0.0f); V = float3(0.0f, 1.0f, 0.0f); A = float3(0.0f, 0.0f, sg.z);
-            uv = float2(-p.x * sg.z, p.y);
-        }
-        if (depth > 0.0005f) {
-            uv *= inv_tile;
-            const float2 gx = float2(dot(dpx, U), dot(dpx, V)) * inv_tile;
-            const float2 gy = float2(dot(dpy, U), dot(dpy, V)) * inv_tile;
-            const float scale = depth * inv_tile;
-            const float vz = max(dot(v, A), 0.2f);
-            const float2 view_step = -float2(dot(v, U), dot(v, V)) / vz * scale;
-            const int steps = int(lerp(6.0f, 20.0f, saturate(1.0f - dot(v, A))));
-            const float th = pom_march(uv, layer, view_step, gx, gy, steps);
-            p += (U * view_step.x + V * view_step.y) * (th / inv_tile);
-            const float lz = dot(kSunDir, A);
-            if (lz > 0.05f)
-                psh = pom_shadow_faded(uv + view_step * th, th, layer,
-                                       float2(dot(kSunDir, U), dot(kSunDir, V)) / lz * scale, lz, gx, gy);
-        }
+        p += scan_pom_shift(gd ? MD.ground_layer : MD.rock_layer, gd ? MD.ground_inv_tile : MD.rock_inv_tile,
+                            gd ? MD.ground_depth : MD.rock_depth, p, n, v, bw, dpx, dpy,
+                            length(cam_pos - i.world), psh);
     }
     [unroll] for (int c5 = 0; c5 < 4; ++c5) {
         if (wc[c5] <= 0.0f) continue;

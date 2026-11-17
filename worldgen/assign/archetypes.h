@@ -46,6 +46,14 @@ struct BiomeArchetype {
     float    tree_cover   = 0.0f;
     // Relative weight per species, indexed like TreeTable::species.
     std::vector<float> tree_species;
+
+    // --- rocks (layer 9) ---
+    // Chance a candidate cell holds a boulder / an outcrop inside a rock
+    // patch, and the share of the biome that is patch. All 0 when the biome
+    // has no rocks block.
+    float    rock_boulders = 0.0f;
+    float    rock_outcrops = 0.0f;
+    float    rock_cover    = 0.0f;
 };
 
 // One tree species. `form` and everything the engine reads under "shape" are
@@ -68,10 +76,33 @@ struct TreeTable {
     std::vector<TreeSpecies> species;
 };
 
+// One class of rock (layer 9): boulders, or outcrops set into slopes.
+struct RockClass {
+    float cell      = 8.0f;    // candidate spacing, metres
+    float size_min  = 0.4f;    // metres across; skewed to the small end (cubic)
+    float size_max  = 4.0f;
+    float sink      = 0.25f;   // share of the size set below the ground
+    float max_slope = 1.5f;    // rise over run; steeper ground holds none
+    // Outcrops want a slope: kept with weight 0 at slope_lo rising to 1 at
+    // slope_hi. Boulders leave both 0, which keeps every slope.
+    float slope_lo  = 0.0f;
+    float slope_hi  = 0.0f;
+};
+
+struct RockTable {
+    RockClass boulder, outcrop;
+    float patch_freq    = 0.006f;  // cycles per metre of the rock patch noise
+    float patch_edge    = 0.12f;
+    float shore         = 0.3f;    // metres above sea level a rock's base needs
+    int   blend_sharpen = 2;       // biome blend weights to this power for rocks
+    bool  present       = false;   // the table had a rocks block
+};
+
 struct ArchetypeTable {
     std::vector<BiomeArchetype> biomes;
     float sea_level = 0.0f;
     TreeTable trees;
+    RockTable rocks;
 
     size_t size() const { return biomes.size(); }
     const BiomeArchetype& operator[](size_t i) const { return biomes[i]; }

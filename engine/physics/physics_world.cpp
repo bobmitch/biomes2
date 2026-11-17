@@ -7,6 +7,7 @@
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
+#include <Jolt/Physics/Collision/Shape/ScaledShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
@@ -74,6 +75,7 @@ struct PhysicsWorld::Impl {
     ObjectVsBPFilter          obj_vs_bp;
     ObjectPairFilter          obj_pair;
     JPH::Ref<JPH::CharacterVirtual> character;
+    std::vector<JPH::RefConst<JPH::Shape>> prop_shapes;   // add_prop_mesh
 };
 
 PhysicsWorld::PhysicsWorld() = default;
@@ -231,6 +233,40 @@ void PhysicsWorld::set_chunk_mesh(const ChunkKey& key, const float* verts,
         body_is_mesh_[id.GetIndexAndSequenceNumber()] = 1;
         ++mesh_bodies_;
     }
+}
+
+int PhysicsWorld::add_prop_mesh(const float* verts, unsigned nverts, const unsigned* idx, unsigned nidx) {
+    if (!impl_) { prop_error_ = "physics not initialised"; return -1; }
+    JPH::VertexList vl;
+    vl.resize(nverts);
+    for (unsigned i = 0; i < nverts; ++i)
+        vl[i] = JPH::Float3(verts[size_t(i) * 3 + 0], verts[size_t(i) * 3 + 1], verts[size_t(i) * 3 + 2]);
+    JPH::IndexedTriangleList tl;
+    tl.reserve(nidx / 3);
+    for (unsigned t = 0; t + 2 < nidx; t += 3) {
+        const unsigned a = idx[t], b = idx[t + 1], c = idx[t + 2];
+        if (a == b || b == c || a == c || a >= nverts || b >= nverts || c >= nverts) continue;
+        tl.push_back(JPH::IndexedTriangle(a, b, c, 0));
+    }
+    if (tl.empty()) { prop_error_ = "no triangles"; return -1; }
+    JPH::MeshShapeSettings ms(vl, tl);
+    JPH::ShapeSettings::ShapeResult r = ms.Create();
+    if (r.HasError()) { prop_error_ = r.GetError().c_str(); return -1; }
+    impl_->prop_shapes.push_back(r.Get());
+    return int(impl_->prop_shapes.size()) - 1;
+}
+
+uint32_t PhysicsWorld::add_static_prop(int mesh, const float pos[3], const float rot[4], float scale) {
+    if (!impl_ || mesh < 0 || mesh >= int(impl_->prop_shapes.size()) || scale <= 0.0f) return 0;
+    JPH::RefConst<JPH::Shape> shape = new JPH::ScaledShape(impl_->prop_shapes[size_t(mesh)], JPH::Vec3::sReplicate(scale));
+    JPH::BodyCreationSettings bcs(shape, JPH::RVec3(pos[0], pos[1], pos[2]),
+                                  JPH::Quat(rot[0], rot[1], rot[2], rot[3]).Normalized(),
+                                  JPH::EMotionType::Static, Layers::NON_MOVING);
+    const JPH::BodyID id = impl_->system.GetBodyInterface().CreateAndAddBody(bcs, JPH::EActivation::DontActivate);
+    if (id.IsInvalid()) return 0;
+    const uint32_t h = id.GetIndexAndSequenceNumber();
+    props_[h] = id;
+    return h;
 }
 
 uint32_t PhysicsWorld::add_static_capsule(const float a[3], const float b[3], float radius) {

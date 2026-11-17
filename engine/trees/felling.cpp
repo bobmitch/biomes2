@@ -32,6 +32,11 @@ int TreeFelling::hits_needed(float trunk_r) const {
 
 void TreeFelling::update(float x, float z) {
     if (!renderer_ || !physics_) return;
+    // Rocks (layer 9) near the player get their colliders here too: every
+    // mode that has a player already calls this, and a rock is a prop like
+    // a trunk -- static, diffed by id.
+    renderer_->rocks().sync_colliders(physics_, renderer_->rock_field().rocks(),
+                                      renderer_->rock_field().version(), x, z);
     const TreeRenderer& tr = renderer_->trees();
     if (!tr.ready()) return;
     TreeField& field = renderer_->tree_field();

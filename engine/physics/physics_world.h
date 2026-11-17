@@ -93,6 +93,12 @@ public:
     // `asleep` adds it without waking it, for a log loaded from a save.
     uint32_t add_log(const float pos[3], const float rot[4], float trunk_r, float y0, float y1,
                      float crown_y, float crown_r, const float spin[3], bool asleep);
+    // Rocks (layer 9): a static mesh shape built once per model, in the
+    // model's own unit space, and static bodies that scale and place it.
+    // add_prop_mesh returns the shape's index, or -1.
+    int      add_prop_mesh(const float* verts, unsigned nverts, const unsigned* idx, unsigned nidx);
+    uint32_t add_static_prop(int mesh, const float pos[3], const float rot[4], float scale);
+    const std::string& prop_error() const { return prop_error_; }
     void     remove_body(uint32_t handle);
     // Where a body is: its shape origin and rotation. `active` false once
     // Jolt has put it to sleep, which is what "came to rest" means.
@@ -174,6 +180,7 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    std::string prop_error_;   // why the last add_prop_mesh failed
 
     std::unordered_map<ChunkKey, JPH::BodyID, ChunkKeyHash> bodies_;
     std::unordered_map<uint32_t, JPH::BodyID> props_;

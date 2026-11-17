@@ -55,7 +55,13 @@ namespace worldgen {
 //      it; MSVC and GCC evaluated it in different orders and grew different
 //      forests, so v12 never existed on Linux. Trees now keep a metre clear
 //      of every channel on both.
-static const int kGeneratorVersion = 13;
+//  14  layer 9, rocks: boulders on 8 m cells and outcrops on 48 m cells that
+//      want a slope, kept by biome density inside seeded patches, standing
+//      on the real surface (layer 8's bisection, shared and bit-identical),
+//      sunk by a share of their size, clear of rivers, the shore, every tree
+//      trunk and (boulders) every outcrop. A rock is a pure function of its
+//      cell; rock_id is its save identity. Terrain and trees are unchanged.
+static const int kGeneratorVersion = 14;
 
 }  // namespace worldgen
 

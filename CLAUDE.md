@@ -14,6 +14,7 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `worldgen/golden/` | Pinned seed hashes. Changes must be deliberate. |
 | `engine/trees/` | Tree meshes (procedural, made here), the CPU tile streamer over layer 8, GPU culling and impostors, felling. |
 | `engine/foliage/` | Ground cover -- grass, flowers, bushes -- generated on the GPU each frame (`foliage.hlsl`). |
+| `engine/rocks/` | Layer 9's rocks: procedural meshes, the CPU tile streamer, instanced drawing on the terrain's root signature, static colliders. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32). Debug tool, Windows only. |
 | `tools/shared/` | Presentation, shared by the harness and the viewer. |
@@ -71,7 +72,7 @@ fallback), `--gi-report` (DDGI at three views), `--lights-report` (ADR-004 L3: l
 configurations timed) and `--fell` (with `--fell-save` / `--fell-verify`).
 Every mode takes `--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
-`--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`; `--shot` also
+`--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`, `--no-rocks`; `--shot` also
 takes `--lights <n>` (campfires round the camera) and `--ground` (the
 `--cam` x and z at eye height on the ground). `--flight` also takes `--settle`, `--holes` and
 `--flight-speed <m/s>` and `--flight-from x y z`; `--shot` takes
@@ -585,6 +586,70 @@ from the same mesh split at `kCutHeight`. F6/F9 save/load `build/edits.bin`
 and `build/trees.bin` (same field id). `--fell` walks into a trunk, fells
 it and watches the log; `--fell-save` then `--fell-verify` in a second
 process checks the log is where it rested and the tree does not stand.
+
+### Rocks
+
+**Placement is layer 9, in `worldgen/`, under the golden hash (v14)**, in
+layer 8's shape: two classes on their own candidate grids -- boulders on
+8 m cells (0.4-4 m across) and outcrops on 48 m cells (4-10 m) -- each a
+pure function of its cell, `rock_id(kind, i, j)` its save identity. A
+biome's `rocks` block in archetypes.json gives boulders and outcrops
+(chance a cell holds one inside a rock patch) and cover (share of the
+biome that is patch); the top-level `rocks` block the classes. Sizes are
+skewed to the small end by a cube (invariant 9: no pow). Outcrops are kept
+with a chance rising with slope, so they stand in hillsides. A rock stands
+on the real surface -- layer 8's bisection, moved into `real_ground` and
+proved bit-identical by the golden gate before any rock existed -- sunk by
+`sink` x its size, and keeps clear of rivers, the shore, every tree trunk
+(trees are pinned, so rocks give way) and, for a boulder, every outcrop. Its
+`biome` is the dominant one where it stands, which picks its rock scan.
+
+**Engine** (`engine/rocks/`): `RockField` streams 64 m tiles of boulder
+cells on two workers, each tile also owning the outcrops whose CELL ORIGIN
+falls in it, so none is in two tiles. `rock_mesh` builds 8 boulder and 4
+outcrop models at startup -- icospheres cut by random planes into facets,
+flattened, outcrops elongated and banded by a sawtooth of strata -- in unit
+size with the origin at the base, two levels each, absolute indices.
+`RockRenderer` culls on the CPU into two lists per frame in an upload buffer
+-- the camera's (frustum, 700 m, near level inside 30 + 12 x size m) and the
+sun's (boulders within 200 m, outcrops within 600 m) -- grouped by model and
+level, one DrawIndexedInstanced each. **They draw on the TERRAIN's root
+signature**, straight after the terrain in the main pass and in each
+cascade, so the constants, shadow table and scans are already bound; t0 is
+rebound per group to its instance range. `rocks.hlsl` shades exactly as the
+terrain does -- the shared `scan.hlsli` (scan declarations, triplanar,
+`scan_pom_shift`) was cut out of `mesh.hlsl` for it, and the cliff still
+came out within one level of the pre-refactor still on every pixel -- with
+the biome's rock scan, parallax and its self-shadow, and a dithered fade
+over the last 12% of the draw distance.
+
+**Collision**: one Jolt mesh shape per model from its far level
+(`PhysicsWorld::add_prop_mesh`), and a scaled static body
+(`add_static_prop`) for every rock within 40 m of the player, diffed by id
+like the trunks -- synced from `TreeFelling::update`, which every mode with
+a player already calls. **The physics copy is wound the other way**: the
+draw's triangles are clockwise from outside for D3D, which Jolt takes as
+back faces, and its rays ignore those -- the first probe went straight
+through a boulder to the terrain under it. The `--walk` report probes it: a
+ray down the nearest big boulder's axis hits a prop 6 cm under the near
+level's top.
+
+- Every `--shot` and `--walk` report has a `rocks:` line -- resident,
+  drawn, triangles, colliders -- and names the largest outcrop and the
+  nearest outcrop and boulder over 2 m, for a `--cam`. The badlands
+  hillside draws 368 rocks, 119k triangles. **Cost: within noise**, walking
+  and on a badlands flight (median 2.36 / 2.37 ms with and without).
+- `validate`'s `rocks` check: each configured biome grows each class it is
+  configured for, unconfigured ones no more than a trace, and every pinned
+  rock's ground is air over rock. Measured per hectare (boulders/outcrops):
+  highland 14.7 / 0.48, rift 9.0 / 0.50, ashlands 9.9 / 0.28, badlands 7.5 /
+  0.17, meadows 1.4 / 0.01.
+- **Not done**: grass grows through a rock's footprint (`cs_bake` does not
+  know about them); the RT scene, DDGI, the heightfield GI's top-down pass,
+  the far shadow and local-light shadow faces ignore rocks; the LOD switch
+  pops (no cross-fade); outcrops read more as big boulders than as bedrock
+  -- a stronger strata pass or a flatter, more deeply set shape is the
+  next tuning. Shots do not run physics: the collision probe is in `--walk`.
 
 ### Ground cover
 
@@ -1273,6 +1338,10 @@ gates it: a shaft must end in cave air) and `column_band` drops its 64 m cave
 padding (1129 → 736 chunks wanted). The `cave entrances` check asserts ZERO
 shafts while caves are off. What follows about layer 7 describes the code,
 which is intact, and applies again when the densities come back.
+
+**Rocks are pinned the same way** (v14): at the same 24 sites, boulders over
+a 64 m tile and outcrops over 3 x 3 of their cells, with their own
+per-layer hash (the fifth in the gate's failure report).
 
 **Trees are pinned by their instances**, like layer 7: a 64 m tile at each of
 the first 24 land cells, every tree's id, species, variant and quantised

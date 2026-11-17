@@ -130,6 +130,36 @@ ArchetypeTable load_archetypes(const std::string& path) {
             throw std::runtime_error("archetypes: trees.cell and trees.altitude_ramp must be positive");
     }
 
+    // Layer 9's classes. Optional: a table without them places no rocks.
+    if (root.has("rocks")) {
+        const jsonlite::Value& rr = root.obj.at("rocks");
+        RockTable& rt = t.rocks;
+        rt.present       = true;
+        rt.patch_freq    = static_cast<float>(rr.number("patch_freq"));
+        rt.patch_edge    = static_cast<float>(rr.number("patch_edge"));
+        rt.shore         = static_cast<float>(rr.number("shore"));
+        rt.blend_sharpen = static_cast<int>(rr.number("blend_sharpen"));
+        if (rt.blend_sharpen < 1 || rt.blend_sharpen > 16)
+            throw std::runtime_error("archetypes: rocks.blend_sharpen must be 1..16");
+        auto read_class = [](const jsonlite::Value& c, RockClass& k, const char* what) {
+            const jsonlite::Array& sz = c.array("size");
+            if (sz.size() != 2) throw std::runtime_error(std::string("archetypes: rocks.") + what + ".size needs 2 entries");
+            k.cell      = static_cast<float>(c.number("cell"));
+            k.size_min  = static_cast<float>(sz[0].num);
+            k.size_max  = static_cast<float>(sz[1].num);
+            k.sink      = static_cast<float>(c.number("sink"));
+            k.max_slope = static_cast<float>(c.number("max_slope"));
+            k.slope_lo  = c.has("slope_lo") ? static_cast<float>(c.number("slope_lo")) : 0.0f;
+            k.slope_hi  = c.has("slope_hi") ? static_cast<float>(c.number("slope_hi")) : 0.0f;
+            if (!(k.cell > 0.0f && k.size_min > 0.0f && k.size_min <= k.size_max &&
+                  k.size_max * 0.5f < k.cell && k.sink >= 0.0f && k.sink < 1.0f && k.slope_lo <= k.slope_hi))
+                throw std::runtime_error(std::string("archetypes: rocks.") + what +
+                                         " needs cell > 0, 0 < size_min <= size_max < 2 cell, 0 <= sink < 1");
+        };
+        read_class(rr.obj.at("boulder"), rt.boulder, "boulder");
+        read_class(rr.obj.at("outcrop"), rt.outcrop, "outcrop");
+    }
+
     const jsonlite::Array& list = root.array("biomes");
     t.biomes.reserve(list.size());
 
@@ -187,6 +217,15 @@ ArchetypeTable load_archetypes(const std::string& path) {
                     throw std::runtime_error("archetypes: " + b.name + " has a negative weight for " + it->first);
                 b.tree_species[k] = static_cast<float>(it->second.num);
             }
+        }
+        if (e.has("rocks")) {
+            const jsonlite::Value& rb = e.obj.at("rocks");
+            b.rock_boulders = static_cast<float>(rb.number("boulders"));
+            b.rock_outcrops = static_cast<float>(rb.number("outcrops"));
+            b.rock_cover    = static_cast<float>(rb.number("cover"));
+            if (b.rock_boulders < 0.0f || b.rock_boulders > 1.0f || b.rock_outcrops < 0.0f ||
+                b.rock_outcrops > 1.0f || b.rock_cover < 0.0f || b.rock_cover > 1.0f)
+                throw std::runtime_error("archetypes: " + b.name + " rocks boulders, outcrops and cover must be in [0, 1]");
         }
 
         t.biomes.push_back(b);

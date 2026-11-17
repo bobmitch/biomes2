@@ -27,6 +27,8 @@
 #include "engine/render/height_gi.h"
 #include "engine/render/far_shadow.h"
 #include "engine/render/scan_library.h"
+#include "engine/rocks/rock_field.h"
+#include "engine/rocks/rock_renderer.h"
 
 #include <unordered_map>
 #include <vector>
@@ -204,6 +206,10 @@ public:
     // the caller adds what has been felled as extra instances -- logs and
     // stumps, posed by physics -- every frame they move.
     TreeField&             tree_field() { return tree_field_; }
+    // Layer 9's rocks: placement, drawing, colliders (--no-rocks).
+    RockField&             rock_field() { return rock_field_; }
+    RockRenderer&          rocks() { return rocks_; }
+    void set_rocks(bool on) { rocks_on_ = on; }
     const TreeRenderer&    trees() const { return trees_; }
     TreeDrawSettings&      tree_settings() { return tree_settings_; }
     void set_trees(bool on) { trees_on_ = on; }
@@ -656,6 +662,9 @@ private:
     ExposureReport exposure_report_;
     SkyCheck sky_check_;
     TreeField        tree_field_;
+    RockField        rock_field_;
+    RockRenderer     rocks_;
+    bool             rocks_on_ = true;
     TreeRenderer     trees_;
     TreeDrawSettings tree_settings_;
     FoliageRenderer  foliage_;

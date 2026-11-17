@@ -1210,6 +1210,8 @@ void Renderer::record_shadows(const ViewConstants& view) {
         cmd_->SetGraphicsRootDescriptorTable(4, srv_heap_->GetGPUDescriptorHandleForHeapStart());
         cmd_->IASetIndexBuffer(&ibv);
         cmd_->ExecuteIndirect(cmd_sig_.Get(), kSlots, mesher_.draw_args(), 0, nullptr, 0);
+        // Rocks: the same root and constants, their own casters.
+        if (rocks_on_ && rocks_.ready() && mode_ != Mode::Wireframe) rocks_.record_shadow(cmd_.Get(), UINT(frame_));
 
         // Trees, culled against this cascade but levelled by the camera's
         // distance, so a shadow always matches the tree that casts it.
@@ -2885,6 +2887,10 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         // Three workers: the first fill of a 500 m radius is ~300 tiles, and
         // the frame loop never waits on them.
         tree_field_.init(&world_, 3);
+        // Layer 9's rocks: the meshes, on the terrain's root signature, and
+        // two placement workers.
+        if (!rocks_.init(device_.Get(), queue_.Get(), mesh_root_.Get(), error)) return false;
+        rock_field_.init(&world_, 2);
     }
     startup_log().push_back(std::make_pair(std::string("phase: tree models + impostor bake"), startup_now_ms() - t0));
     t0 = startup_now_ms();
@@ -2906,6 +2912,15 @@ void Renderer::update_trees(const ViewConstants& view, bool settle) {
     // A tile beyond the draw distance is never drawn, but one tile of margin
     // keeps a turn of the head from waiting on placement.
     const float radius = tree_settings_.max_dist + 64.0f;
+    // The rocks stream beside the trees, out to their own draw distance.
+    const float rock_radius = RockRenderer::kDrawDist + 64.0f;
+    if (rocks_on_) {
+        rock_field_.update(view.cam_pos[0], view.cam_pos[2], rock_radius);
+        for (int i = 0; settle && i < 4000 && !rock_field_.settled(); ++i) {
+            Sleep(2);
+            rock_field_.update(view.cam_pos[0], view.cam_pos[2], rock_radius);
+        }
+    }
     tree_field_.update(view.cam_pos[0], view.cam_pos[2], radius);
     if (settle) {
         // A still waits for every tile, the way it waits for every chunk.
@@ -3526,6 +3541,12 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     }
     // DDGI's cascades follow the camera; the shadow constants carry them.
     ddgi_.begin_frame(view.cam_pos);
+    // The rocks' lists for this frame -- the sun's is drawn by the cascades.
+    if (rocks_on_ && rocks_.ready() && mode_ != Mode::Wireframe) {
+        float rvp[16];
+        build_view_proj(view, rvp);
+        rocks_.prepare(UINT(frame_), rock_field_.rocks(), view.cam_pos, rvp);
+    }
     record_shadows(view);
     // The heightfield's sky share at the eye, for the haze and the mist.
     if (hfgi_on_ && !gi_active() && mode_ != Mode::Wireframe)
@@ -3630,6 +3651,8 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         // arguments and the command processor skips it, which is cheaper than
         // compacting the array every time a chunk moves.
         cmd_->ExecuteIndirect(cmd_sig_.Get(), kSlots, mesher_.draw_args(), 0, nullptr, 0);
+        // Rocks right after the ground, on its root signature and constants.
+        if (rocks_on_ && rocks_.ready() && !wire) rocks_.record(cmd_.Get(), UINT(frame_));
     }
 
     // Trees after the ground, before the sea. Not in wireframe: the wire view

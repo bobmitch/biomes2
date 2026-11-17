@@ -35,7 +35,9 @@ enum FeatureId : uint32_t {
     FEATURE_CAVE      = 8u,
     FEATURE_ENTRANCE  = 9u,
     FEATURE_TREES     = 10u,   // which cells hold a tree, and its rolls
-    FEATURE_TREE_PATCH = 11u   // the patch / clearing noise
+    FEATURE_TREE_PATCH = 11u,  // the patch / clearing noise
+    FEATURE_ROCKS     = 12u,   // which cells hold a rock, and its rolls
+    FEATURE_ROCK_PATCH = 13u   // the rock patch noise
 };
 
 inline uint64_t hash64(uint64_t x) {
@@ -264,6 +266,7 @@ struct SeedWorld {
     uint32_t s_cont = 0, s_dang = 0, s_wx = 0, s_wz = 0, s_height = 0;
     uint32_t s_overhang = 0, s_cave = 0, s_entrance = 0;
     uint32_t s_trees = 0, s_tree_patch = 0;
+    uint32_t s_rocks = 0, s_rock_patch = 0;
     float    land_fraction = 0.0f;
 
     // --- layer 5 ---
@@ -409,6 +412,42 @@ enum TreeReject {
 // The one tree a cell holds, if any. Same answer trees_in_cells gives.
 bool tree_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
                   int i, int j, TreeInstance& out, int* reason = nullptr);
+
+// --- layer 9: rocks -------------------------------------------------------------
+// Boulders and outcrops, each a pure function of its candidate cell like a
+// tree, and pinned the same way. Two classes on their own grids: boulders
+// (kind 0) on small cells, outcrops (kind 1) on large ones that want a slope.
+// The engine draws, textures (by `biome`'s rock scan) and collides them.
+struct RockInstance {
+    float    x, y, z;        // the rock's origin: centre of its base, set `sink` below the ground
+    float    size;           // metres across
+    float    yaw01;          // [0, 1) of a full turn
+    float    tilt01;         // [0, 1), the engine's to interpret
+    uint32_t id;             // rock_id(kind, i, j)
+    uint8_t  kind;           // 0 boulder, 1 outcrop
+    uint8_t  variant;        // which of the engine's meshes, 0..255
+    uint16_t biome;          // the dominant biome where it stands: its material
+};
+
+inline uint32_t rock_id(int kind, int i, int j) {
+    return (static_cast<uint32_t>(kind & 1) << 31) |
+           ((static_cast<uint32_t>(i + 16384) & 0x7FFFu) << 16) |
+           (static_cast<uint32_t>(j + 32768) & 0xFFFFu);
+}
+
+enum RockReject {
+    ROCK_KEPT = 0, ROCK_OUTSIDE, ROCK_NO_LAND, ROCK_CLEARING, ROCK_ROLL, ROCK_SHORE,
+    ROCK_SLOPE, ROCK_RIVER, ROCK_SURFACE, ROCK_TREE, ROCK_OUTCROP,
+    ROCK_REJECT_COUNT
+};
+
+// The one rock of `kind` a cell holds, if any.
+bool rock_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
+                  int kind, int i, int j, RockInstance& out, int* reason = nullptr);
+
+// Every rock of `kind` whose cell lies in [i0, i1) x [j0, j1), in cell order.
+void rocks_in_cells(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
+                    int kind, int i0, int j0, int i1, int j1, std::vector<RockInstance>& out);
 
 // Layer 6. Positive is rock, negative is air; the sign change is the surface.
 float terrain_density(const SeedWorld& w, const WorldParams& wp,

@@ -288,6 +288,37 @@ int biome_mix(const SeedWorld& w, const WorldParams& wp, float x, float z,
     return n;
 }
 
+// Where the REAL surface is at (x, z), near the 2.5D height h. Layer 6's
+// overhang term moves the ground off h by up to strength * overhang_scale, a
+// few metres in a forest. Testing for air and rock 0.75 m either side of h
+// rejected 80% of forest candidates that had passed everything else
+// (validate --tree-reasons). So bracket the crossing within that
+// displacement, walking down from above it in 1 m steps, and bisect.
+// False when there is rock at the top of the bracket or none inside it.
+// Layers 8 and 9 both stand on it; the arithmetic is layer 8's, moved.
+static bool real_ground(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
+                        float x, float z, float h, int nb, const int* bio, const float* bw, float& ground) {
+    float ov = 0.0f;
+    for (int k = 0; k < nb; ++k) ov = ov + bw[k] * table[bio[k]].overhang_strength;
+    ov = ov * wp.overhang_scale + 1.0f;
+    float y_air = h + ov;
+    if (terrain_density(w, wp, table, x, y_air, z) > 0.0f) return false;
+    float y_rock = y_air;
+    bool found = false;
+    while (y_rock > h - ov) {
+        y_rock = y_rock - 1.0f;
+        if (terrain_density(w, wp, table, x, y_rock, z) > 0.0f) { found = true; break; }
+        y_air = y_rock;
+    }
+    if (!found) return false;
+    for (int it = 0; it < 8; ++it) {
+        const float ym = 0.5f * (y_air + y_rock);
+        if (terrain_density(w, wp, table, x, ym, z) > 0.0f) y_rock = ym; else y_air = ym;
+    }
+    ground = y_rock;
+    return true;
+}
+
 // --- layer 8: trees -----------------------------------------------------------
 // Cheapest test first. Most candidate cells are in a clearing or a treeless
 // biome and are rejected on the blend and the patch noise alone; the height,
@@ -402,30 +433,9 @@ bool tree_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTabl
     }
     if (pick >= nsp) TREE_NO(TREE_ALTITUDE);
 
-    // Stand the trunk on the REAL surface. Layer 6's overhang term moves the
-    // ground off the 2.5D height by up to strength * overhang_scale, a few
-    // metres in a forest. Testing for air and rock 0.75 m either side of h
-    // rejected 80% of forest candidates that had passed everything else
-    // (validate --tree-reasons). So bracket the crossing within that
-    // displacement, walking down from above it in 1 m steps, and bisect.
-    float ov = 0.0f;
-    for (int k = 0; k < nb; ++k) ov = ov + bw[k] * table[bio[k]].overhang_strength;
-    ov = ov * wp.overhang_scale + 1.0f;
-    float y_air = h + ov;
-    if (terrain_density(w, wp, table, x, y_air, z) > 0.0f) TREE_NO(TREE_SURFACE);
-    float y_rock = y_air;
-    bool found = false;
-    while (y_rock > h - ov) {
-        y_rock = y_rock - 1.0f;
-        if (terrain_density(w, wp, table, x, y_rock, z) > 0.0f) { found = true; break; }
-        y_air = y_rock;
-    }
-    if (!found) TREE_NO(TREE_SURFACE);
-    for (int it = 0; it < 8; ++it) {
-        const float ym = 0.5f * (y_air + y_rock);
-        if (terrain_density(w, wp, table, x, ym, z) > 0.0f) y_rock = ym; else y_air = ym;
-    }
-    const float ground = y_rock;
+    // Stand the trunk on the REAL surface (real_ground, above).
+    float ground = 0.0f;
+    if (!real_ground(w, wp, table, x, z, h, nb, bio, bw, ground)) TREE_NO(TREE_SURFACE);
     // No roof: a tree under an overhang would grow through it.
     if (terrain_density(w, wp, table, x, ground + 3.0f, z) > 0.0f) TREE_NO(TREE_SURFACE);
     if (terrain_density(w, wp, table, x, ground + 8.0f, z) > 0.0f) TREE_NO(TREE_SURFACE);
@@ -454,6 +464,145 @@ void trees_in_cells(const SeedWorld& w, const WorldParams& wp, const ArchetypeTa
     for (int j = j0; j < j1; ++j) {
         for (int i = i0; i < i1; ++i) {
             if (tree_at_cell(w, wp, table, i, j, t)) out.push_back(t);
+        }
+    }
+}
+
+// --- layer 9: rocks -------------------------------------------------------------
+// Layer 8's shape: hashed rolls per cell, biome properties blended across a
+// border, the real surface. Then two exclusions the trees do not need: a
+// rock keeps clear of every trunk (trees are pinned, so rocks give way), and
+// a boulder keeps clear of every outcrop.
+bool rock_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
+                  int kind, int i, int j, RockInstance& out, int* reason) {
+#define ROCK_NO(r) do { if (reason) *reason = (r); return false; } while (0)
+    const RockTable& rt = table.rocks;
+    if (!rt.present) ROCK_NO(ROCK_NO_LAND);
+    const RockClass& rc = kind == 0 ? rt.boulder : rt.outcrop;
+    const uint32_t k0 = kind == 0 ? 0u : 16u;   // each class its own rolls
+
+    const float u_x = tree_unit(tree_hash(i, j, w.s_rocks, k0 + 0u));
+    const float u_z = tree_unit(tree_hash(i, j, w.s_rocks, k0 + 1u));
+    const float x = (static_cast<float>(i) + 0.1f + 0.8f * u_x) * rc.cell;
+    const float z = (static_cast<float>(j) + 0.1f + 0.8f * u_z) * rc.cell;
+    if (x * x + z * z > wp.radius * wp.radius) ROCK_NO(ROCK_OUTSIDE);
+
+    int   bio[4];
+    float bw[4];
+    const int nb = biome_mix(w, wp, x, z, bio, bw);
+    if (nb == 0) ROCK_NO(ROCK_NO_LAND);
+    {
+        float land = 0.0f, sharp = 0.0f;
+        float sw[4];
+        for (int k = 0; k < nb; ++k) {
+            land = land + bw[k];
+            float p = 1.0f;
+            for (int e = 0; e < rt.blend_sharpen; ++e) p = p * bw[k];
+            sw[k] = p;
+            sharp = sharp + p;
+        }
+        if (sharp > 0.0f) {
+            for (int k = 0; k < nb; ++k) bw[k] = sw[k] / sharp * land;
+        }
+    }
+    float density = 0.0f;
+    int dom = 0;
+    for (int k = 0; k < nb; ++k) {
+        if (bw[k] > bw[dom]) dom = k;
+        const BiomeArchetype& a = table[bio[k]];
+        const float d = kind == 0 ? a.rock_boulders : a.rock_outcrops;
+        if (d <= 0.0f) continue;
+        const float patch = tree_patch(x, z, rt.patch_freq, a.rock_cover, rt.patch_edge, w.s_rock_patch);
+        density = density + bw[k] * d * patch;
+    }
+    if (density <= 0.0f) ROCK_NO(ROCK_CLEARING);
+    if (tree_unit(tree_hash(i, j, w.s_rocks, k0 + 2u)) >= density) ROCK_NO(ROCK_ROLL);
+
+    // Sizes skewed to the small end: a cube of a uniform.
+    const float u_s = tree_unit(tree_hash(i, j, w.s_rocks, k0 + 3u));
+    const float size = rc.size_min + (rc.size_max - rc.size_min) * (u_s * u_s * u_s);
+    const float rad = 0.45f * size;
+
+    const float r = std::sqrt(x * x + z * z) / wp.radius;
+    const float h = terrain_height(w, wp, table, x, z, r);
+    if (h < table.sea_level + rt.shore) ROCK_NO(ROCK_SHORE);
+    const float e = rad > 1.0f ? rad : 1.0f;
+    const float hx = terrain_height(w, wp, table, x + e, z, r) - terrain_height(w, wp, table, x - e, z, r);
+    const float hz = terrain_height(w, wp, table, x, z + e, r) - terrain_height(w, wp, table, x, z - e, r);
+    const float slope = std::sqrt((hx * hx + hz * hz) / (4.0f * e * e));
+    if (slope > rc.max_slope) ROCK_NO(ROCK_SLOPE);
+    if (rc.slope_hi > rc.slope_lo) {
+        float want = (slope - rc.slope_lo) / (rc.slope_hi - rc.slope_lo);
+        want = want < 0.0f ? 0.0f : (want > 1.0f ? 1.0f : want);
+        if (tree_unit(tree_hash(i, j, w.s_rocks, k0 + 4u)) >= want) ROCK_NO(ROCK_SLOPE);
+    }
+    float rw = 0.0f, rd = 0.0f;
+    // Two statements: see the river exclusion in tree_at_cell.
+    const float river_d = nearest_river(w, wp, x, z, rw, rd);
+    if (river_d < rw + rad + 1.0f) ROCK_NO(ROCK_RIVER);
+
+    float ground = 0.0f;
+    if (!real_ground(w, wp, table, x, z, h, nb, bio, bw, ground)) ROCK_NO(ROCK_SURFACE);
+    // No roof over it.
+    if (terrain_density(w, wp, table, x, ground + size + 1.0f, z) > 0.0f) ROCK_NO(ROCK_SURFACE);
+
+    // Clear of every trunk: the tree cells whose jitter box can reach.
+    {
+        const float tc = table.trees.cell;
+        const float reach = rad + 0.6f;
+        const int ti0 = static_cast<int>(std::floor((x - reach) / tc));
+        const int ti1 = static_cast<int>(std::floor((x + reach) / tc));
+        const int tj0 = static_cast<int>(std::floor((z - reach) / tc));
+        const int tj1 = static_cast<int>(std::floor((z + reach) / tc));
+        for (int tj = tj0; tj <= tj1; ++tj) {
+            for (int ti = ti0; ti <= ti1; ++ti) {
+                TreeInstance t;
+                if (!tree_at_cell(w, wp, table, ti, tj, t)) continue;
+                const float dx = t.x - x, dz = t.z - z;
+                if (dx * dx + dz * dz < reach * reach) ROCK_NO(ROCK_TREE);
+            }
+        }
+    }
+    // A boulder clear of every outcrop.
+    if (kind == 0) {
+        const RockClass& oc = rt.outcrop;
+        const float reach = rad + 0.45f * oc.size_max;
+        const int oi0 = static_cast<int>(std::floor((x - reach) / oc.cell));
+        const int oi1 = static_cast<int>(std::floor((x + reach) / oc.cell));
+        const int oj0 = static_cast<int>(std::floor((z - reach) / oc.cell));
+        const int oj1 = static_cast<int>(std::floor((z + reach) / oc.cell));
+        for (int oj = oj0; oj <= oj1; ++oj) {
+            for (int oi = oi0; oi <= oi1; ++oi) {
+                RockInstance o;
+                if (!rock_at_cell(w, wp, table, 1, oi, oj, o)) continue;
+                const float dx = o.x - x, dz = o.z - z;
+                const float lim = rad + 0.45f * o.size;
+                if (dx * dx + dz * dz < lim * lim) ROCK_NO(ROCK_OUTCROP);
+            }
+        }
+    }
+
+    out.x = x;
+    out.y = ground - rc.sink * size;
+    out.z = z;
+    out.size = size;
+    out.yaw01 = tree_unit(tree_hash(i, j, w.s_rocks, k0 + 5u));
+    out.tilt01 = tree_unit(tree_hash(i, j, w.s_rocks, k0 + 6u));
+    out.id = rock_id(kind, i, j);
+    out.kind = static_cast<uint8_t>(kind);
+    out.variant = static_cast<uint8_t>(tree_hash(i, j, w.s_rocks, k0 + 7u) & 0xFFu);
+    out.biome = static_cast<uint16_t>(bio[dom]);
+    if (reason) *reason = ROCK_KEPT;
+    return true;
+#undef ROCK_NO
+}
+
+void rocks_in_cells(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
+                    int kind, int i0, int j0, int i1, int j1, std::vector<RockInstance>& out) {
+    RockInstance r;
+    for (int j = j0; j < j1; ++j) {
+        for (int i = i0; i < i1; ++i) {
+            if (rock_at_cell(w, wp, table, kind, i, j, r)) out.push_back(r);
         }
     }
 }
@@ -835,6 +984,8 @@ SeedWorld build_world(uint64_t world_seed,
     w.s_entrance = feature_seed(world_seed, FEATURE_ENTRANCE);
     w.s_trees = feature_seed(world_seed, FEATURE_TREES);
     w.s_tree_patch = feature_seed(world_seed, FEATURE_TREE_PATCH);
+    w.s_rocks = feature_seed(world_seed, FEATURE_ROCKS);
+    w.s_rock_patch = feature_seed(world_seed, FEATURE_ROCK_PATCH);
     const uint32_t s_cont = w.s_cont, s_dang = w.s_dang, s_wx = w.s_wx, s_wz = w.s_wz;
     const uint32_t s_cell = feature_seed(world_seed, FEATURE_CELLS);
 

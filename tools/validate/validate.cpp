@@ -80,12 +80,17 @@ struct SeedResult {
     std::vector<double> tree_count;   // per biome
     std::vector<double> tree_area;    // m^2 sampled per biome
     int   golden_trees = 0;           // trees that went into the hash
+    // Layer 9, sampled the same way per class (0 boulders, 1 outcrops).
+    std::vector<double> rock_count[2];
+    std::vector<double> rock_area[2];
+    int   golden_rocks = 0;           // rocks that went into the hash
+    int   rocks_unseated = 0;         // pinned rocks whose ground is not air over rock
     uint64_t hash = 0;
     // The same hash, split by layer, computed alongside it: grid (layers 0,
-    // 1, 4-6 sampled), biomes (layer 3), entrances (7), trees (8). When the
+    // 1, 4-6 sampled), biomes (layer 3), entrances (7), trees (8), rocks (9). When the
     // gate fails these say WHICH layer moved; on a two-OS split that is the
     // difference between a day of guessing and one CI run.
-    uint64_t layer_hash[4] = {0, 0, 0, 0};
+    uint64_t layer_hash[5] = {0, 0, 0, 0, 0};
     uint64_t river_hash = 0;          // the layer-5 segment buffer, bit-exact
     int      river_count = 0;
     std::string tree_dump;            // the first trees hashed, bit-exact
@@ -508,13 +513,44 @@ static SeedResult eval_seed(uint64_t world_seed,
         }
     }
 
+    // --- layer 9: rocks, sampled per biome, as the trees are ---
+    {
+        for (int kind = 0; kind < 2; ++kind) {
+            out.rock_count[kind].assign(nb, 0.0);
+            out.rock_area[kind].assign(nb, 0.0);
+            if (!table.rocks.present) continue;
+            const float cell = kind == 0 ? table.rocks.boulder.cell : table.rocks.outcrop.cell;
+            const int half = kind == 0 ? 4 : 1;
+            for (int i = 0; i < n; ++i) {
+                if (biome[i] < 0) continue;
+                const int ci = static_cast<int>(std::floor(w.pts[i].first / cell));
+                const int cj = static_cast<int>(std::floor(w.pts[i].second / cell));
+                for (int jj = cj - half; jj < cj + half; ++jj) {
+                    for (int ii = ci - half; ii < ci + half; ++ii) {
+                        const float cx = (ii + 0.5f) * cell, cz = (jj + 0.5f) * cell;
+                        int bb[4];
+                        float bw[4];
+                        const int m = biome_mix(w, wp, cx, cz, bb, bw);
+                        if (m == 0) continue;
+                        int dom = 0;
+                        for (int k = 1; k < m; ++k) if (bw[k] > bw[dom]) dom = k;
+                        RockInstance rk;
+                        if (rock_at_cell(w, wp, table, kind, ii, jj, rk)) out.rock_count[kind][bb[dom]] += 1.0;
+                        out.rock_area[kind][bb[dom]] += cell * cell;
+                    }
+                }
+            }
+        }
+    }
+
     // --- determinism hash ---
     // Layers 0 and 1 on a fixed grid, plus the layer-3 assignment. Quantised,
     // because the point is to catch a changed generator, not float noise.
     {
         uint64_t h = 0xCBF29CE484222325ull;
-        uint64_t lh[4] = {0xCBF29CE484222325ull, 0xCBF29CE484222325ull,
-                          0xCBF29CE484222325ull, 0xCBF29CE484222325ull};
+        uint64_t lh[5] = {0xCBF29CE484222325ull, 0xCBF29CE484222325ull,
+                          0xCBF29CE484222325ull, 0xCBF29CE484222325ull,
+                          0xCBF29CE484222325ull};
         const int HG = 256;
         const float R = wp.radius, hstep = 2.0f * R / HG;
         for (int gj = 0; gj < HG; ++gj) {
@@ -647,8 +683,46 @@ static SeedResult eval_seed(uint64_t world_seed,
                 }
             }
         }
+        // Layer 9 by its instances, as layer 8: at the same first 24 land
+        // sites, boulders over a 64 m tile and outcrops over 3 x 3 of their
+        // cells. Each pinned rock's ground must also be air over rock: the
+        // bisection put it there, and a sign error would bury or float it.
+        if (table.rocks.present) {
+            std::vector<RockInstance> rs;
+            int tiles = 0;
+            for (int i = 0; i < n && tiles < 24; ++i) {
+                if (biome[i] < 0) continue;
+                ++tiles;
+                for (int kind = 0; kind < 2; ++kind) {
+                    const RockClass& rc = kind == 0 ? table.rocks.boulder : table.rocks.outcrop;
+                    const int half = kind == 0 ? 4 : 1;
+                    const int ci = static_cast<int>(std::floor(w.pts[i].first / rc.cell));
+                    const int cj = static_cast<int>(std::floor(w.pts[i].second / rc.cell));
+                    rs.clear();
+                    rocks_in_cells(w, wp, table, kind, ci - half, cj - half, ci + half, cj + half, rs);
+                    h = fnv1a(h, static_cast<uint64_t>(rs.size()));
+                    lh[4] = fnv1a(lh[4], static_cast<uint64_t>(rs.size()));
+                    for (size_t m = 0; m < rs.size(); ++m) {
+                        const RockInstance& rk = rs[m];
+                        const uint64_t q[6] = {
+                            static_cast<uint64_t>(rk.id),
+                            (static_cast<uint64_t>(rk.variant) << 16) | rk.biome,
+                            static_cast<uint64_t>(static_cast<int64_t>(rk.x * 64.0f)),
+                            static_cast<uint64_t>(static_cast<int64_t>(rk.y * 64.0f)),
+                            static_cast<uint64_t>(static_cast<int64_t>(rk.z * 64.0f)),
+                            static_cast<uint64_t>(static_cast<int64_t>(rk.size * 64.0f))};
+                        for (int k = 0; k < 6; ++k) { h = fnv1a(h, q[k]); lh[4] = fnv1a(lh[4], q[k]); }
+                        h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(rk.yaw01 * 4096.0f)));
+                        const float gy = rk.y + rc.sink * rk.size;
+                        if (terrain_density(w, wp, table, rk.x, gy + 0.05f, rk.z) > 0.0f ||
+                            terrain_density(w, wp, table, rk.x, gy - 0.05f, rk.z) <= 0.0f) ++out.rocks_unseated;
+                    }
+                    out.golden_rocks += static_cast<int>(rs.size());
+                }
+            }
+        }
         out.hash = h;
-        for (int k = 0; k < 4; ++k) out.layer_hash[k] = lh[k];
+        for (int k = 0; k < 5; ++k) out.layer_hash[k] = lh[k];
         // Rivers by their buffer, NOT in the pinned hash: a diagnostic. The
         // grid samples every 78 m and can miss a channel 38 m wide.
         {
@@ -751,6 +825,11 @@ struct Summary {
     float tree_spearman = 0.0f;
     int   tree_bare_seeds = 0;        // seeds where a treed biome grew nothing
     float mean_golden_trees = 0.0f;
+    std::vector<double> rock_per_ha[2];  // per biome and class, mean over seeds that have it
+    std::vector<int>    rock_seeds[2];
+    int   rock_failures = 0;
+    int   rocks_unseated = 0;
+    float mean_golden_rocks = 0.0f;
     float min_home_share = 2.0f;     // islandness: measured, not asserted
     float mean_home_share = 0.0f;
     float mean_landmasses = 0.0f;
@@ -848,6 +927,19 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
                 r.tree_area[b] >= 20000.0 && r.tree_count[b] == 0.0) ++sm.tree_bare_seeds;
         }
         sm.mean_golden_trees += r.golden_trees;
+        for (int kind = 0; kind < 2; ++kind) {
+            if (sm.rock_per_ha[kind].empty()) {
+                sm.rock_per_ha[kind].assign(table.size(), 0.0);
+                sm.rock_seeds[kind].assign(table.size(), 0);
+            }
+            for (size_t b = 0; b < table.size() && b < r.rock_area[kind].size(); ++b) {
+                if (r.rock_area[kind][b] <= 0.0) continue;
+                sm.rock_per_ha[kind][b] += r.rock_count[kind][b] / r.rock_area[kind][b] * 10000.0;
+                ++sm.rock_seeds[kind][b];
+            }
+        }
+        sm.mean_golden_rocks += r.golden_rocks;
+        sm.rocks_unseated += r.rocks_unseated;
         sm.min_home_share = std::min(sm.min_home_share, r.home_share);
         sm.mean_home_share += r.home_share;
         sm.mean_landmasses += r.landmasses;
@@ -883,6 +975,29 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
     sm.mean_relaxed *= inv; sm.mean_overflow *= inv; sm.mean_candidates *= inv;
     sm.mean_river_segments *= inv;
     sm.mean_golden_trees *= inv;
+    sm.mean_golden_rocks *= inv;
+    // Rocks: every biome configured with a class grows some of it (mean over
+    // the seeds it appeared in), none configured without grows more than a
+    // trace from a neighbour's blend, and every pinned rock is seated.
+    if (table.rocks.present) {
+        int fails = 0;
+        for (int kind = 0; kind < 2; ++kind) {
+            double max_ha = 0.0;
+            for (size_t b = 0; b < sm.rock_per_ha[kind].size(); ++b) {
+                if (sm.rock_seeds[kind][b] > 0) sm.rock_per_ha[kind][b] /= sm.rock_seeds[kind][b];
+                if (sm.rock_per_ha[kind][b] > max_ha) max_ha = sm.rock_per_ha[kind][b];
+            }
+            for (size_t b = 0; b < sm.rock_per_ha[kind].size(); ++b) {
+                if (sm.rock_seeds[kind][b] == 0) continue;
+                const float d = kind == 0 ? table[b].rock_boulders : table[b].rock_outcrops;
+                const double cfg = d * table[b].rock_cover;
+                if (cfg > 0.0 && sm.rock_per_ha[kind][b] <= 0.0) ++fails;
+                if (cfg <= 0.0 && sm.rock_per_ha[kind][b] > 0.05 * max_ha) ++fails;
+            }
+        }
+        if (sm.rocks_unseated > 0) ++fails;
+        sm.rock_failures = fails;
+    }
     // Trees: what each biome actually grew, against what it was configured to
     // grow (density x cover, the expected share of candidate cells). The
     // configured ranking must survive into the world: altitude, slope, shore
@@ -1210,7 +1325,7 @@ static const int kGoldenSeeds = 8;
 // independent build_world with its own per-feature seeds (invariant 4), and
 // if that were ever untrue this is the one check that would say so.
 // Per-layer hashes and seed 0's first trees, from the last golden_hashes.
-static uint64_t g_layer_hash[kGoldenSeeds][4];
+static uint64_t g_layer_hash[kGoldenSeeds][5];
 static std::string g_seed0_trees;
 static uint64_t g_river_hash[kGoldenSeeds];
 static int g_river_count[kGoldenSeeds];
@@ -1232,7 +1347,7 @@ static void golden_hashes(const WorldParams& wp, const ArchetypeTable& table,
                  i += static_cast<int>(nthreads)) {
                 const SeedResult r = eval_seed(static_cast<uint64_t>(i), gw, table, ap);
                 hashes[i] = r.hash;
-                for (int k = 0; k < 4; ++k) g_layer_hash[i][k] = r.layer_hash[k];
+                for (int k = 0; k < 5; ++k) g_layer_hash[i][k] = r.layer_hash[k];
                 g_river_hash[i] = r.river_hash;
                 g_river_count[i] = r.river_count;
                 if (i == 0) g_seed0_trees = r.tree_dump + "    seed 0's tiles:\n" + r.tile_dump;
@@ -1346,16 +1461,17 @@ static int run_golden_gate(const WorldParams& wp, const ArchetypeTable& table,
                         static_cast<unsigned long long>(g.seeds[i].second),
                         static_cast<unsigned long long>(now[i].second));
         }
-        std::printf("\n  By layer (grid / biomes / entrances / trees), to compare with\n"
+        std::printf("\n  By layer (grid / biomes / entrances / trees / rocks), to compare with\n"
                     "  a build that agrees with the pin -- the layer that differs is\n"
                     "  the one that moved:\n");
         for (size_t i = 0; i < now.size(); ++i) {
-            std::printf("    seed %llu: %016llx %016llx %016llx %016llx\n",
+            std::printf("    seed %llu: %016llx %016llx %016llx %016llx %016llx\n",
                         static_cast<unsigned long long>(now[i].first),
                         static_cast<unsigned long long>(g_layer_hash[i][0]),
                         static_cast<unsigned long long>(g_layer_hash[i][1]),
                         static_cast<unsigned long long>(g_layer_hash[i][2]),
-                        static_cast<unsigned long long>(g_layer_hash[i][3]));
+                        static_cast<unsigned long long>(g_layer_hash[i][3]),
+                        static_cast<unsigned long long>(g_layer_hash[i][4]));
         }
         for (size_t i = 0; i < now.size(); ++i)
             std::printf("    seed %llu rivers: %d segments, %016llx\n", static_cast<unsigned long long>(now[i].first),
@@ -1372,12 +1488,13 @@ static int run_golden_gate(const WorldParams& wp, const ArchetypeTable& table,
                 static_cast<int>(now.size()), kGeneratorVersion);
     if (std::getenv("VALIDATE_LAYER_HASHES")) {
         for (size_t i = 0; i < now.size(); ++i) {
-            std::printf("    seed %llu: %016llx %016llx %016llx %016llx\n",
+            std::printf("    seed %llu: %016llx %016llx %016llx %016llx %016llx\n",
                         static_cast<unsigned long long>(now[i].first),
                         static_cast<unsigned long long>(g_layer_hash[i][0]),
                         static_cast<unsigned long long>(g_layer_hash[i][1]),
                         static_cast<unsigned long long>(g_layer_hash[i][2]),
-                        static_cast<unsigned long long>(g_layer_hash[i][3]));
+                        static_cast<unsigned long long>(g_layer_hash[i][3]),
+                        static_cast<unsigned long long>(g_layer_hash[i][4]));
         }
         for (size_t i = 0; i < now.size(); ++i)
             std::printf("    seed %llu rivers: %d segments, %016llx\n", static_cast<unsigned long long>(now[i].first),
@@ -2214,6 +2331,18 @@ int main(int argc, char** argv) {
                           per.c_str(), s.tree_spearman, s.tree_bare_seeds, s.mean_golden_trees);
             line("trees", s.tree_failures == 0, d);
         }
+        if (table.rocks.present) {
+            std::string per;
+            for (size_t b = 0; b < table.size() && b < s.rock_per_ha[0].size(); ++b) {
+                char one[80];
+                std::snprintf(one, sizeof(one), "%s%s %.1f/%.2f", b ? ", " : "", table[b].name.c_str(),
+                              s.rock_per_ha[0][b], s.rock_per_ha[1][b]);
+                per += one;
+            }
+            std::snprintf(d, sizeof(d), "boulders/outcrops per ha %s; %d unseated, %.0f rocks hashed/seed",
+                          per.c_str(), s.rocks_unseated, s.mean_golden_rocks);
+            line("rocks", s.rock_failures == 0, d);
+        }
         if (caves_enabled(table)) {
             std::snprintf(d, sizeof(d), "%.1f shafts/seed (min %d, floor 8), reaching cave air "
                           "%.0f m down; %d mouths sealed, %d sampled segments still solid",
@@ -2256,6 +2385,7 @@ int main(int argc, char** argv) {
                          land_mean_ok &&
                          s.river_failures == 0 && s.lod_failures == 0 &&
                          s.seam_failures == 0 && s.tree_failures == 0 &&
+                         s.rock_failures == 0 &&
                          // It printed FAIL and never failed the run: the
                          // entrance check was missing from this conjunction.
                          s.entrance_failures == 0 &&
