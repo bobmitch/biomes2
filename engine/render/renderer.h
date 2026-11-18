@@ -27,6 +27,7 @@
 #include "engine/render/height_gi.h"
 #include "engine/render/far_shadow.h"
 #include "engine/render/scan_library.h"
+#include "engine/render/forest_map.h"
 #include "engine/rocks/rock_field.h"
 #include "engine/rocks/rock_renderer.h"
 
@@ -210,6 +211,8 @@ public:
     RockField&             rock_field() { return rock_field_; }
     RockRenderer&          rocks() { return rocks_; }
     void set_rocks(bool on) { rocks_on_ = on; }
+    // The canopy shell past the trees' draw distance (forest_map.h; --no-forest-shell).
+    void set_forest_shell(bool on) { forest_on_ = on; }
     const TreeRenderer&    trees() const { return trees_; }
     TreeDrawSettings&      tree_settings() { return tree_settings_; }
     void set_trees(bool on) { trees_on_ = on; }
@@ -529,6 +532,8 @@ private:
     HeightGi hfgi_;
     FarShadow far_;
     ScanLibrary scans_;
+    ForestMap forest_;
+    bool forest_on_ = true;
     bool far_on_ = true;
     void record_far(const float vp[16]);
     bool hfgi_on_ = true;

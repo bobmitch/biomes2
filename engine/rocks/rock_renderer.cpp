@@ -199,9 +199,12 @@ void RockRenderer::prepare(UINT frame, const std::vector<worldgen::RockInstance>
         const float br = r.size * std::sqrt(rm.radius * rm.radius + 0.25f * rm.height * rm.height);
         const float dx = c[0] - cam[0], dy = c[1] - cam[1], dz = c[2] - cam[2];
         const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+        // Reach is horizontal, as the trees' and the shell's are; the level
+        // (below) is by 3D distance, which is what sets the size on screen.
+        const float dh = std::sqrt(dx * dx + dz * dz);
         const float sreach = r.kind == 0 ? kShadowBoulders : kShadowOutcrops;
-        if (d - br < sreach) shadow_idx.push_back(uint32_t(i) << 8 | (m * 2 + 1));
-        if (d - br > kDrawDist) continue;
+        if (dh - br < sreach) shadow_idx.push_back(uint32_t(i) << 8 | (m * 2 + 1));
+        if (dh - br > kDrawDist) continue;
         bool in = true;
         for (int p = 0; p < 6 && in; ++p)
             if (planes[p][0] * c[0] + planes[p][1] * c[1] + planes[p][2] * c[2] + planes[p][3] < -br) in = false;

@@ -109,7 +109,13 @@ void cs_cull(uint3 id : SV_DispatchThreadID) {
 
     const float3 dv = c - cam_pos;
     const float d = length(dv);
-    if (d - r > max_dist) return;
+    // The draw distance and its fade are HORIZONTAL, as the tile streamer and
+    // the canopy shell (forest.hlsli) measure theirs; the level is chosen by
+    // the 3D distance, which is what decides how big a tree is on screen.
+    // A 3D draw distance left a hole under a camera high in the air: trees
+    // below were past it while the shell, measured flat, had not begun.
+    const float dh = length(dv.xz);
+    if (dh - r > max_dist) return;
     [unroll] for (int k = 0; k < 6; ++k) {
         if (dot(frustum[k].xyz, c) + frustum[k].w < -r) return;
     }
@@ -129,7 +135,7 @@ void cs_cull(uint3 id : SV_DispatchThreadID) {
     // into all three at full detail, 2.9 ms of a forest frame. No fade bands:
     // a shadow does not need to cross-fade, and a dithered caster is holes.
     if (shadow_pass > 0.5f) {
-        if (d > max_dist) return;
+        if (dh > max_dist) return;
         uint lvl = d < lod0_dist ? 0u : (d < lod1_dist ? 1u : 2u);
         const uint floor_lvl = shadow_pass > 2.5f ? 2u : (shadow_pass > 1.5f ? 1u : 0u);
         lvl = max(lvl, floor_lvl);
@@ -141,7 +147,7 @@ void cs_cull(uint3 id : SV_DispatchThreadID) {
 
     // The far fade: the last 12% of the draw distance, dithered out.
     const float far_band = 0.12f * max_dist;
-    const float far_w = saturate((max_dist - d) / far_band);
+    const float far_w = saturate((max_dist - dh) / far_band);
 
     // Cross-fade bands at each level boundary, 15% of the boundary distance:
     // both levels draw, on complementary sides of one dither threshold.

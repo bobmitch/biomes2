@@ -72,7 +72,8 @@ fallback), `--gi-report` (DDGI at three views), `--lights-report` (ADR-004 L3: l
 configurations timed) and `--fell` (with `--fell-save` / `--fell-verify`).
 Every mode takes `--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
-`--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`, `--no-rocks`; `--shot` also
+`--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`, `--no-rocks`,
+`--no-forest-shell`; `--shot` also
 takes `--lights <n>` (campfires round the camera) and `--ground` (the
 `--cam` x and z at eye height on the ground). `--flight` also takes `--settle`, `--holes` and
 `--flight-speed <m/s>` and `--flight-from x y z`; `--shot` takes
@@ -603,6 +604,92 @@ from the same mesh split at `kCutHeight`. F6/F9 save/load `build/edits.bin`
 and `build/trees.bin` (same field id). `--fell` walks into a trunk, fells
 it and watches the log; `--fell-save` then `--fell-verify` in a second
 process checks the log is where it rested and the tree does not stand.
+
+### Far forest: the canopy shell
+
+Past the trees' draw distance the TERRAIN is the forest: lifted to the
+canopy and shaded as crowns wherever trees stand. Placing trees is the cost
+that grows with area (a CPU decision per 4 m cell), and nothing a kilometre
+away needs to be collidable, so the far forest is the placement's
+EXPECTATION rather than its draw.
+
+- **The forest map** (`engine/render/forest_map.{h,cpp}`): 1024^2 over the
+  disc (~20 m texels), baked once per seed on every core (~380 ms) from
+  layer 8's own terms short of the per-cell rolls -- the blend sharpened as
+  trees sharpen it, density x patch noise, the species' altitude fit (so the
+  treeline is the trees'), shore, slope and rivers. Per texel: cover
+  (crowns dropped at random, 1 - exp(-n x crown area)), mean canopy height,
+  conifer share, leaf albedo. Heap [70..71], t47..t48 in the terrain's
+  table.
+- **`BIOMES_FOREST_CHECK=1` checks the map against layer 8 itself**
+  (`build/forest_check.txt`): every 16th texel each way, every tree cell in
+  it through `tree_at_cell` -- trees grown against trees expected, texels
+  the map calls wood where layer 8 grew none (and the reverse), and what
+  rejected the cells. It found the visible wrong patches: rivers. Left out
+  at first as "narrower than a texel", channels up to ~40 m run through
+  woods, and the shell laid canopy straight over them -- 23 of 1558 sampled
+  texels wood-but-bare, their cells rejected mostly by `river`. The map now
+  removes the share of each texel inside a channel's width + 1 m (layer 8's
+  own rule): 23 -> 3, the rest the rolls' own variance. The slope test
+  became a share falling off over 0.7-1.3 x the limit, not a cut on a
+  twenty-metre average: bare-but-wooded 11 -> 9. Trees grown / expected
+  0.92 -> 0.98. Bake ~380 ms (the river lookups).
+- **The shell** (`forest.hlsli`, `mesh.hlsl`): `vs_main` lifts up-facing
+  terrain by cover x height x 0.85, faded in from 75% to 100% of the tree
+  draw distance -- measured from the camera in the shadow constants, so
+  every pass that draws the terrain with `vs_main` lifts it the same way:
+  the cascades, the far terrain shadow and the heightfield GI's top-down
+  map all see the shell, and far woods cast long evening shadows. That
+  needed the terrain root's shadow CBV and table visible to the vertex
+  shader. Coming in from 88% to 130% left a pale band past the trees where
+  neither was whole.
+- **Shading as leaves.** `ps_main` blends the canopy over the ground by the
+  shell's weight, lit as `trees.hlsl` lights leaves -- `leaf_sun_light`
+  (wrap, transmission), diffuse GI, no specular. On the ground's BRDF it
+  read pale and blue beside the real trees: the specular reflected grey sky
+  that crowns do not. The sun and sky shares (`kShellSun` 0.7, `kShellSky`
+  0.85, leaves shading leaves) were matched over the shell's own footprint
+  against the trees drawn to 2 km, no mist, fixed exposure: real (88.9,
+  114.8, 71.1), shell (85.3, 114.9, 63.5) -- no tint needed. Measuring
+  with mist, or over boxes chosen by eye, moved nothing: the mist adds the
+  same grey to both, and the boxes held as much meadow as forest. The mask
+  came from a temporary view of the map's own cover and weight.
+- **Crowns** are jittered domes, one per cell, 7 m (4 m conifers), the
+  tallest winning where they overlap, each with its own tone, and leaf
+  clusters a fifth that size on them. Each scale fades into its average as
+  its pixel footprint grows -- a procedural mip chain. The first version's
+  value-noise bumps read as soft square blobs, low resolution beside the
+  real trees, and unfaded they aliased into ripples a kilometre out. Cover
+  goes through `smoothstep(0.15, 0.55)`: a wood's edge is a few metres and
+  the texels twenty, so bilinear cover blurred every edge and clump.
+- **The shell's sun comes from the FAR terrain shadow**, not the cascades:
+  it holds terrain and the lifted shell (drawn with `vs_main`) but no trees.
+  The shell already darkens itself for leaves shading leaves, and the
+  cascades also hold the real trees, whose last row cast onto the shell
+  behind it: a dark band between the trees and the shell. Weighting the
+  cascades by the shell's fade did not remove it -- the shadows fell
+  beyond the band.
+- **The trees' distance-fade dither walks per frame** (`keep_pixel`'s
+  `frame`, lit passes only), so TAA resolves a fading tree into a fade; the
+  fixed 4x4 screen door read as a checkerboard at the border.
+- **Cost**: walking within noise; a flight from 260 m, median 2.12 / 2.13
+  against 1.98 / 1.98 ms; startup +380 ms (the map bake).
+- **One metric for the hand-over: HORIZONTAL distance.** The trees' cull
+  (`tree_cull.hlsl`), their far fade, the rocks' reach and fade, the tile
+  streamers and the shell's band all measure distance flat; the trees' and
+  rocks' LEVEL is still chosen by 3D distance, which is what sets the size
+  on screen. The trees' draw distance used to be 3D while the shell's band
+  was flat, and from 650 m up the forest under the camera was bare: its
+  trees were past the draw distance, and the shell, measured flat, had not
+  begun. Cost nothing measurable: a flight at 260 m 2.12 ms as before, at
+  650 m 1.30 ms; walking unchanged.
+- **Seen, not fixed**: where the canopy ends at a clearing the lifted edge
+  is a steep wall shaded as ground, where real trees would show their
+  sides.
+- **Not done**: GPU-generated far cards (500-1500 m, for single trees on a
+  skyline from the air) -- the shell was expected to carry most of it, and
+  does; the RT scene and DDGI do not see the shell (it starts where they
+  stop mattering); no altitude gate was needed.
 
 ### Rocks
 

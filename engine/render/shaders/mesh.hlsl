@@ -30,6 +30,7 @@ StructuredBuffer<uint2> g_vertex_mat : register(t2);
 StructuredBuffer<uint3> g_vertex_wts : register(t3);
 
 #include "engine/render/shaders/scan.hlsli"
+#include "engine/render/shaders/forest.hlsli"
 
 cbuffer MeshConstants : register(b0) {
     row_major float4x4 view_proj;
@@ -73,8 +74,11 @@ float4 unpack_material(uint m) {
 VSOut vs_main(uint vid : SV_VertexID) {
     const Vertex v = g_vertices[vid];
     VSOut o;
-    o.clip = mul(float4(v.pos, 1.0f), view_proj);
-    o.world = v.pos;
+    // The canopy shell lifts far forest to its canopy (forest.hlsli). In
+    // every pass that draws the terrain, so its shadows come with it.
+    const float3 pos = v.pos + float3(0.0f, forest_lift(v.pos, v.nrm), 0.0f);
+    o.clip = mul(float4(pos, 1.0f), view_proj);
+    o.world = pos;
     o.nrm = v.nrm;
     // Indices are absolute, so the vertex id says which slot this is.
     o.fade = g_fade[vid / uint(slot_vertices)];
@@ -267,12 +271,44 @@ ScanResult scan_surface(VSOut i, float3 n, float level, float3 v, out float psh)
     return r;
 }
 
+// The canopy shell's crowns (forest.hlsli): a jittered dome per cell, the
+// tallest wins where they overlap, so crowns are round with dark gaps
+// between them rather than value noise's soft square blobs, which read as
+// low resolution beside the real trees. Returns the dome height (0 gap .. 1
+// top), its gradient in q units, and a per-crown random for its tone.
+float crown_dome(float2 q, out float2 grad, out float tone) {
+    const float2 c = floor(q);
+    float best = 0.0f;
+    grad = float2(0.0f, 0.0f);
+    tone = 0.5f;
+    [unroll] for (int j = -1; j <= 1; ++j) {
+        [unroll] for (int i = -1; i <= 1; ++i) {
+            const float2 cell = c + float2(i, j);
+            const float h0 = hash21(cell), h1 = hash21(cell + float2(37.0f, 11.0f));
+            const float h2 = hash21(cell + float2(-23.0f, 59.0f));
+            const float2 p = cell + 0.5f + 0.38f * float2(h0 * 2.0f - 1.0f, h1 * 2.0f - 1.0f);
+            const float r = 0.5f + 0.3f * h2;
+            const float2 dq = q - p;
+            const float h = 1.0f - dot(dq, dq) / (r * r);
+            if (h > best) {
+                best = h;
+                grad = -2.0f * dq / (r * r);
+                tone = h0;
+            }
+        }
+    }
+    return saturate(best);
+}
+
 // The heightfield GI's top-down view (height_gi.h): the terrain's albedo as
 // lighting sees it, ground or rock by slope. Fades and skirts do not matter
 // from above: the depth test keeps the top.
 float4 ps_top(VSOut i) : SV_Target0 {
     const float3 n = normalize(i.nrm);
-    return float4(lerp(i.rock.rgb, i.ground.rgb, smoothstep(0.62f, 0.86f, n.y)), 1.0f);
+    float3 albedo = lerp(i.rock.rgb, i.ground.rgb, smoothstep(0.62f, 0.86f, n.y));
+    const Forest f = forest_at(i.world);
+    albedo = lerp(albedo, f.leaf, f.cover * f.w * saturate((n.y - 0.55f) / 0.3f));
+    return float4(albedo, 1.0f);
 }
 
 SceneOut ps_main(VSOut i) {
@@ -319,6 +355,59 @@ SceneOut ps_main(VSOut i) {
         albedo = apply_surface_texture(mat.rgb, i.world, n);
     }
 
+    // The canopy shell (forest.hlsli): far forest as a surface of crowns,
+    // shaded the way trees.hlsl shades leaves -- wrapped diffuse and light
+    // through the leaves, no specular, skylight by diffuse GI alone -- then
+    // blended over the ground by the shell's weight. On the ground's BRDF a
+    // first version reflected grey-blue sky off the canopy that real crowns
+    // do not, and read pale beside the trees. A crown mass seen from above
+    // is also leaves shading leaves: kShellSun and kShellSky are the shares
+    // of sun and sky its surface takes, matched in a still against the
+    // trees drawn to 2 km. Crown-sized bumps while a crown spans a few
+    // pixels, faded into their average past it: unfaded, 6 m bumps aliased
+    // into ripples a kilometre out.
+    float  cw = 0.0f, shell_sun = 1.0f, shell_sky = 1.0f, shell_w = 0.0f;
+    float3 leaf_alb = 0.0f, leaf_n = n;
+    {
+        const Forest f = forest_at(i.world);
+        cw = f.cover * f.w * saturate((n.y - 0.55f) / 0.3f);
+        shell_w = f.w;
+        if (cw > 0.002f) {
+            // Two scales, each faded into its average as its pixel footprint
+            // grows -- a procedural mip chain: crowns ~7 m (4 m conifers),
+            // and leaf clusters a fifth of that on them.
+            const float sz = lerp(7.0f, 4.0f, f.conifer);
+            const float fp = length(fwidth(i.world.xz));
+            const float k = saturate(1.6f - 0.9f * fp / sz);           // crowns while ~2+ px across
+            const float k2 = saturate(1.6f - 0.9f * fp / (0.2f * sz)); // clusters likewise
+            float p = 0.5f, tone = 0.5f;
+            float3 cn = float3(0.0f, 1.0f, 0.0f);
+            if (k > 0.0f) {
+                float2 g;
+                p = crown_dome(i.world.xz / sz, g, tone);
+                // The dome's slope, crowns half as tall as they are wide.
+                cn = normalize(float3(-g.x * 0.5f, 1.0f, -g.y * 0.5f));
+                if (k2 > 0.0f) {
+                    const float2 q2 = i.world.xz / (0.2f * sz);
+                    const float c0 = value_noise(q2), cx = value_noise(q2 + float2(0.3f, 0.0f));
+                    const float cz = value_noise(q2 + float2(0.0f, 0.3f));
+                    p = saturate(p * (0.8f + 0.4f * lerp(0.5f, c0, k2)));
+                    cn = normalize(cn + k2 * float3(-(cx - c0) * 1.5f, 0.0f, -(cz - c0) * 1.5f));
+                }
+            }
+            // The average of a dome field's height is about a third; the
+            // shading below is calibrated round 0.5, so map it there.
+            const float pat = lerp(0.5f, saturate(p * 1.4f), k);
+            const float crown_tone = lerp(1.0f, 0.82f + 0.36f * tone, k);
+            leaf_alb = f.leaf * (0.7f + 0.6f * pat) * crown_tone;
+            leaf_n = normalize(lerp(float3(0.0f, 1.0f, 0.0f), cn, k));
+            shell_sun = kShellSun * (0.4f + 1.2f * pat);
+            shell_sky = kShellSky * (0.5f + pat);
+        } else {
+            cw = 0.0f;
+        }
+    }
+
     // Sun shadow: from the terrain itself and from the trees (shadow.hlsli).
     // The geometric normal decides it and offsets the lookup; the scan's
     // normal shades.
@@ -330,10 +419,28 @@ SceneOut ps_main(VSOut i) {
     // the shading normal was the mesh's, since N.L was <= 0 anyway -- so
     // every gentle dip facing away from the sun lit up as a golden oval,
     // unshadowed under a dark wood (fixed after the scans landed).
-    const float sh = lam > 0.0f ? shadow_factor(i.world, n) * psh * saturate(lam * 10.0f) : 0.0f;
+    // A canopy wraps the light round its crowns, so the shell looks up its
+    // shadow a little past the ground's terminator.
+    const float sf = (lam > 0.0f || (cw > 0.0f && lam > -0.3f)) ? shadow_factor(i.world, n) : 0.0f;
+    const float sh = lam > 0.0f ? sf * psh * saturate(lam * 10.0f) : 0.0f;
     const Surface s = make_surface(albedo, rough, ns, v);
     // Direct and ambient apart (scene_out.hlsli): the post chain shades
     // each with its own occlusion. The scan's occlusion is ambient only.
-    return scene_out(sun_light(s, sh), ambient_light(s, i.world) * ao + local_lights(s, i.world, i.clip),
+    float3 dir = sun_light(s, sh);
+    float3 amb = ambient_light(s, i.world) * ao + local_lights(s, i.world, i.clip);
+    if (cw > 0.0f) {
+        // The shell's sun comes from the FAR terrain shadow, which holds the
+        // terrain and the lifted shell but no trees -- not from the cascades.
+        // The shell already darkens itself for leaves shading leaves
+        // (kShellSun), and the cascades also hold the real trees: the last
+        // row of them cast their shadows onto the shell behind it, and the
+        // double darkening drew a band between the trees and the shell.
+        const float sf_shell = lam > -0.3f ? far_shadow(i.world) : 0.0f;
+        const float3 ldir = leaf_sun_light(leaf_alb, leaf_n, v, 0.6f, 0.7f, sf_shell * shell_sun) * 0.85f;
+        const float3 lamb = leaf_alb / kPi * gi_diffuse(i.world, leaf_n, v) * shell_sky;
+        dir = lerp(dir, ldir, cw);
+        amb = lerp(amb, lamb, cw);
+    }
+    return scene_out(dir, amb,
                      i.world, cam_pos, far_plane);
 }

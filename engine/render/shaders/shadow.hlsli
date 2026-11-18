@@ -52,6 +52,10 @@ cbuffer ShadowConstants : register(b2) {
     float4 shadow_scale;
     // The far terrain shadow (far_shadow.h): map corner x, z, extent; w on.
     float4 l_far;
+    // The canopy shell (forest_map.h, forest.hlsli): the map's corner x, z,
+    // extent, w on; then the band it fades in over, metres from the camera.
+    float4 l_forest;
+    float4 l_forest2;
 };
 
 Texture2DArray<float>  g_shadow     : register(t8);

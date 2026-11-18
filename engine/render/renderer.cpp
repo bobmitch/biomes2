@@ -74,8 +74,10 @@ struct ShadowConstants {
     float shadow_frame[4]; // the shadow filter's frame, for its rotation (shadow.hlsli)
     float scale[4];        // each cascade's share of its slice (its resolution / 4096)
     float far_map[4];      // the far terrain shadow (far_shadow.h): corner x, z, extent; w on
+    float forest[4];       // the canopy shell (forest_map.h): corner x, z, extent; w on
+    float forest2[4];      // ... the band it fades in over, metres from the camera
 };
-static_assert(sizeof(ShadowConstants) == 704, "ShadowConstants must match shadow.hlsli");
+static_assert(sizeof(ShadowConstants) == 736, "ShadowConstants must match shadow.hlsli");
 
 // Matches cbuffer ClusterConstants in lights.hlsl.
 struct ClusterConstants {
@@ -728,12 +730,19 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
         params[2].Descriptor.ShaderRegister = 1;
+        // Visible to the vertex shader too since the canopy shell, which
+        // lifts far terrain from the forest map (forest.hlsli).
         params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-        params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         params[3].Descriptor.ShaderRegister = 2;
         // The shadow table: the sun's map at heap [0], and since ADR-004 L3
         // the local lights' buffers and atlas at [24..28] (t20..t24).
-        D3D12_DESCRIPTOR_RANGE sr[8] = {};
+        D3D12_DESCRIPTOR_RANGE sr[9] = {};
+        // The forest map at [70..71] (t47..t48): the canopy shell.
+        sr[8].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[8].NumDescriptors = 2;
+        sr[8].BaseShaderRegister = 47;
+        sr[8].OffsetInDescriptorsFromTableStart = ForestMap::kSrvA;
         sr[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr[0].NumDescriptors = 1;
         sr[0].BaseShaderRegister = 8;
@@ -773,8 +782,8 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         sr[6].BaseShaderRegister = 43;
         sr[6].OffsetInDescriptorsFromTableStart = 65;
         params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        params[4].DescriptorTable.NumDescriptorRanges = 8;
+        params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[4].DescriptorTable.NumDescriptorRanges = 9;
         params[4].DescriptorTable.pDescriptorRanges = sr;
         // Each vertex's surface material (ADR-004 L1), parallel to t0.
         params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -1124,6 +1133,17 @@ void Renderer::record_shadows(const ViewConstants& view) {
     sc.shadow_frame[0] = float(post_frame_ % 1024u);
     sc.shadow_frame[1] = pom_on_ ? 1.0f : 0.0f;   // parallax on the scans (pom.hlsli)
     far_.constants(on && far_on_, sc.far_map);
+    if (forest_.ready() && forest_on_ && trees_on_) {
+        sc.forest[0] = sc.forest[1] = -0.5f * forest_.extent();
+        sc.forest[2] = forest_.extent();
+        sc.forest[3] = 1.0f;
+        // The shell is whole by the time the trees have gone: from 75% of
+        // their draw distance to 100% (their own fade is the last 12%). Coming
+        // in from 88% to 130% left a pale band past the trees where neither
+        // was at full strength.
+        sc.forest2[0] = 0.75f * tree_settings_.max_dist;
+        sc.forest2[1] = 1.00f * tree_settings_.max_dist;
+    }
     if (sc.far_map[3] > 0.5f && std::getenv("BIOMES_FAR_DBG")) sc.far_map[3] = 2.0f;   // the far map in place of the cascades, to judge it
     fill_light(sc.light);
     // BIOMES_GI_DBG splits DDGI's cost for A/B: 1 samples stale probes and
@@ -2879,6 +2899,14 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
             for (TreeLook& l : looks)
                 if (!l.bark_scan.empty()) scans_.lookup(l.bark_scan, l.bark, l.bark_layer, l.bark_inv_tile, l.bark_tint, l.bark_depth);
             startup_log().push_back(std::make_pair("phase: scans -- " + scans_.note(), startup_now_ms() - ts));
+        }
+        // The forest map for the canopy shell, from layer 8's own terms.
+        {
+            if (!forest_.build(world_, looks, device_.Get(), queue_.Get(), srv_heap_.Get(), error)) return false;
+            char line[160];
+            std::snprintf(line, sizeof line, "phase: forest map %dx%d, %.0f%% of land forested", ForestMap::kSize,
+                          ForestMap::kSize, 100.0f * forest_.forested_share());
+            startup_log().push_back(std::make_pair(std::string(line), forest_.bake_ms()));
         }
         if (!trees_.init(device_.Get(), queue_.Get(), looks, srv_heap_.Get(), 1, error)) return false;
         // The canopy map (ADR-004 L6) from the same models' crowns.

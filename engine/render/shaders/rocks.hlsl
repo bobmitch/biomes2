@@ -82,8 +82,9 @@ float4 ps_rock_top(VSOut i) : SV_Target0 {
 
 SceneOut ps_rock(VSOut i) {
     const float dist = length(cam_pos - i.world);
-    // A dithered fade over the last 12% of the draw distance.
-    const float fade = saturate((i.draw_dist - dist) / (0.12f * i.draw_dist));
+    // A dithered fade over the last 12% of the draw distance, measured flat
+    // like the draw distance itself (rock_renderer.cpp).
+    const float fade = saturate((i.draw_dist - length(cam_pos.xz - i.world.xz)) / (0.12f * i.draw_dist));
     clip(fade - rock_dither(i.clip.xy));
 
     const float3 n = normalize(i.nrm);

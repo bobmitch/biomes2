@@ -107,10 +107,15 @@ float3 qrot(float4 q, float3 v) {
     return v + q.w * t + cross(q.xyz, t);
 }
 
-bool keep_pixel(float2 px, uint packed) {
+// `frame` walks the dither from frame to frame in the lit passes, so TAA
+// resolves a fading tree into a smooth fade instead of a fixed screen-door
+// pattern -- at the far end of the draw distance that pattern read as a
+// checkerboard beside the canopy shell. Both sides of a level cross-fade
+// read the same frame, so they stay complementary. Shadow casters pass 0.
+bool keep_pixel(float2 px, uint packed, float frame) {
     const float w = float((packed >> 20) & 0xFFu) / 255.0f;
     const uint side = (packed >> 28) & 1u;
-    const float d = dither(px);
+    const float d = dither(px + 5.588238f * frame);
     return side == 0u ? d < w : d >= w;
 }
 
@@ -313,7 +318,7 @@ MeshOut vs_mesh(uint vid : SV_VertexID, uint iid : SV_InstanceID) { return mesh_
 MeshOut vs_mesh_shadow(uint vid : SV_VertexID, uint iid : SV_InstanceID) { return mesh_vertex(vid, iid, false); }
 
 SceneOut ps_mesh(MeshOut i, bool front : SV_IsFrontFace) {
-    if (!keep_pixel(i.clip.xy, i.packed)) discard;
+    if (!keep_pixel(i.clip.xy, i.packed, fmod(l_shadow_frame.x, 64.0f))) discard;
     // The cut: a log keeps the trunk above it, a stump below it.
     if (i.mode == 1u && i.kind < 0.5f) clip(i.local_y - cut_height + 0.002f);
     if (i.mode == 2u && i.kind < 0.5f) clip(cut_height + 0.002f - i.local_y);
@@ -375,7 +380,7 @@ static const float kImpostorShadowOpacity = 0.78f;
 // The mesh as a shadow caster: the same cut, the same leaf coverage, no
 // colour. Without the leaf test every card would cast a solid square.
 void ps_mesh_shadow(MeshOut i) {
-    if (!keep_pixel(i.clip.xy, i.packed)) discard;
+    if (!keep_pixel(i.clip.xy, i.packed, 0.0f)) discard;
     if (i.mode == 1u && i.kind < 0.5f) clip(i.local_y - cut_height + 0.002f);
     if (i.mode == 2u && i.kind < 0.5f) clip(cut_height + 0.002f - i.local_y);
     if (i.kind > 0.5f && i.kind < 2.5f) {
@@ -520,7 +525,7 @@ bool impostor_fetch(ImpOut i, float3 rd, out float4 acc_a, out float4 acc_n) {
 }
 
 SceneOut ps_impostor(ImpOut i) {
-    if (!keep_pixel(i.clip.xy, i.packed)) discard;
+    if (!keep_pixel(i.clip.xy, i.packed, fmod(l_shadow_frame.x, 64.0f))) discard;
     float4 acc_a, acc_n;
     if (!impostor_fetch(i, normalize(i.world - cam_pos), acc_a, acc_n)) discard;
     const float3 albedo = (acc_a.rgb / max(acc_a.a, 1e-4f)) * (0.9f + 0.2f * i.tint);
