@@ -863,6 +863,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (pdb != std::string::npos) g_renderer.set_post_debug(float(std::atof(c2.c_str() + pdb + 12)));
         const size_t fd = c2.find("--foliage-debug");
         if (fd != std::string::npos) g_renderer.foliage_settings().debug = float(std::atof(c2.c_str() + fd + 15));
+        {
+            const size_t gw = c2.find("--grass-width ");
+            if (gw != std::string::npos) g_renderer.foliage_settings().blade_width = float(std::atof(c2.c_str() + gw + 14));
+            const size_t gt = c2.find("--grass-tuft ");
+            if (gt != std::string::npos) g_renderer.foliage_settings().tuft = float(std::atof(c2.c_str() + gt + 13));
+            const size_t gd = c2.find("--grass-density ");
+            if (gd != std::string::npos) g_renderer.foliage_settings().max_blades = float(std::atof(c2.c_str() + gd + 16));
+        }
         // Where LOD 0 hands over to LOD 1, in metres: 0 shows LOD 1 up close.
         const size_t tl = c2.find("--tree-lod0");
         if (tl != std::string::npos) g_renderer.tree_settings().lod0_dist = float(std::atof(c2.c_str() + tl + 11));

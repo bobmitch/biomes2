@@ -38,7 +38,7 @@ struct FoliageFrame {
     float wind;         float far_plane;
     UINT  s_grass;      float grass_freq;
     float near_radius;  float debug;
-    float pad[2];
+    float blade_width;  float tuft;
 };
 static_assert(sizeof(FoliageFrame) == 272, "FoliageFrame must match foliage.hlsl");
 
@@ -351,19 +351,28 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         const uint32_t a = 2 * (S - 1);
         idx.push_back(a); idx.push_back(a + 1); idx.push_back(2 * S);
     };
-    blade(5);   // 27, at 0
-    blade(2);   // 9, at 27
-    for (uint32_t q = 0; q < 2; ++q) {   // 12, at 36
+    // A blade instance draws up to three blades, a tuft (foliage.hlsl's
+    // kTuftMax): the same strip three times, 2S + 1 vertices apart.
+    auto tuft = [&](uint32_t S) {
+        const size_t first = idx.size();
+        blade(S);
+        const size_t one = idx.size() - first;
+        for (uint32_t t = 1; t < 3; ++t)
+            for (size_t i = 0; i < one; ++i) idx.push_back(idx[first + i] + t * (2 * S + 1));
+    };
+    tuft(5);   // 81, at 0
+    tuft(2);   // 27, at 81
+    for (uint32_t q = 0; q < 2; ++q) {   // 12, at 108
         const uint32_t b = q * 4;
         const uint32_t t[6] = {b, b + 1, b + 2, b, b + 2, b + 3};
         idx.insert(idx.end(), t, t + 6);
     }
-    for (uint32_t c = 0; c < 14; ++c) {   // 84, at 48
+    for (uint32_t c = 0; c < 14; ++c) {   // 84, at 120
         const uint32_t b = c * 4;
         const uint32_t t[6] = {b, b + 1, b + 2, b, b + 2, b + 3};
         idx.insert(idx.end(), t, t + 6);
     }
-    if (idx.size() != 132) { error = "foliage index layout disagrees with foliage.hlsl"; return false; }
+    if (idx.size() != 204) { error = "foliage index layout disagrees with foliage.hlsl"; return false; }
     if (!make_buffer(device_, idx.size() * 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
                      D3D12_RESOURCE_STATE_GENERIC_READ, ib_, error, "foliage indices")) return false;
     {
@@ -477,6 +486,8 @@ void FoliageRenderer::record(ID3D12GraphicsCommandList* cmd, UINT frame, const F
     fr.card_near = s.card_near;
     fr.card_far = s.card_far;
     fr.max_blades = s.max_blades;
+    fr.blade_width = s.blade_width;
+    fr.tuft = s.tuft;
     fr.slot_count = kPool;
     fr.bake_count = static_cast<UINT>(bake_now_.size());
     fr.s_tree_patch = s_tree_patch_;
@@ -533,7 +544,7 @@ void FoliageRenderer::record(ID3D12GraphicsCommandList* cmd, UINT frame, const F
     cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     D3D12_INDEX_BUFFER_VIEW ibv = {};
     ibv.BufferLocation = ib_->GetGPUVirtualAddress();
-    ibv.SizeInBytes = 132 * 4;
+    ibv.SizeInBytes = 204 * 4;
     ibv.Format = DXGI_FORMAT_R32_UINT;
     cmd->IASetIndexBuffer(&ibv);
     ID3D12PipelineState* pso[4] = {blade_pso_.Get(), blade_pso_.Get(), card_pso_.Get(), bush_pso_.Get()};

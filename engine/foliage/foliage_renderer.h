@@ -33,6 +33,8 @@ struct FoliageSettings {
     float near_radius = 10.0f;   // full density inside this
     float wind = 1.0f;
     float debug = 0.0f;          // 1 tints by kind
+    float blade_width = 1.4f;    // a multiplier on every blade's width (--grass-width)
+    float tuft = 3.0f;           // blades per placed blade, fanned from one root, 1-3 (--grass-tuft)
 };
 
 struct FoliageFrameInputs {
@@ -46,6 +48,7 @@ struct FoliageFrameInputs {
 
 class FoliageRenderer {
 public:
+
     bool init(ID3D12Device* device, const WorldGpu* world, const char* archetypes_path,
               std::string& error);
     // Tiles to keep round (x, z). `settle` bakes every missing tile this

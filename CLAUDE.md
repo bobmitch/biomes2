@@ -815,6 +815,18 @@ longhand -- five heights and three density probes -- it exceeded FXC's 4096
 temp registers (X4505). One call site per field function, each in a
 `[loop]`, the probes as one loop with a little state machine.
 
+**Tufts.** A placed blade draws THREE (`tuft`, `kTuftMax` in `foliage.hlsl`;
+the index ranges hold three strips each): the placed one and two more 2.5-7
+cm off its root, each with its own angle, 65-105% of its height, leaning
+out -- one placement reads as a clump. Blades are also 1.4x as wide. The
+spawn meadow went from stems over pale ground to a sward. `--grass-tuft
+1|2|3`, `--grass-width <k>`, `--grass-density <blades/m^2>` (96) for A/B.
+Cost walking at 2560 x 1440: all ground cover ~1.0 ms (5.19 with
+`--no-foliage`, 6.23 before); tufts of 3 +0.26, with the width +0.32,
+tufts of 2 with the width +0.18. Tinting the terrain under grass toward
+the sward (a 256 m grass map from the cells, read by the terrain shader)
+was built and judged not to look right; left for a later quality pass.
+
 Not handled: grass does not know about dig edits, and floats over a dug hole.
 
 ### The frame: HDR targets and the post chain

@@ -34,6 +34,7 @@ cbuffer FoliageFrame : register(b0) {
     float  wind;        float far_plane;
     uint   s_grass;     float grass_freq;
     float  near_radius; float debug;
+    float  blade_width; float tuft;      // width multiplier; blades a blade instance draws, fanned from one root (1-3)
 };
 
 cbuffer DrawConst : register(b3) { uint g_segments; };
@@ -69,9 +70,11 @@ RWStructuredBuffer<uint>  g_args     : register(u6);   // 4 x DRAW_INDEXED
 
 static const uint kTile = 16;
 static const uint kCaps[4] = {400000u, 400000u, 160000u, 40000u};
-// Index ranges in the shared index buffer, set by FoliageRenderer.
-static const uint kIdxFirst[4] = {0u, 27u, 36u, 48u};
-static const uint kIdxCount[4] = {27u, 9u, 12u, 84u};
+// Index ranges in the shared index buffer, set by FoliageRenderer. A blade
+// instance's range holds kTuftMax blades; vs_blade collapses those past `tuft`.
+static const uint kTuftMax = 3u;
+static const uint kIdxFirst[4] = {0u, 81u, 108u, 120u};
+static const uint kIdxCount[4] = {81u, 27u, 12u, 84u};
 
 uint pack8(float v) { return uint(saturate(v) * 255.0f + 0.5f); }
 float unpack8(uint v, uint shift) { return float((v >> shift) & 0xFFu) / 255.0f; }
@@ -369,14 +372,37 @@ float blade_fade(float d) {
     return saturate((blade_range - d) / max(blade_range - card_near, 1.0f));
 }
 
-FolOut vs_blade(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
-    const Blade b = g_list[iid];
+FolOut vs_blade(uint vid_all : SV_VertexID, uint iid : SV_InstanceID) {
+    Blade b = g_list[iid];
     const uint S = g_segments;
+    // A TUFT: up to kTuftMax blades from one instance, each 2S + 1 vertices.
+    // The first is the placed blade; the others stand a few centimetres off
+    // its root at their own angle and height, leaning out, so one placement
+    // reads as a clump rather than a lone stem.
+    const uint per = 2u * S + 1u;
+    const uint bi = vid_all / per, vid = vid_all - bi * per;
+    float hmul = 1.0f, lean_out = 0.0f;
+    float3 lean_dir = 0.0f;
+    if (bi > 0u) {
+        if (float(bi) >= tuft) {
+            FolOut z = (FolOut)0;
+            z.clip = float4(0.0f, 0.0f, 0.0f, 1.0f);   // collapsed: a zero-area triangle
+            return z;
+        }
+        const uint hs = fhash(b.seed, 31u + bi);
+        const float oa = funit(hs) * 6.2831853f;
+        lean_dir = float3(cos(oa), 0.0f, sin(oa));
+        b.pos += lean_dir * (0.025f + 0.045f * funit(fhash(hs, 1u)));
+        b.a = (b.a & ~0xFFu) | (fhash(hs, 2u) & 0xFFu);
+        b.seed = fhash(hs, 3u);
+        hmul = 0.65f + 0.4f * funit(fhash(hs, 4u));
+        lean_out = 0.12f + 0.18f * funit(fhash(hs, 5u));
+    }
     const uint row = min(vid >> 1, S);
     const float side = (vid & 1u) ? 0.5f : -0.5f;
     const float tt = float(row) / float(S);
     const float ang = float(b.a & 0xFFu) / 255.0f * 6.2831853f;
-    const float hgt = float((b.a >> 8) & 0xFFu) * 0.01f;
+    const float hgt = float((b.a >> 8) & 0xFFu) * 0.01f * hmul;
     const float widen = 1.0f + float((b.a >> 16) & 0xFu) / 5.0f;
     const bool narrow = ((b.a >> 25) & 1u) != 0u;
     const float scale = float((b.a >> 26) & 63u) / 63.0f;
@@ -386,9 +412,9 @@ FolOut vs_blade(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     const float2 w = wind_at(b.pos.xz);
     // Tip displacement as a fraction of the height; the stem shortens so the
     // blade bends rather than stretches.
-    const float3 D = (f * curl + float3(w.x, 0.0f, w.y)) * hgt;
+    const float3 D = (f * curl + lean_dir * lean_out + float3(w.x, 0.0f, w.y)) * hgt;
     const float lean2 = dot(D, D) / max(hgt * hgt, 1e-4f);
-    const float width = (narrow ? 0.009f : 0.016f) * widen * (row == S ? 0.0f : pow(1.0f - tt, 0.6f));
+    const float width = (narrow ? 0.009f : 0.016f) * blade_width * widen * (row == S ? 0.0f : pow(1.0f - tt, 0.6f));
     const float h = hgt * max(scale, 0.05f);
     const float3 p = b.pos + float3(0.0f, h * tt * (1.0f - 0.35f * lean2 * tt), 0.0f) + D * (tt * tt) * max(scale, 0.05f)
                    + rt * (side * width);
