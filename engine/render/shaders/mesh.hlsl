@@ -56,6 +56,7 @@ struct VSOut {
     float4 w0 : TEXCOORD6;     // material weights 0..3, 4..7, 8..11
     float4 w1 : TEXCOORD7;
     float4 w2 : TEXCOORD8;
+    float  shell : TEXCOORD9;  // the canopy shell's lift as a share of its full height (forest.hlsli)
 };
 
 float4 unpack_weights(uint u) {
@@ -76,7 +77,9 @@ VSOut vs_main(uint vid : SV_VertexID) {
     VSOut o;
     // The canopy shell lifts far forest to its canopy (forest.hlsli). In
     // every pass that draws the terrain, so its shadows come with it.
-    const float3 pos = v.pos + float3(0.0f, forest_lift(v.pos, v.nrm), 0.0f);
+    float shell_frac;
+    const float3 pos = v.pos + float3(0.0f, forest_lift(v.pos, v.nrm, shell_frac), 0.0f);
+    o.shell = shell_frac;
     o.clip = mul(float4(pos, 1.0f), view_proj);
     o.world = pos;
     o.nrm = v.nrm;
@@ -371,6 +374,19 @@ SceneOut ps_main(VSOut i) {
     {
         const Forest f = forest_at(i.world);
         cw = f.cover * f.w * saturate((n.y - 0.55f) / 0.3f);
+        // The wall where the canopy ends at a clearing: cover falls from 1 to
+        // 0 across one twenty-metre texel, so the lifted surface drops the
+        // canopy's height in about that -- and the cover sampled ON the wall
+        // was partial, so most of it shaded as bare ground, a brown mesa
+        // round every wood and clump. The lift share interpolated from the
+        // vertices says how far up the wall a pixel is: above its foot it
+        // is the side of the wood.
+        const float wall_up = saturate(i.shell * 1.6f);
+        cw = max(cw, wall_up);
+        // The face's own normal, before any branch (it takes derivatives).
+        float3 nf = normalize(cross(ddy(i.world), ddx(i.world)));
+        if (dot(nf, v) < 0.0f) nf = -nf;
+        const float steep = saturate((0.85f - nf.y) / 0.45f);
         shell_w = f.w;
         if (cw > 0.002f) {
             // Two scales, each faded into its average as its pixel footprint
@@ -401,8 +417,13 @@ SceneOut ps_main(VSOut i) {
             const float crown_tone = lerp(1.0f, 0.82f + 0.36f * tone, k);
             leaf_alb = f.leaf * (0.7f + 0.6f * pat) * crown_tone;
             leaf_n = normalize(lerp(float3(0.0f, 1.0f, 0.0f), cn, k));
+            // On a wall the canopy's side faces out: shade it with the face's
+            // own normal (the mesh's normals are the unlifted ground's), and
+            // let a side take less sky than a top.
+            if (steep > 0.0f)
+                leaf_n = normalize(lerp(leaf_n, normalize(nf + 0.3f * (leaf_n - float3(0.0f, 1.0f, 0.0f))), steep));
             shell_sun = kShellSun * (0.4f + 1.2f * pat);
-            shell_sky = kShellSky * (0.5f + pat);
+            shell_sky = kShellSky * (0.5f + pat) * (1.0f - 0.35f * steep);
         } else {
             cw = 0.0f;
         }

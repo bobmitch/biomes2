@@ -683,9 +683,17 @@ EXPECTATION rather than its draw.
   trees were past the draw distance, and the shell, measured flat, had not
   begun. Cost nothing measurable: a flight at 260 m 2.12 ms as before, at
   650 m 1.30 ms; walking unchanged.
-- **Seen, not fixed**: where the canopy ends at a clearing the lifted edge
-  is a steep wall shaded as ground, where real trees would show their
-  sides.
+- **Clearing edges are slopes of crowns, not walls.** Cover falls from 1 to
+  0 across one twenty-metre texel, so with the lift following the
+  sharpened cover every wood stood on a near-vertical wall -- a mesa with a
+  flat top -- and the cover sampled ON the wall was partial, so it shaded
+  as bare ground, grey-brown. Now the lift follows the map's own bilinear
+  cover (`Forest.raw`) while the colour keeps the sharpened one, so a
+  wood's margin is a slope; the vertex shader passes its lift as a share of
+  the full canopy (`VSOut.shell`), which says how far up a slope a pixel
+  is, and above its foot it is canopy, lit with the face's own normal (the
+  mesh's normals are the unlifted ground's) and taking less sky on a side.
+  Colour match unchanged (87.8, 117.0, 65.3); flight cost unchanged.
 - **Not done**: GPU-generated far cards (500-1500 m, for single trees on a
   skyline from the air) -- the shell was expected to carry most of it, and
   does; the RT scene and DDGI do not see the shell (it starts where they

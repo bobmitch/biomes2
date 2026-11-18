@@ -13,7 +13,8 @@ Texture2D<float4> g_forest_a : register(t47);   // cover, canopy height, conifer
 Texture2D<float4> g_forest_b : register(t48);   // leaf albedo, linear
 
 struct Forest {
-    float  cover;     // canopy fraction, 0..1
+    float  cover;     // canopy fraction, 0..1, sharpened for colour
+    float  raw;       // the map's own cover, bilinear: what the lift follows
     float  height;    // canopy height, metres
     float  conifer;
     float3 leaf;      // linear albedo
@@ -47,6 +48,7 @@ Forest forest_at(float3 world) {
     // the map's texels are twenty, so bilinear cover blurred every edge and
     // clump the real trees draw crisply.
     f.cover = smoothstep(0.15f, 0.55f, saturate(a.x));
+    f.raw = saturate(a.x);
     f.height = a.y;
     f.conifer = a.z;
     // The leaf colour is averaged over trees; where cover is thin it was
@@ -56,11 +58,18 @@ Forest forest_at(float3 world) {
 }
 
 // The lift at a vertex: the canopy's top where the ground faces up.
-float forest_lift(float3 world, float3 nrm) {
+// `frac` is the lift as a share of the full canopy there (cover x weight x
+// up): interpolated across a wall it says how high up the wall a pixel is.
+float forest_lift(float3 world, float3 nrm, out float frac) {
+    frac = 0.0f;
     const Forest f = forest_at(world);
-    if (f.w <= 0.0f || f.cover <= 0.0f) return 0.0f;
+    if (f.w <= 0.0f || f.raw <= 0.0f) return 0.0f;
     const float up = saturate((normalize(nrm).y - 0.55f) / 0.3f);
-    return f.cover * f.height * kShellLift * f.w * up;
+    // The lift follows the map's own bilinear cover, not the sharpened one
+    // the colour uses: sharpened, every wood stood on a vertical wall, a
+    // mesa with a flat top; this way its edge is a slope of crowns.
+    frac = f.raw * f.w * up;
+    return frac * f.height * kShellLift;
 }
 
 #endif
