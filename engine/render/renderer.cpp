@@ -1271,7 +1271,9 @@ void Renderer::record_shadows(const ViewConstants& view) {
 
 void Renderer::set_rt_shadows(bool on) {
     rt_shadows_ = on;
-    if (on) set_rt_active(true);
+    if (on && rt_ok_) set_rt_active(true);
+    // Nothing else wants the scene: stop building it.
+    if (!on && !rt_sky_ && !gi_on_) set_rt_active(false);
 }
 
 void Renderer::set_rt_sky(bool on) {
@@ -3000,6 +3002,10 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     startup_log().push_back(std::make_pair(std::string("phase: mist map + volumes"), startup_now_ms() - t0));
     t0 = startup_now_ms();
     if (!create_rt(error)) return false;
+    // Denoised ray-traced key-light shadows are the default wherever DXR 1.1
+    // is (rt_denoise.h); without it the cascades and PCSS, as before.
+    // --no-rt-shadows (R in the window) for the cascades.
+    if (rt_ok_) set_rt_shadows(true);
     startup_log().push_back(std::make_pair(std::string("phase: ray-tracing scene"), startup_now_ms() - t0));
 
     ready_ = true;

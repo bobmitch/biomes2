@@ -820,7 +820,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // The mist (ADR-004 L4): off, or thicker or thinner than authored.
         if (c2.find("--no-fog") != std::string::npos) g_renderer.set_fog(false);
         // The ray-tracing scene (ADR-004 L5).
-        if (c2.find("--rt-shadows") != std::string::npos) g_renderer.set_rt_shadows(true);
+        // RT shadows are on by default where DXR 1.1 is; --no-rt-shadows for
+        // the cascades (PCSS). --rt-shadows is kept, and changes nothing.
+        if (c2.find("--no-rt-shadows") != std::string::npos) g_renderer.set_rt_shadows(false);
+        else if (c2.find("--rt-shadows") != std::string::npos) g_renderer.set_rt_shadows(true);
         if (c2.find("--no-rt-denoise") != std::string::npos) g_renderer.set_rt_denoise(false);
         if (c2.find("--rt-sparse-terrain") != std::string::npos) g_renderer.set_rt_sparse_terrain(true);
         if (c2.find("--rt-sky") != std::string::npos) g_renderer.set_rt_sky(true);

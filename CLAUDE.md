@@ -1040,8 +1040,13 @@ atmosphere's aerial perspective, and its far end over the sky.
 
 ### The ray-tracing scene (ADR-004 L5)
 
-DXR 1.1 inline RayQuery, off until asked for: `--rt-shadows` (`R` in the
-window) traces the key light's shadow in place of the cascades;
+DXR 1.1 inline RayQuery. **Denoised RT key-light shadows are the DEFAULT
+wherever DXR 1.1 is** (`Renderer::init` turns them on after `create_rt`);
+without it the cascades and PCSS, as before. `--no-rt-shadows` (`R` in the
+window) for the cascades -- it also stops building the RT scene when
+neither `--rt-sky` nor DDGI wants it; `--rt-shadows` still parses and
+changes nothing. Every headless mode now runs with RT shadows unless told
+otherwise, so a figure measured before this is a cascades figure;
 `--rt-report` measures. `engine/render/rt_scene.{h,cpp}` keeps a BLAS per
 drawn chunk at LOD 0-3 (+-512 m, the cascades' reach) -- pointing at the
 whole vertex pool and the slot's own index range, because the pool's
@@ -1418,6 +1423,9 @@ lit tables), [46] UAV; `--post-debug 3` shows it.
   show through it.
 
 ### Shadows
+
+(Without DXR, or with `--no-rt-shadows`. Under RT shadows -- the default
+-- only the far two cascades are drawn, for the mist.)
 
 Sun shadows, **four cascades out to 28, 100, 380 m and 1.6 km**, cast by
 the terrain and the trees and received by both through one function,
