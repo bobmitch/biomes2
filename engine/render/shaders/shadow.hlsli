@@ -46,7 +46,9 @@ cbuffer ShadowConstants : register(b2) {
     float4 l_prev_cam;
     // The heightfield GI (hfgi.hlsli): the map's min corner x, z; w on.
     float4 l_hf;
-    // The shadow filter's frame (x), for its rotation to walk under TAA.
+    // The shadow filter's frame (x), for its rotation to walk under TAA;
+    // y parallax on; z the first cascade drawn -- 2 under RT shadows, which
+    // skip the near two (their readers start at the first drawn).
     float4 l_shadow_frame;
     // Each cascade's corner of its slice: its resolution over the slice's.
     float4 shadow_scale;
@@ -156,7 +158,8 @@ float cascade_visibility(float3 world, float3 n) {
     if (shadow_res < 0.0f) return 1.0f;
     const float d = length(world - shadow_cam);
     if (d >= shadow_split.w || l_far.w > 1.5f) return far_shadow(world);   // w 2: the far map everywhere (BIOMES_FAR_DBG)
-    const uint c = d < shadow_split.x ? 0u : (d < shadow_split.y ? 1u : (d < shadow_split.z ? 2u : 3u));
+    const uint c = max(d < shadow_split.x ? 0u : (d < shadow_split.y ? 1u : (d < shadow_split.z ? 2u : 3u)),
+                       uint(l_shadow_frame.z + 0.5f));
     const float lo = c == 0u ? 0.0f : shadow_split[c - 1u];
     const float hi = shadow_split[c];
     const float band = (c == 3u ? 0.2f : 0.12f) * (hi - lo);

@@ -205,7 +205,7 @@ struct RtConstants {
     float near_plane;  float far_plane; float csm_reach; UINT frame;
     UINT  checks;      float light_radius;
     UINT  sky_rays;    UINT sky_mask;
-    float sky_range;   float pad1[3];
+    float sky_range;   UINT sparse; UINT pad1[2];
 };
 static_assert(sizeof(RtConstants) == 144, "RtConstants must match rt_shadow.hlsl");
 // The mist's froxels: 160 x 90 x 128, log-spaced from 0.5 m to 6 km.
@@ -996,7 +996,7 @@ bool Renderer::create_shadow_resources(std::string& error) {
     // second range of the table that starts at the sun's map, [0];
     // [29..35] the mist (L4): its map, two inject volumes (this frame's and
     // last's, swapping), the integrated volume, and their UAVs.
-    hd.NumDescriptors = 72;   // [48..61] the heightfield GI (L6), [64..66] the far terrain shadow
+    hd.NumDescriptors = RtDenoise::kHeapEnd;   // [48..61] the heightfield GI (L6), [64..66] the far terrain shadow, [72..77] the RT shadow's denoiser
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srv_heap_));
     if (FAILED(hr)) { error = hr_text("shared srv heap", hr); return false; }
@@ -1132,6 +1132,13 @@ void Renderer::record_shadows(const ViewConstants& view) {
     if (!on) sc.res = -sc.res;
     sc.shadow_frame[0] = float(post_frame_ % 1024u);
     sc.shadow_frame[1] = pom_on_ ? 1.0f : 0.0f;   // parallax on the scans (pom.hlsli)
+    // Under RT shadows no surface reads the cascades (shadow_factor is 1 and
+    // the composite takes the traced visibility), and the mist reads one tap:
+    // the near two -- real leaves every frame, cards every second, most of
+    // the cascades' cost -- are not drawn, and the mist starts at the third.
+    // The RT instruments compare against all four, so they keep them.
+    const UINT first_cascade = (rt_shadows_ && rt_ok_ && rt_active_ && !rt_checks_ && mode_ != Mode::Wireframe) ? 2u : 0u;
+    sc.shadow_frame[2] = float(first_cascade);
     far_.constants(on && far_on_, sc.far_map);
     if (forest_.ready() && forest_on_ && trees_on_) {
         sc.forest[0] = sc.forest[1] = -0.5f * forest_.extent();
@@ -1201,6 +1208,8 @@ void Renderer::record_shadows(const ViewConstants& view) {
     ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
     const UINT dinc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     for (UINT c = 0; c < kCascades; ++c) {
+        // Skipped under RT: invalid, so it is drawn the frame RT goes off.
+        if (c < first_cascade) { cascade_valid_[c] = false; continue; }
         // Not due: its map and matrix stand from the frame that drew them.
         if (!due[c]) continue;
         cascade_valid_[c] = true;
@@ -1322,7 +1331,7 @@ bool Renderer::create_rt(std::string& error) {
     if (!buffer(rt_stats_buf_, D3D12_HEAP_TYPE_DEFAULT, 128, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) { error = "rt stats"; return false; }
     for (UINT f = 0; f < kFrameCount; ++f) {
         if (!buffer(rt_stats_rb_[f], D3D12_HEAP_TYPE_READBACK, 128, false, D3D12_RESOURCE_STATE_COPY_DEST) ||
-            !buffer(rt_cb_[f], D3D12_HEAP_TYPE_UPLOAD, 256, false, D3D12_RESOURCE_STATE_GENERIC_READ)) { error = "rt buffers"; return false; }
+            !buffer(rt_cb_[f], D3D12_HEAP_TYPE_UPLOAD, 512, false, D3D12_RESOURCE_STATE_GENERIC_READ)) { error = "rt buffers"; return false; }
         rt_cb_[f]->Map(0, nullptr, &rt_cb_cpu_[f]);
     }
     {
@@ -1351,6 +1360,13 @@ bool Renderer::create_rt(std::string& error) {
         h.ptr += SIZE_T(37) * inc;
         device_->CreateUnorderedAccessView(rt_vis_.Get(), nullptr, &ud, h);
     }
+    // The traced shadow's denoiser (rt_denoise.h). Without it the shadow is
+    // the raw trace, as before it existed.
+    {
+        std::string dwhy;
+        if (!rt_den_.init(device_.Get(), srv_heap_.Get(), width_, height_, dwhy))
+            startup_log().push_back(std::make_pair(std::string("rt shadow denoiser off: ") + dwhy, 0.0));
+    }
     // Root signature: constants, the shadow constants, the TLAS, the sun's
     // map, depth, the six geometry buffers gi_trace reads, the visibility
     // UAV, the stats.
@@ -1365,7 +1381,12 @@ bool Renderer::create_rt(std::string& error) {
         r_shadow2[2].BaseShaderRegister = 43; r_shadow2[2].OffsetInDescriptorsFromTableStart = 65;
         r_depth.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;  r_depth.NumDescriptors = 1;  r_depth.BaseShaderRegister = 0;
         r_vis.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;    r_vis.NumDescriptors = 1;    r_vis.BaseShaderRegister = 0;
-        D3D12_ROOT_PARAMETER p[14] = {};
+        // The sparse trace's target (rt_denoise.h), u2.
+        D3D12_DESCRIPTOR_RANGE r_half = {};
+        r_half.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; r_half.NumDescriptors = 1; r_half.BaseShaderRegister = 2;
+        D3D12_ROOT_PARAMETER p[15] = {};
+        p[14].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[14].DescriptorTable.NumDescriptorRanges = 1; p[14].DescriptorTable.pDescriptorRanges = &r_half;
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[2].Descriptor.ShaderRegister = 30;
@@ -1381,7 +1402,7 @@ bool Renderer::create_rt(std::string& error) {
         p[11].DescriptorTable.NumDescriptorRanges = 1; p[11].DescriptorTable.pDescriptorRanges = &r_vis;
         p[12].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; p[12].Descriptor.ShaderRegister = 1;
         p[13].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[13].Descriptor.ShaderRegister = 37;   // tree uv, kind, seed
-        for (int k = 0; k < 14; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        for (int k = 0; k < 15; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_STATIC_SAMPLER_DESC cmp = {};
         cmp.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
         cmp.AddressU = cmp.AddressV = cmp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
@@ -1400,7 +1421,7 @@ bool Renderer::create_rt(std::string& error) {
         pt.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         const D3D12_STATIC_SAMPLER_DESC rt_samplers[2] = {cmp, pt};
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 14;
+        rsd.NumParameters = 15;
         rsd.pParameters = p;
         rsd.NumStaticSamplers = 2;
         rsd.pStaticSamplers = rt_samplers;
@@ -1700,7 +1721,18 @@ void Renderer::record_rt_trace() {
     rc.sky_rays = rt_sky_ ? UINT(rt_sky_rays_) : 0u;
     rc.sky_mask = rt_sky_mask_;
     rc.sky_range = 80.0f;
+    // Sparse terrain (rt_denoise.h): terrain traced at one pixel of each 2x2
+    // a frame, everything else every pixel. Not with the traced sky or the
+    // instruments, which are per pixel; not without the denoiser, which is
+    // what fills the pixels skipped.
+    const bool den = rt_denoise_on_ && rt_den_.ready() && rt_shadows_;
+    const bool sparse = den && rt_sparse_terrain_ && !rt_sky_ && !rt_checks_;
+    // Two passes when sparse (rt_shadow.hlsl): the quads' constants at 0,
+    // the rest's at 256.
+    rc.sparse = sparse ? 1u : 0u;
     std::memcpy(rt_cb_cpu_[frame_], &rc, sizeof rc);
+    rc.sparse = 2u;
+    std::memcpy(static_cast<char*>(rt_cb_cpu_[frame_]) + 256, &rc, sizeof rc);
 
     tr(mesher_.indices(), ib, ib | nps);
     tr(shadow_map_.Get(), ps, ps | nps);
@@ -1728,6 +1760,7 @@ void Renderer::record_rt_trace() {
     cmd_->SetComputeRootDescriptorTable(11, at(37));
     cmd_->SetComputeRootUnorderedAccessView(12, rt_stats_buf_->GetGPUVirtualAddress());
     cmd_->SetComputeRootShaderResourceView(13, rt_.tree_attributes() ? rt_.tree_attributes()->GetGPUVirtualAddress() : any);
+    cmd_->SetComputeRootDescriptorTable(14, at(RtDenoise::kUavRaw));
     cmd_->SetPipelineState(rt_clear_pso_.Get());
     cmd_->Dispatch(4, 1, 1);
     {
@@ -1738,7 +1771,40 @@ void Renderer::record_rt_trace() {
     }
     cmd_->EndQuery(rt_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q + 2);
     cmd_->SetPipelineState(rt_pso_.Get());
+    if (sparse) {
+        cmd_->Dispatch(((width_ + 1) / 2 + 7) / 8, ((height_ + 1) / 2 + 7) / 8, 1);
+        cmd_->SetComputeRootConstantBufferView(0, rt_cb_[frame_]->GetGPUVirtualAddress() + 256);
+    }
     cmd_->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
+    // The denoiser, on the raw trace before the composite reads it.
+    if (den) {
+        D3D12_RESOURCE_BARRIER u = {};
+        u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        u.UAV.pResource = nullptr;   // the visibility, and the sparse trace
+        cmd_->ResourceBarrier(1, &u);
+        RtDenoise::Inputs di = {};
+        std::memcpy(di.inv_view_proj, rc.inv_view_proj, sizeof di.inv_view_proj);
+        {
+            // TAA's reprojection, composed the same way (in double).
+            double inv[16], m[16];
+            if (invert4(vp_nj_d_, inv)) {
+                mat_mul(inv, prev_vp_d_, m);
+                for (int i = 0; i < 16; ++i) di.clip_to_prev[i] = float(m[i]);
+            }
+        }
+        for (int k = 0; k < 3; ++k) { di.cam[k] = cur_cam_[k]; di.prev_cam[k] = prev_cam_[k]; }
+        for (int k = 0; k < 2; ++k) { di.jitter[k] = jitter_[k]; di.prev_jitter[k] = prev_jitter_[k]; }
+        const float jx = cur_cam_[0] - prev_cam_[0], jy = cur_cam_[1] - prev_cam_[1], jz = cur_cam_[2] - prev_cam_[2];
+        di.history_ok = rt_den_.last_run() + 1 == post_frame_ && jx * jx + jy * jy + jz * jz < 400.0f;
+        // BIOMES_DEN_NOHIST=1: no history, every frame -- what a pixel just
+        // uncovered in motion looks like, the spatial filter alone.
+        static const bool den_nohist = std::getenv("BIOMES_DEN_NOHIST") != nullptr;
+        if (den_nohist) di.history_ok = false;
+        di.sparse = sparse;
+        rt_den_.record(cmd_.Get(), UINT(post_frame_), di);
+        // Its frame counter runs on post_frame_, which a still's warm-up
+        // advances too.
+    }
     tr(rt_vis_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nps);
     cmd_->EndQuery(rt_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q + 3);
     cmd_->ResolveQueryData(rt_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q, 4, rt_query_rb_.Get(), UINT64(q) * 8);
@@ -3031,6 +3097,7 @@ void Renderer::resize(UINT width, UINT height) {
     create_rtvs(ignored);
     create_depth(ignored);
     create_post_targets(ignored);
+    if (rt_ok_) rt_den_.resize(width_, height_, ignored);
     hist_valid_ = false;
 }
 
@@ -3513,6 +3580,8 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     std::memcpy(prev_vp_, view_proj_nj_, sizeof prev_vp_);
     std::memcpy(prev_vp_d_, vp_nj_d_, sizeof prev_vp_d_);
     for (int k = 0; k < 3; ++k) prev_cam_[k] = cur_cam_[k];
+    prev_jitter_[0] = jitter_[0];
+    prev_jitter_[1] = jitter_[1];
     if (post_queries_) {
         cmd_->EndQuery(post_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q0 + 4);
         cmd_->ResolveQueryData(post_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q0, 5, post_query_rb_.Get(), UINT64(q0) * 8);

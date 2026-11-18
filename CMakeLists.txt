@@ -163,6 +163,7 @@ if(BIOMES2_ENGINE)
     engine/render/ddgi.cpp
     engine/render/height_gi.cpp
     engine/render/far_shadow.cpp
+    engine/render/rt_denoise.cpp
     engine/render/scan_library.cpp
     engine/render/forest_map.cpp
     engine/rocks/rock_mesh.cpp

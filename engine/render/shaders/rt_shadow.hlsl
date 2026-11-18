@@ -26,7 +26,7 @@ cbuffer RtConstants : register(b0) {
     float  near_plane; float far_plane; float csm_reach; uint frame;
     uint   checks;     float light_radius;                // checks: the instruments; light_radius: the disk, radians
     uint   sky_rays;   uint sky_mask;                     // L6: rays a pixel a frame (0 = off), and what they see
-    float  sky_range;  float3 pad1;
+    float  sky_range;  uint sparse; uint2 pad1;        // sparse: 1 the quads' pass, 2 the rest (rt_denoise.h)
 };
 
 Texture2D<float>          g_depth : register(t0);
@@ -39,6 +39,19 @@ RWTexture2D<unorm float2> u_vis   : register(u0);   // x the key light's visibil
 // [13] traced sky x 1000, [14] the canopy map's x 1000, summed over [15]
 // terrain pixels inside 200 m; [16] their absolute difference x 1000
 RWStructuredBuffer<uint>  u_stats : register(u1);
+// Sparse terrain: the key light's visibility per pixel for the denoiser,
+// -1 where this frame did not trace. Terrain is traced at one pixel of each
+// 2x2 quad a frame, rotating (kRtQuad, shared with rt_denoise.hlsl), so
+// each terrain pixel every fourth frame; everything else -- trees, trunks,
+// grass, rocks, water -- every pixel every frame. Ground shadows are soft
+// and mostly still; a crown's are neither.
+// Two dispatches, so the rays that are traced fill whole waves: skipping
+// three terrain pixels in four inside one dispatch saved a fifth, not three
+// quarters -- a wave waits for its slowest lane. sparse 1: one thread per
+// quad, at this frame's pixel of it, whatever it is; sparse 2: every other
+// pixel, which leaves after the terrain test if it is terrain.
+RWTexture2D<float>        u_raw   : register(u2);
+static const int2 kRtQuad[4] = {int2(0, 0), int2(1, 1), int2(1, 0), int2(0, 1)};
 
 uint pcg_hash(uint v) {
     const uint s = v * 747796405u + 2891336453u;
@@ -69,10 +82,23 @@ float3 normal_from_depth(int2 p, float3 P) {
 
 [numthreads(8, 8, 1)]
 void cs_rt_shadow(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= width || id.y >= height) return;
-    const int2 p = int2(id.xy);
+    // Sparse (the sky and the instruments are per pixel, and the renderer
+    // never asks for both): see u_raw.
+    int2 p;
+    if (sparse == 1u) {
+        if (id.x >= (width + 1u) / 2u || id.y >= (height + 1u) / 2u) return;
+        p = min(int2(id.xy) * 2 + kRtQuad[frame & 3u], int2(int(width) - 1, int(height) - 1));
+    } else {
+        if (id.x >= width || id.y >= height) return;
+        p = int2(id.xy);
+        if (sparse == 2u && all((p & 1) == kRtQuad[frame & 3u])) return;   // the quads' pass has it
+    }
     const float z = g_depth[p];
-    if (z >= 1.0f) { u_vis[p] = float2(1.0f, 1.0f); return; }
+    if (z >= 1.0f) {
+        if (sparse != 0u) u_raw[p] = 1.0f;
+        else u_vis[p] = float2(1.0f, 1.0f);
+        return;
+    }
     const float2 uv = (float2(p) + 0.5f) / float2(width, height);
     const float3 P = world_at(uv, z);
     const float3 n = normal_from_depth(p, P);
@@ -104,8 +130,16 @@ void cs_rt_shadow(uint3 id : SV_DispatchThreadID) {
     // sharper than any real shadow.
     float3 t1 = normalize(abs(key_dir.y) < 0.99f ? cross(key_dir, float3(0.0f, 1.0f, 0.0f)) : cross(key_dir, float3(1.0f, 0.0f, 0.0f)));
     const float3 t2 = cross(key_dir, t1);
-    const float u1 = frac(52.9829189f * frac(dot(float2(p) + float(frame % 64u) * 5.588238f, float2(0.06711056f, 0.00583715f))));
-    const float u2 = frac(u1 * 7.23f + float(frame % 16u) * 0.618034f);
+    // The point on the disk: an R2 sequence in TIME, offset per pixel by a
+    // hash -- each pixel walks a well-spread set of points frame to frame,
+    // and neighbours are uncorrelated. It was interleaved gradient noise,
+    // which suits TAA but leaves its diagonal structure in a temporal
+    // accumulation, and the denoiser (rt_denoise.hlsl) cannot tell that
+    // pattern from shadow; white error across pixels it can.
+    const uint ph = pcg_hash(uint(p.x) + pcg_hash(uint(p.y) + 0x9E3779B9u));
+    const float2 r2 = frac(float2(ph & 0xFFFFu, ph >> 16) / 65536.0f +
+                           float(frame % 4096u) * float2(0.7548776662f, 0.5698402910f));
+    const float u1 = r2.x, u2 = r2.y;
     const float rr = light_radius * sqrt(u1), ang = 6.2831853f * u2;
     GiRay sr;
     sr.dir = normalize(key_dir + (t1 * cos(ang) + t2 * sin(ang)) * rr);
@@ -120,7 +154,15 @@ void cs_rt_shadow(uint3 id : SV_DispatchThreadID) {
         sr.tmin = 0.0f;
         nl = n;
     }
+    if (sparse == 2u && on_terrain) {
+        u_raw[p] = -1.0f;   // terrain, not this frame's pixel of its quad
+        return;
+    }
     const float vis = dot(nl, key_dir) > -0.05f ? gi_occluded(sr) : 0.0f;
+    if (sparse != 0u) {
+        u_raw[p] = vis;
+        return;
+    }
 
     // The sky (L6): cosine-weighted about the shading normal, an R2 sequence
     // rotated per pixel and advanced per frame so TAA integrates a different

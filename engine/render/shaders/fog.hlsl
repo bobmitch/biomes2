@@ -94,7 +94,11 @@ float key_visibility(float3 p) {
     if (shadow_res < 0.0f) return 1.0f;
     const float d = length(p - shadow_cam);
     if (d >= shadow_split.w) return 1.0f;
-    const uint c = d < shadow_split.x ? 0u : (d < shadow_split.y ? 1u : (d < shadow_split.z ? 2u : 3u));
+    // Under RT shadows the near two cascades are not drawn (l_shadow_frame.z
+    // is the first that is): the mist reads the third, fitted round the
+    // camera, whose 0.19 m texels are far finer than a froxel.
+    const uint c = max(d < shadow_split.x ? 0u : (d < shadow_split.y ? 1u : (d < shadow_split.z ? 2u : 3u)),
+                       uint(l_shadow_frame.z + 0.5f));
     const float4 lp = mul(float4(p, 1.0f), light_vp[c]);
     const float2 uv = float2(lp.x * 0.5f + 0.5f, 0.5f - lp.y * 0.5f) * shadow_scale[c];
     return g_shadow.SampleCmpLevelZero(g_shadow_cmp, float3(uv, float(c)), lp.z - 0.12f / shadow_depth_range[c]);

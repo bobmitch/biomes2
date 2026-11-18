@@ -203,6 +203,10 @@ void step_window_physics(float dt, float t, float vx, float vz, bool jump, float
     g_physics.character_position(g_feet);
 }
 bool g_captured = false;
+// The window's client size, and so every mode's render size: --res W H
+// (1280 x 720 by default), so a cost can be measured at the resolution it
+// will be played at.
+float g_res_w = 1280.0f, g_res_h = 720.0f;
 bool g_want_shot = false;
 // Time of day running on its own (H): an hour every ten seconds.
 bool g_time_lapse = false;
@@ -284,6 +288,13 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (wp == 'L') { g_renderer.set_shadows(!g_renderer.shadows()); return 0; }
+            // The traced shadow's denoiser (rt_denoise.h), for A/B under R.
+            // Shift+F8: terrain traced sparsely (one pixel per 2x2 a frame) or every pixel.
+            if (wp == VK_F8) {
+                if (GetKeyState(VK_SHIFT) & 0x8000) g_renderer.set_rt_sparse_terrain(!g_renderer.rt_sparse_terrain());
+                else g_renderer.set_rt_denoise(!g_renderer.rt_denoise());
+                return 0;
+            }
             if (wp == 'G') { g_renderer.set_foliage(!g_renderer.foliage_on()); return 0; }
             if (wp == 'Y') { g_renderer.set_taa(!g_renderer.taa()); return 0; }
             if (wp == 'O') { g_renderer.set_ao(!g_renderer.ao()); return 0; }
@@ -658,6 +669,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return ok ? 0 : 1;
     }
 
+    {
+        const std::string rs = cmdline ? cmdline : "";
+        const size_t r = rs.find("--res ");
+        int rw = 0, rh = 0;
+        if (r != std::string::npos && std::sscanf(rs.c_str() + r + 6, "%d %d", &rw, &rh) == 2 && rw >= 64 && rh >= 64) {
+            g_res_w = float(rw);
+            g_res_h = float(rh);
+        }
+    }
     WNDCLASSA wc = {};
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = inst;
@@ -665,10 +685,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     wc.lpszClassName = "biomes2_engine";
     RegisterClassA(&wc);
 
-    RECT rc = {0, 0, 1280, 720};
-    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+    // With --res the window is borderless: a framed window is shrunk to fit
+    // the screen, and 2560 x 1440 on a 1440p screen came out 1421 tall.
+    const bool res_given = cmdline && std::strstr(cmdline, "--res ") != nullptr;
+    const DWORD wstyle = res_given ? WS_POPUP : WS_OVERLAPPEDWINDOW;
+    RECT rc = {0, 0, LONG(g_res_w), LONG(g_res_h)};
+    AdjustWindowRect(&rc, wstyle, FALSE);
     HWND hwnd = CreateWindowA("biomes2_engine", "biomes2 engine",
-                              WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                              wstyle, res_given ? 0 : CW_USEDEFAULT, res_given ? 0 : CW_USEDEFAULT,
                               rc.right - rc.left, rc.bottom - rc.top,
                               nullptr, nullptr, inst, nullptr);
     if (!hwnd) return 1;
@@ -797,6 +821,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (c2.find("--no-fog") != std::string::npos) g_renderer.set_fog(false);
         // The ray-tracing scene (ADR-004 L5).
         if (c2.find("--rt-shadows") != std::string::npos) g_renderer.set_rt_shadows(true);
+        if (c2.find("--no-rt-denoise") != std::string::npos) g_renderer.set_rt_denoise(false);
+        if (c2.find("--rt-sparse-terrain") != std::string::npos) g_renderer.set_rt_sparse_terrain(true);
         if (c2.find("--rt-sky") != std::string::npos) g_renderer.set_rt_sky(true);
         {
             const size_t k = c2.find("--rt-sky-rays ");
@@ -920,7 +946,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (ln != std::string::npos) scatter_lights(std::atoi(cl.c_str() + ln + 9));
         }
         engine::ViewConstants v = {};
-        fill_view(g_camera, 1280.0f, 720.0f, 0.0f, v);
+        fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
 
         bool ok = g_renderer.capture(v, shot_path.c_str(), error);
         {
@@ -945,14 +971,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 };
                 for (int i = 0; i < n; ++i) {
                     t += 1.0f / 60.0f;
-                    fill_view(g_camera, 1280.0f, 720.0f, t, v);
+                    fill_view(g_camera, g_res_w, g_res_h, t, v);
                     g_renderer.step_offscreen(v);
                     log_frame(i);
                 }
                 g_renderer.set_capture_raw(true);
                 for (int i = 0; i < 8 && ok; ++i) {
                     t += 1.0f / 60.0f;
-                    fill_view(g_camera, 1280.0f, 720.0f, t, v);
+                    fill_view(g_camera, g_res_w, g_res_h, t, v);
                     char p[64];
                     std::snprintf(p, sizeof p, "build/shake_%d.bmp", i);
                     ok = g_renderer.capture(v, p, error);
@@ -993,8 +1019,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             int used = 0;
             while (pf && std::sscanf(s, "%f %f%n", &px, &py, &used) == 2) {
                 s += used;
-                const float nx = ((px + 0.5f) / 1280.0f) * 2.0f - 1.0f;
-                const float ny = 1.0f - ((py + 0.5f) / 720.0f) * 2.0f;
+                const float nx = ((px + 0.5f) / g_res_w) * 2.0f - 1.0f;
+                const float ny = 1.0f - ((py + 0.5f) / g_res_h) * 2.0f;
                 float d[3];
                 for (int k = 0; k < 3; ++k) {
                     d[k] = fwd[k] + right[k] * nx * v.tan_half_fov * v.aspect +
@@ -1797,7 +1823,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             c.yaw = -1.5708f;
             c.pitch = -0.785f;
             engine::ViewConstants cv = {};
-            fill_view(c, 1280.0f, 720.0f, 0.0f, cv);
+            fill_view(c, g_res_w, g_res_h, 0.0f, cv);
             g_renderer.set_mode(engine::Mode::Mesh);
             std::string e3;
             g_renderer.capture(cv, "build/b6_dig.bmp", e3);
@@ -2191,7 +2217,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                         c.yaw = 0.0f;
                         c.pitch = 0.25f;
                         engine::ViewConstants cv = {};
-                        fill_view(c, 1280.0f, 720.0f, 0.0f, cv);
+                        fill_view(c, g_res_w, g_res_h, 0.0f, cv);
                         const engine::Mode was = g_renderer.mode();
                         g_renderer.set_mode(engine::Mode::Mesh);
                         std::string e2;
@@ -2365,7 +2391,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_camera.yaw = vw.yaw; g_camera.pitch = vw.pitch;
             g_renderer.set_time_of_day(vw.hours);
             engine::ViewConstants v = {};
-            fill_view(g_camera, 1280.0f, 720.0f, 0.0f, v);
+            fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
             std::string err;
             double lum[2] = {0.0, 0.0};
             float ms = 0.0f;
@@ -2491,7 +2517,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_camera.x = cx; g_camera.y = cy; g_camera.z = cz;
             g_camera.yaw = 0.0f; g_camera.pitch = -0.35f;
             engine::ViewConstants v = {};
-            fill_view(g_camera, 1280.0f, 720.0f, 0.0f, v);
+            fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
             std::string err;
             g_renderer.capture(v, "build/leak.bmp", err);
             for (int i = 0; i < 1200; ++i) g_renderer.step_offscreen(v);
@@ -2510,7 +2536,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 g_camera.yaw = 0.0f; g_camera.pitch = -0.3f;
             }
             engine::ViewConstants v = {};
-            fill_view(g_camera, 1280.0f, 720.0f, 0.0f, v);
+            fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
             std::string err;
             // The first capture streams and meshes the chamber and builds its
             // BLAS; then the probes get 240 frames; then the measured still.
@@ -3401,7 +3427,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (back && !shot_taken && (vantage || total >= swim_seconds * 0.8)) {
                 shot_taken = true;
                 engine::ViewConstants cv = {};
-                fill_view(g_camera, 1280.0f, 720.0f, float(total), cv);
+                fill_view(g_camera, g_res_w, g_res_h, float(total), cv);
                 g_renderer.set_mode(engine::Mode::Mesh);
                 std::string err;
                 g_renderer.capture(cv, "build/swim.bmp", err);
@@ -3676,7 +3702,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (c.y < behind + 2.5f) c.y = behind + 2.5f;
             c.pitch = -0.33f;
             engine::ViewConstants v = {};
-            fill_view(c, 1280.0f, 720.0f, 0.0f, v);
+            fill_view(c, g_res_w, g_res_h, 0.0f, v);
             g_renderer.set_mode(engine::Mode::Mesh);
             std::string err;
             g_renderer.capture(v, "build/b4_walk.bmp", err);

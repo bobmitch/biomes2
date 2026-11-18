@@ -26,6 +26,7 @@
 #include "engine/render/ddgi.h"
 #include "engine/render/height_gi.h"
 #include "engine/render/far_shadow.h"
+#include "engine/render/rt_denoise.h"
 #include "engine/render/scan_library.h"
 #include "engine/render/forest_map.h"
 #include "engine/rocks/rock_field.h"
@@ -294,6 +295,15 @@ public:
     bool rt_available() const { return rt_ok_; }
     void set_rt_shadows(bool on);
     bool rt_shadows() const { return rt_shadows_; }
+    // The traced shadow's denoiser (rt_denoise.h; --no-rt-denoise, F8).
+    void set_rt_denoise(bool on) { rt_denoise_on_ = on; }
+    bool rt_denoise() const { return rt_denoise_on_; }
+    // Terrain traced at one pixel of each 2x2 a frame, everything else every
+    // pixel (rt_denoise.h; --rt-sparse-terrain, Shift+F8). Off by default:
+    // it pays only where bare terrain fills the screen, and grass is not
+    // terrain to the trace -- walking at 1440p it was slower than full.
+    void set_rt_sparse_terrain(bool on) { rt_sparse_terrain_ = on; }
+    bool rt_sparse_terrain() const { return rt_sparse_terrain_; }
     void set_rt_active(bool on);   // the scene and the trace, without replacing the cascades
     void set_rt_checks(bool on) { rt_checks_ = on; }   // the CSM and normal instruments (--rt-report)
     // L6: the ambient scaled by a traced sky visibility -- terrain, trunks and
@@ -653,6 +663,10 @@ private:
     float cur_fwd_[3] = {0, 0, 1}, cur_right_[3] = {1, 0, 0}, cur_up_[3] = {0, 1, 0};
     float cur_tan_ = 1.0f, cur_aspect_ = 1.0f, cur_time_ = 0.0f;
     float jitter_[2] = {0, 0};
+    float prev_jitter_[2] = {0, 0};   // last frame's, for the shadow denoiser's reprojection
+    RtDenoise rt_den_;
+    bool rt_denoise_on_ = true;
+    bool rt_sparse_terrain_ = false;
     UINT  hist_cur_ = 0;
     bool  hist_valid_ = false;
     unsigned long long post_frame_ = 0;

@@ -59,6 +59,9 @@ cmake -S . -B build/cmake -G Ninja && cmake --build build/cmake
 `validate.exe`, `view.exe` and `engine.exe` all read data by paths relative to
 the repository root, so run them from there. `engine.exe --shot <path>` renders
 one frame at a fixed camera and writes a BMP without opening a window.
+Every mode renders at 1280 x 720 unless given `--res W H` (borderless, so
+2560 x 1440 fits a 1440p screen exactly); measure costs at the resolution
+that will be played -- per-pixel passes scale 4x from 720p to 1440p.
 
 The engine's headless modes all write a text file under `build/` and exit:
 `--shot`, `--flight <s>`, `--walk <s>`, `--overhang`, `--dig`, `--dig-save`,
@@ -1078,6 +1081,74 @@ albedo), SM 6.5, compiled with DXC. `rt_shadow.hlsl` is the pass.
   render under `--rt-shadows` -- the mist reads them -- so this is an A/B,
   not a replacement yet. Memory: 94-270 MB of terrain BLAS, two 94 MB TLAS
   sized for 67k instances, 103 MB scratch.
+- **The shadow is denoised** (`engine/render/rt_denoise.{h,cpp}`,
+  `shaders/rt_denoise.hlsl`; on with `--rt-shadows`, `--no-rt-denoise` /
+  `F8` for A/B). One ray a pixel a frame is grain that TAA cannot remove --
+  it clips history to each pixel's 3x3 neighbourhood, and a 1-sample
+  shadow's neighbourhood holds 0 and 1 -- so the shadow is filtered on its
+  own between the trace and the composite, SVGF's shape for a scalar: a
+  temporal pass through TAA's own clip-to-last-frame matrix (this frame's
+  jitter off, last frame's on, so the history stays on last frame's grid),
+  a long mean and second moment up to 24 frames, a fast 3-frame mean that
+  cuts the long one short where they part (anti-lag), and disocclusion by
+  the distance stored with the history; then four edge-aware a-trous
+  passes (steps 1, 2, 4, 8) written back into the visibility's x. Heap
+  [72..78], UAVs only, ~35 MB at 1280 x 720, ~140 MB at 2560 x 1440.
+  - **Full resolution is the default; two cheaper traces were tried.**
+    *Half resolution for everything* (one ray per 2x2 quad, rotating,
+    denoised on the quads, upsampled by distance) cut the RT pass ~4x at
+    2560 x 1440 (the 17:30 wood 5.7 -> 1.6 ms) and looked right in stills,
+    but BOILED on trees in motion, Lumen-like: a quad's history mixes four
+    pixels' leaves and a swaying crown keeps resetting it. Removed.
+    *Sparse terrain* (`--rt-sparse-terrain`, Shift+F8) keeps trees at
+    every pixel and traces terrain -- what the trace's terrain-only primary
+    ray says is terrain -- at one pixel of each quad a frame (`kRtQuad`,
+    the same table in `rt_shadow.hlsl` and `rt_denoise.hlsl`); a skipped
+    pixel carries its history and one with none is filled by the a-trous.
+    It must be TWO dispatches -- the quads' pixels, then the rest, which
+    leave after the terrain test -- because skipping three pixels in four
+    inside one dispatch saved a fifth, not three quarters: a wave waits for
+    its slowest lane. Two passes: close floor 4.0 -> 2.5 ms, the wood 5.9
+    -> 5.7, the forest from the air 6.1 -> 6.6, and walking 7.85 ms
+    against full resolution's 7.63 -- grass is not terrain to the trace,
+    and it covers the ground. Off by default.
+  - **Under RT shadows the near two cascades are not drawn**
+    (`first_cascade`, `l_shadow_frame.z`): no surface reads them, and the
+    mist's one tap starts at the third, fitted round the camera at 0.19 m
+    texels. They are marked invalid and redraw the frame RT goes off; the
+    RT instruments keep all four. Walking at 1440p, full-resolution RT
+    7.95-8.15 -> 7.60-7.63 ms.
+  - Edge-stopping is SVGF's, made gentler on converged pixels: 1.5 sigma
+    of the MEAN's variance (the sample's over n), a depth tolerance of 5%
+    of the local plane's prediction, and a pass runs only while its step
+    is within 8 / sqrt(frames) pixels (ReBLUR's shrinking reach). The
+    history test is 3% + 0.3 m, loose enough for swaying crowns. These
+    were chasing crowns that looked soft beside raw RT; together they
+    moved the image about 1 luma, and the softness turned out to be the
+    point: raw RT under TAA keeps 1-sample sparkle (TAA's 3x3 clip lets
+    it through), which reads as leaf detail. A wrong lead worth knowing:
+    `--no-taa` stills render ONE frame, so they show the denoiser with no
+    history at all.
+  - **The disk samples are an R2 sequence in time, offset per pixel by a
+    hash**, not interleaved gradient noise: IGN's diagonal structure
+    survived accumulation as hatching the filter could not tell from
+    shadow. Raw (`--no-rt-denoise`) is now white grain under TAA.
+  - Instruments: `BIOMES_DEN_DBG=1` the temporal pass alone, `=2` each
+    pixel's history length in place of the shadow (white is 24 frames);
+    `BIOMES_DEN_NOHIST=1` no history ever -- a just-disoccluded pixel, the
+    spatial filter alone, which is what motion shows at edges.
+  - Measured: still-frame flicker on the close floor view (`--cam -30 0 -60
+    3.14 -1.0 --ground --time 16 --no-foliage --shake 60`): cascades
+    1.77-3.50, RT raw 2.3-5.6, RT denoised 0.76-0.95; the 17:30 wood with
+    grass, cascades 2.12-2.90, raw 3.86-4.86, denoised 1.58-2.38.
+    Walking at **2560 x 1440** (`--walk 15 --uncapped --res 2560 1440`):
+    no shadows 4.49, PCSS 6.20-6.25, RT denoised 7.60-7.63 with the near
+    cascades skipped. The RT pass in stills: close floor 4.0 ms, the 17:30
+    wood 5.9, the forest from the air 6.1 -- the denoiser ~0.9 of each,
+    the rest the trace, most of it alpha-tested leaf cards.
+  - **RT woods are darker than the cascades' and it is the trace, not the
+    denoiser**: raw and denoised agree from the air; the RT scene shades
+    crowns with every tree's LOD 1 cards (see the 76-79% agreement).
 
 ### Canopy shade: crown volumes and a traced sky (ADR-004 L6, step 1)
 
