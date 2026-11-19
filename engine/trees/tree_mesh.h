@@ -47,6 +47,7 @@ struct TreeLook {
     int   limbs = 6;
     float leaf_density = 0.5f;    // leaf area density in the crown, m^2/m^3: the RT crown volume's extinction
     float nominal_height = 15.0f; // metres the mesh is built at
+    float bend = 1.0f;            // how far the wind bends it: a birch more, a spruce less (tree_sway.h)
     // A CC0 bark scan (assets/textures/scans.json), retinted to `bark`;
     // empty keeps the procedural bark. The renderer fills the rest from the
     // scan library before the trees initialise.

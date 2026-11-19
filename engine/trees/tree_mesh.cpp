@@ -499,6 +499,7 @@ bool load_tree_looks(const worldgen::ArchetypeTable& table, const char* json_pat
                 l.limbs = int(s.number("limbs"));
                 l.leaf_density = float(s.number("leaf_density"));
                 if (s.has("bark_scan")) l.bark_scan = s.string("bark_scan");
+                if (s.has("bend")) l.bend = float(s.number("bend"));
             }
             const worldgen::TreeSpecies& ts = table.trees.species[i];
             l.nominal_height = 0.5f * (ts.height_min + ts.height_max);

@@ -51,7 +51,8 @@ struct SpeciesLook {
     float3 bark_tint;       // authored / scan mean, linear
     float  bark_inv_tile;   // 1 / the scan's tile in metres
     float  bark_depth;      // the scan's parallax depth, metres (pom.hlsli)
-    float3 pad;
+    float  bend;            // how far the wind bends it (archetypes.json shape.bend; tree_sway.h)
+    float2 pad;
 };
 
 // The CC0 scans (scan_library.h): A sRGB albedo + height, B normal xy,
@@ -61,6 +62,7 @@ Texture2DArray<float4> g_scan_b    : register(t45);
 SamplerState           g_scan_samp : register(s5);
 #include "engine/render/shaders/pom.hlsli"
 #include "engine/render/shaders/wind.hlsli"
+#include "engine/render/tree_sway.h"
 
 cbuffer DrawOffset : register(b1) { uint g_list_offset; };
 
@@ -271,29 +273,19 @@ MeshOut mesh_vertex(uint vid, uint iid, bool lit) {
 
     float3 p = v.pos;
     if (inst.mode == 0u) {
-        // Wind (weather.h, wind.hlsli), worked out in WORLD space and turned
-        // into the model's frame at the end, so every tree bends the way the
-        // air goes whatever its yaw. The local speed is the gust field at the
-        // trunk, so a gust front crosses a wood tree by tree.
-        //  - lean: the crown pushed downwind by the drag, speed squared --
-        //    3% of the height in a 20 m/s gale, nothing in a breeze;
-        //  - sway: the crown swinging about that lean, mostly along the wind
-        //    with a little across it, speed^1.5 -- ~5 cm on a 20 m tree at
-        //    the median 3.5 m/s, ~40 cm in a gale;
-        //  - flutter: the cards, rising with the speed and levelling off.
-        // Frequencies stay fixed: a frequency that followed the wind would
-        // slide the phase by t x its change, and t is in thousands of seconds.
-        const float phase = float(inst.id & 1023u) * 0.37f;
+        // Wind (tree_sway.h), worked out in WORLD space and turned into the
+        // model's frame at the end, so every tree bends the way the air goes
+        // whatever its yaw. The local speed is the gust field at the trunk,
+        // so a gust front crosses a wood tree by tree. The same function on
+        // the CPU leans this tree's ray-tracing instance (rt_scene.cpp), so
+        // its traced shadow sways with it. The cards flutter on top, rising
+        // with the local speed and levelling off.
         const float h = saturate(p.y / max(mi.top, 1.0f));
-        const float2 wd = wind_v.xy;
-        const float u = wind_v.z * wind_gust(inst.pos.xz, wind_v, wind_drift, time);
-        const float u20 = u / 20.0f;
-        const float lean = 0.03f * u20 * u20;
-        const float swing = 0.022f * u20 * sqrt(u20) + 0.0015f;
-        const float along = sin(time * 0.9f + phase) * 0.6f + sin(time * 2.1f + phase * 1.7f) * 0.25f;
-        const float across = sin(time * 1.3f + phase * 2.3f) * 0.3f;
-        const float2 o2 = (wd * (lean + swing * along) + float2(-wd.y, wd.x) * (swing * across)) * (mi.top * h * h);
-        float3 off = float3(o2.x, -0.5f * lean * mi.top * h * h * h, o2.y) * wind;
+        float u;
+        const float3 o = ts_crown_offset(mi.top, inst.id, inst.pos.x, inst.pos.z, time,
+                                         wind_v.x, wind_v.y, wind_v.z, wind_v.w, wind_drift.x, wind_drift.y,
+                                         wind, lk.bend, u);
+        float3 off = float3(o.x * h * h, o.y * h * h * h, o.z * h * h);
         if (foliage) {
             const float flutter = 0.05f * v.sway * wind * min(0.25f + u * 0.2f, 2.0f);
             off += float3(sin(time * 5.3f + v.seed * 40.0f), sin(time * 4.1f + v.seed * 23.0f) * 0.5f,
@@ -475,7 +467,16 @@ ImpOut impostor_vertex(uint vid, uint iid, bool lit) {
     const float2 c = float2((corner == 1u || corner == 2u) ? 1.0f : -1.0f,
                             (corner >= 2u) ? 1.0f : -1.0f);
     const float r = mi.bound * inst.scale;
-    const float3 centre = inst.pos + float3(0.0f, (mi.top * 0.5f) * inst.scale, 0.0f);
+    // An impostor leans as its tree would (tree_sway.h): the card moves
+    // rigidly by the offset at about two thirds of the height, where the
+    // crown's mass is (h^2 = 0.45). Past 170 m the trunk's base moving with it
+    // is a few centimetres a pixel would not show; a gale's lean is not.
+    float u_imp;
+    const float3 lean = ts_crown_offset(mi.top, inst.id, inst.pos.x, inst.pos.z, time,
+                                        wind_v.x, wind_v.y, wind_v.z, wind_v.w, wind_drift.x, wind_drift.y,
+                                        wind, g_looks[mi.species].bend, u_imp);
+    const float3 centre = inst.pos + float3(0.0f, (mi.top * 0.5f) * inst.scale, 0.0f) +
+                          float3(lean.x, 0.0f, lean.z) * 0.45f;
     const float3 world = centre + (cam_right * c.x + cam_up * c.y) * r;
     ImpOut o;
     o.clip = mul(float4(world, 1.0f), view_proj);

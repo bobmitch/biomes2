@@ -2,6 +2,7 @@
 #define NOMINMAX   // windows.h, via d3d12.h, would turn worldgen's std::min into a macro
 #endif
 #include "engine/render/rt_scene.h"
+#include "engine/render/tree_sway.h"
 #include "engine/rocks/rock_field.h"
 #include "engine/meshing/chunk_mesher.h"
 #include "engine/trees/leaf_cutout.h"
@@ -643,6 +644,27 @@ void RtScene::record(ID3D12GraphicsCommandList* cmd, UINT frame,
             for (int c = 0; c < 3; ++c) d.Transform[r][c] = R[r][c] * s;
             d.Transform[r][3] = t.pos[r];
         }
+        // The wind's lean, as trees.hlsl bends the mesh (tree_sway.h): the
+        // crown's offset at the top, applied as a SHEAR -- each point moved by
+        // TS_SHEAR_FIT x that offset x (its model height over the top), the
+        // base fixed -- since an instance transform is affine and the mesh's
+        // bend goes as h^2. Added to the model-y column, which is what
+        // multiplies a point's own height. Without it every traced shadow
+        // stood still under a swaying crown: ~0.7 m off in a gale.
+        float lean_y[3] = {0.0f, 0.0f, 0.0f};
+        if (sway_.on) {
+            const float top = models[t.model].top > 1.0f ? models[t.model].top : 1.0f;
+            const size_t species = t.model / kTreeVariants;
+            const float bend = species < looks.size() ? looks[species].bend : 1.0f;
+            float u_here;
+            const ts_float3 o = ts_crown_offset(top, t.id, t.pos[0], t.pos[2], sway_.time,
+                                                sway_.wind_v[0], sway_.wind_v[1], sway_.wind_v[2], sway_.wind_v[3],
+                                                sway_.drift[0], sway_.drift[1], sway_.mult, bend, u_here);
+            lean_y[0] = TS_SHEAR_FIT * o.x / top;
+            lean_y[1] = TS_SHEAR_FIT * o.y / top;
+            lean_y[2] = TS_SHEAR_FIT * o.z / top;
+            for (int r = 0; r < 3; ++r) d.Transform[r][1] += lean_y[r];
+        }
         d.InstanceID = kTreeFlag | t.model;
         d.InstanceMask = kMaskTrees;
         d.AccelerationStructure = tree_blas_[t.model]->GetGPUVirtualAddress();
@@ -666,6 +688,10 @@ void RtScene::record(ID3D12GraphicsCommandList* cmd, UINT frame,
         for (int r = 0; r < 3; ++r) {
             for (int k = 0; k < 3; ++k) e.Transform[r][k] = R[r][k] * s * rad[k];
             e.Transform[r][3] = t.pos[r] + R[r][1] * s * c.cy;
+            // The same shear, on the ellipsoid: its points sit at model height
+            // cy + rv * (unit y), so the centre moves and the vertical axis tilts.
+            e.Transform[r][1] += lean_y[r] * c.rv;
+            e.Transform[r][3] += lean_y[r] * c.cy;
         }
         e.InstanceID = kCrownFlag | t.model;
         e.InstanceMask = kMaskCrowns;

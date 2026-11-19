@@ -171,6 +171,8 @@ public:
     // Screen-space reflections on the sea (F7, --no-ssr).
     void  set_ssr(bool on) { ssr_on_ = on; }
     bool  ssr() const { return ssr_on_; }
+    // The RT scene's trees lean with their meshes (tree_sway.h); off for A/B.
+    void  set_rt_sway(bool on) { rt_sway_ = on; }
     void  set_wave_detail(bool on) { detail_on_ = on; }
     bool  wave_detail() const { return detail_on_; }
     const OceanDetail& ocean() const { return ocean_; }
@@ -563,6 +565,7 @@ private:
     bool ssr_on_ = true;
     // The ripples: two FFT tiles a frame (ocean_detail.h). F4, --no-wave-detail.
     OceanDetail ocean_;
+    bool rt_sway_ = true;
     bool detail_on_ = true;
     float ocean_t_ = -1.0f;
     // archetypes.json's "water": what the sea's body does to light.

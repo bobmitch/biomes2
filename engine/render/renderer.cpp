@@ -3826,6 +3826,18 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         const UINT q = UINT(frame_) * 4;
         if (rt_queries_) cmd_->EndQuery(rt_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q + 0);
         rt_.set_rocks(rocks_on_ ? &rock_field_.rocks() : nullptr, 300.0f);
+        {
+            // The trees' wind (update_weather), so their instances lean with
+            // their meshes (tree_sway.h).
+            RtScene::Sway sw;
+            sw.on = rt_sway_;
+            sw.time = view.time;
+            for (int k = 0; k < 4; ++k) sw.wind_v[k] = tree_settings_.wind_v[k];
+            sw.drift[0] = tree_settings_.wind_drift[0];
+            sw.drift[1] = tree_settings_.wind_drift[1];
+            sw.mult = tree_settings_.wind;
+            rt_.set_sway(sw);
+        }
         if (!(rt_.debug_ & 8u)) rt_.record(cmd_.Get(), UINT(frame_), streamer_, mesher_, trees_.models(), trees_.looks(),
                    trees_.instance_list(), view.cam_pos, tree_settings_.max_dist);
         if (rt_queries_) cmd_->EndQuery(rt_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q + 1);

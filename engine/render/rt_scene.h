@@ -102,6 +102,18 @@ public:
         rocks_ = rocks;
         rock_range_ = range;
     }
+    // The wind the trees bend in this frame (tree_sway.h), so each standing
+    // tree's instances lean with its mesh: the frame clock; direction x, z,
+    // mean m/s, gustiness; the drift; the settings' multiplier. off = false
+    // leaves every tree upright, for A/B (--rt-no-sway).
+    struct Sway {
+        bool  on = true;
+        float time = 0.0f;
+        float wind_v[4] = {1, 0, 0, 0};
+        float drift[2] = {0, 0};
+        float mult = 1.0f;
+    };
+    void set_sway(const Sway& s) { sway_ = s; }
 
     D3D12_GPU_VIRTUAL_ADDRESS tlas() const;
     ID3D12Resource* tree_positions() const { return tree_pos_.Get(); }
@@ -169,6 +181,7 @@ private:
     ComPtr<ID3D12Resource> crown_aabb_, crown_blas_;
     struct Crown { float cy, rh, rv; };
     std::vector<Crown> crowns_by_model_;
+    Sway sway_;
     Stats stats_;
 };
 

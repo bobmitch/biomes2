@@ -69,7 +69,7 @@ struct LookGpu {
     float bark[3]; float leaf_kind;
     float leaf[3]; float bark_layer;   // the bark scan's layer, -1 procedural
     float bark_tint[3]; float bark_inv_tile;
-    float bark_depth; float pad[3];   // the bark scan's parallax depth, metres
+    float bark_depth; float bend; float pad[2];   // the bark scan's parallax depth, metres; the wind's give (tree_sway.h)
 };
 static_assert(sizeof(LookGpu) == 64, "SpeciesLook must match trees.hlsl");
 
@@ -507,6 +507,7 @@ bool TreeRenderer::init(ID3D12Device* device, ID3D12CommandQueue* queue,
         lk[s].bark_layer = looks_[s].bark_layer;
         lk[s].bark_inv_tile = looks_[s].bark_inv_tile;
         lk[s].bark_depth = looks_[s].bark_depth;
+        lk[s].bend = looks_[s].bend;
         for (int k = 0; k < 3; ++k) lk[s].bark_tint[k] = looks_[s].bark_tint[k];
     }
 

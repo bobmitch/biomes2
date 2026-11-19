@@ -1922,11 +1922,31 @@ the block added.
   ahead); `--sea-report` tabulates wind, swell, depth and six hours of
   automatic weather, and asserts the mean, the inversion, growth with depth
   and no wave taller than 1.1 x its depth.
-- **Not done**: RT shadows and DDGI trace STATIC trees (the leaf cutouts),
-  so in a gale a crown's traced shadow sits up to ~0.7 m from its swayed
-  crown (the cascades sway with it). Impostors do not lean. No species
-  stiffness. Wind does not yet roughen the water locally (gust patches,
-  cat's paws), and no rain, cloud or fetch shelter behind islands.
+- **Trees in the wind, everywhere they are drawn or traced.** The sway is
+  `engine/render/tree_sway.h` and the gusts `engine/render/wind.h`, both
+  compiled as C++ AND HLSL (`wind.hlsli` only adapts them), so the mesh
+  `trees.hlsl` bends and the instance the RT scene leans move by one formula
+  in one gust. `small` is a Windows macro (`#define small char`): not a
+  variable name in a header the C++ side includes.
+  - **RT**: every standing tree's instances -- cards, leaf cutouts, crown
+    ellipsoid -- are SHEARED by the crown's offset (`RtScene::set_sway`, in
+    the TLAS rebuild it already did every frame): an instance transform is
+    affine, the mesh bends as h^2, so the shear is the least-squares line
+    through h^2 over the crown pinned at the base (`TS_SHEAR_FIT` 0.8).
+    `--rt-report` at 20 m/s, key-light agreement with the (swaying)
+    cascades in the two woodland views: 75.8 / 78.7% upright, 76.5 / 81.0%
+    leaning, 77.8 / 81.4% in calm air. Cost: nothing measurable (1440p walk,
+    7,419 instances). `--rt-no-sway` for A/B. DDGI's probe rays and the
+    traced sky see the same instances.
+  - **Impostors** move rigidly by the offset at h^2 = 0.45 (the crown's
+    mass), main and shadow passes alike.
+  - **Species bend**: archetypes.json `shape.bend` (presentation only),
+    scaling lean and swing: birch 1.4, willow 1.3, alder 1.1, maple 1.0,
+    beech 0.9, oak 0.85, pine 0.75, scrub 0.7, fir 0.6, spruce 0.55, snag
+    0.25. In `SpeciesLook` for the GPU, `TreeLook` for the RT scene.
+  - Not done: the canopy map (1 m crowns for the no-RT sky shade) is static;
+    leaf flutter is raster only (centimetres).
+- **Not done**: no rain, cloud or fetch shelter behind islands.
 
 The water asks the SHARED FIELD FUNCTION how deep it is, so the shoreline is
 the real one at every LOD. That is M1 paying off somewhere other than terrain.
