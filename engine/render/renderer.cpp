@@ -68,8 +68,10 @@ struct WaterConstants {
     float deep_colour[3]; float refraction;
     float frame;          float storm_turbidity; float pad3[2];
     float detail_on;      float detail_var0; float detail_var1; float choppy;
+    float wind_v[4];
+    float wind_drift[2];  float pad5[2];
 };
-static_assert(sizeof(WaterConstants) == 576, "WaterConstants must match water.hlsl");
+static_assert(sizeof(WaterConstants) == 608, "WaterConstants must match water.hlsl");
 
 // Heap slots past the RT denoiser's: the sea's copies of the lit scene and of
 // depth, which it reads while it draws into the one and tests against the
@@ -4070,6 +4072,10 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         wc.detail_var0 = ocean_.variance(0);
         wc.detail_var1 = ocean_.variance(1);
         wc.choppy = ocean_.choppy();
+        // The wind as grass and trees get it (update_weather), for the gusts.
+        for (int k = 0; k < 4; ++k) wc.wind_v[k] = tree_settings_.wind_v[k];
+        wc.wind_drift[0] = tree_settings_.wind_drift[0];
+        wc.wind_drift[1] = tree_settings_.wind_drift[1];
         wc.frame = float(post_frame_ % 64);
         std::memcpy(water_cb_cpu_[frame_], &wc, sizeof wc);
         water_pending_ = true;

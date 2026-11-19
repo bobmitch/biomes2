@@ -279,7 +279,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == 'K') {
                 // Cycle the water debug views.
                 float m = g_renderer.water_debug() + 1.0f;
-                if (m > 7.5f) m = 0.0f;
+                if (m > 8.5f) m = 0.0f;
                 g_renderer.set_water_debug(m);
                 return 0;
             }

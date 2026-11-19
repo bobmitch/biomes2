@@ -67,6 +67,10 @@ cbuffer WaterConstants : register(b0) {
     // The ripples (ocean_detail.h): on/off, the mean square slope each FFT
     // tile carries, and the choppiness its Jacobian was made with.
     float  detail_on;     float detail_var0;  float detail_var1;  float choppy;
+    // The weather's wind (weather.h), as grass and trees get it: direction x,
+    // z; mean m/s; gustiness. And the metres the air has moved (wind.hlsli).
+    float4 wind_v;
+    float2 wind_drift;    float2 pad5;
 };
 
 // The lit scene and its depth as the composite left them -- copies, because
@@ -87,6 +91,7 @@ SamplerState g_wrap : register(s3);
 #include "engine/render/shaders/lighting.hlsli"
 #include "engine/render/atmosphere.h"
 #include "engine/render/shaders/haze.hlsli"
+#include "engine/render/shaders/wind.hlsli"
 
 WwSea frame_sea() {
     WwSea s;
@@ -406,10 +411,27 @@ float4 ps_main(VSOut i) : SV_Target0 {
     const float f1 = detail_on * saturate(2.0f - fp / 0.015f);
     const float4 d0 = f0 > 0.0f ? g_detail.SampleLevel(g_wrap, float3(i.world.xz / od_tile[0], 0.0f), 0) : float4(0, 0, 0, 0);
     const float4 d1 = f1 > 0.0f ? g_detail.SampleLevel(g_wrap, float3(i.world.xz / od_tile[1], 1.0f), 0) : float4(0, 0, 0, 0);
-    const float2 dslope = d0.xy * f0 + d1.xy * f1;
+    // --- the wind on the water --------------------------------------------
+    // Ripples answer the wind in seconds, so the gust field the grass and
+    // trees bend in (wind.hlsli: carried by the air, at p - drift) also
+    // roughens the water under it: dark patches of ruffled water run across
+    // the sea at the wind's speed, and in light air the water between them
+    // goes glassy. The ripples' strength follows the local wind as their
+    // slope does (Cox-Munk), with a threshold: capillary ripples do not form
+    // under ~1.2 m/s and are not fully grown until ~3.8. With a softer one
+    // (0.5-2.5) a light air's lulls never went glassy and no patch showed. The 7.7 m tile answers in full, the 31 m
+    // tile's longer ripples, which take longer to grow, by 60%. The trains --
+    // waves metres long, built over minutes -- do not answer gusts.
+    const float u_mean = max(wind_v.z, 0.1f);
+    const float u_here = wind_v.z * wind_gust(i.world.xz, wind_v, wind_drift, time);
+    const float e_mean = od_cox_munk(u_mean) * smoothstep(1.2f, 3.8f, u_mean);
+    const float e_here = od_cox_munk(u_here) * smoothstep(1.2f, 3.8f, u_here);
+    const float gs = clamp(sqrt(e_here / max(e_mean, 1e-5f)), 0.0f, 2.0f);
+    const float s1 = gs, s0 = lerp(1.0f, gs, 0.6f);
+    const float2 dslope = d0.xy * (f0 * s0) + d1.xy * (f1 * s1);
     // Slopes add: the trains' (from their normal) and the ripples'.
     float3 n = normalize(float3(-(-base.x / base.y + dslope.x), 1.0f, -(-base.z / base.y + dslope.y)));
-    const float var_unres = detail_on * (detail_var0 * (1.0f - f0) + detail_var1 * (1.0f - f1));
+    const float var_unres = detail_on * (detail_var0 * (1.0f - f0) * s0 * s0 + detail_var1 * (1.0f - f1) * s1 * s1);
     // Seen from below -- a swimmer looking up -- the surface faces away.
     const bool below = dot(v, gn) < 0.0f;
     if (below) { n = -n; gn = -gn; }
@@ -460,7 +482,14 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // angle going almost fully reflective is most of why water looks wet.
     // The old cap at 0.9 was for a two-colour stand-in sky; the sky is the
     // atmosphere's own now, and the near scene is in it.
-    const float ndv = saturate(dot(n, v));
+    // Roughness the pixel cannot resolve still does what ripples do to a
+    // reflection: a rough patch at a grazing view shadows and masks itself and
+    // reflects less, and what it does reflect comes from higher, darker sky.
+    // That is how a gust's ruffled patch reads as dark against glassy water a
+    // kilometre off, where its ripples are long since below a pixel. The rms
+    // slope raises the angle Fresnel sees and lifts the reflected ray.
+    const float rough_unres = sqrt(var_unres);
+    const float ndv = saturate(dot(n, v) + 0.8f * rough_unres);
     const float fres = below ? 0.0f : 0.02f + 0.98f * pow(1.0f - ndv, 5.0f);
     // The reflection along the shading normal. One that leaves at or below the
     // horizon -- off the back of a wave -- meets the next wave, not the sky
@@ -486,7 +515,7 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // Wind breaks a reflection up: a breeze leaves the shore's image in
     // pieces and a gale leaves none. Without this, a storm wave seen from a
     // swimmer's trough reflected the beach like polished glass.
-    const float calm = saturate(1.2f - 1.2f * sea_state);
+    const float calm = saturate(1.2f - 1.2f * u_here / 20.0f);   // the local wind: a reflection survives in a lull
     float4 hit = (below || fres < 0.06f || open < 0.01f || calm <= 0.0f) ? float4(0, 0, 0, 0)
                                                                          : ssr(i.world + gn * 0.05f, rr, px);
     hit.a *= calm;
@@ -498,7 +527,7 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // hard-edged bands. The eye-to-water stretch of mist is laid over the
     // whole sea below.
     const float4 mf = mist(uv, vz);
-    const float3 sky_r = sky_reflection(normalize(float3(rs.x, max(rs.y, 0.01f), rs.z)));
+    const float3 sky_r = sky_reflection(normalize(float3(rs.x, max(rs.y, 0.01f) + 1.0f * rough_unres, rs.z)));
     const float3 refl = lerp(deep_in, lerp(sky_r, hit.rgb, hit.a), open);
 
     // Sun glitter. Near the camera the ripples are in the normal and every
@@ -546,7 +575,8 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // 20, and this is a quadratic through it. The ripples' J only frays the
     // edges (a third of it): at full weight they made a quarter of a gale's
     // sea white with speckle, where real whitecaps cover a tenth.
-    const float U = min(sea_state * 20.0f, 22.0f);
+    // Half the local wind's say: a gust over a developed sea breaks more of it.
+    const float U = min(lerp(sea_state * 20.0f, u_here, 0.5f), 22.0f);
     const float jac = jac_g + 0.35f * (d0.z * f0 + d1.z * f1);
     const float jt = 0.527f + 0.0279f * U - 0.000623f * U * U;
     const float breaking = saturate((jt - jac) / 0.06f) * saturate((U - 3.0f) / 3.0f) * i.fade;
@@ -555,6 +585,7 @@ float4 ps_main(VSOut i) : SV_Target0 {
     const float foam = saturate(max(shore_foam, crest_foam));
 
     // 7: the folding measure, white at 1 (still), black at 0 (folding).
+    if (debug_mode > 7.5f) return float4(saturate(gs * 0.5f).xxx, 0.0f);   // 8: the gusts' ripple strength, grey = mean
     if (debug_mode > 6.5f) return float4(saturate(jac).xxx, 0.0f);
     const float4 dbg = debug_view(i, n, foam, hit.a);
     if (dbg.a < 0.5f) return dbg;

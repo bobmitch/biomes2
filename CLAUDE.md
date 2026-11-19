@@ -1752,8 +1752,9 @@ with the weather would flood coastlines and no screenshot of a rough sea would
 look wrong.
 
 Controls: `--sea-shot` (stands the camera off the nearest coast, over 4-12 m of
-water), `--water-debug 1..7` (depth, foam, normal, displacement, surviving
-significant height, SSR source: green screen / red sky, the folding measure J;
+water), `--water-debug 1..8` (depth, foam, normal, displacement, surviving
+significant height, SSR source: green screen / red sky, the folding measure J,
+the gusts' ripple strength;
 marked as debug, so shown unexposed), `--no-water`, `--no-ssr`,
 `--no-wave-detail`, and `K` / `F7` / `F4` in the window.
 Weather controls are under the weather section.
@@ -1834,6 +1835,20 @@ F4 / `--no-wave-detail` for A/B.
   calm water at a grazing view was pocked with dark spots.
 - **Cost: +0.03 ms** (1440p flight over the sea, 4.62 / 4.59 light wind,
   4.87 / 4.84 gale); ~3 MB of fields and a 1 MB output.
+- **Gusts on the water (cat's paws)**: the sea samples the same gust field
+  the grass and trees bend in (`wind.hlsli`, `wind_v` / `wind_drift` in the
+  water constants, at p - drift), and scales the ripples by the local wind's
+  Cox-Munk slope over the mean's, with a threshold -- none under 1.2 m/s,
+  full by 3.8 (a softer 0.5-2.5 never let a light air's lulls go glassy).
+  The 7.7 m tile answers in full, the 31 m by 60%; the trains not at all.
+  Where the ripples are below a pixel, their unresolved rms slope still
+  raises the angle Fresnel sees (+0.8 x) and lifts the reflected sky ray
+  (+1.0 x): that is what makes a ruffled patch read dark against glassy water
+  far off, where the glint width alone showed nothing. SSR fades by the
+  local wind, and foam's wind is half local. `--water-debug 8` shows the
+  gusts' ripple strength (grey = the mean). Cost: nothing measurable. Gale
+  foam came down to 8.3% of the frame against Monahan's 10.5%: the gust
+  field is skewed, most of the sea a little under the mean.
 - Once in this session a shot failed at init with "ocean detail pso cs_cols"
   and the next run hung; every run since, cold and cached, was clean. Not
   reproduced or explained.
