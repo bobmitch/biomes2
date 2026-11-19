@@ -44,6 +44,7 @@ struct ww_float3 { float x, y, z; };
 // shading choice rather than a bug. Measuring the pixels was what caught it;
 // three different depths returning one identical colour is not a sea.
 #define WW_OUT_F3 ww_float3&
+#define WW_OUT_F float&
 #define WW_IN_SEA const WwSea&
 inline float ww_saturate(float a) { return a < 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a); }
 inline float ww_sin(float a) { return std::sin(a); }
@@ -54,6 +55,7 @@ inline float ww_sqrt(float a) { return std::sqrt(a); }
 #define WW_F2 float2
 #define WW_F3 float3
 #define WW_OUT_F3 out float3
+#define WW_OUT_F out float
 #define WW_IN_SEA WwSea
 #define ww_saturate saturate
 #define ww_sin sin
@@ -270,13 +272,20 @@ WW_FN float ww_total_amplitude(WW_IN_SEA sea) {
 // `scale` and `qc` are ww_local's x and y; ww_surface below works them out,
 // and the water's pixel shader takes them from its vertices instead, which
 // saves a pass over every train at every pixel.
+//
+// `out_jacobian` is the determinant of the horizontal throw's Jacobian:
+// 1 on still water, falling as crests compress and folding at 0, which is
+// where a real wave breaks -- the foam's measure (water.hlsl), the same
+// matrix ww_rest_point inverts.
 WW_FN WW_F3 ww_surface_with(float x, float z, float t, WW_IN_SEA sea, float depth, float fade,
-                            float min_wavelength, float scale, float qc, WW_OUT_F3 out_normal) {
+                            float min_wavelength, float scale, float qc, WW_OUT_F3 out_normal,
+                            WW_OUT_F out_jacobian) {
 
     WW_F3 p;
     p.x = x; p.y = 0.0f; p.z = z;
 
     float nx = 0.0f, nz = 0.0f, ny = 1.0f;
+    float jxx = 1.0f, jxz = 0.0f, jzz = 1.0f;
 
     for (int i = 0; i < WW_WAVES; i = i + 1) {
         const float a = ww_raw_amp(sea, i, depth, fade, min_wavelength) * scale;
@@ -297,7 +306,12 @@ WW_FN WW_F3 ww_surface_with(float x, float z, float t, WW_IN_SEA sea, float dept
         nx = nx - d.x * wa * c;
         nz = nz - d.y * wa * c;
         ny = ny - qc * wa * s;
+        const float g = qc * wa * s;
+        jxx = jxx - g * d.x * d.x;
+        jxz = jxz - g * d.x * d.y;
+        jzz = jzz - g * d.y * d.y;
     }
+    out_jacobian = jxx * jzz - jxz * jxz;
 
     const float len = ww_sqrt(nx * nx + ny * ny + nz * nz);
     const float inv = len > 1e-6f ? 1.0f / len : 1.0f;
@@ -310,7 +324,8 @@ WW_FN WW_F3 ww_surface_with(float x, float z, float t, WW_IN_SEA sea, float dept
 WW_FN WW_F3 ww_surface(float x, float z, float t, WW_IN_SEA sea, float depth, float fade,
                        float min_wavelength, WW_OUT_F3 out_normal) {
     const WW_F3 loc = ww_local(sea, depth, fade, min_wavelength);
-    return ww_surface_with(x, z, t, sea, depth, fade, min_wavelength, loc.x, loc.y, out_normal);
+    float jac;
+    return ww_surface_with(x, z, t, sea, depth, fade, min_wavelength, loc.x, loc.y, out_normal, jac);
 }
 
 // Newton steps ww_rest_point takes. --sea-report prints the horizontal miss

@@ -22,6 +22,7 @@
 #include "engine/render/local_lights.h"
 #include "engine/render/fog.h"
 #include "engine/render/weather.h"
+#include "engine/render/ocean_detail.h"
 #include "engine/render/rt_scene.h"
 #include "engine/render/canopy.h"
 #include "engine/render/ddgi.h"
@@ -170,6 +171,9 @@ public:
     // Screen-space reflections on the sea (F7, --no-ssr).
     void  set_ssr(bool on) { ssr_on_ = on; }
     bool  ssr() const { return ssr_on_; }
+    void  set_wave_detail(bool on) { detail_on_ = on; }
+    bool  wave_detail() const { return detail_on_; }
+    const OceanDetail& ocean() const { return ocean_; }
     // LOD transitions: hold the outgoing chunk until its replacements are
     // meshed, then dither-cross-fade over `frames`. See Streamer.
     void  set_lod_hold(bool on) { streamer_.set_lod_hold(on); }
@@ -557,6 +561,10 @@ private:
     void record_water();
     bool water_pending_ = false;
     bool ssr_on_ = true;
+    // The ripples: two FFT tiles a frame (ocean_detail.h). F4, --no-wave-detail.
+    OceanDetail ocean_;
+    bool detail_on_ = true;
+    float ocean_t_ = -1.0f;
     // archetypes.json's "water": what the sea's body does to light.
     struct WaterOptics {
         float extinction[3] = {0.40f, 0.11f, 0.09f};   // per metre, linear rgb

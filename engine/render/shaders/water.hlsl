@@ -29,6 +29,7 @@
 
 #include "engine/field/real_field.hlsl"
 #include "engine/render/water_wave.h"
+#include "engine/render/ocean_spectrum.h"
 
 cbuffer WaterConstants : register(b0) {
     row_major float4x4 view_proj;
@@ -63,6 +64,9 @@ cbuffer WaterConstants : register(b0) {
     float3 extinction;    float ssr_on;       // per metre, linear rgb
     float3 deep_colour;   float refraction;   // linear; the screen shift at full strength
     float  frame;         float storm_turbidity;  float2 pad3;   // extinction x (1 + this x roughness^2)
+    // The ripples (ocean_detail.h): on/off, the mean square slope each FFT
+    // tile carries, and the choppiness its Jacobian was made with.
+    float  detail_on;     float detail_var0;  float detail_var1;  float choppy;
 };
 
 // The lit scene and its depth as the composite left them -- copies, because
@@ -76,6 +80,9 @@ Texture3D<float4> g_fog      : register(t4);
 SamplerState g_linear : register(s0);
 SamplerState g_point  : register(s1);
 SamplerState g_wrap_u : register(s2);
+// The ripples' two tiles (ocean_fft.hlsl): slope x, slope z, J - 1, foam.
+Texture2DArray<float4> g_detail : register(t5);
+SamplerState g_wrap : register(s3);
 
 #include "engine/render/shaders/lighting.hlsli"
 #include "engine/render/atmosphere.h"
@@ -373,16 +380,36 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // the detail the geometry could not carry.
     const WwSea sea = frame_sea();
     float3 pn;
+    float jac_g;
     ww_surface_with(i.world.x, i.world.z, time, sea, i.depth, i.fade,
-                    max(i.minwl * 0.5f, 0.35f), i.cap_q.x, i.cap_q.y, pn);
+                    max(i.minwl * 0.5f, 0.35f), i.cap_q.x, i.cap_q.y, pn, jac_g);
     float3 gn = normalize(i.nrm);
-    float3 n = normalize(lerp(pn, gn, 0.25f));
+    const float3 base = normalize(lerp(pn, gn, 0.25f));
     const float3 v = normalize(cam_pos - i.world);
     const float3 l = normalize(sun_dir);
     const float2 px = i.clip.xy;
     const float2 uv = px * inv_size;
     const float dist = length(i.world - cam_pos);
     const float vz = max(dot(i.world - cam_pos, cam_fwd), near_plane);
+
+    // --- the ripples (ocean_detail.h) --------------------------------------
+    // Each tile's band is kept only while a pixel can resolve it: the 31 m
+    // tile's shortest ripple is 0.6 m and the 7.7 m tile's 6 cm, so they fade
+    // as the pixel's footprint on the water (stretched along the view at a
+    // grazing angle, as the grid's spacing is) reaches a quarter and then
+    // half of that. What fades is not lost: its slope widens the sun's glint
+    // below, which is the glitter path a rough sea shows far off.
+    const float ang = 2.0f * tan_half_fov * inv_size.y;
+    const float lateral = vz * ang;
+    const float fp = sqrt(lateral * lateral / max(abs(dot(v, gn)), 0.02f));
+    const float f0 = detail_on * saturate(2.0f - fp / 0.15f);
+    const float f1 = detail_on * saturate(2.0f - fp / 0.015f);
+    const float4 d0 = f0 > 0.0f ? g_detail.SampleLevel(g_wrap, float3(i.world.xz / od_tile[0], 0.0f), 0) : float4(0, 0, 0, 0);
+    const float4 d1 = f1 > 0.0f ? g_detail.SampleLevel(g_wrap, float3(i.world.xz / od_tile[1], 1.0f), 0) : float4(0, 0, 0, 0);
+    const float2 dslope = d0.xy * f0 + d1.xy * f1;
+    // Slopes add: the trains' (from their normal) and the ripples'.
+    float3 n = normalize(float3(-(-base.x / base.y + dslope.x), 1.0f, -(-base.z / base.y + dslope.y)));
+    const float var_unres = detail_on * (detail_var0 * (1.0f - f0) + detail_var1 * (1.0f - f1));
     // Seen from below -- a swimmer looking up -- the surface faces away.
     const bool below = dot(v, gn) < 0.0f;
     if (below) { n = -n; gn = -gn; }
@@ -444,12 +471,16 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // far headland, so its reflection reached far below its mirror image with
     // a vertical edge at its tip.
     const float3 rs = reflect(-v, n);
-    const float open = smoothstep(-0.05f, 0.04f + 0.2f * saturate(sea_state), rs.y);
+    // Whether the next wave closes the view is a question for the WAVES, not
+    // the ripples on them: with the ripples' tilt in it, calm water at a
+    // grazing angle was pocked with dark spots.
+    const float3 rs_base = reflect(-v, below ? -base : base);
+    const float open = smoothstep(-0.05f, 0.04f + 0.2f * saturate(sea_state), rs_base.y);
     // The ray takes a calmer normal than the shading: the per-pixel ripples
     // would scatter it into noise TAA cannot settle. Not where the reflection
     // is too faint to matter (looking down into the water near the camera,
     // Fresnel gives it a few percent) or closed off by the next wave.
-    float3 rr = reflect(-v, normalize(lerp(n, gn, 0.4f)));
+    float3 rr = reflect(-v, normalize(lerp(below ? -base : base, gn, 0.4f)));
     rr.y = max(rr.y, 0.01f);
     rr = normalize(rr);
     // Wind breaks a reflection up: a breeze leaves the shore's image in
@@ -470,16 +501,19 @@ float4 ps_main(VSOut i) : SV_Target0 {
     const float3 sky_r = sky_reflection(normalize(float3(rs.x, max(rs.y, 0.01f), rs.z)));
     const float3 refl = lerp(deep_in, lerp(sky_r, hit.rgb, hit.a), open);
 
-    // Sun glitter. The exponent falls as the wind gets up: a calm sea gives
-    // one hard highlight, a rough one scatters it into a broad track,
-    // because the facets that catch the sun are spread over more angles.
+    // Sun glitter. Near the camera the ripples are in the normal and every
+    // facet that catches the sun is its own hard sparkle; further off the
+    // ripples are too small to resolve and their slope goes into the lobe
+    // instead (Beckmann: mean square slope m^2, Blinn-Phong exponent about
+    // 2 / m^2 - 2), so a rough sea's sparkles merge into a broad track. The
+    // floor is ~900, a calm sea's single hard highlight. It used to be a
+    // hand-set lerp on the wind, 900 to 60 and then 250: broad lobes on
+    // smooth metre-wide faces were soft pale blobs, and narrow ones on a
+    // distant rough sea had no track at all.
     // Normalised Blinn-Phong, (shine + 8) / 8 pi, so the glint carries the
     // sun's real energy (ADR-004 L1). Not where a reflected surface hides it.
     const float3 h = normalize(l + v);
-    // 250 at the rough end, not 60: real glitter is many small sparkles off
-    // ripples these normals do not carry, and a broad lobe on smooth wave
-    // faces a metre across painted a gale's sunward sea with soft pale blobs.
-    const float  shine = lerp(900.0f, 250.0f, saturate(sea_state));
+    const float  shine = 2.0f / (var_unres + 0.0022f) - 2.0f;
     const float3 spec = below ? float3(0, 0, 0) :
         kSunLux * ((shine + 8.0f) / (8.0f * kPi) * pow(saturate(dot(n, h)), shine) *
                    saturate(dot(n, l))) * f_schlick(float3(0.02f, 0.02f, 0.02f), saturate(dot(v, h))) *
@@ -495,18 +529,33 @@ float4 ps_main(VSOut i) : SV_Target0 {
     const float lace = 0.6f * wnoise(i.world.xz * 0.45f + float2(time * 0.13f, time * 0.07f)) +
                        0.4f * wnoise(i.world.xz * 1.7f - float2(time * 0.21f, -time * 0.11f));
     const float shore_foam = smoothstep(1.0f - shallow, 1.25f - shallow, lace) * shallow * i.fade;
-    const float wave_h = (i.world.y - sea_level) / max(0.7f * i.hs, 0.001f);
-    // The top quarter of the wave, not the top half. Measured from a camera
-    // standing in the water: the displacement visible from there runs -3.34 m
-    // to +1.21 m against an amplitude of 3.71, because the near crests hide
-    // everything taller behind them. A threshold set from the sea's full
-    // crest height therefore marks water nobody can see, which is how the
-    // first two attempts both produced exactly 2.9% coverage and did not move
-    // when the number changed.
-    const float crest_foam = saturate((wave_h - 0.25f) * 2.6f) *
-                             saturate((sea_state - 0.28f) * 2.4f) * i.fade;
+    // Whitecaps where the surface FOLDS: the Jacobian of the trains' throw
+    // (ww_surface_with) and the ripples' (ocean_fft.hlsl) together, 1 on
+    // still water and 0 where a crest comes to a point and breaks. The wind
+    // sets how far short of folding a crest may break -- none under ~4 m/s,
+    // Beaufort 4 -- and the ripples break the band up, so foam sits on the
+    // sharpest crests in pieces rather than on every crest's top quarter.
+    // The 31 m tile also keeps the foam its compressions made, decaying over
+    // a couple of seconds IN THE TILE, so it trails behind them as streaks;
+    // in a strong wind that is laid over the whole sea, as windrows are.
+    // The height test this replaces marked every crest's top quarter alike.
+    //
+    // The threshold is MEASURED: --sea-report's section 3b tabulates the
+    // trains' J at the share of the sea Monahan's fit says is whitecap
+    // (3.84e-6 U^3.41: 1% at 10 m/s, 10% at 20), 0.63 at 4 m/s to 0.84 at
+    // 20, and this is a quadratic through it. The ripples' J only frays the
+    // edges (a third of it): at full weight they made a quarter of a gale's
+    // sea white with speckle, where real whitecaps cover a tenth.
+    const float U = min(sea_state * 20.0f, 22.0f);
+    const float jac = jac_g + 0.35f * (d0.z * f0 + d1.z * f1);
+    const float jt = 0.527f + 0.0279f * U - 0.000623f * U * U;
+    const float breaking = saturate((jt - jac) / 0.06f) * saturate((U - 3.0f) / 3.0f) * i.fade;
+    const float trail = d0.w * f0 * saturate((U - 10.0f) / 10.0f);
+    const float crest_foam = saturate(breaking * (0.55f + 0.9f * d0.w) + 0.25f * trail);
     const float foam = saturate(max(shore_foam, crest_foam));
 
+    // 7: the folding measure, white at 1 (still), black at 0 (folding).
+    if (debug_mode > 6.5f) return float4(saturate(jac).xxx, 0.0f);
     const float4 dbg = debug_view(i, n, foam, hit.a);
     if (dbg.a < 0.5f) return dbg;
 

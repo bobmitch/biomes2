@@ -67,13 +67,15 @@ struct WaterConstants {
     float extinction[3];  float ssr_on;
     float deep_colour[3]; float refraction;
     float frame;          float storm_turbidity; float pad3[2];
+    float detail_on;      float detail_var0; float detail_var1; float choppy;
 };
-static_assert(sizeof(WaterConstants) == 560, "WaterConstants must match water.hlsl");
+static_assert(sizeof(WaterConstants) == 576, "WaterConstants must match water.hlsl");
 
 // Heap slots past the RT denoiser's: the sea's copies of the lit scene and of
 // depth, which it reads while it draws into the one and tests against the
 // other.
-const UINT kWaterSceneSrv = 79, kWaterDepthSrv = 80, kHeapSlots = 81;
+// [81..82] the ripples' tiles (OceanDetail).
+const UINT kWaterSceneSrv = 79, kWaterDepthSrv = 80, kHeapSlots = 83;
 static_assert(RtDenoise::kHeapEnd <= kWaterSceneSrv, "the sea's heap slots overlap the denoiser's");
 
 // Matches cbuffer ShadowConstants in shadow.hlsli: 368 bytes, in a 512-byte buffer.
@@ -569,9 +571,9 @@ bool Renderer::create_water_pipeline(std::string& error) {
         // Since the sea draws after the composite: t0 the lit scene's copy,
         // t1 depth's copy, t2 the sky-view table, t3 the aerial perspective,
         // t4 the mist -- one table from heap [3], the post chain's base.
-        D3D12_DESCRIPTOR_RANGE wr[5] = {};
-        const UINT w_heap[5] = {kWaterSceneSrv, kWaterDepthSrv, 10, 11, 32};
-        for (UINT k = 0; k < 5; ++k) {
+        D3D12_DESCRIPTOR_RANGE wr[6] = {};
+        const UINT w_heap[6] = {kWaterSceneSrv, kWaterDepthSrv, 10, 11, 32, OceanDetail::kSrvSlot};
+        for (UINT k = 0; k < 6; ++k) {
             wr[k].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
             wr[k].NumDescriptors = 1;
             wr[k].BaseShaderRegister = k;
@@ -579,24 +581,26 @@ bool Renderer::create_water_pipeline(std::string& error) {
         }
         params[12].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[12].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        params[12].DescriptorTable.NumDescriptorRanges = 5;
+        params[12].DescriptorTable.NumDescriptorRanges = 6;
         params[12].DescriptorTable.pDescriptorRanges = wr;
-        D3D12_STATIC_SAMPLER_DESC ss[3] = {};
+        D3D12_STATIC_SAMPLER_DESC ss[4] = {};
         ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         ss[1].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
         ss[2].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-        for (int k = 0; k < 3; ++k) {
+        ss[3].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        for (int k = 0; k < 4; ++k) {
             ss[k].AddressU = ss[k].AddressV = ss[k].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
             ss[k].MaxLOD = D3D12_FLOAT32_MAX;
             ss[k].ShaderRegister = k;
             ss[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         }
         ss[2].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;   // the sky table wraps in azimuth
+        ss[3].AddressU = ss[3].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;   // the ripples' tiles repeat
 
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
         rsd.NumParameters = 13;
         rsd.pParameters = params;
-        rsd.NumStaticSamplers = 3;
+        rsd.NumStaticSamplers = 4;
         rsd.pStaticSamplers = ss;
         rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
@@ -1896,6 +1900,7 @@ bool Renderer::create_fog(std::string& error) {
     if (!fog_map_.build(world_, "worldgen/data/archetypes.json", error)) return false;
     if (!weather_.load("worldgen/data/archetypes.json", error)) return false;
     if (!load_water_optics("worldgen/data/archetypes.json", error)) return false;
+    if (!ocean_.init(device_.Get(), srv_heap_.Get(), error)) return false;
     weather_.set_seed(world_.field_id());
     update_weather(0.0);
 
@@ -3483,6 +3488,9 @@ void Renderer::record_water() {
 
     ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
     cmd_->SetDescriptorHeaps(1, heaps);
+    // The ripples' tiles for this frame (ocean_fft.hlsl): compute, then
+    // readable by the sea's pixel shader.
+    if (detail_on_) ocean_.record(cmd_.Get(), UINT(frame_));
     cmd_->SetPipelineState(water_pso_.Get());
     cmd_->SetGraphicsRootSignature(water_root_.Get());
     cmd_->SetGraphicsRootConstantBufferView(0, water_cb_[frame_]->GetGPUVirtualAddress());
@@ -3789,6 +3797,12 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     for (int k = 0; k < 3; ++k) tree_settings_.sun_dir[k] = sky_frame_.key_dir[k];
     // This frame's wind and sea, from the frame's own clock.
     update_weather(view.time);
+    // The ripples follow the same wind and clock.
+    {
+        const float dt = ocean_t_ < 0.0f ? 0.0f : view.time - ocean_t_;
+        ocean_t_ = view.time;
+        ocean_.update(view.time, dt, weather_now_.sea_wind, weather_now_.wind_dir, sea_);
+    }
     // The ray-tracing scene (ADR-004 L5): due BLAS and this frame's TLAS.
     if (rt_ok_ && rt_active_) {
         if (rt_seed_) {
@@ -4051,6 +4065,11 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         wc.ssr_on = ssr_on_ ? 1.0f : 0.0f;
         wc.refraction = water_optics_.refraction;
         wc.storm_turbidity = water_optics_.storm_turbidity;
+        const bool detail = detail_on_ && ocean_.ready();
+        wc.detail_on = detail ? 1.0f : 0.0f;
+        wc.detail_var0 = ocean_.variance(0);
+        wc.detail_var1 = ocean_.variance(1);
+        wc.choppy = ocean_.choppy();
         wc.frame = float(post_frame_ % 64);
         std::memcpy(water_cb_cpu_[frame_], &wc, sizeof wc);
         water_pending_ = true;

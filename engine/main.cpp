@@ -266,6 +266,11 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_renderer.weather().set_heading(h);
                 return 0;
             }
+            if (wp == VK_F4) {
+                // The sea's ripples (FFT detail), for A/B.
+                g_renderer.set_wave_detail(!g_renderer.wave_detail());
+                return 0;
+            }
             if (wp == VK_F7) {
                 // Screen-space reflections on the sea, for A/B.
                 g_renderer.set_ssr(!g_renderer.ssr());
@@ -274,7 +279,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == 'K') {
                 // Cycle the water debug views.
                 float m = g_renderer.water_debug() + 1.0f;
-                if (m > 6.5f) m = 0.0f;
+                if (m > 7.5f) m = 0.0f;
                 g_renderer.set_water_debug(m);
                 return 0;
             }
@@ -586,6 +591,39 @@ static int run_sea_report(const char* path) {
     std::fprintf(f, "waves grow with depth up to deep water: %s\n", grows ? "PASS" : "FAIL");
     std::fprintf(f, "no wave taller than its water can hold: %s\n", held ? "PASS" : "FAIL");
     if (!grows || !held) ok = false;
+
+    // 3b. Whitecaps: the trains' folding measure (ww_surface_with's Jacobian,
+    // 1 on still water, 0 where a crest folds) against the share of the sea
+    // that is whitecap at each wind, Monahan's fit W = 3.84e-6 U^3.41. The
+    // J at that quantile is the threshold water.hlsl's foam is fitted to.
+    std::fprintf(f, "\n3b. whitecaps: the trains' Jacobian J at the Monahan coverage, deep water, steady wind:\n");
+    std::fprintf(f, "%-7s %10s %8s %8s %8s %12s\n", "wind", "Monahan-%", "J 1%", "J 5%", "J 20%", "J@Monahan");
+    const float cap_winds[] = {4.0f, 6.0f, 8.0f, 10.0f, 12.0f, 15.0f, 18.0f, 20.0f, 24.0f};
+    for (float u : cap_winds) {
+        weather.set_wind(u);
+        weather.set_swell(0.0f);
+        const WwSea sea = weather.sea(weather.at(1000.0));
+        const ww_float3 loc = ww_local(sea, 1e4f, 1.0f, 0.0f);
+        std::vector<float> js;
+        js.reserve(160 * 160 * 2);
+        for (int ti = 0; ti < 2; ++ti) {
+            const float t = ti == 0 ? 0.0f : 7.3f;
+            for (int j = 0; j < 160; ++j) {
+                for (int i = 0; i < 160; ++i) {
+                    const float x = -210.0f + 420.0f * float(i) / 159.0f;
+                    const float z = -210.0f + 420.0f * float(j) / 159.0f;
+                    ww_float3 nrm;
+                    float jac = 1.0f;
+                    ww_surface_with(x, z, t, sea, 1e4f, 1.0f, 0.0f, loc.x, loc.y, nrm, jac);
+                    js.push_back(jac);
+                }
+            }
+        }
+        std::sort(js.begin(), js.end());
+        auto q = [&](double share) { return js[size_t((share < 0.999 ? share : 0.999) * double(js.size() - 1))]; };
+        const double w0 = 3.84e-6 * std::pow(double(u), 3.41), w = w0 < 0.3 ? w0 : 0.3;
+        std::fprintf(f, "%-7.1f %10.2f %8.3f %8.3f %8.3f %12.3f\n", u, 100.0 * w, q(0.01), q(0.05), q(0.20), q(w));
+    }
 
     // 4. The automatic weather over six hours of four seeds: how often each wind.
     std::fprintf(f, "\n4. automatic weather, seeds 1-4, six hours each sampled every 10 s:\n");
@@ -921,6 +959,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     g_renderer.set_water_debug(water_debug);
     if (no_water) g_renderer.set_water(false);
     if (cmdline && std::string(cmdline).find("--no-ssr") != std::string::npos) g_renderer.set_ssr(false);
+    if (cmdline && std::string(cmdline).find("--no-wave-detail") != std::string::npos) g_renderer.set_wave_detail(false);
     if (no_lod_hold) g_renderer.set_lod_hold(false);
     {
         const std::string c2 = cmdline ? cmdline : "";
@@ -1377,6 +1416,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                  w.wind_dir[0], w.wind_dir[1], w.gust, w.sea_wind, w.swell_hs, w.swell_dir[0],
                                  w.swell_dir[1], 4.0 * std::sqrt(m0), g_camera.x, g_camera.y, g_camera.z, depth,
                                  depth > 0.0f ? ww_significant_height_lod(sea, depth, 0.0f) : 0.0f);
+                    {
+                        const engine::OceanDetail& od = g_renderer.ocean();
+                        std::fprintf(f, "  sea slope (mean square, both axes): Cox-Munk %.4f; trains %.4f, ripples %.4f "
+                                        "(31 m tile %.4f, 7.7 m tile %.4f)%s\n",
+                                     od_cox_munk(w.sea_wind > 1.0f ? w.sea_wind : 1.0f),
+                                     od.gerstner_variance(), od.variance(0) + od.variance(1), od.variance(0), od.variance(1),
+                                     g_renderer.wave_detail() ? "" : " -- ripples OFF");
+                    }
                     // Along the view, flat: what the water ahead can carry.
                     const float fx = std::sin(g_camera.yaw), fz = std::cos(g_camera.yaw);
                     std::fprintf(f, "  ahead (depth m / Hs m):");

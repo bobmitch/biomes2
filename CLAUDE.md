@@ -1752,9 +1752,10 @@ with the weather would flood coastlines and no screenshot of a rough sea would
 look wrong.
 
 Controls: `--sea-shot` (stands the camera off the nearest coast, over 4-12 m of
-water), `--water-debug 1..6` (depth, foam, normal, displacement, surviving
-significant height, SSR source: green screen / red sky; marked as debug, so
-shown unexposed), `--no-water`, `--no-ssr`, and `K` / `F7` in the window.
+water), `--water-debug 1..7` (depth, foam, normal, displacement, surviving
+significant height, SSR source: green screen / red sky, the folding measure J;
+marked as debug, so shown unexposed), `--no-water`, `--no-ssr`,
+`--no-wave-detail`, and `K` / `F7` / `F4` in the window.
 Weather controls are under the weather section.
 
 **The sea draws AFTER the composite (ADR-004 L7)**, onto the lit scene, in
@@ -1780,14 +1781,62 @@ detectors historical.
   under a grey horizon. Reflections leaving below a roughness-dependent
   horizon take the water's colour (`open`): clamped, they lit every gale back
   slope with the horizon's beige and sent SSR along the sea into headlands.
-- **Gale glint** is now 250-900 (not 60): broad lobes on smooth faces read as
-  pale blobs. Shore foam is drifting value-noise lace, thick at the waterline.
+- Shore foam is drifting value-noise lace, thick at the waterline.
 - **Cost** at 2560 x 1440, the sea filling the frame: 0.83 ms light wind
   (SSR 0.39 of it), ~1.0 ms gale; was 0.25 / 0.38. Walking where the sea is
   incidental: +0.25 ms (the two full-frame copies and the grid).
 - **Not done**: a faint strip just under the horizon where SSR misses land;
   storm troughs over very shallow water bare the seabed (seen in `--swim`);
-  no underwater rendering; crest foam is still the old smooth style.
+  no underwater rendering.
+
+### The sea's ripples and whitecaps
+
+`engine/render/ocean_detail.{h,cpp}`, `ocean_spectrum.h` (compiled as C++ and
+HLSL, so the CPU sums the spectrum the GPU synthesises), `shaders/ocean_fft.hlsl`.
+F4 / `--no-wave-detail` for A/B.
+
+- **Two 256^2 FFT tiles a frame**, 31 m and 7.7 m (not multiples, so the
+  repeats never line up), carrying 4.5 m down to ~6 cm and splitting at 0.6 m
+  over a 15% overlap whose two bands sum to one. Phillips round the weather's
+  wind (`sea_wind`), 7% kept against it. Each texel's frequency is fixed and
+  the weather only reweights amplitudes, so a veering wind slides no phase.
+  The random field is a hash of the texel: nothing stored. Three complex
+  IFFTs a tile (two real fields packed in each): slope x + i slope z, the
+  choppy displacement's derivatives, then the output (slope x, slope z,
+  J - 1, foam). Rows and columns are one group a line, all eight radix-2
+  stages in group memory. `half` is an HLSL type: not a variable name.
+- **Never geometry, never physics.** The trains (`water_wave.h`) stay the
+  surface the grid, the swimmer and every height query use.
+- **Normalised to Cox-Munk**: the CPU scales the ripples so the trains' mean
+  square slope plus theirs is 0.003 + 0.00512 U, at least 30% of it ripples.
+  Re-summed only when the wind moves 2% or half a degree, only where each
+  band is (~33k spectrum evaluations). Every shot report prints the budget:
+  at 6 m/s, Cox-Munk 0.034, trains 0.015, ripples 0.018.
+- **Distance**: a tile fades as the pixel's footprint (stretched along a
+  grazing view) reaches a quarter to a half of its shortest ripple -- 0.6 m
+  and 6 cm -- and the slope it no longer resolves widens the sun's lobe
+  (Beckmann: exponent ~2 / m^2 - 2, floor ~900). Near the camera every facet
+  is its own sparkle; far off they merge into a glitter track. This replaced
+  a hand-set exponent on the wind (900 to 60, then 250).
+- **Whitecaps where the surface FOLDS**: the trains' Jacobian
+  (`ww_surface_with`'s new out parameter) plus a third of the ripples'. The
+  threshold is MEASURED: `--sea-report` 3b gives the trains' J at Monahan's
+  whitecap share (3.84e-6 U^3.41), 0.63 at 4 m/s to 0.84 at 20, and the shader
+  uses a quadratic through it. A gale frame's lower half measured 10.6% foam
+  against Monahan's 10.5%. At full weight the ripples' J made 25-30%, white
+  speckle all over; without the ripples the old thresholds made none.
+- **Trailing foam** lives in the 31 m tile's alpha, laid where the ripples
+  compress hard (J < 0.85) and decaying over ~2 s IN THE TILE, so it streaks
+  behind the moving compressions; it textures the whitecaps and, past 10 m/s,
+  is laid lightly over the sea. Laid at any compression, it covered the tile.
+- **Reflections**: SSR's ray and the "closed by the next wave" test (`open`)
+  use the trains' normal, not the ripples': with the ripples' tilt in `open`,
+  calm water at a grazing view was pocked with dark spots.
+- **Cost: +0.03 ms** (1440p flight over the sea, 4.62 / 4.59 light wind,
+  4.87 / 4.84 gale); ~3 MB of fields and a 1 MB output.
+- Once in this session a shot failed at init with "ocean detail pso cs_cols"
+  and the next run hung; every run since, cold and cached, was clean. Not
+  reproduced or explained.
 
 ### Weather: the wind, and the sea it raises
 
