@@ -591,8 +591,16 @@ bool Renderer::create_water_pipeline(std::string& error) {
     rt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
     rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
     rt.BlendOp = D3D12_BLEND_OP_ADD;
-    rt.SrcBlendAlpha = D3D12_BLEND_ONE;
-    rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    // The direct target's alpha is how much contact shadow the pixel takes
+    // (post.hlsl), and the sea writes no depth, so the composite's march runs
+    // on the SEABED and its answer multiplies the whole blended colour, the
+    // sea's reflection included. Water takes none: alpha 0 wherever it draws.
+    // Blending its alpha in as ONE made every water pixel 1, and the seabed's
+    // contact shadows speckled the sea in a band at a low sun, flickering
+    // with the march's jitter. Keeping the seabed's share, (1 - a), left 5x
+    // the band's frame-to-frame change of --no-contact in the shallows.
+    rt.SrcBlendAlpha = D3D12_BLEND_ZERO;
+    rt.DestBlendAlpha = D3D12_BLEND_ZERO;
     rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     // The ambient target: the sea only removes what is under it there, so
@@ -600,6 +608,7 @@ bool Renderer::create_water_pipeline(std::string& error) {
     pd.BlendState.IndependentBlendEnable = TRUE;
     D3D12_RENDER_TARGET_BLEND_DESC& rt1 = pd.BlendState.RenderTarget[1];
     rt1 = rt;
+    rt1.SrcBlendAlpha = D3D12_BLEND_ONE;   // the ambient alpha (AO's weight) as before
     rt1.SrcBlend = D3D12_BLEND_ZERO;
     rt1.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
 

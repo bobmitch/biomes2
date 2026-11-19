@@ -1454,6 +1454,17 @@ lit tables), [46] UAV; `--post-debug 3` shows it.
 - The sea writes its colour to the direct target as before and only REMOVES
   ambient under it (ZERO / INV_SRC_ALPHA on target 1), so seabed AO does not
   show through it.
+- **The sea zeroes the direct target's alpha**, the contact-shadow mask
+  (ZERO / ZERO). It writes no depth, so the composite's 0.5 m march runs on
+  the SEABED and multiplies the whole blended colour, reflection and all.
+  Blending its alpha as ONE / INV_SRC_ALPHA left every water pixel at 1:
+  at a low sun the seabed's contact shadows speckled the sea in a band
+  that flickered with the march's jitter (`--sea-shot --time 17.5`).
+  Keeping the seabed's share (1 - a) still left 5x `--no-contact`'s
+  frame-to-frame change in the shallows; zero matches it exactly. RT
+  shadows are also traced from the seabed's depth, but agree with the
+  cascades on open water (0.7% of a sea view differs, all round the
+  island's trees).
 
 ### Shadows
 
