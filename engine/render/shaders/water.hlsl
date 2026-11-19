@@ -48,9 +48,21 @@ cbuffer WaterConstants : register(b0) {
     float4 l_sky_zenith;
     float4 l_sky_horizon_sun;
     float4 l_sky_horizon_away;
+    // The weather's sea (water_wave.h, weather.cpp): each train's deep-water
+    // amplitude, and the crests' target steepness. sea_state above is now
+    // the weather's roughness, the wind over 20 m/s.
+    float4 wave_amp[WW_WAVES / 4];
+    float  wave_steep; float3 pad2;
 };
 
 #include "engine/render/shaders/lighting.hlsli"
+
+WwSea frame_sea() {
+    WwSea s;
+    [unroll] for (int i = 0; i < WW_WAVES; ++i) s.amp[i] = wave_amp[i >> 2][i & 3];
+    s.steep = wave_steep;
+    return s;
+}
 
 struct VSOut {
     float4 clip   : SV_Position;
@@ -60,6 +72,8 @@ struct VSOut {
     float  dist   : TEXCOORD3;
     float  fade   : TEXCOORD4;
     float  minwl  : TEXCOORD5;   // shortest wave this spacing can carry
+    float  hs     : TEXCOORD6;   // significant height the grid carries here (the foam's yardstick)
+    float2 cap_q  : TEXCOORD7;   // ww_local's breaking scale and Q, for the pixel's own normal
 };
 
 // A PROJECTED grid: the vertices are laid out on the SCREEN and dropped onto
@@ -159,23 +173,30 @@ VSOut vs_main(uint vid : SV_VertexID) {
     // only stops the far plane ring itself from heaving.
     const float fade = saturate(1.0f - (d - far_plane * 0.5f) / (far_plane * 0.5f));
 
-    float3 nrm;
-    const float3 p = ww_surface(rest.x, rest.y, time, sea_state, fade, minwl, nrm);
-    const float3 world = float3(p.x, sea_level + p.y, p.z);
+    // The terrain, from the same field the mesher uses, under the REST point:
+    // the depth tames the waves (water_wave.h), so it has to be known before
+    // the displacement. Positive means there is water here; negative means
+    // this vertex is inland, and the depth test against the terrain already
+    // drawn is what removes it. Read at the rest point rather than where the
+    // water is thrown to, a few metres off: on a beach that is centimetres.
+    const float r = sqrt(rest.x * rest.x + rest.y * rest.y) / w_radius;
+    const float ground = real_terrain_height(rest.x, rest.y, r, 0.0f);
+    const float depth = sea_level - ground;
 
-    // The terrain, from the same field the mesher uses. Positive means there
-    // is water here; negative means this vertex is inland, and the depth test
-    // against the terrain already drawn is what removes it.
-    const float r = sqrt(world.x * world.x + world.z * world.z) / w_radius;
-    const float ground = real_terrain_height(world.x, world.z, r, 0.0f);
+    float3 nrm;
+    const float3 p = ww_surface(rest.x, rest.y, time, frame_sea(), depth, fade, minwl, nrm);
+    const float3 world = float3(p.x, sea_level + p.y, p.z);
 
     o.world = world;
     o.clip = mul(float4(world, 1.0f), view_proj);
     o.nrm = nrm;
-    o.depth = sea_level - ground;
+    o.depth = depth;
     o.dist = d;
     o.fade = fade;
     o.minwl = minwl;
+    const float3 loc = ww_local(frame_sea(), depth, fade, minwl);
+    o.hs = loc.z / max(fade, 1e-4f);
+    o.cap_q = loc.xy;
     return o;
 }
 
@@ -205,8 +226,8 @@ float4 debug_view(VSOut i, float3 n, float foam) {
     if (debug_mode < 4.5f) {           // displacement, +/- 4 m over the full range
         return float4(saturate((i.world.y - sea_level) * 0.125f + 0.5f).xxx, 1.0f);
     }
-    // 5: the amplitude the LOD is actually letting through, 0..4 m.
-    return float4(saturate(ww_total_amplitude_lod(sea_state, i.minwl) * 0.25f).xxx, 1.0f);
+    // 5: the significant height the LOD and the depth let through, 0..8 m.
+    return float4(saturate(i.hs * 0.125f).xxx, 1.0f);
 }
 
 float4 water_colour(VSOut i);
@@ -242,9 +263,10 @@ float4 water_colour(VSOut i) {
     // It uses the pixel's OWN spacing limit, half the vertex's, because a
     // pixel resolves finer detail than the cell it sits in -- that is exactly
     // the detail the geometry could not carry.
+    const WwSea sea = frame_sea();
     float3 pn;
-    ww_surface(i.world.x, i.world.z, time, sea_state, i.fade,
-               max(i.minwl * 0.5f, 0.35f), pn);
+    ww_surface_with(i.world.x, i.world.z, time, sea, i.depth, i.fade,
+                    max(i.minwl * 0.5f, 0.35f), i.cap_q.x, i.cap_q.y, pn);
     const float3 n = normalize(lerp(pn, normalize(i.nrm), 0.25f));
     const float3 v = normalize(cam_pos - i.world);
     const float3 l = normalize(sun_dir);
@@ -267,7 +289,7 @@ float4 water_colour(VSOut i) {
     const float3 refl = reflect(-v, n);
     const float3 sky = sky_colour(refl);
 
-    // Sun glitter. The exponent falls as the sea gets rougher: a calm sea
+    // Sun glitter. The exponent falls as the wind gets up: a calm sea
     // gives one hard highlight, a rough one scatters it into a broad track,
     // because the facets that catch the sun are spread over more angles.
     //
@@ -285,7 +307,7 @@ float4 water_colour(VSOut i) {
     // sprout foam from a normal that is not being displaced any more.
     const float shore_foam = saturate(1.0f - i.depth / 2.2f) * i.fade;
     const float wave_h = (i.world.y - sea_level) /
-                         max(ww_total_amplitude_lod(sea_state, i.minwl), 0.001f);
+                         max(0.7f * i.hs, 0.001f);
     // The top quarter of the wave, not the top half. Measured from a camera
     // standing in the water: the displacement visible from there runs -3.34 m
     // to +1.21 m against an amplitude of 3.71, because the near crests hide

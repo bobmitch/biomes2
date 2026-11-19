@@ -159,6 +159,7 @@ if(BIOMES2_ENGINE)
     engine/render/rt_check.cpp
     engine/render/sky.cpp
     engine/render/fog.cpp
+    engine/render/weather.cpp
     engine/render/rt_scene.cpp
     engine/render/canopy.cpp
     engine/render/ddgi.cpp

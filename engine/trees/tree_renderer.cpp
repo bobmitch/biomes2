@@ -27,7 +27,7 @@ const UINT kCapLod1 = 4096;
 const UINT kCapImp = 98304;
 const UINT kMaxInstances = 131072;        // 20 bits of index in a visible entry
 
-// Matches cbuffer TreeFrame in trees.hlsl and tree_cull.hlsl: 320 bytes.
+// Matches cbuffer TreeFrame in trees.hlsl and tree_cull.hlsl: 352 bytes.
 struct TreeFrame {
     float view_proj[16];
     float cam_pos[3];   float time;
@@ -47,8 +47,10 @@ struct TreeFrame {
     float bake_dir[3];   float bake_r;
     float bake_right[3]; float bake_centre_y;
     float bake_up[3];    float shadow_pass;
+    float wind_v[4];
+    float wind_drift[2]; float wind_pad[2];
 };
-static_assert(sizeof(TreeFrame) == 320, "TreeFrame must match the HLSL cbuffer");
+static_assert(sizeof(TreeFrame) == 352, "TreeFrame must match the HLSL cbuffer");
 const UINT kCbStride = 512;
 // Per frame in flight: the camera's constants, then one per shadow cascade.
 // The main pass, four sun cascades, and up to twelve local-light faces.
@@ -860,6 +862,9 @@ void fill_common(TreeFrame& tf, UINT count, UINT models, UINT quad_first, UINT q
     tf.quad_first = quad_first;
     tf.quad_base = quad_base;
     tf.wind = s.wind;
+    for (int k = 0; k < 4; ++k) tf.wind_v[k] = s.wind_v[k];
+    tf.wind_drift[0] = s.wind_drift[0];
+    tf.wind_drift[1] = s.wind_drift[1];
     tf.cut_height = kCutHeight;
     tf.debug = s.debug;
 }

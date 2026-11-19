@@ -7,8 +7,8 @@
 // the mist's extinction at the surface, the height over which it thins by e,
 // and the surface it lies on -- the ground, or the sea where there is sea.
 // Per-biome densities and the sea's come from archetypes.json ("fog"). The
-// froxel volume (fog.hlsl) reads it every frame and adds what moves: wind-
-// drifted patches, morning mist, a thin haze everywhere.
+// froxel volume (fog.hlsl) reads it every frame and adds what moves: patches
+// drifting on the weather's wind (weather.h), morning mist, a thin haze.
 //
 // The central, safe biomes and open water are the misty ones on purpose --
 // the wider map should be found, not seen. This is the hook that a later
@@ -29,7 +29,6 @@ struct FogSettings {
     float sea_density = 0.004f, sea_height = 90.0f;
     float haze = 0.00008f;       // extinction everywhere, per metre
     float morning = 2.5f;        // how much thicker the mist is round dawn
-    float wind[2] = {1.5f, 0.6f};
     float patch = 160.0f;        // patch size, metres
     float phase_g = 0.55f;
     float albedo = 0.95f;

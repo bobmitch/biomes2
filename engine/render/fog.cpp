@@ -29,9 +29,6 @@ bool FogMap::build(const WorldGpu& world, const char* archetypes_path, std::stri
             settings_.sea_height = float(sea.number("height"));
             settings_.haze = float(g.number("haze"));
             settings_.morning = float(g.number("morning"));
-            const jsonlite::Array& w = g.array("wind");
-            settings_.wind[0] = float(w[0].num);
-            settings_.wind[1] = float(w[1].num);
             settings_.patch = float(g.number("patch"));
             settings_.phase_g = float(g.number("phase_g"));
             settings_.albedo = float(g.number("albedo"));

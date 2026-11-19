@@ -54,7 +54,11 @@ struct WaterConstants {
     float cam_water;   // world y of the sea surface directly at the camera
     float pad0[2];
     float light[7][4]; // the frame's light (ADR-004 L2): Renderer::fill_light
+    float wave_amp[WW_WAVES];   // the weather's sea (water_wave.h)
+    float wave_steep;
+    float pad2[3];
 };
+static_assert(sizeof(WaterConstants) == 432, "WaterConstants must match water.hlsl");
 
 // Matches cbuffer ShadowConstants in shadow.hlsli: 368 bytes, in a 512-byte buffer.
 struct ShadowConstants {
@@ -193,7 +197,7 @@ struct FogConstants {
     float cam_fwd[3];   float jitter;
     float near_z;       float log_ratio; UINT history_valid; float time_factor;
     float map_extent;   float haze;      float sea_level;    float patch;
-    float wind[2];      float phase_g;   float albedo;
+    float drift[2];     float phase_g;   float albedo;
     float screen_w;     float screen_h;  float density_scale; float cam_sky;
 };
 static_assert(sizeof(FogConstants) == 192, "FogConstants must match fog.hlsl");
@@ -1843,6 +1847,9 @@ void Renderer::record_rt_trace() {
 
 bool Renderer::create_fog(std::string& error) {
     if (!fog_map_.build(world_, "worldgen/data/archetypes.json", error)) return false;
+    if (!weather_.load("worldgen/data/archetypes.json", error)) return false;
+    weather_.set_seed(world_.field_id());
+    update_weather(0.0);
 
     // Timestamps for the post chain: five a frame per frame in flight.
     {
@@ -2108,8 +2115,9 @@ void Renderer::record_fog() {
     fc.haze = fs.haze;
     fc.sea_level = world_.params().sea_level;
     fc.patch = fs.patch;
-    fc.wind[0] = fs.wind[0];
-    fc.wind[1] = fs.wind[1];
+    // The mist drifts at a share of the wind (weather.h's drift integral).
+    fc.drift[0] = weather_now_.drift[0] * weather_.settings().mist_drift;
+    fc.drift[1] = weather_now_.drift[1] * weather_.settings().mist_drift;
     fc.phase_g = fs.phase_g;
     fc.albedo = fs.albedo;
     fc.screen_w = float(width_);
@@ -3613,10 +3621,28 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     ++post_frame_;
 }
 
+void Renderer::update_weather(double t) {
+    weather_now_ = weather_.at(t);
+    sea_ = weather_.sea(weather_now_);
+    weather_t_ = t;
+    const float wv[4] = {weather_now_.wind_dir[0], weather_now_.wind_dir[1],
+                         weather_now_.wind_speed, weather_now_.gust};
+    for (int k = 0; k < 4; ++k) {
+        tree_settings_.wind_v[k] = wv[k];
+        foliage_settings_.wind_v[k] = wv[k];
+    }
+    for (int k = 0; k < 2; ++k) {
+        tree_settings_.wind_drift[k] = weather_now_.drift[k];
+        foliage_settings_.wind_drift[k] = weather_now_.drift[k];
+    }
+}
+
 void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HANDLE rtv) {
     // This frame's sun, moon and sky (ADR-004 L2), before anything uses them.
     update_sky(view.cam_pos[1]);
     for (int k = 0; k < 3; ++k) tree_settings_.sun_dir[k] = sky_frame_.key_dir[k];
+    // This frame's wind and sea, from the frame's own clock.
+    update_weather(view.time);
     // The ray-tracing scene (ADR-004 L5): due BLAS and this frame's TLAS.
     if (rt_ok_ && rt_active_) {
         if (rt_seed_) {
@@ -3845,7 +3871,10 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         wc.aspect = view.aspect;
         wc.tan_half_fov = view.tan_half_fov;
         wc.sea_level = world_.params().sea_level;
-        wc.sea_state = sea_state_;
+        // The weather's roughness: the highlight's spread and the whitecaps.
+        wc.sea_state = Weather::roughness(weather_now_);
+        for (int k = 0; k < WW_WAVES; ++k) wc.wave_amp[k] = sea_.amp[k];
+        wc.wave_steep = sea_.steep;
         wc.grid_cells = static_cast<float>(kWaterCells);
         wc.extent = kFarPlane;
         wc.debug_mode = water_debug_;
@@ -3853,7 +3882,8 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         // shader's idea of "is the eye above the water here" and the
         // swimmer's are one answer rather than two that usually agree.
         wc.cam_water = wc.sea_level + ww_height_at(view.cam_pos[0], view.cam_pos[2],
-                                                   view.time, sea_state_);
+                                                   view.time, sea_,
+                                                   wc.sea_level - world_.height(view.cam_pos[0], view.cam_pos[2]));
 
         cmd_->SetPipelineState(water_pso_.Get());
         cmd_->SetGraphicsRootSignature(water_root_.Get());

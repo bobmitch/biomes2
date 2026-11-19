@@ -20,6 +20,7 @@
 #include "engine/render/shaders/leaf.hlsli"
 #include "engine/render/shaders/scene_out.hlsli"
 #include "engine/render/shaders/local_lights.hlsli"
+#include "engine/render/shaders/wind.hlsli"
 
 cbuffer FoliageFrame : register(b0) {
     row_major float4x4 view_proj;
@@ -35,6 +36,8 @@ cbuffer FoliageFrame : register(b0) {
     uint   s_grass;     float grass_freq;
     float  near_radius; float debug;
     float  blade_width; float tuft;      // width multiplier; blades a blade instance draws, fanned from one root (1-3)
+    float4 wind_v;                       // weather.h: direction x, z; mean m/s; gustiness
+    float2 wind_drift;  float2 wind_pad; // metres the air has moved
 };
 
 cbuffer DrawConst : register(b3) { uint g_segments; };
@@ -358,12 +361,19 @@ FolOut with_gi(FolOut o) {
     return o;
 }
 
-// Wind: a gust field drifting across the ground, plus a quick flutter.
+// Wind (weather.h, wind.hlsli): the tip's push as a fraction of the blade's
+// height. A blade bends with the drag, the speed squared, until it is lying
+// over: 0.3 in a light breeze (3 m/s), 0.7 at 6, 1.0 at 10, 1.3 in a gale.
+// The gust cells drifting over the ground are what make a meadow ripple;
+// the quick sway on top grows with the speed. `wind` is the settings'
+// multiplier (1).
 float2 wind_at(float2 p) {
-    const float2 dir = normalize(float2(1.0f, 0.35f));
-    const float gust = vnoise(p * 0.04f - dir * time * 0.6f);
-    const float sway = sin(time * 2.3f + dot(p, float2(0.7f, 0.4f)));
-    return dir * (0.25f + 0.75f * gust * gust) * wind + float2(0.06f, 0.03f) * sway * wind;
+    const float2 v = wind_velocity(p, wind_v, wind_drift, time);
+    const float s2 = dot(v, v);
+    const float bend = 1.4f * s2 / (s2 + 40.0f);
+    const float2 dir = wind_v.xy;
+    const float sway = sin(time * 2.3f + dot(p, float2(0.7f, 0.4f))) * min(0.02f + 0.012f * wind_v.z, 0.2f);
+    return (dir * (bend + sway) + float2(-dir.y, dir.x) * (0.5f * sway)) * wind;
 }
 
 float blade_fade(float d) {

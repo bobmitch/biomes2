@@ -21,6 +21,7 @@
 #include "engine/render/sky.h"
 #include "engine/render/local_lights.h"
 #include "engine/render/fog.h"
+#include "engine/render/weather.h"
 #include "engine/render/rt_scene.h"
 #include "engine/render/canopy.h"
 #include "engine/render/ddgi.h"
@@ -154,10 +155,17 @@ public:
 
     const WorldGpu& world() const { return world_; }
 
-    // Sea state: 0 calm, 1 storm. Storms are a planned mechanic, so this is a
-    // runtime value and nothing about the surface shape is baked.
-    void  set_sea_state(float s) { sea_state_ = s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s); }
-    float sea_state() const { return sea_state_; }
+    // The weather (weather.h): the wind every swaying thing shares and the sea
+    // it raises. Automatic unless overridden; --sea-state and [ ] set the
+    // storm dial (0 calm, 1 gale), --wind a speed. update_weather(t) is
+    // called by record_scene with the frame's clock, and by anything (the
+    // physics sync) that needs this frame's sea before the frame is drawn.
+    void  set_sea_state(float s) { weather_.set_storm(s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s)); }
+    float sea_state() const { return weather_now_.storm; }
+    Weather& weather() { return weather_; }
+    const WeatherState& weather_state() const { return weather_now_; }
+    const WwSea& sea() const { return sea_; }
+    void  update_weather(double t);
     void  set_water(bool on) { water_ = on; }
     // LOD transitions: hold the outgoing chunk until its replacements are
     // meshed, then dither-cross-fade over `frames`. See Streamer.
@@ -606,6 +614,10 @@ private:
     ComPtr<ID3D12Resource>  rt_query_rb_;
     bool  rt_query_pending_[kFrameCount] = {};
     FogMap fog_map_;
+    Weather      weather_;
+    WeatherState weather_now_;
+    WwSea        sea_ = {};
+    double       weather_t_ = -1.0;
     PostTimes post_times_;
     ComPtr<ID3D12QueryHeap> post_queries_;
     ComPtr<ID3D12Resource>  post_query_rb_;
@@ -720,7 +732,6 @@ private:
     std::vector<ChunkKey>   patches_removed_;
     FrameStats  stats_;
     Mode        mode_ = Mode::Mesh;
-    float       sea_state_ = 0.25f;
     bool        water_ = true;
     float       water_debug_ = 0.0f;
     float       mesh_debug_ = 0.0f;

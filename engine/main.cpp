@@ -29,6 +29,7 @@
 // ---------------------------------------------------------------------------
 #include "engine/render/renderer.h"
 #include "engine/render/water_wave.h"
+#include "engine/render/weather.h"
 #include "engine/render/shader_compile.h"
 #include "engine/render/sky.h"
 #include "engine/camera.h"
@@ -181,7 +182,11 @@ void sync_sea(float t) {
     engine::SeaParams s;
     s.on = g_renderer.water();
     s.level = g_renderer.world().params().sea_level;
+    // The weather at this frame's clock, so the sea is the one about to be
+    // drawn even before record_scene asks for it.
+    g_renderer.update_weather(t);
     s.state = g_renderer.sea_state();
+    s.sea = g_renderer.sea();
     s.time = t;
     g_physics.set_sea(s);
 }
@@ -242,9 +247,23 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == VK_OEM_4 || wp == VK_OEM_6) {
                 // [ and ]: calm to storm without leaving the water. Seeing the
                 // surface change under one camera is the only way to judge
-                // whether the sea state actually reads as weather.
+                // whether the weather actually reads as weather. Fixes the
+                // dial; \ hands it back to the automatic weather. The sea
+                // answers over weather.sea_lag_s, as it would to a real wind.
                 const float d = (wp == VK_OEM_6) ? 0.1f : -0.1f;
                 g_renderer.set_sea_state(g_renderer.sea_state() + d);
+                return 0;
+            }
+            if (wp == VK_OEM_5) {
+                g_renderer.weather().set_auto();
+                return 0;
+            }
+            if (wp == VK_OEM_1) {
+                // ;: turn the wind 45 degrees.
+                const engine::WeatherState& w = g_renderer.weather_state();
+                float h = std::atan2(w.wind_dir[1], w.wind_dir[0]) + 0.78539816f;
+                if (h < 0.0f) h += 6.2831853f;
+                g_renderer.weather().set_heading(h);
                 return 0;
             }
             if (wp == 'K') {
@@ -415,100 +434,180 @@ void fill_view(const engine::Camera& cam, float w, float h, float t,
 
 }  // namespace
 
-// --sea-report: what the sea state actually produces, measured on the C++ side
-// of the SAME function the shader draws. Storms are a planned mechanic, so the
-// thing that matters is not that waves exist but that the dial maps onto a
-// usable range of weather -- and the formula in water_wave.h is not evidence
-// of that, only the numbers it produces are.
+// --sea-report: what the weather's sea actually produces, measured on the C++
+// side of the SAME function the shader draws. The thing that matters is not
+// that waves exist but that the wind maps onto a usable range of weather, and
+// that depth tames them -- and the spectrum in weather.cpp is not evidence of
+// either, only the numbers it produces are.
 //
 // The assertion worth making is the one you would never catch by looking: the
-// MEAN surface height must stay at sea level whatever the sea state. A Gerstner
+// MEAN surface height must stay at sea level whatever the weather. A Gerstner
 // sum has zero mean by construction, so a non-zero mean here means an amplitude
 // or a steepness term has acquired a bias -- the sea would silently rise or
 // fall with the weather, flooding or draining coastlines, and no screenshot of
 // a rough sea would look wrong.
-static int run_sea_report(const char* path) {
-    FILE* f = std::fopen(path, "w");
-    if (!f) return 1;
+namespace {
+struct SeaStats { double hi, lo, mean, slope, miss, naive; };
 
-    std::fprintf(f, "The sea surface, measured from engine/render/water_wave.h\n");
-    std::fprintf(f, "-- the same text the shader compiles.\n\n");
-    std::fprintf(f, "%-6s %10s %10s %10s %10s %9s\n",
-                 "state", "crest-m", "trough-m", "height-m", "max-slope", "mean-m");
-
+SeaStats measure_sea(const WwSea& sea, float depth, bool invert) {
     const int N = 160;          // sample grid a side
     const float span = 420.0f;  // metres, several of the longest wavelength
-    double worst_mean = 0.0;
-    bool ok = true;
-    double inv_miss[11] = {0}, inv_naive[11] = {0};
-
-    for (int s = 0; s <= 10; s += 2) {
-        const float state = float(s) / 10.0f;
-        double lo = 1e30, hi = -1e30, sum = 0.0, slope = 0.0;
-        int n = 0;
-        // Two times, because a single snapshot of a travelling wave can miss
-        // the crest entirely and report a calm sea.
-        for (int ti = 0; ti < 2; ++ti) {
-            const float t = ti == 0 ? 0.0f : 7.3f;
-            for (int j = 0; j < N; ++j) {
-                for (int i = 0; i < N; ++i) {
-                    const float x = -span * 0.5f + span * float(i) / float(N - 1);
-                    const float z = -span * 0.5f + span * float(j) / float(N - 1);
-                    ww_float3 nrm;
-                    const ww_float3 p = ww_surface(x, z, t, state, 1.0f, 0.0f, nrm);
-                    if (p.y < lo) lo = p.y;
-                    if (p.y > hi) hi = p.y;
-                    sum += p.y;
-                    ++n;
-                    // ny is cos of the angle from vertical; smaller means steeper.
-                    const double sl = nrm.y > 1e-6f ? (1.0 / nrm.y) : 1e6;
-                    if (sl > slope) slope = sl;
-
-                    // The waterline physics asks for: the surface ABOVE
-                    // (x, z), not the water that started there. Every
-                    // fourth sample is plenty to find the worst case.
-                    if ((i & 3) == 0 && (j & 3) == 0) {
-                        const ww_float2 r = ww_rest_point(x, z, t, state, 0.0f);
-                        ww_float3 n2;
-                        const ww_float3 q = ww_surface(r.x, r.y, t, state, 1.0f, 0.0f, n2);
-                        const double mx = double(q.x) - x, mz = double(q.z) - z;
-                        const double miss = std::sqrt(mx * mx + mz * mz);
-                        if (miss > inv_miss[s]) inv_miss[s] = miss;
-                        const double naive = std::fabs(double(p.y) - double(q.y));
-                        if (naive > inv_naive[s]) inv_naive[s] = naive;
-                    }
+    SeaStats r = {-1e30, 1e30, 0.0, 0.0, 0.0, 0.0};
+    double sum = 0.0;
+    int n = 0;
+    // Two times, because a single snapshot of a travelling wave can miss
+    // the crest entirely and report a calm sea.
+    for (int ti = 0; ti < 2; ++ti) {
+        const float t = ti == 0 ? 0.0f : 7.3f;
+        for (int j = 0; j < N; ++j) {
+            for (int i = 0; i < N; ++i) {
+                const float x = -span * 0.5f + span * float(i) / float(N - 1);
+                const float z = -span * 0.5f + span * float(j) / float(N - 1);
+                ww_float3 nrm;
+                const ww_float3 p = ww_surface(x, z, t, sea, depth, 1.0f, 0.0f, nrm);
+                if (p.y < r.lo) r.lo = p.y;
+                if (p.y > r.hi) r.hi = p.y;
+                sum += p.y;
+                ++n;
+                // ny is cos of the angle from vertical; smaller means steeper.
+                const double sl = nrm.y > 1e-6f ? (1.0 / nrm.y) : 1e6;
+                if (sl > r.slope) r.slope = sl;
+                // The waterline physics asks for: the surface ABOVE (x, z),
+                // not the water that started there. Every fourth sample is
+                // plenty to find the worst case.
+                if (invert && (i & 3) == 0 && (j & 3) == 0) {
+                    const ww_float2 rp = ww_rest_point(x, z, t, sea, depth, 0.0f);
+                    ww_float3 n2;
+                    const ww_float3 q = ww_surface(rp.x, rp.y, t, sea, depth, 1.0f, 0.0f, n2);
+                    const double mx = double(q.x) - x, mz = double(q.z) - z;
+                    const double miss = std::sqrt(mx * mx + mz * mz);
+                    if (miss > r.miss) r.miss = miss;
+                    const double naive = std::fabs(double(p.y) - double(q.y));
+                    if (naive > r.naive) r.naive = naive;
                 }
             }
         }
-        const double mean = n ? sum / n : 0.0;
-        const double amean = mean < 0.0 ? -mean : mean;
-        if (amean > worst_mean) worst_mean = amean;
-        if (amean > 0.05) ok = false;
-
-        std::fprintf(f, "%-6.1f %10.2f %10.2f %10.2f %10.2f %9.4f\n",
-                     state, hi, lo, hi - lo, slope, mean);
     }
+    r.mean = n ? sum / n : 0.0;
+    return r;
+}
+}  // namespace
+
+static int run_sea_report(const char* path) {
+    FILE* f = std::fopen(path, "w");
+    if (!f) return 1;
+    engine::Weather weather;
+    std::string err;
+    if (!weather.load("worldgen/data/archetypes.json", err)) {
+        std::fprintf(f, "%s\n", err.c_str());
+        std::fclose(f);
+        return 1;
+    }
+    weather.set_seed(1);
+    weather.set_heading(0.6f);
+
+    std::fprintf(f, "The sea surface, measured from engine/render/water_wave.h -- the same\n");
+    std::fprintf(f, "text the shader compiles -- raised by engine/render/weather.cpp.\n");
+    std::fprintf(f, "Heights are crest to trough over a 420 m patch at two times.\n\n");
+
+    bool ok = true;
+    double worst_mean = 0.0;
+    auto check_mean = [&](const SeaStats& st) {
+        const double am = std::fabs(st.mean);
+        if (am > worst_mean) worst_mean = am;
+        if (am > 0.05) ok = false;
+    };
+
+    // 1. The wind sea alone, deep water, steady wind (the sea fully answered).
+    std::fprintf(f, "1. wind sea alone (no swell), deep water:\n");
+    std::fprintf(f, "%-7s %8s %8s %9s %9s %9s %9s %9s\n", "wind", "storm", "Hs-m", "crest-m",
+                 "trough-m", "height-m", "max-slope", "mean-m");
+    const float winds[] = {0.5f, 2.0f, 3.5f, 6.0f, 10.0f, 15.0f, 20.0f, 24.0f};
+    double inv_miss = 0.0;
+    for (float u : winds) {
+        weather.set_wind(u);
+        weather.set_swell(0.0f);
+        const engine::WeatherState w = weather.at(1000.0);
+        const WwSea sea = weather.sea(w);
+        const SeaStats st = measure_sea(sea, 1e4f, true);
+        check_mean(st);
+        if (st.miss > inv_miss) inv_miss = st.miss;
+        double m0 = 0.0;
+        for (int i = 0; i < WW_WAVES; ++i) m0 += 0.5 * double(sea.amp[i]) * sea.amp[i];
+        std::fprintf(f, "%-7.1f %8.2f %8.2f %9.2f %9.2f %9.2f %9.2f %9.4f   (naive waterline error %.3f m)\n",
+                     u, w.storm, 4.0 * std::sqrt(m0), st.hi, st.lo, st.hi - st.lo, st.slope, st.mean, st.naive);
+    }
+
+    // 2. The swell alone.
+    std::fprintf(f, "\n2. swell alone (a calm wind), deep water:\n");
+    std::fprintf(f, "%-7s %9s %9s\n", "Hs-m", "height-m", "max-slope");
+    const float swells[] = {0.25f, 1.0f, 2.5f};
+    for (float hs : swells) {
+        weather.set_wind(0.5f);
+        weather.set_swell(hs);
+        const SeaStats st = measure_sea(weather.sea(weather.at(1000.0)), 1e4f, false);
+        check_mean(st);
+        std::fprintf(f, "%-7.2f %9.2f %9.2f\n", hs, st.hi - st.lo, st.slope);
+    }
+
+    // 3. Depth, at a near gale with its swell: the waves die towards the
+    // shore, the long ones first, and nothing stands much taller than the
+    // water is deep. The cap is on the significant height (WW_BREAK_HS x
+    // depth); the biggest single wave of a random sea runs ~1.6-1.9 times
+    // that, so the check is the tallest wave in the patch against 1.1 x
+    // depth -- a wave that size is breaking, which is the point.
+    std::fprintf(f, "\n3. depth, at 15 m/s wind with a 2 m swell:\n");
+    std::fprintf(f, "%-8s %9s %9s %10s\n", "depth-m", "height-m", "limit-m", "verdict");
+    weather.set_wind(15.0f);
+    weather.set_swell(2.0f);
+    const WwSea gale = weather.sea(weather.at(1000.0));
+    const float depths[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f, 64.0f, 1e4f};
+    double prev = 0.0;
+    bool grows = true, held = true;
+    for (float d : depths) {
+        const SeaStats st = measure_sea(gale, d, d < 100.0f);
+        check_mean(st);
+        if (st.miss > inv_miss) inv_miss = st.miss;
+        const double h = st.hi - st.lo;
+        const double limit = 1.1 * d;
+        const bool deep = d > 1000.0f;
+        const bool in = deep || h <= limit + 0.01;
+        if (!in) held = false;
+        if (h + 0.01 < prev) grows = false;
+        prev = h;
+        std::fprintf(f, "%-8.2f %9.2f %9.2f %10s\n", deep ? 9999.0f : d, h,
+                     deep ? 0.0 : limit, deep ? "deep" : (in ? "ok" : "TOO TALL"));
+    }
+    std::fprintf(f, "waves grow with depth up to deep water: %s\n", grows ? "PASS" : "FAIL");
+    std::fprintf(f, "no wave taller than its water can hold: %s\n", held ? "PASS" : "FAIL");
+    if (!grows || !held) ok = false;
+
+    // 4. The automatic weather over six hours of four seeds: how often each wind.
+    std::fprintf(f, "\n4. automatic weather, seeds 1-4, six hours each sampled every 10 s:\n");
+    weather.set_auto();
+    int bins[6] = {0, 0, 0, 0, 0, 0};
+    const char* names[6] = {"calm <2", "light 2-5", "moderate 5-8", "fresh 8-14", "strong 14-18", "gale 18+"};
+    double worst_swell = 0.0;
+    const int per_seed = 2160, samples = 4 * per_seed;
+    for (int k = 0; k < samples; ++k) {
+        if (k % per_seed == 0) weather.set_seed(uint32_t(1 + k / per_seed));
+        const engine::WeatherState w = weather.at(double(k % per_seed) * 10.0);
+        const float u = w.wind_speed;
+        bins[u < 2 ? 0 : u < 5 ? 1 : u < 8 ? 2 : u < 14 ? 3 : u < 18 ? 4 : 5]++;
+        if (w.swell_hs > worst_swell) worst_swell = w.swell_hs;
+    }
+    for (int b = 0; b < 6; ++b) std::fprintf(f, "  %-13s %5.1f%%\n", names[b], 100.0 * bins[b] / samples);
+    std::fprintf(f, "  biggest swell %.2f m\n", worst_swell);
 
     std::fprintf(f, "\nmean surface height must stay at sea level: worst |mean| %.4f m -> %s\n",
-                 worst_mean, ok ? "PASS" : "FAIL (the sea rises with the weather)");
-
-    // The swimmer's waterline. ww_height_at inverts the Gerstner throw so it
-    // returns the surface directly above a point; "naive" is what you would
-    // get by skipping that and reading the water that STARTED there.
-    std::fprintf(f, "\nwaterline inversion (%d Newton steps), what physics floats on:\n",
-                 WW_INVERT_STEPS);
-    std::fprintf(f, "%-6s %16s %22s\n", "state", "miss-m (horiz)", "naive-error-m (vert)");
-    bool inv_ok = true;
-    for (int s = 0; s <= 10; s += 2) {
-        std::fprintf(f, "%-6.1f %16.6f %22.3f\n", float(s) / 10.0f, inv_miss[s], inv_naive[s]);
-        if (inv_miss[s] > 0.001) inv_ok = false;
-    }
-    std::fprintf(f, "inversion lands within 1 mm of the asked point: %s\n",
-                 inv_ok ? "PASS" : "FAIL (raise WW_INVERT_STEPS)");
+                 worst_mean, worst_mean <= 0.05 ? "PASS" : "FAIL (the sea rises with the weather)");
+    const bool inv_ok = inv_miss <= 0.001;
+    std::fprintf(f, "waterline inversion (%d Newton steps) lands within 1 mm of the asked point: "
+                    "worst %.6f m -> %s\n", WW_INVERT_STEPS, inv_miss, inv_ok ? "PASS" : "FAIL (raise WW_INVERT_STEPS)");
     if (!inv_ok) ok = false;
     std::fprintf(f, "\nmax-slope is 1/n.y, so 1.00 is flat and the Gerstner limit is\n");
-    std::fprintf(f, "where crests come to a point. Steepness rises with the sea\n");
-    std::fprintf(f, "state on purpose -- sharpening crests is most of what makes a\n");
+    std::fprintf(f, "where crests come to a point. Steepness rises with the storm\n");
+    std::fprintf(f, "on purpose -- sharpening crests is most of what makes a\n");
     std::fprintf(f, "storm read as one rather than as calm water scaled up.\n");
     std::fclose(f);
     return ok ? 0 : 1;
@@ -530,7 +629,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     // the finished world rather than eight chunks of it.
     std::string shot_path;
     bool start_overlay = false, debug_layer = false;
-    float sea_state = 0.25f;
+    // The weather (weather.h) is automatic unless one of these fixes it:
+    // --sea-state the storm dial 0..1, --wind a speed in m/s, --wind-dir a
+    // heading in degrees (the way the air moves, from +x towards +z),
+    // --swell a significant height in metres.
+    float sea_state = -1.0f, wind_mps = -1.0f, wind_dir_deg = -1000.0f, swell_hs = -1.0f;
     float water_debug = 0.0f;
     bool  no_water = false;
     double flight_seconds = 0.0;
@@ -595,6 +698,26 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             size_t p = cl.find_first_not_of(" \t", ss + 11);
             if (p != std::string::npos) sea_state = float(std::atof(cl.c_str() + p));
         }
+        auto flag_num = [&](const char* name, float& out) {
+            const size_t at = cl.find(name);
+            if (at == std::string::npos) return;
+            const size_t q = cl.find_first_not_of(" \t", at + std::string(name).size());
+            if (q != std::string::npos) out = float(std::atof(cl.c_str() + q));
+        };
+        flag_num("--wind-dir", wind_dir_deg);
+        {
+            // "--wind" alone, not the prefix of --wind-dir.
+            size_t at = 0;
+            while ((at = cl.find("--wind", at)) != std::string::npos) {
+                if (cl.compare(at, 10, "--wind-dir") != 0) {
+                    const size_t q = cl.find_first_not_of(" \t", at + 6);
+                    if (q != std::string::npos) wind_mps = float(std::atof(cl.c_str() + q));
+                    break;
+                }
+                at += 6;
+            }
+        }
+        flag_num("--swell", swell_hs);
         no_water = cl.find("--no-water") != std::string::npos;
         const size_t wd = cl.find("--water-debug");
         if (wd != std::string::npos) {
@@ -782,7 +905,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return ok ? 0 : 1;
     }
     if (start_overlay) g_renderer.set_mode(engine::Mode::Wireframe);
-    g_renderer.set_sea_state(sea_state);
+    if (sea_state >= 0.0f) g_renderer.set_sea_state(sea_state);
+    if (wind_mps >= 0.0f) g_renderer.weather().set_wind(wind_mps);
+    if (wind_dir_deg > -999.0f) {
+        float rad = wind_dir_deg * 0.017453293f;
+        while (rad < 0.0f) rad += 6.2831853f;
+        g_renderer.weather().set_heading(rad);
+    }
+    if (swell_hs >= 0.0f) g_renderer.weather().set_swell(swell_hs);
     g_renderer.set_water_debug(water_debug);
     if (no_water) g_renderer.set_water(false);
     if (no_lod_hold) g_renderer.set_lod_hold(false);
@@ -1226,6 +1356,33 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 std::fprintf(f, "sky: %02d:%02d, sun %.1f deg up; key light the %s, %.4g lux; sky on level ground %.4g lux\n",
                              int(sf.hours), int((sf.hours - float(int(sf.hours))) * 60.0f), sf.sun_elevation_deg,
                              sf.key_is_moon ? "moon" : "sun", kl, sm);
+                {
+                    // The weather (weather.h) and the sea under the camera.
+                    const engine::WeatherState& w = g_renderer.weather_state();
+                    const WwSea& sea = g_renderer.sea();
+                    double m0 = 0.0;
+                    for (int i = 0; i < WW_WAVES; ++i) m0 += 0.5 * double(sea.amp[i]) * sea.amp[i];
+                    const float sl = g_renderer.world().params().sea_level;
+                    const float depth = sl - g_renderer.world().height(g_camera.x, g_camera.z);
+                    std::fprintf(f, "weather: %s, storm %.2f, wind %.1f m/s towards (%.2f, %.2f), gusts %.2f; "
+                                    "sea developed for %.1f m/s, swell Hs %.2f m towards (%.2f, %.2f); "
+                                    "deep-water Hs %.2f m; camera (%.1f, %.1f, %.1f) over %.1f m of water, significant height there %.2f m\n",
+                                 g_renderer.weather().automatic() ? "automatic" : "fixed", w.storm, w.wind_speed,
+                                 w.wind_dir[0], w.wind_dir[1], w.gust, w.sea_wind, w.swell_hs, w.swell_dir[0],
+                                 w.swell_dir[1], 4.0 * std::sqrt(m0), g_camera.x, g_camera.y, g_camera.z, depth,
+                                 depth > 0.0f ? ww_significant_height_lod(sea, depth, 0.0f) : 0.0f);
+                    // Along the view, flat: what the water ahead can carry.
+                    const float fx = std::sin(g_camera.yaw), fz = std::cos(g_camera.yaw);
+                    std::fprintf(f, "  ahead (depth m / Hs m):");
+                    const float ahead[5] = {25.0f, 50.0f, 100.0f, 200.0f, 400.0f};
+                    for (float a : ahead) {
+                        const float px = g_camera.x + fx * a, pz = g_camera.z + fz * a;
+                        const float d = sl - g_renderer.world().height(px, pz);
+                        std::fprintf(f, " %.0f m: %.1f / %.2f;", a, d,
+                                     d > 0.0f ? ww_significant_height_lod(sea, d, 0.0f) : 0.0f);
+                    }
+                    std::fprintf(f, "\n");
+                }
                 const engine::Renderer::PostTimes& pt = g_renderer.post_times();
                 std::fprintf(f, "gpu: atmosphere %.3f ms, mist inject %.3f ms, mist integrate %.3f ms, "
                                 "post chain in all %.3f ms (smoothed over the still's frames)\n",
@@ -3264,13 +3421,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // of.
         const engine::WorldGpu& wg = g_renderer.world();
         const float sea = wg.params().sea_level;
+        g_renderer.update_weather(0.0);
         const float state = g_renderer.sea_state();
+        // The weather's sea. Under --sea-state the dial is fixed and the sea
+        // with it (only the swell's heading wanders, slowly).
+        const WwSea& wsea = g_renderer.sea();
+        auto surf_at = [&](float x, float z, float t) {
+            return ww_height_at(x, z, t, wsea, sea - wg.height(x, z));
+        };
         // "Deep" is deep enough that no trough at this sea state can put the
         // floating feet on the bottom: float depth, plus the full amplitude
         // the trough can fall, plus a metre. Below this, touching the seabed
         // while swimming is legitimate and is not counted.
         const float deep = engine::PhysicsWorld::kFloatDepth +
-                           ww_total_amplitude(state) + 1.0f;
+                           ww_total_amplitude(wsea) + 1.0f;
 
         // A beach: the nearest coast to the origin along any of 72 spokes
         // where the land side is low enough to walk down (under 6 m, 20 m
@@ -3417,7 +3581,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 // of nothing.
                 const double eye_y = double(g_feet[1]) + kEyeAboveFeet;
                 const double surf = double(sea) +
-                    ww_height_at(g_feet[0], g_feet[2], float(total), state);
+                    surf_at(g_feet[0], g_feet[2], float(total));
                 const double clear = eye_y - surf;
                 if (clear < eye_min) eye_min = clear;
                 if (clear > eye_max) eye_max = clear;
@@ -3442,8 +3606,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             // whatever was happening, and twice photographed a camera 7 cm
             // under the surface that the report then had to explain.
             const double eye_local = double(g_camera.y) - (double(sea) +
-                ww_height_at(g_camera.x, g_camera.z, float(total), state));
-            const bool trough_sea = ww_total_amplitude(state) > 1.5f;
+                surf_at(g_camera.x, g_camera.z, float(total)));
+            const bool trough_sea = ww_total_amplitude(wsea) > 1.5f;
             const bool vantage = md == engine::Medium::Swimming && eye_local > 0.2 &&
                                  (!trough_sea || double(g_camera.y) < double(sea) - 1.0);
             if (back && !shot_taken && (vantage || total >= swim_seconds * 0.8)) {
@@ -3454,7 +3618,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 std::string err;
                 g_renderer.capture(cv, "build/swim.bmp", err);
                 shot_eye_local = double(g_camera.y) - (double(sea) +
-                    ww_height_at(g_camera.x, g_camera.z, float(total), state));
+                    surf_at(g_camera.x, g_camera.z, float(total)));
                 shot_eye_sea = double(g_camera.y) - double(sea);
                 shot_cam = g_camera;
                 shot_time = float(total);
@@ -3486,7 +3650,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(f, "distance swum: %.1f m\n", swum);
             std::fprintf(f, "\n'deep' is a column over %.2f m: float depth %.2f + the sea's "
                             "full amplitude %.2f + 1 m\n",
-                         deep, engine::PhysicsWorld::kFloatDepth, ww_total_amplitude(state));
+                         deep, engine::PhysicsWorld::kFloatDepth, ww_total_amplitude(wsea));
             std::fprintf(f, "frames in deep water: %llu\n", deep_frames);
             std::fprintf(f, "  of which standing on the seabed: %llu -> %s\n",
                          deep_standing,
@@ -4105,10 +4269,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             char title[400];
             const float tod = g_renderer.time_of_day();
             std::snprintf(title, sizeof(title),
-                          "biomes2 engine - %02d:%02d%s [PgUp/PgDn H] - %s [M] %s [T] - trees %.0f m [-=] %s - %.0f fps (worst %.1f ms) - "
+                          "biomes2 engine - %02d:%02d%s [PgUp/PgDn H] - wind %.1f m/s, sea Hs %.1f m%s [[ ] \\ ;] - %s [M] %s [T] - trees %.0f m [-=] %s - %.0f fps (worst %.1f ms) - "
                           "%zu chunks, %u tris - %u meshed/frame in %.3f ms - "
                           "%zu pending, %zu slots free%s%s",
                           int(tod), int((tod - float(int(tod))) * 60.0f), g_time_lapse ? " running" : "",
+                          g_renderer.weather_state().wind_speed, ww_significant_height(g_renderer.sea()),
+                          g_renderer.weather().automatic() ? "" : " fixed",
                           g_renderer.mode() == engine::Mode::Mesh ? "shaded" : "wireframe",
                           g_renderer.texture_mode() < 0.5f ? "flat"
                           : g_renderer.texture_mode() < 1.5f ? "detail"

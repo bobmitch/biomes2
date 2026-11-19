@@ -31,7 +31,7 @@ cbuffer FogConstants : register(b0) {
     float3 cam_fwd;    float jitter;      // where in its slice this frame samples, 0..1
     float  near_z;     float log_ratio;   uint history_valid; float time_factor;
     float  map_extent; float haze;        float sea_level;    float patch;
-    float2 wind;       float phase_g;     float albedo;
+    float2 drift;      float phase_g;     float albedo;   // drift: metres the patches have moved (weather.h)
     float  screen_w;   float screen_h;    float density_scale; float cam_sky;   // cam_sky: DDGI's share of open sky at the eye
 };
 
@@ -72,12 +72,14 @@ float vnoise3(float3 p) {
 
 // Extinction per metre. The map's mist, thinning with height above the
 // surface it lies on, times the hour; broken into patches that drift on the
-// wind and are flattened, as banks of mist are; and the haze everywhere.
+// wind and are flattened, as banks of mist are; and the haze everywhere. The
+// drift is the weather's integral of the wind, never wind x time, which
+// jumps the moment the wind changes.
 float fog_density(float3 p) {
     const float4 m = g_fog_map.SampleLevel(g_lin, p.xz / map_extent + 0.5f, 0);
     const float h = max(p.y - m.z, 0.0f);
     float d = m.x * exp(-h / max(m.y, 1.0f)) * time_factor;
-    const float3 q = (p - float3(wind.x, 0.0f, wind.y) * time) / patch * float3(1.0f, 3.0f, 1.0f);
+    const float3 q = (p - float3(drift.x, 0.0f, drift.y)) / patch * float3(1.0f, 3.0f, 1.0f);
     const float n = 0.65f * vnoise3(q) + 0.35f * vnoise3(q * 3.1f + 17.0f);
     d *= saturate(1.6f * n - 0.15f);
     return (d + haze) * density_scale;

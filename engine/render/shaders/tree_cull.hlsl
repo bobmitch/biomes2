@@ -51,6 +51,8 @@ cbuffer TreeFrame : register(b0) {
     float3 bake_dir;   float bake_r;
     float3 bake_right; float bake_centre_y;
     float3 bake_up;    float shadow_pass;
+    float4 wind_v;                       // weather.h: direction x, z; mean m/s; gustiness
+    float2 wind_drift;  float2 wind_pad; // metres the air has moved
 };
 
 StructuredBuffer<TreeInstance> g_instances : register(t1);

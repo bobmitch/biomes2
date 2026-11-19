@@ -74,7 +74,8 @@ views, and L6's sky visibility with and without crowns), `--leak-test`
 fallback), `--gi-report` (DDGI at three views), `--lights-report` (ADR-004 L3: local lights at night, six
 configurations timed) and `--fell` (with `--fell-save` / `--fell-verify`).
 Every mode takes `--time <hours>` (ADR-004 L2: 14 by default, which is the
-pre-L2 sun), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
+pre-L2 sun), the weather's `--sea-state <0..1>`, `--wind <m/s>`,
+`--wind-dir <deg>` and `--swell <m>` (automatic weather otherwise), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
 `--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`, `--no-rocks`,
 `--no-forest-shell`; `--shot` also
 takes `--lights <n>` (campfires round the camera) and `--ground` (the
@@ -1744,18 +1745,92 @@ shader draws. It is **not** the ADR-001 dialect and invariant 9 does not reach
 it: the sea feeds no hash, no save and no generator decision, so `sin` and
 `cos` are allowed here where they are forbidden four directories away.
 
-Wave height is a runtime value, because storms are a planned mechanic. The
-dial is `sea_state`, 0 to 1, and `--sea-report` says what it buys: **0.20 m
-crest-to-trough calm, 7.51 m at full storm**, with the surface mean staying at
-sea level to 2.4 mm — the one thing worth asserting, because a sea that rose
+Wave height is set by the WEATHER (below), because storms are a planned
+mechanic. The surface mean stays at sea level to 4.5 mm in every case
+`--sea-report` tries -- the one thing worth asserting, because a sea that rose
 with the weather would flood coastlines and no screenshot of a rough sea would
 look wrong.
 
-Controls: `--sea-state <0..1>`, `--sea-shot` (stands the camera off the nearest
-coast, which is the only vantage a 7 m swell reads as a swell from),
-`--water-debug 1..5` (depth, foam, normal, displacement, surviving amplitude;
-with `--tonemap 0` since L1),
-`--no-water`, and `[` `]` `K` in the window.
+Controls: `--sea-shot` (stands the camera off the nearest coast, over 4-12 m of
+water), `--water-debug 1..5` (depth, foam, normal, displacement, surviving
+significant height; with `--tonemap 0` since L1 -- this session's tries came
+out solid white even so, not chased), `--no-water`, and `K` in the window.
+Weather controls are under the weather section.
+
+### Weather: the wind, and the sea it raises
+
+`engine/render/weather.{h,cpp}`, tuned by archetypes.json's `weather` block.
+One state that grass, trees, the mist and the sea all read; before it, grass
+and trees blew one fixed way, the mist another, and the waves ran on headings
+no wind chose. Presentation only -- validate and the golden gate passed with
+the block added.
+
+- **A pure function of the seed (`field_id`) and the frame's clock**, the
+  clock the waves and the swimmer use, so saves, replays and stills agree.
+  The storm dial (0..1) is a slow noise (period 8 min); wind = 0.5 + 23.5 x
+  storm^2 m/s; the heading wanders +-100 degrees over 15 min. The wind sea
+  answers the wind averaged over 90 s; the swell (0.25-3 m Hs, ~110 m long,
+  its own heading) the storm averaged over 10 min, so it outlasts a gale.
+  Six hours of four seeds: calm 31%, light 25%, moderate 13%, fresh 19%,
+  strong 6%, gale 6%.
+- **Drift** is the integral of the wind, cached and advanced each call.
+  Anything the air CARRIES (the mist's patches, the gust field) moves by it,
+  never by wind x t, which jumps as soon as the wind changes.
+- **`wind.hlsli`**: gust cells ~90 x 45 m (stretched along the wind) and
+  faster turbulence, sampled at p - drift, averaging 1x the mean speed.
+  Grass bends with speed^2 to lying over (`wind_at` in `foliage.hlsl`).
+  Trees lean downwind (speed^2, 3% of height in a 20 m/s gale), swing about
+  the lean (speed^1.5) and flutter, worked out in WORLD space and turned into
+  the model's frame, sampled at the trunk so a gust crosses a wood tree by
+  tree. Frequencies stay fixed: one that followed the wind would slide its
+  phase by t x the change. The mist drifts at `mist_drift` (0.5) of the wind.
+- **The sea is 32 FIXED trains** (`water_wave.h`): golden-angle headings,
+  log-spaced 157 m to 4.1 m. The weather sets only their AMPLITUDES. A
+  heading or wavelength that changed at runtime would slide the phase by
+  k x |x| x the change, faster than the wave travels 5 km out, so a veering
+  wind hands energy to the trains already pointing its way. Sixteen trains
+  was too few: two carried a gale's peak 85 degrees apart, an egg-crate
+  lattice of crests that the crest foam drew as a grid of squares.
+- **Spectrum**: Pierson-Moskowitz capped by fetch-limited (JONSWAP) growth
+  over `fetch_km` (150), its peak frequency times `peak_shift` (1.4) -- a
+  real gale's 120 m, 1-in-30 peak reads as a slow heave -- cos^2 spread round
+  the wind; the swell a narrow lump, cos^8. Each normalised to its Hs, so
+  the height does not depend on which trains point downwind. Trains under
+  1% of the biggest height and 2% of the steepest slope are zeroed and
+  skipped. Deep-water Hs: 0.26 m at 3.5 m/s, 0.77 at 6, 1.98 at 10, 3.96 at
+  20; a 20 m/s gale with its swell is 7.2 m crest to trough in the report's
+  patch.
+- **Depth tames the waves** (`ww_depth_factor`): each train times
+  tanh(2 k h) -- long swell dies first over a shoal, short chop survives
+  into a lagoon -- then the local Hs is capped at 0.55 x depth
+  (`WW_BREAK_HS`), so the biggest wave is about the depth, where it breaks.
+  The first cap was on the SUM of amplitudes (every crest at once), ~3x what
+  a random sea shows: a coast in a gale went flat. Plain tanh(k h) also took
+  half the swell off coast-side cameras. Speed does NOT vary with depth:
+  w(h) inside `k x - w t` winds the wavefronts into stripes as t grows.
+- **Physics floats on the same sea**: `SeaParams.sea`, depth from the column
+  height at the swimmer (the shader reads it at the rest point; centimetres
+  apart on a beach). `--swim 40 --wind 20`: 0 frames standing in deep water,
+  eye under 2.3% of frames (11% on the old storm).
+- **Cost** (`--flight 10 --settle --flight-from 1638 12 838 --res 2560
+  1440`, the sea filling the frame): the old 4-train sea 0.14 ms, now 0.25 ms
+  in light air and 0.38 ms in a gale. The per-pixel normal takes its
+  breaking scale and Q from the vertex, and the depth term uses a rational
+  tanh (`ww_tanh_pos`): HLSL's tanh at 32 trains three times a pixel was
+  +0.69 ms on its own.
+- **Controls**: `--sea-state <0..1>` fixes the storm dial, `--wind <m/s>`
+  the speed, `--wind-dir <deg>` the heading (0 = +x, 90 = +z), `--swell <m>`
+  the swell's Hs; in the window `[` `]` step the dial, `;` turns the wind
+  45 degrees, `\` goes back to automatic. The title shows wind and Hs.
+  Every `--shot` report has a `weather:` line (and depth and Hs 25-400 m
+  ahead); `--sea-report` tabulates wind, swell, depth and six hours of
+  automatic weather, and asserts the mean, the inversion, growth with depth
+  and no wave taller than 1.1 x its depth.
+- **Not done**: RT shadows and DDGI trace STATIC trees (the leaf cutouts),
+  so in a gale a crown's traced shadow sits up to ~0.7 m from its swayed
+  crown (the cascades sway with it). Impostors do not lean. No species
+  stiffness. Wind does not yet roughen the water locally (gust patches,
+  cat's paws), and no rain, cloud or fetch shelter behind islands.
 
 The water asks the SHARED FIELD FUNCTION how deep it is, so the shoreline is
 the real one at every LOD. That is M1 paying off somewhere other than terrain.

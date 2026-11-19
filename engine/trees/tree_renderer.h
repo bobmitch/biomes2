@@ -32,7 +32,11 @@ struct TreeDrawSettings {
     float max_dist = 500.0f;    // the draw-distance slider
     float lod0_dist = 45.0f;    // full mesh inside this
     float lod1_dist = 170.0f;   // simplified mesh inside this; impostors beyond
-    float wind = 1.0f;
+    float wind = 1.0f;          // a multiplier on the weather's sway
+    // The weather (weather.h), set by the renderer every frame: direction x,
+    // z; mean speed m/s; gustiness. And the metres the air has moved.
+    float wind_v[4] = {0.94f, 0.33f, 4.0f, 0.4f};
+    float wind_drift[2] = {0.0f, 0.0f};
     float debug = 0.0f;         // 1 tints by level
     // Towards the key light -- sun, or moon at night -- which an impostor's
     // shadow card faces. The renderer sets it every frame (ADR-004 L2).

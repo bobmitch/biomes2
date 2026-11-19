@@ -39,8 +39,10 @@ struct FoliageFrame {
     UINT  s_grass;      float grass_freq;
     float near_radius;  float debug;
     float blade_width;  float tuft;
+    float wind_v[4];
+    float wind_drift[2]; float wind_pad[2];
 };
-static_assert(sizeof(FoliageFrame) == 272, "FoliageFrame must match foliage.hlsl");
+static_assert(sizeof(FoliageFrame) == 304, "FoliageFrame must match foliage.hlsl");
 
 std::string hr_text(const char* what, HRESULT hr) {
     char buf[256];
@@ -495,6 +497,9 @@ void FoliageRenderer::record(ID3D12GraphicsCommandList* cmd, UINT frame, const F
     fr.tree_patch_edge = tree_patch_edge_;
     fr.sea_level = sea_level_;
     fr.wind = s.wind;
+    for (int k = 0; k < 4; ++k) fr.wind_v[k] = s.wind_v[k];
+    fr.wind_drift[0] = s.wind_drift[0];
+    fr.wind_drift[1] = s.wind_drift[1];
     fr.far_plane = in.far_plane;
     fr.s_grass = s_grass_;
     fr.grass_freq = 1.0f / 45.0f;
