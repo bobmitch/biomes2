@@ -255,55 +255,8 @@ void cs_ssgi(uint3 id : SV_DispatchThreadID) {
 
 // --- the atmosphere ---------------------------------------------------------------
 
-// The sky along a direction: the sky-view table, then the sun's disk, limb
-// darkened, and the moon's.
-float3 sky_at(float3 d) {
-    float u, v;
-    atm_sky_uv(d, kAtmGround + cam_alt_km, u, v);
-    float3 c = g_skyview.SampleLevel(g_wrap_u, float2(u, v), 0).rgb;
-    const float r_sun = 0.2667f * 0.0174533f, r_moon = 0.259f * 0.0174533f;
-    // The angle to each centre, from the chord: acos is too coarse this
-    // close to 1 in single precision.
-    const float a_sun = 2.0f * asin(saturate(0.5f * length(d - sky_sun_dir)));
-    const float a_moon = 2.0f * asin(saturate(0.5f * length(d - sky_moon_dir)));
-    if (a_sun < r_sun) {
-        const float t = a_sun / r_sun;
-        c += sun_disk * (1.0f - 0.6f * (1.0f - sqrt(max(0.0f, 1.0f - t * t))));
-    }
-    if (a_moon < r_moon) c += moon_disk;
-    return min(c, kSceneMaxNits);
-}
-
-// The haze between the camera and a point `dist` metres away along this
-// pixel's ray: (in-scattered light, transmittance). The volume's slice k ends
-// at far * ((k + 1) / 32)^2 (atmosphere.hlsl); nearer than slice 0 fades
-// from nothing.
-float4 aerial(float2 uv, float dist) {
-    const float w = sqrt(saturate(dist / far_plane)) * 32.0f - 1.0f;
-    float4 s = g_ap.SampleLevel(g_linear, float3(uv, (max(w, 0.0f) + 0.5f) / 32.0f), 0);
-    if (w < 0.0f) {
-        const float f = w + 1.0f;
-        s = float4(s.rgb * f, lerp(1.0f, s.a, f));
-    }
-    return s;
-}
-
-// The mist between the eye and view depth z (L4). Slice s of the volume holds
-// what has accumulated by the FAR side of the slice, view depth
-// near * e^((s + 1) / 128 * ln(far / near)); nearer than slice 0's far side
-// fades from nothing.
-float4 mist(float2 uv, float z) {
-    if (fog_on < 0.5f) return float4(0.0f, 0.0f, 0.0f, 1.0f);
-    const float n = 128.0f;
-    const float z1 = fog_near * exp(fog_log_ratio / n);
-    if (z <= z1) {
-        const float4 s0 = g_fog.SampleLevel(g_linear, float3(uv, 0.5f / n), 0);
-        const float f = saturate(z / z1);
-        return float4(s0.rgb * f, lerp(1.0f, s0.a, f));
-    }
-    const float w = log(z / fog_near) / fog_log_ratio * n;
-    return g_fog.SampleLevel(g_linear, float3(uv, saturate((w - 0.5f) / n)), 0);
-}
+// sky_at, aerial and mist, shared with the sea, which composites after this.
+#include "engine/render/shaders/haze.hlsli"
 
 // --- composite ----------------------------------------------------------------
 
@@ -363,10 +316,10 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     if (g_ambient[p].a < -0.5f) { u_scene[p] = float4(amb, 0.0f); return; }
     const float2 uv = (float2(p) + 0.5f) * inv_size;
     if (z >= 1.0f) {
-        // Nothing with depth: the sky. The sea beyond the clipmap draws
-        // without depth, blending its colour into the direct target and
-        // taking its share out of the ambient one, which was cleared to the
-        // marker -- so what is left of the marker is how much sky shows.
+        // Nothing with depth: the sky. (The sea draws over this afterwards,
+        // water.hlsl. Before it did, it blended into the scene targets, and
+        // what was left of the ambient marker was how much sky showed; that
+        // is now always all of it, and the arithmetic is left as it was.)
         const float3 d = normalize(world_at(uv, 1.0f) - cam_pos);
         const float vis = saturate(amb.g / kSkyClearG);
         const float4 apf = aerial(uv, far_plane);

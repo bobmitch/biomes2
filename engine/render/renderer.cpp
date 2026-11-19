@@ -3,6 +3,7 @@
 #include "engine/render/water_wave.h"
 #include "engine/render/lighting_units.h"
 #include "engine/render/atmosphere.h"
+#include "worldgen/assign/json_lite.h"
 
 #include <d3dcompiler.h>
 #include <algorithm>
@@ -57,8 +58,23 @@ struct WaterConstants {
     float wave_amp[WW_WAVES];   // the weather's sea (water_wave.h)
     float wave_steep;
     float pad2[3];
+    // The post chain's share (haze.hlsli) and the water's optics.
+    float inv_size[2];    float near_plane;    float cam_alt_km;
+    float sky_sun_dir[3]; float fog_on;
+    float sky_moon_dir[3]; float fog_near;
+    float sun_disk[3];    float fog_log_ratio;
+    float moon_disk[3];   float cam_sky;
+    float extinction[3];  float ssr_on;
+    float deep_colour[3]; float refraction;
+    float frame;          float storm_turbidity; float pad3[2];
 };
-static_assert(sizeof(WaterConstants) == 432, "WaterConstants must match water.hlsl");
+static_assert(sizeof(WaterConstants) == 560, "WaterConstants must match water.hlsl");
+
+// Heap slots past the RT denoiser's: the sea's copies of the lit scene and of
+// depth, which it reads while it draws into the one and tests against the
+// other.
+const UINT kWaterSceneSrv = 79, kWaterDepthSrv = 80, kHeapSlots = 81;
+static_assert(RtDenoise::kHeapEnd <= kWaterSceneSrv, "the sea's heap slots overlap the denoiser's");
 
 // Matches cbuffer ShadowConstants in shadow.hlsli: 368 bytes, in a 512-byte buffer.
 struct ShadowConstants {
@@ -538,7 +554,7 @@ bool Renderer::create_water_pipeline(std::string& error) {
         // initialise, and because that path ends in a modal message box the
         // headless run simply hung. A descriptor costs 2 DWORDs however big
         // the struct behind it is.
-        D3D12_ROOT_PARAMETER params[12] = {};
+        D3D12_ROOT_PARAMETER params[13] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         params[0].Descriptor.ShaderRegister = 0;
@@ -550,10 +566,38 @@ bool Renderer::create_water_pipeline(std::string& error) {
             params[2 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
             params[2 + i].Descriptor.ShaderRegister = 11 + i;
         }
+        // Since the sea draws after the composite: t0 the lit scene's copy,
+        // t1 depth's copy, t2 the sky-view table, t3 the aerial perspective,
+        // t4 the mist -- one table from heap [3], the post chain's base.
+        D3D12_DESCRIPTOR_RANGE wr[5] = {};
+        const UINT w_heap[5] = {kWaterSceneSrv, kWaterDepthSrv, 10, 11, 32};
+        for (UINT k = 0; k < 5; ++k) {
+            wr[k].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            wr[k].NumDescriptors = 1;
+            wr[k].BaseShaderRegister = k;
+            wr[k].OffsetInDescriptorsFromTableStart = w_heap[k] - 3;
+        }
+        params[12].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[12].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[12].DescriptorTable.NumDescriptorRanges = 5;
+        params[12].DescriptorTable.pDescriptorRanges = wr;
+        D3D12_STATIC_SAMPLER_DESC ss[3] = {};
+        ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        ss[1].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        ss[2].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        for (int k = 0; k < 3; ++k) {
+            ss[k].AddressU = ss[k].AddressV = ss[k].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            ss[k].MaxLOD = D3D12_FLOAT32_MAX;
+            ss[k].ShaderRegister = k;
+            ss[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        }
+        ss[2].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;   // the sky table wraps in azimuth
 
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 12;
+        rsd.NumParameters = 13;
         rsd.pParameters = params;
+        rsd.NumStaticSamplers = 3;
+        rsd.pStaticSamplers = ss;
         rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
         ComPtr<ID3DBlob> sig, sig_err;
@@ -587,43 +631,18 @@ bool Renderer::create_water_pipeline(std::string& error) {
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.RasterizerState.DepthClipEnable = TRUE;
 
-    // Straight alpha over the terrain already drawn. Depth WRITE is off: the
-    // sea is transparent in the shallows, and a transparent surface that
-    // writes depth hides whatever is drawn after it.
-    D3D12_RENDER_TARGET_BLEND_DESC& rt = pd.BlendState.RenderTarget[0];
-    rt.BlendEnable = TRUE;
-    rt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
-    rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-    rt.BlendOp = D3D12_BLEND_OP_ADD;
-    // The direct target's alpha is how much contact shadow the pixel takes
-    // (post.hlsl), and the sea writes no depth, so the composite's march runs
-    // on the SEABED and its answer multiplies the whole blended colour, the
-    // sea's reflection included. Water takes none: alpha 0 wherever it draws.
-    // Blending its alpha in as ONE made every water pixel 1, and the seabed's
-    // contact shadows speckled the sea in a band at a low sun, flickering
-    // with the march's jitter. Keeping the seabed's share, (1 - a), left 5x
-    // the band's frame-to-frame change of --no-contact in the shallows.
-    rt.SrcBlendAlpha = D3D12_BLEND_ZERO;
-    rt.DestBlendAlpha = D3D12_BLEND_ZERO;
-    rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    // The ambient target: the sea only removes what is under it there, so
-    // the seabed's occlusion does not show through (water.hlsl).
-    pd.BlendState.IndependentBlendEnable = TRUE;
-    D3D12_RENDER_TARGET_BLEND_DESC& rt1 = pd.BlendState.RenderTarget[1];
-    rt1 = rt;
-    rt1.SrcBlendAlpha = D3D12_BLEND_ONE;   // the ambient alpha (AO's weight) as before
-    rt1.SrcBlend = D3D12_BLEND_ZERO;
-    rt1.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-
+    // Opaque, onto the lit scene (post.hlsl's composite has run): the sea does
+    // its own see-through -- the seabed from a copy of the scene, bent by the
+    // waves and dimmed by the water -- so nothing is blended. It writes depth,
+    // so TAA reprojects the water's surface and not the seabed under it.
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     pd.DepthStencilState.DepthEnable = TRUE;
-    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
     pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
     pd.SampleMask = UINT_MAX;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pd.NumRenderTargets = 2;
+    pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = kSceneFormat;
-    pd.RTVFormats[1] = kSceneFormat;
     pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     pd.SampleDesc.Count = 1;
 
@@ -663,7 +682,7 @@ bool Renderer::create_water_pipeline(std::string& error) {
         hp.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC rd = {};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rd.Width = 512;                 // CBVs are 256-byte aligned; 288 bytes since L2's light
+        rd.Width = 1024;                // CBVs are 256-byte aligned; 560 bytes since the sea moved after the composite
         rd.Height = 1;
         rd.DepthOrArraySize = 1;
         rd.MipLevels = 1;
@@ -1009,7 +1028,7 @@ bool Renderer::create_shadow_resources(std::string& error) {
     // second range of the table that starts at the sun's map, [0];
     // [29..35] the mist (L4): its map, two inject volumes (this frame's and
     // last's, swapping), the integrated volume, and their UAVs.
-    hd.NumDescriptors = RtDenoise::kHeapEnd;   // [48..61] the heightfield GI (L6), [64..66] the far terrain shadow, [72..77] the RT shadow's denoiser
+    hd.NumDescriptors = kHeapSlots;   // [79..80] the sea's copies; [48..61] the heightfield GI (L6), [64..66] the far terrain shadow, [72..77] the RT shadow's denoiser
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srv_heap_));
     if (FAILED(hr)) { error = hr_text("shared srv heap", hr); return false; }
@@ -1845,9 +1864,38 @@ void Renderer::record_rt_trace() {
 // froxels, post.hlsl's composite for applying it.
 // ---------------------------------------------------------------------------
 
+// archetypes.json's "water": the sea's body, presentation only. Colours are
+// authored sRGB, as everywhere; extinction is per metre and already linear.
+bool Renderer::load_water_optics(const char* archetypes_path, std::string& error) {
+    try {
+        const jsonlite::Value root = jsonlite::parse_file(archetypes_path);
+        if (!root.has("water")) return true;
+        const jsonlite::Value& w = root.at("water");
+        if (w.has("extinction")) {
+            const jsonlite::Array& a = w.array("extinction");
+            for (int k = 0; k < 3; ++k) water_optics_.extinction[k] = float(a[k].num);
+        }
+        if (w.has("deep_colour")) {
+            const jsonlite::Array& a = w.array("deep_colour");
+            for (int k = 0; k < 3; ++k) {
+                const float c = float(a[k].num);
+                water_optics_.deep_colour[k] = c <= 0.04045f ? c / 12.92f
+                                                             : std::pow((c + 0.055f) / 1.055f, 2.4f);
+            }
+        }
+        if (w.has("refraction")) water_optics_.refraction = float(w.number("refraction"));
+        if (w.has("storm_turbidity")) water_optics_.storm_turbidity = float(w.number("storm_turbidity"));
+    } catch (const std::exception& e) {
+        error = std::string("archetypes.json water: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
 bool Renderer::create_fog(std::string& error) {
     if (!fog_map_.build(world_, "worldgen/data/archetypes.json", error)) return false;
     if (!weather_.load("worldgen/data/archetypes.json", error)) return false;
+    if (!load_water_optics("worldgen/data/archetypes.json", error)) return false;
     weather_.set_seed(world_.field_id());
     update_weather(0.0);
 
@@ -3139,7 +3187,7 @@ bool Renderer::create_post_targets(std::string& error) {
     if (!post_rtv_heap_) {
         D3D12_DESCRIPTOR_HEAP_DESC hd = {};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        hd.NumDescriptors = 2;
+        hd.NumDescriptors = 3;   // the two scene targets, and the composited scene the sea draws onto
         if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&post_rtv_heap_)))) {
             error = "post rtv heap";
             return false;
@@ -3175,7 +3223,10 @@ bool Renderer::create_post_targets(std::string& error) {
              D3D12_RESOURCE_STATE_RENDER_TARGET, zero) ||
         !tex(hdr_ambient_, w, h, kSceneFormat, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
              D3D12_RESOURCE_STATE_RENDER_TARGET, sky) ||
-        !tex(scene_, w, h, kSceneFormat, uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr) ||
+        !tex(scene_, w, h, kSceneFormat, uav | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr) ||
+        !tex(scene_copy_, w, h, kSceneFormat, D3D12_RESOURCE_FLAG_NONE, read, nullptr) ||
+        !tex(depth_copy_, w, h, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE, read, nullptr) ||
         !tex(ao_, (w + 1) / 2, (h + 1) / 2, DXGI_FORMAT_R8_UNORM, uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr) ||
         !tex(ssgi_, (w + 1) / 2, (h + 1) / 2, DXGI_FORMAT_R16G16B16A16_FLOAT, uav, read, nullptr) ||
         !tex(history_[0], w, h, kSceneFormat, uav, read, nullptr) ||
@@ -3188,6 +3239,8 @@ bool Renderer::create_post_targets(std::string& error) {
     device_->CreateRenderTargetView(hdr_direct_.Get(), nullptr, r);
     r.ptr += rinc;
     device_->CreateRenderTargetView(hdr_ambient_.Get(), nullptr, r);
+    r.ptr += rinc;
+    device_->CreateRenderTargetView(scene_.Get(), nullptr, r);
 
     const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     auto slot = [&](UINT i) {
@@ -3217,6 +3270,8 @@ bool Renderer::create_post_targets(std::string& error) {
     srv(history_[0].Get(), kSceneFormat, 8);
     srv(history_[1].Get(), kSceneFormat, 9);
     uavd(ao_.Get(), DXGI_FORMAT_R8_UNORM, 12);
+    srv(scene_copy_.Get(), kSceneFormat, kWaterSceneSrv);
+    srv(depth_copy_.Get(), DXGI_FORMAT_R32_FLOAT, kWaterDepthSrv);
     // The screen-space bounce (L6): the scene reads [45] (t29, a fifth range
     // of the lit tables), cs_ssgi writes [46] (u6).
     srv(ssgi_.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 45);
@@ -3374,6 +3429,83 @@ bool Renderer::create_post_pipelines(std::string& error) {
         return false;
     }
     return true;
+}
+
+// The sea, onto the composited scene (water.hlsl). Entered with scene_ in
+// UNORDERED_ACCESS (the composite just wrote it) and depth_ readable; leaves
+// scene_ a RENDER_TARGET and depth_ readable, with the sea's own depth in it.
+void Renderer::record_water() {
+    auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+        D3D12_RESOURCE_BARRIER rb = {};
+        rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        rb.Transition.pResource = r;
+        rb.Transition.StateBefore = a;
+        rb.Transition.StateAfter = b;
+        rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd_->ResourceBarrier(1, &rb);
+    };
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES nps = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    const D3D12_RESOURCE_STATES cs = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    const D3D12_RESOURCE_STATES cd = D3D12_RESOURCE_STATE_COPY_DEST;
+    // The copies the sea reads while it draws into the scene and its depth.
+    tr(scene_.Get(), ua, cs);
+    tr(depth_.Get(), read, cs);
+    tr(scene_copy_.Get(), read, cd);
+    tr(depth_copy_.Get(), read, cd);
+    cmd_->CopyResource(scene_copy_.Get(), scene_.Get());
+    cmd_->CopyResource(depth_copy_.Get(), depth_.Get());
+    tr(scene_copy_.Get(), cd, read);
+    tr(depth_copy_.Get(), cd, read);
+    tr(scene_.Get(), cs, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    tr(depth_.Get(), cs, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    // The sky, the air and the mist, read in a pixel shader now as well.
+    tr(sky_view_tex_.Get(), nps, read);
+    tr(ap_tex_.Get(), nps, read);
+    const bool fog = fog_on_ && mode_ != Mode::Wireframe;
+    if (fog) tr(fog_integrated_.Get(), nps, read);
+
+    const UINT rinc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = post_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += SIZE_T(2) * rinc;
+    const D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+    cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    D3D12_VIEWPORT vp = {};
+    vp.Width = float(width_);
+    vp.Height = float(height_);
+    vp.MaxDepth = 1.0f;
+    D3D12_RECT sc = {0, 0, LONG(width_), LONG(height_)};
+    cmd_->RSSetViewports(1, &vp);
+    cmd_->RSSetScissorRects(1, &sc);
+    cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
+    cmd_->SetDescriptorHeaps(1, heaps);
+    cmd_->SetPipelineState(water_pso_.Get());
+    cmd_->SetGraphicsRootSignature(water_root_.Get());
+    cmd_->SetGraphicsRootConstantBufferView(0, water_cb_[frame_]->GetGPUVirtualAddress());
+    cmd_->SetGraphicsRootConstantBufferView(1, world_.world_cb()->GetGPUVirtualAddress());
+    ID3D12Resource* wb[10] = {
+        world_.cells(), world_.cell_offsets(), world_.cell_items(),
+        world_.archetypes(), world_.rivers(), world_.river_offsets(),
+        world_.river_items(), world_.entrances(), world_.entrance_offsets(),
+        world_.entrance_items()};
+    for (UINT i = 0; i < 10; ++i) {
+        cmd_->SetGraphicsRootUnorderedAccessView(2 + i, wb[i]->GetGPUVirtualAddress());
+    }
+    const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_GPU_DESCRIPTOR_HANDLE table = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+    table.ptr += UINT64(3) * inc;
+    cmd_->SetGraphicsRootDescriptorTable(12, table);
+    cmd_->IASetIndexBuffer(&water_ibv_);
+    cmd_->DrawIndexedInstanced(water_index_count_, 1, 0, 0, 0);
+
+    tr(sky_view_tex_.Get(), read, nps);
+    tr(ap_tex_.Get(), read, nps);
+    if (fog) tr(fog_integrated_.Get(), read, nps);
+    tr(depth_.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, read);
 }
 
 void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
@@ -3557,7 +3689,21 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     // Direct x contact + ambient x AO.
     cmd_->SetPipelineState(composite_pso_.Get());
     cmd_->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
-    tr(scene_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+    if (water_pending_) {
+        record_water();
+        // Back to the post chain's bindings, which TAA and the meter use.
+        cmd_->SetDescriptorHeaps(1, heaps);
+        cmd_->SetComputeRootSignature(post_root_.Get());
+        cmd_->SetComputeRootConstantBufferView(0, post_cb_[frame_]->GetGPUVirtualAddress());
+        cmd_->SetComputeRootDescriptorTable(1, srvs);
+        cmd_->SetComputeRootDescriptorTable(2, uavs);
+        cmd_->SetComputeRootUnorderedAccessView(3, lumhist_->GetGPUVirtualAddress());
+        cmd_->SetComputeRootUnorderedAccessView(4, expo_->GetGPUVirtualAddress());
+        cmd_->SetComputeRootDescriptorTable(5, ssgi_uav);
+        tr(scene_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
+    } else {
+        tr(scene_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+    }
     // TAA into this frame's history.
     ID3D12Resource* cur = history_[hist_cur_].Get();
     tr(cur, read, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3843,9 +3989,10 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         foliage_.record(cmd_.Get(), frame_, fi, foliage_settings_);
     }
 
-    // The sea goes last: it is transparent, so it has to blend over whatever
-    // is behind it, and the depth buffer the terrain just wrote is what tells
-    // it where the land is in front.
+    // The sea's constants. It DRAWS in record_post, after the composite, onto
+    // the lit scene: it needs that scene for what shows through it and for
+    // what it reflects (record_water).
+    water_pending_ = false;
     if (water_ && water_pso_ && mode_ != Mode::Wireframe) {
         WaterConstants wc = {};
         std::memcpy(wc.view_proj, mc.view_proj, sizeof wc.view_proj);
@@ -3884,23 +4031,29 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         wc.cam_water = wc.sea_level + ww_height_at(view.cam_pos[0], view.cam_pos[2],
                                                    view.time, sea_,
                                                    wc.sea_level - world_.height(view.cam_pos[0], view.cam_pos[2]));
-
-        cmd_->SetPipelineState(water_pso_.Get());
-        cmd_->SetGraphicsRootSignature(water_root_.Get());
-        std::memcpy(water_cb_cpu_[frame_], &wc, sizeof wc);
-        cmd_->SetGraphicsRootConstantBufferView(
-            0, water_cb_[frame_]->GetGPUVirtualAddress());
-        cmd_->SetGraphicsRootConstantBufferView(1, world_.world_cb()->GetGPUVirtualAddress());
-        ID3D12Resource* wb[10] = {
-            world_.cells(), world_.cell_offsets(), world_.cell_items(),
-            world_.archetypes(), world_.rivers(), world_.river_offsets(),
-            world_.river_items(), world_.entrances(), world_.entrance_offsets(),
-            world_.entrance_items()};
-        for (UINT i = 0; i < 10; ++i) {
-            cmd_->SetGraphicsRootUnorderedAccessView(2 + i, wb[i]->GetGPUVirtualAddress());
+        // What the post chain knows, for the haze and the sky (haze.hlsli).
+        wc.inv_size[0] = 1.0f / float(width_ ? width_ : 1);
+        wc.inv_size[1] = 1.0f / float(height_ ? height_ : 1);
+        wc.near_plane = kNearPlane;
+        wc.cam_alt_km = sky_frame_.cam_alt_km;
+        for (int k = 0; k < 3; ++k) {
+            wc.sky_sun_dir[k] = sky_frame_.sun_dir[k];
+            wc.sky_moon_dir[k] = sky_frame_.moon_dir[k];
+            wc.sun_disk[k] = sky_frame_.sun_disk[k];
+            wc.moon_disk[k] = sky_frame_.moon_disk[k];
+            wc.extinction[k] = water_optics_.extinction[k];
+            wc.deep_colour[k] = water_optics_.deep_colour[k];
         }
-        cmd_->IASetIndexBuffer(&water_ibv_);
-        cmd_->DrawIndexedInstanced(water_index_count_, 1, 0, 0, 0);
+        wc.fog_on = fog_on_ ? 1.0f : 0.0f;
+        wc.fog_near = kFogNear;
+        wc.fog_log_ratio = std::log(kFogFar / kFogNear);
+        wc.cam_sky = gi_active() ? ddgi_.camera_sky() : (hfgi_on_ ? hfgi_.camera_sky() : 1.0f);
+        wc.ssr_on = ssr_on_ ? 1.0f : 0.0f;
+        wc.refraction = water_optics_.refraction;
+        wc.storm_turbidity = water_optics_.storm_turbidity;
+        wc.frame = float(post_frame_ % 64);
+        std::memcpy(water_cb_cpu_[frame_], &wc, sizeof wc);
+        water_pending_ = true;
     }
 
     record_post(rtv);

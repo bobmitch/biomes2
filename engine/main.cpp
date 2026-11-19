@@ -266,10 +266,15 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_renderer.weather().set_heading(h);
                 return 0;
             }
+            if (wp == VK_F7) {
+                // Screen-space reflections on the sea, for A/B.
+                g_renderer.set_ssr(!g_renderer.ssr());
+                return 0;
+            }
             if (wp == 'K') {
                 // Cycle the water debug views.
                 float m = g_renderer.water_debug() + 1.0f;
-                if (m > 4.5f) m = 0.0f;
+                if (m > 6.5f) m = 0.0f;
                 g_renderer.set_water_debug(m);
                 return 0;
             }
@@ -915,6 +920,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     if (swell_hs >= 0.0f) g_renderer.weather().set_swell(swell_hs);
     g_renderer.set_water_debug(water_debug);
     if (no_water) g_renderer.set_water(false);
+    if (cmdline && std::string(cmdline).find("--no-ssr") != std::string::npos) g_renderer.set_ssr(false);
     if (no_lod_hold) g_renderer.set_lod_hold(false);
     {
         const std::string c2 = cmdline ? cmdline : "";

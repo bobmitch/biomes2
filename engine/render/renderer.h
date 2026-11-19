@@ -167,6 +167,9 @@ public:
     const WwSea& sea() const { return sea_; }
     void  update_weather(double t);
     void  set_water(bool on) { water_ = on; }
+    // Screen-space reflections on the sea (F7, --no-ssr).
+    void  set_ssr(bool on) { ssr_on_ = on; }
+    bool  ssr() const { return ssr_on_; }
     // LOD transitions: hold the outgoing chunk until its replacements are
     // meshed, then dither-cross-fade over `frames`. See Streamer.
     void  set_lod_hold(bool on) { streamer_.set_lod_hold(on); }
@@ -548,6 +551,20 @@ private:
     bool create_post_pipelines(std::string& error);
     void record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer);
     ComPtr<ID3D12Resource> hdr_direct_, hdr_ambient_, scene_, ao_, history_[2];
+    // The sea draws after the composite (record_water) and reads these: the
+    // lit scene and depth as they were before it.
+    ComPtr<ID3D12Resource> scene_copy_, depth_copy_;
+    void record_water();
+    bool water_pending_ = false;
+    bool ssr_on_ = true;
+    // archetypes.json's "water": what the sea's body does to light.
+    struct WaterOptics {
+        float extinction[3] = {0.40f, 0.11f, 0.09f};   // per metre, linear rgb
+        float deep_colour[3] = {0.0012f, 0.0067f, 0.022f};   // linear
+        float refraction = 0.04f;
+        float storm_turbidity = 4.0f;   // extinction x (1 + this x roughness^2)
+    } water_optics_;
+    bool load_water_optics(const char* archetypes_path, std::string& error);
     ComPtr<ID3D12DescriptorHeap> post_rtv_heap_;
     ComPtr<ID3D12RootSignature> post_root_;
     ComPtr<ID3D12PipelineState> ao_pso_, composite_pso_, taa_pso_, final_pso_, ssgi_pso_;

@@ -172,7 +172,7 @@ WeatherState Weather::at(double t) {
 // with a train at every 137.5 degrees the share that points downwind varies
 // with the heading, and the height must not.
 //
-// The swell is a narrow lump round its own wavelength and a cos^8 spread
+// The swell is a narrow lump round its own wavelength and a cos^4 spread
 // round its heading, scaled the same way. Energies add.
 WwSea Weather::sea(const WeatherState& w) const {
     WwSea s;
@@ -210,10 +210,12 @@ WwSea Weather::sea(const WeatherState& w) const {
         e_wind[i] = spec * dw;
         sum_w += e_wind[i];
 
-        const float lk = std::log(k / ks) / 0.2f;
+        const float lk = std::log(k / ks) / 0.3f;
         const float cs = d.x * w.swell_dir[0] + d.y * w.swell_dir[1];
+        // cos^4, and 0.3 in log k: with cos^8 and 0.2 the swell sat on one
+        // or two trains and a calm sea read as corrugated iron.
         const float c2 = cs > 0.0f ? cs * cs : 0.0f;
-        const float ds = c2 * c2 * c2 * c2;
+        const float ds = c2 * c2;
         e_swell[i] = std::exp(-0.5f * lk * lk) * ds;
         sum_s += e_swell[i];
     }

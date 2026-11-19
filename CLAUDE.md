@@ -1752,10 +1752,42 @@ with the weather would flood coastlines and no screenshot of a rough sea would
 look wrong.
 
 Controls: `--sea-shot` (stands the camera off the nearest coast, over 4-12 m of
-water), `--water-debug 1..5` (depth, foam, normal, displacement, surviving
-significant height; with `--tonemap 0` since L1 -- this session's tries came
-out solid white even so, not chased), `--no-water`, and `K` in the window.
+water), `--water-debug 1..6` (depth, foam, normal, displacement, surviving
+significant height, SSR source: green screen / red sky; marked as debug, so
+shown unexposed), `--no-water`, `--no-ssr`, and `K` / `F7` in the window.
 Weather controls are under the weather section.
+
+**The sea draws AFTER the composite (ADR-004 L7)**, onto the lit scene, in
+`record_water` between `cs_composite` and TAA. It reads copies of the scene
+and depth (heap [79..80]) and writes colour opaquely and its own depth, so TAA
+reprojects the surface and the crack test sees water as drawn. The sea, not
+the composite, now applies the haze and mist over itself (`haze.hlsli`,
+shared with post.hlsl). This makes the older notes about the sea blending into
+the two scene targets, zeroing the contact mask, and breaking the pixel
+detectors historical.
+- **Refraction**: the seabed from the scene copy, shifted by the normal's
+  tilt (`refraction` 0.04), refusing shifts onto things in front of the water,
+  dimmed per channel by `extinction` along the view leg AND the leg down to
+  the seabed, filled by `deep_colour` x the light. `storm_turbidity` makes a
+  rough sea murky. All in archetypes.json's `water` block.
+- **SSR**: a world-space march (28 steps growing 1.35x, to ~3.8 km) against
+  the depth copy, binary refinement, and a hit only if the refined point is AT
+  the surface: rays that cleared a hilltop from the water but ran behind it as
+  the camera sees it gave every headland a slab of reflection. Skipped where
+  Fresnel < 0.06, faded out as the wind rises. Misses take the sky from the
+  composited scene where the reflected direction lands on sky
+  (`sky_reflection`); the sky table alone has no mist and left a blue band
+  under a grey horizon. Reflections leaving below a roughness-dependent
+  horizon take the water's colour (`open`): clamped, they lit every gale back
+  slope with the horizon's beige and sent SSR along the sea into headlands.
+- **Gale glint** is now 250-900 (not 60): broad lobes on smooth faces read as
+  pale blobs. Shore foam is drifting value-noise lace, thick at the waterline.
+- **Cost** at 2560 x 1440, the sea filling the frame: 0.83 ms light wind
+  (SSR 0.39 of it), ~1.0 ms gale; was 0.25 / 0.38. Walking where the sea is
+  incidental: +0.25 ms (the two full-frame copies and the grid).
+- **Not done**: a faint strip just under the horizon where SSR misses land;
+  storm troughs over very shallow water bare the seabed (seen in `--swim`);
+  no underwater rendering; crest foam is still the old smooth style.
 
 ### Weather: the wind, and the sea it raises
 
