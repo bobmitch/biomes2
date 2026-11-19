@@ -26,8 +26,12 @@ cbuffer RtConstants : register(b0) {
     float  near_plane; float far_plane; float csm_reach; uint frame;
     uint   checks;     float light_radius;                // checks: the instruments; light_radius: the disk, radians
     uint   sky_rays;   uint sky_mask;                     // L6: rays a pixel a frame (0 = off), and what they see
-    float  sky_range;  uint sparse; uint2 pad1;        // sparse: 1 the quads' pass, 2 the rest (rt_denoise.h)
+    float  sky_range;  uint sparse; uint leaf_mode; uint pad1;   // sparse: 1 the quads' pass, 2 the rest (rt_denoise.h)
 };
+// leaf_mode, how the shadow ray meets leaves: 0 the opaque cutouts (the
+// default), 4 the alpha-tested cards (no cutouts, or --rt-card-leaves). The
+// rest are BIOMES_RT_LEAVES's instruments: 1 every card opaque, 2 cards
+// culled, 3 the alpha test's loop and fetches with a trivial pattern.
 
 Texture2D<float>          g_depth : register(t0);
 RWTexture2D<unorm float2> u_vis   : register(u0);   // x the key light's visibility, y the sky's
@@ -78,6 +82,35 @@ float3 normal_from_depth(int2 p, float3 P) {
     float3 n = normalize(cross(dy, dx));
     if (dot(n, cam_pos - P) < 0.0f) n = -n;
     return n;
+}
+
+float key_occluded(GiRay r) {
+    if (leaf_mode == 0u) return gi_occluded_cutouts(r);
+    if (leaf_mode == 4u) return gi_occluded(r);
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+    RayDesc rd;
+    rd.Origin = r.origin; rd.TMin = r.tmin; rd.Direction = r.dir; rd.TMax = r.tmax;
+    if (leaf_mode == 3u) {
+        // The alpha test's round trip and fetches with a trivial pattern in
+        // place of leaf_coverage: one cell in four of a grid on the card's uv,
+        // which lets about as much light through a wood as the leaves do.
+        q.TraceRayInline(g_tlas, RAY_FLAG_NONE, kRtMaskSurfaces, rd);
+        while (q.Proceed()) {
+            if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE) continue;
+            const TreeRtInfo ti = g_rt_tree_info[q.CandidateInstanceID() & 0x3FFFFFu];
+            const uint ib = ti.ibase_leaf + 3u * q.CandidatePrimitiveIndex();
+            const float2 b = q.CandidateTriangleBarycentrics();
+            const float2 uv = g_rt_tree_attr[ti.vbase + g_rt_tree_idx[ib + 0u]].xy * (1.0f - b.x - b.y) +
+                              g_rt_tree_attr[ti.vbase + g_rt_tree_idx[ib + 1u]].xy * b.x +
+                              g_rt_tree_attr[ti.vbase + g_rt_tree_idx[ib + 2u]].xy * b.y;
+            const int2 c = int2(floor(uv * 6.0f));
+            if (((c.x | c.y) & 1) == 0) { q.CommitNonOpaqueTriangleHit(); q.Abort(); }
+        }
+        return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0f : 1.0f;
+    }
+    q.TraceRayInline(g_tlas, leaf_mode == 1u ? RAY_FLAG_FORCE_OPAQUE : RAY_FLAG_CULL_NON_OPAQUE, kRtMaskSurfaces, rd);
+    while (q.Proceed()) {}
+    return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0f : 1.0f;
 }
 
 [numthreads(8, 8, 1)]
@@ -158,7 +191,7 @@ void cs_rt_shadow(uint3 id : SV_DispatchThreadID) {
         u_raw[p] = -1.0f;   // terrain, not this frame's pixel of its quad
         return;
     }
-    const float vis = dot(nl, key_dir) > -0.05f ? gi_occluded(sr) : 0.0f;
+    const float vis = dot(nl, key_dir) > -0.05f ? key_occluded(sr) : 0.0f;
     if (sparse != 0u) {
         u_raw[p] = vis;
         return;

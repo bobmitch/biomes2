@@ -151,6 +151,7 @@ if(BIOMES2_ENGINE)
     engine/svdag/brick_pager.cpp
     engine/field/world_gpu.cpp
     engine/trees/tree_mesh.cpp
+    engine/trees/leaf_cutout.cpp
     engine/trees/tree_field.cpp
     engine/trees/tree_renderer.cpp
     engine/trees/felling.cpp

@@ -205,7 +205,7 @@ struct RtConstants {
     float near_plane;  float far_plane; float csm_reach; UINT frame;
     UINT  checks;      float light_radius;
     UINT  sky_rays;    UINT sky_mask;
-    float sky_range;   UINT sparse; UINT pad1[2];
+    float sky_range;   UINT sparse; UINT leaf_mode; UINT pad1;
 };
 static_assert(sizeof(RtConstants) == 144, "RtConstants must match rt_shadow.hlsl");
 // The mist's froxels: 160 x 90 x 128, log-spaced from 0.5 m to 6 km.
@@ -1723,6 +1723,14 @@ void Renderer::record_rt_trace() {
     rc.sky_rays = rt_sky_ ? UINT(rt_sky_rays_) : 0u;
     rc.sky_mask = rt_sky_mask_;
     rc.sky_range = 80.0f;
+    // How the shadow ray meets leaves (rt_shadow.hlsl): the opaque cutouts
+    // where the scene has them, else the alpha-tested cards (4).
+    // BIOMES_RT_LEAVES, an instrument for the leaf cost, overrides: 1 every
+    // card opaque, 2 cards culled, 3 the alpha test with a trivial pattern
+    // in place of leaf_coverage, 4 the alpha-tested cards.
+    static const int leaf_env = std::getenv("BIOMES_RT_LEAVES") ? std::atoi(std::getenv("BIOMES_RT_LEAVES")) : -1;
+    rc.leaf_mode = rt_.has_cutouts() ? 0u : 4u;
+    if (leaf_env > 0) rc.leaf_mode = UINT(leaf_env);
     // Sparse terrain (rt_denoise.h): terrain traced at one pixel of each 2x2
     // a frame, everything else every pixel. Not with the traced sky or the
     // instruments, which are per pixel; not without the denoiser, which is

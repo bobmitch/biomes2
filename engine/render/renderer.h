@@ -303,6 +303,10 @@ public:
     // it pays only where bare terrain fills the screen, and grass is not
     // terrain to the trace -- walking at 1440p it was slower than full.
     void set_rt_sparse_terrain(bool on) { rt_sparse_terrain_ = on; }
+    // --rt-card-leaves: the key-light shadow ray alpha-tests the leaf cards
+    // as before the cutouts (rt_scene.h), which are then not built. Before
+    // the first frame.
+    void set_rt_card_leaves(bool on) { rt_.cutouts_ = !on; }
     bool rt_sparse_terrain() const { return rt_sparse_terrain_; }
     void set_rt_active(bool on);   // the scene and the trace, without replacing the cascades
     void set_rt_checks(bool on) { rt_checks_ = on; }   // the CSM and normal instruments (--rt-report)
@@ -356,6 +360,7 @@ public:
         return ddgi_.count(queue_.Get(), out, error, centre, radius);
     }
     const RtScene::Stats& rt_scene_stats() const { return rt_.stats(); }
+    const RtScene& rt_scene() const { return rt_; }
     struct RtStats {
         uint32_t lit_lit = 0, shadow_shadow = 0, rt_only = 0, csm_only = 0;
         uint32_t primary_agree = 0, primary_nearer = 0, primary_farther = 0;

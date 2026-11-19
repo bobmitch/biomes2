@@ -826,6 +826,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         else if (c2.find("--rt-shadows") != std::string::npos) g_renderer.set_rt_shadows(true);
         if (c2.find("--no-rt-denoise") != std::string::npos) g_renderer.set_rt_denoise(false);
         if (c2.find("--rt-sparse-terrain") != std::string::npos) g_renderer.set_rt_sparse_terrain(true);
+        if (c2.find("--rt-card-leaves") != std::string::npos) g_renderer.set_rt_card_leaves(true);
         if (c2.find("--rt-sky") != std::string::npos) g_renderer.set_rt_sky(true);
         {
             const size_t k = c2.find("--rt-sky-rays ");
@@ -1238,6 +1239,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                     const engine::Renderer::RtStats& rs = g_renderer.rt_stats();
                     std::fprintf(f, "gpu: ray tracing -- BLAS + TLAS build %.3f ms, trace (key light%s) %.3f ms\n",
                                  rs.build_ms, g_renderer.rt_sky() ? " + sky" : "", rs.trace_ms);
+                    const engine::RtScene::Stats& ss = g_renderer.rt_scene_stats();
+                    std::fprintf(f, "rt leaves: %s; %u cards, %u cutout triangles (%u of them needles), cut in %.0f ms, "
+                                 "%.1f MB BLAS, %u instances\n",
+                                 g_renderer.rt_scene().has_cutouts() ? "opaque cutouts" : "alpha-tested cards",
+                                 ss.cutout_cards, ss.cutout_tris, ss.cutout_needle_tris, ss.cutout_ms,
+                                 ss.cutout_bytes / 1048576.0, ss.instances_cutouts);
                 }
                 const engine::Renderer::SkyCheck& sk = g_renderer.last_sky_check();
                 if (sk.valid)
@@ -2702,6 +2709,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(f, "  TLAS: %u chunk instances, %u trees, %u crowns, %u rocks; %u drawn LOD 0-3 chunks without a BLAS; %u pending\n",
                          rs.instances_terrain, rs.instances_trees, rs.instances_crowns, rs.instances_rocks,
                          rs.drawn_without_blas, rs.pending);
+            std::fprintf(f, "  leaf cutouts (the key-light shadow's leaves): %s; %u cards cut into %u triangles in %.0f ms, "
+                         "%.1f MB of BLAS, %u instances\n",
+                         g_renderer.rt_scene().has_cutouts() ? "on" : "OFF, the shadow ray alpha-tests the cards",
+                         rs.cutout_cards, rs.cutout_tris, rs.cutout_ms, rs.cutout_bytes / 1048576.0, rs.instances_cutouts);
             std::fprintf(f, "  GPU: BLAS + TLAS build %.3f ms a frame (steady), shadow trace and checks %.3f ms\n",
                          st.build_ms, st.trace_ms);
             if (prim > 0)

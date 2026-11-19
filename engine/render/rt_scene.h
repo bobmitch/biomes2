@@ -11,9 +11,15 @@
 //            it is read back two frames after the chunk is meshed, then the
 //            build is queued, at most kBuildsPerFrame a frame.
 //   trees    one BLAS per model from its LOD 1 mesh, built once: bark and
-//            caps opaque, leaves and needles NON-opaque -- a shadow ray
-//            passing a card keeps a share of its light, so a crown is a
-//            transmittance, as the ADR asks, without proxy hulls.
+//            caps opaque, leaves and needles NON-opaque, alpha-tested by
+//            every ray but the key-light shadow's (cutouts, below).
+//   cutouts  one more BLAS per model: its bark, and its LOD 1 leaf cards cut
+//            along the leaf pattern into OPAQUE triangles (leaf_cutout.h),
+//            instanced per standing tree beside the tree itself under
+//            kMaskCutouts, which rocks carry too. The key-light shadow ray
+//            traces terrain and kMaskCutouts only, so it never enters the
+//            cards' BLAS and never calls the shader; every other ray keeps
+//            the cards (alpha-tested, or culled for the crowns' volume).
 //   crowns   (ADR-004 L6) one shared procedural BLAS, a unit-sphere AABB,
 //            instanced per standing tree as an ellipsoid round its crown
 //            with the species' leaf area density: a volume the sky rays
@@ -55,7 +61,7 @@ public:
     // info buffer, so gi_trace needs no new binding.
     static const UINT kRockFlag = 0x200000u;
     static const UINT kRockInfoBase = 1024u;
-    static const UINT kMaskTerrain = 0x1u, kMaskTrees = 0x2u, kMaskCrowns = 0x4u;
+    static const UINT kMaskTerrain = 0x1u, kMaskTrees = 0x2u, kMaskCrowns = 0x4u, kMaskCutouts = 0x8u;
     static const int  kMaxLod = 3;
 
     bool init(ID3D12Device* device, std::string& error);
@@ -72,6 +78,11 @@ public:
     // Crown volumes in the TLAS (L6). Off unless something traces them: they
     // double the tree instances.
     bool crowns_ = false;
+    // Leaf cutouts in the TLAS for the key-light shadow (on unless asked
+    // off, before the first record). has_cutouts: they were built and are
+    // in the TLAS, so the shadow ray may cull the cards.
+    bool cutouts_ = true;
+    bool has_cutouts() const { return cutouts_ && !cutout_blas_.empty(); }
 
     // Builds what is due and the TLAS, on `cmd`, after the frame's meshing
     // and before anything traces. The pool's vertices and indices must be in
@@ -103,6 +114,12 @@ public:
         UINT64 blas_bytes = 0, tlas_bytes = 0, scratch_bytes = 0;
         UINT built_this_frame = 0, pending = 0;
         UINT instances_terrain = 0, instances_trees = 0, instances_crowns = 0, instances_rocks = 0;
+        UINT instances_cutouts = 0;
+        // The leaf cutouts, built once: cards cut, triangles, BLAS bytes,
+        // CPU ms to cut them.
+        UINT cutout_cards = 0, cutout_tris = 0, cutout_needle_tris = 0;
+        UINT64 cutout_bytes = 0;
+        double cutout_ms = 0.0;
         UINT drawn_without_blas = 0;     // drawn LOD 0-3 chunks not (yet) in the TLAS
         // Where queued chunks went, since start: the queue's own accounts.
         UINT64 noted = 0, dropped_remeshed = 0, dropped_moved = 0, empty = 0, built_total = 0;
@@ -140,6 +157,8 @@ private:
     // Trees: positions (float3), indices, and per-model info for gi_trace.
     ComPtr<ID3D12Resource> tree_pos_, tree_idx_, tree_info_, tree_attr_;
     std::vector<ComPtr<ID3D12Resource> > tree_blas_;
+    ComPtr<ID3D12Resource> cutout_pos_;                    // every model's cutout triangles, float3, unindexed; freed once built
+    std::vector<ComPtr<ID3D12Resource> > cutout_blas_;     // per model; null where it has no leaves
     std::vector<ComPtr<ID3D12Resource> > rock_blas_;
     const RockMeshes* rock_meshes_ = nullptr;
     std::vector<float> rock_albedo_;

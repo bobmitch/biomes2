@@ -60,6 +60,10 @@ float3 rt_rock_normal(uint inst, uint prim, float3x4 m) {
     return normalize(mul(m, float4(cross(p1 - p0, p2 - p0), 0.0f)));
 }
 static const uint  kRtMaskTerrain = 0x1u, kRtMaskTrees = 0x2u, kRtMaskCrowns = 0x4u;
+// What the key-light shadow ray sees besides terrain (rt_scene.h): one
+// instance beside each tree of its bark and its leaf cards cut into opaque
+// triangles (leaf_cutout.h), and the rocks, which carry both masks.
+static const uint  kRtMaskCutouts = 0x8u;
 // What the surface rays see: terrain and the trees' own geometry. Crowns are
 // a volume for diffuse rays only (gi_transmittance) -- a shadow ray through
 // one would blur every sunfleck the alpha-tested cards make.
@@ -97,6 +101,19 @@ float gi_occluded_masked(GiRay r, uint mask) {
 }
 
 float gi_occluded(GiRay r) { return gi_occluded_masked(r, kRtMaskSurfaces); }
+
+// The same answer through the leaf CUTOUTS: the leaf pattern met as opaque
+// triangles, so traversal never returns to the shader, and the trees' own
+// BLAS -- the cards -- never entered. Only where the scene has them for
+// every tree in it (RtScene::has_cutouts).
+float gi_occluded_cutouts(GiRay r) {
+    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+    RayDesc rd;
+    rd.Origin = r.origin; rd.TMin = r.tmin; rd.Direction = r.dir; rd.TMax = r.tmax;
+    q.TraceRayInline(g_tlas, RAY_FLAG_NONE, kRtMaskTerrain | kRtMaskCutouts, rd);
+    while (q.Proceed()) {}
+    return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0f : 1.0f;
+}
 
 // The light that gets through along r for a DIFFUSE ray (ADR-004 L6): 0 at
 // any opaque hit -- terrain, a trunk -- and Beer-Lambert through every crown

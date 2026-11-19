@@ -1080,6 +1080,39 @@ albedo), SM 6.5, compiled with DXC. `rt_shadow.hlsl` is the pass.
   beside the positions). A flat 55% transmission per card was tried first:
   a dawn sun crosses so many cards that the wood's floor lost every trunk
   shadow under a uniform dimness.
+- **The key-light shadow ray meets leaves as opaque CUTOUTS**, not cards
+  (`engine/trees/leaf_cutout.{h,cpp}`; `--rt-card-leaves` for A/B). At
+  startup each model's LOD 1 cards are cut along that same pattern (blur
+  0.1, kept at 0.5) into triangles: a broad leaf is a pentagon found by
+  bisecting its own coverage along five rays from its centre, grown by
+  sqrt(2 pi / (5 sin 72 deg)) to the leaf's area; needles are marching
+  squares in the sheared frame (|u - 0.5|, 9v + 6|u - 0.5|) where every
+  stroke is an axis-aligned band. One more BLAS per model holds them AND
+  the bark, instanced beside each tree under mask 0x8, which rocks carry
+  too; the shadow ray traces terrain | 0x8 only. Every other ray keeps the
+  cards. 1.87 M triangles, 292 MB of BLAS, cut in ~180 ms on every core.
+  At 2560 x 1440 (trace + denoise): the 17:30 wood 6.09 -> 4.87 ms, the
+  wood from 45 m 4.96 -> 4.03, the close floor 4.21 -> 3.48; BLAS + TLAS
+  +0.06 ms. The floor at EV100 13 46.7 against the cards' 46.4, and
+  agreement with the cascades within a point on every `--rt-report` view.
+  - **This GPU (RX 7900 XT, RDNA3) traverses in shader code**, so the
+    usual "skip the any-hit calls, opaque is 2-4x faster" does not hold:
+    a non-opaque candidate in an inline RayQuery is a branch in the same
+    loop. `BIOMES_RT_LEAVES` split the old cost in the wood: every card
+    opaque 2.53 ms, cards culled 3.22, the alpha test with a trivial
+    pattern 4.87, the real one 5.75 -- the pattern itself 0.4-1.3 ms of it.
+    Dense geometry costs real traversal: the first cut (8 rays, a fine
+    needle grid) was 4.0 M triangles, 623 MB, and traced SLOWER than
+    the coarse one; a coarser still let rays run further and was slower
+    again.
+  - **The first build saved a tenth, not a fifth**: the cutouts sat
+    beside the cards while the shadow ray still entered each tree's own
+    BLAS for its bark, walking every card's BVH nodes to cull them. Bark
+    went into the cutouts' BLAS and the ray stopped seeing mask 0x2.
+  - `BIOMES_RT_LEAVES` overrides the leaf path: 1 every card opaque, 2
+    cards culled, 3 the alpha test with a trivial pattern, 4 the cards.
+  - `leaf_coverage_cpu` is a hand port of `leaf.hlsli`'s `leaf_coverage`:
+    change one, change both, or the shadows are cut from old leaves.
 - **Terrain shadow rays start from Hanika's lifted point** ("Hacking the
   Shadow Terminator"): the pixel's own triangle comes from a terrain-only
   primary ray, and the start is lifted onto the curve its vertex normals

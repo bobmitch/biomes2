@@ -63,6 +63,9 @@ float leaf_layer(float2 uv, float cells, float seed, float narrow) {
 
 float leaf_coverage_sharp(float2 uv, float kind, float seed, float blur, float narrow);
 
+// engine/trees/leaf_cutout.cpp ports this pattern to C++ and cuts the RT
+// shadow's opaque leaves from it: change both, or they cut the old leaves.
+//
 // What leaf_coverage converges to as the card shrinks: the pattern's own
 // average fill. The first version only widened the edges with `blur`, which
 // DIVIDED coverage towards zero, so every crown thinned out with distance.

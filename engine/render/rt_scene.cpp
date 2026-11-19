@@ -4,8 +4,12 @@
 #include "engine/render/rt_scene.h"
 #include "engine/rocks/rock_field.h"
 #include "engine/meshing/chunk_mesher.h"
+#include "engine/trees/leaf_cutout.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstring>
 
@@ -315,6 +319,115 @@ bool RtScene::build_trees(ID3D12GraphicsCommandList4* cl, const std::vector<Tree
         stats_.blas_bytes += pi.ResultDataMaxSizeInBytes;
         ++stats_.tree_blas;
     }
+    // Leaf cutouts (leaf_cutout.h): each model's LOD 1 cards cut along the
+    // leaf pattern into opaque triangles, unindexed, one BLAS a model.
+    cutout_blas_.clear();
+    std::vector<ComPtr<ID3D12Resource> > cut_scratch;
+    if (cutouts_) {
+        const auto t0 = std::chrono::steady_clock::now();
+        // Every model on its own core (~1 s on one), then one buffer.
+        std::vector<std::vector<float> > per(models.size());
+        std::vector<LeafCutoutStats> pst(models.size());
+        {
+            std::atomic<size_t> next(0);
+            auto work = [&]() {
+                for (size_t m; (m = next.fetch_add(1)) < models.size();) {
+                    const size_t species = m / kTreeVariants;
+                    const bool narrow = species < looks.size() && looks[species].form == TreeForm::Weeping;
+                    leaf_cutouts(models[m].lod[1], narrow, per[m], pst[m]);
+                }
+            };
+            const unsigned nt = (std::max)(1u, (std::min)(std::thread::hardware_concurrency(), 16u));
+            std::vector<std::thread> pool;
+            for (unsigned k = 1; k < nt; ++k) pool.emplace_back(work);
+            work();
+            for (size_t k = 0; k < pool.size(); ++k) pool[k].join();
+        }
+        std::vector<float> cpos;
+        std::vector<std::pair<UINT, UINT> > crange(models.size());   // first vertex, vertex count
+        for (size_t m = 0; m < models.size(); ++m) {
+            crange[m].first = UINT(cpos.size() / 3);
+            cpos.insert(cpos.end(), per[m].begin(), per[m].end());
+            crange[m].second = UINT(cpos.size() / 3) - crange[m].first;
+            stats_.cutout_cards += pst[m].cards;
+            stats_.cutout_tris += pst[m].triangles;
+            stats_.cutout_needle_tris += pst[m].needle_tris;
+        }
+        stats_.cutout_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (!cpos.empty() && upload(cpos.data(), cpos.size() * 4, cutout_pos_)) {
+            cutout_blas_.assign(models.size(), ComPtr<ID3D12Resource>());
+            cut_scratch.resize(models.size());
+            for (size_t m = 0; m < models.size(); ++m) {
+                // The model's bark too, so the shadow ray never enters the
+                // tree's own BLAS: it would walk every card's BVH nodes there
+                // only to cull them, and the first build, cutouts alone beside
+                // the cards, saved a tenth of the trace where culling the cards
+                // outright had promised half.
+                const Range& r = ranges[m];
+                D3D12_RAYTRACING_GEOMETRY_DESC g[2] = {};
+                UINT ng = 0;
+                if (r.bark_count >= 3) {
+                    D3D12_RAYTRACING_GEOMETRY_DESC& d = g[ng++];
+                    d.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+                    d.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+                    d.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+                    d.Triangles.VertexBuffer.StartAddress = tree_pos_->GetGPUVirtualAddress() + UINT64(r.vbase) * 12;
+                    d.Triangles.VertexBuffer.StrideInBytes = 12;
+                    d.Triangles.VertexCount = r.vcount;
+                    d.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+                    d.Triangles.IndexBuffer = tree_idx_->GetGPUVirtualAddress() + UINT64(r.bark_first) * 4;
+                    d.Triangles.IndexCount = r.bark_count;
+                }
+                if (crange[m].second >= 3) {
+                    D3D12_RAYTRACING_GEOMETRY_DESC& d = g[ng++];
+                    d.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+                    d.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+                    d.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+                    d.Triangles.VertexBuffer.StartAddress = cutout_pos_->GetGPUVirtualAddress() + UINT64(crange[m].first) * 12;
+                    d.Triangles.VertexBuffer.StrideInBytes = 12;
+                    d.Triangles.VertexCount = crange[m].second;
+                    d.Triangles.IndexFormat = DXGI_FORMAT_UNKNOWN;
+                }
+                if (ng == 0) continue;
+                D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in = {};
+                in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+                in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+                in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+                in.NumDescs = ng;
+                in.pGeometryDescs = g;
+                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pi = {};
+                dev_->GetRaytracingAccelerationStructurePrebuildInfo(&in, &pi);
+                if (!make_buffer(pi.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+                                 D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true, cutout_blas_[m]) ||
+                    !make_buffer(pi.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                 true, cut_scratch[m])) {
+                    // All or none: the shadow ray culls the cards only if
+                    // every model has its cutouts. Those built are in this
+                    // list's builds, so they wait out the GPU like scratch.
+                    for (size_t k = 0; k < cutout_blas_.size(); ++k)
+                        if (cutout_blas_[k]) graveyard_.push_back(std::make_pair(tick_, cutout_blas_[k]));
+                    cutout_blas_.clear();
+                    break;
+                }
+                D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bd = {};
+                bd.Inputs = in;
+                bd.DestAccelerationStructureData = cutout_blas_[m]->GetGPUVirtualAddress();
+                bd.ScratchAccelerationStructureData = cut_scratch[m]->GetGPUVirtualAddress();
+                cl->BuildRaytracingAccelerationStructure(&bd, 0, nullptr);
+                stats_.blas_bytes += pi.ResultDataMaxSizeInBytes;
+                stats_.cutout_bytes += pi.ResultDataMaxSizeInBytes;
+            }
+        }
+    }
+    for (size_t m = 0; m < cut_scratch.size(); ++m)
+        if (cut_scratch[m]) graveyard_.push_back(std::make_pair(tick_, cut_scratch[m]));
+    // The cutouts' vertices are read by the builds alone (nothing traces
+    // their attributes), so they go once the builds are done.
+    if (cutout_pos_) {
+        graveyard_.push_back(std::make_pair(tick_, cutout_pos_));
+        cutout_pos_.Reset();
+    }
+
     rock_blas_.assign(rranges.size(), ComPtr<ID3D12Resource>());
     for (size_t m = 0; m < rranges.size(); ++m) {
         const RockRange& rr = rranges[m];
@@ -502,9 +615,17 @@ void RtScene::record(ID3D12GraphicsCommandList* cmd, UINT frame,
     }
     stats_.instances_trees = 0;
     stats_.instances_crowns = 0;
+    stats_.instances_cutouts = 0;
     const float r2 = tree_range * tree_range;
-    for (size_t i = 0; !(debug_ & 4u) && i < trees.size() && n < max_instances_ &&
-                       stats_.instances_trees + stats_.instances_crowns < kMaxTreeInstances; ++i) {
+    const bool cut = has_cutouts();
+    // Trees, their cutouts and their crowns share one cap. A tree goes in
+    // only with room for its cutouts: the shadow ray culls the cards, so a
+    // tree without them would cast no leaf shadow.
+    auto tree_room = [&](UINT need) {
+        return n + need <= max_instances_ &&
+               stats_.instances_trees + stats_.instances_crowns + stats_.instances_cutouts + need <= kMaxTreeInstances;
+    };
+    for (size_t i = 0; !(debug_ & 4u) && i < trees.size() && tree_room(cut ? 2u : 1u); ++i) {
         const TreeGpuInstance& t = trees[i];
         if (t.mode != 0 || t.model >= tree_blas_.size() || !tree_blas_[t.model]) continue;
         const float dx = t.pos[0] - cam[0], dz = t.pos[2] - cam[2];
@@ -514,7 +635,9 @@ void RtScene::record(ID3D12GraphicsCommandList* cmd, UINT frame,
         const float R[3][3] = {{1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)},
                                {2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)},
                                {2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)}};
-        D3D12_RAYTRACING_INSTANCE_DESC& d = inst[n++];
+        // Built here and copied in: `inst` is a mapped upload heap, which is
+        // write-combined, and the cutouts' copy must not read it back.
+        D3D12_RAYTRACING_INSTANCE_DESC d;
         std::memset(&d, 0, sizeof d);
         for (int r = 0; r < 3; ++r) {
             for (int c = 0; c < 3; ++c) d.Transform[r][c] = R[r][c] * s;
@@ -523,11 +646,18 @@ void RtScene::record(ID3D12GraphicsCommandList* cmd, UINT frame,
         d.InstanceID = kTreeFlag | t.model;
         d.InstanceMask = kMaskTrees;
         d.AccelerationStructure = tree_blas_[t.model]->GetGPUVirtualAddress();
+        std::memcpy(&inst[n++], &d, sizeof d);
         ++stats_.instances_trees;
+        // Its leaf cutouts, placed as the tree is, for the shadow ray alone.
+        if (cut && t.model < cutout_blas_.size() && cutout_blas_[t.model]) {
+            d.InstanceMask = kMaskCutouts;
+            d.AccelerationStructure = cutout_blas_[t.model]->GetGPUVirtualAddress();
+            std::memcpy(&inst[n++], &d, sizeof d);
+            ++stats_.instances_cutouts;
+        }
         // Its crown: the unit sphere scaled to the ellipsoid, then placed as
         // the tree is. Counts against the same cap as the trees.
-        if (!crowns_ || !crown_blas_ || t.model >= crowns_by_model_.size() || n >= max_instances_ ||
-            stats_.instances_trees + stats_.instances_crowns >= kMaxTreeInstances) continue;
+        if (!crowns_ || !crown_blas_ || t.model >= crowns_by_model_.size() || !tree_room(1u)) continue;
         const Crown& c = crowns_by_model_[t.model];
         if (c.rh <= 0.0f) continue;
         D3D12_RAYTRACING_INSTANCE_DESC& e = inst[n++];
@@ -575,7 +705,7 @@ void RtScene::record(ID3D12GraphicsCommandList* cmd, UINT frame,
                 rgb = (cr << 11) | (cg << 5) | cb;
             }
             d.InstanceID = kRockFlag | (rgb << 4) | m;
-            d.InstanceMask = kMaskTrees;
+            d.InstanceMask = kMaskTrees | kMaskCutouts;   // the key-light shadow's casters too
             d.AccelerationStructure = rock_blas_[m]->GetGPUVirtualAddress();
             ++stats_.instances_rocks;
         }
