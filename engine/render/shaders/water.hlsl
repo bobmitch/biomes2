@@ -70,7 +70,7 @@ cbuffer WaterConstants : register(b0) {
     // The weather's wind (weather.h), as grass and trees get it: direction x,
     // z; mean m/s; gustiness. And the metres the air has moved (wind.hlsli).
     float4 wind_v;
-    float2 wind_drift;    float2 pad5;
+    float2 wind_drift;    float swash_runup;  float pad5;   // the swash's highest run up the beach (water_wave.h)
 };
 
 // The lit scene and its depth as the composite left them -- copies, because
@@ -92,6 +92,13 @@ SamplerState g_wrap : register(s3);
 #include "engine/render/atmosphere.h"
 #include "engine/render/shaders/haze.hlsli"
 #include "engine/render/shaders/wind.hlsli"
+
+WwSwash frame_swash() {
+    WwSwash s;
+    [unroll] for (int i = 0; i < WW_SWASH_TRAINS; ++i) s.amp[i] = wave_amp[i >> 2][i & 3];
+    s.runup = swash_runup;
+    return s;
+}
 
 WwSea frame_sea() {
     WwSea s;
@@ -221,12 +228,24 @@ VSOut vs_main(uint vid : SV_VertexID) {
 
     float3 nrm;
     const float3 p = ww_surface(rest.x, rest.y, time, frame_sea(), depth, fade, minwl, nrm);
-    const float3 world = float3(p.x, sea_level + p.y, p.z);
+    // The swash (water_wave.h): within a metre and a half of the still-water
+    // line the sheet rises and falls with each arriving set, so the water
+    // runs up the beach and back; the terrain in front hides it where the
+    // beach is higher. Where it is wet it never sinks below the bed: a storm
+    // trough over half a metre of water fell under the seabed and bared it.
+    const float reach = ww_swash_reach(depth);
+    const float swash = reach > 0.0f ? ww_swash(rest.x, rest.y, time, frame_swash()) * reach : 0.0f;
+    float y = p.y + swash;
+    // A little past the edge too, 12 cm over the ground out to 30 cm beyond
+    // it: the edge is cut per pixel (edge_fade, in the pixel shader), which
+    // can only cut away water that was drawn.
+    if (depth + swash > -0.3f) y = max(y, 0.12f - depth);
+    const float3 world = float3(p.x, sea_level + y, p.z);
 
     o.world = world;
     o.clip = mul(float4(world, 1.0f), view_proj);
     o.nrm = nrm;
-    o.depth = depth;
+    o.depth = depth + swash;   // the water actually over the bed here, for the clip and the shading
     o.dist = d;
     o.fade = fade;
     o.minwl = minwl;
@@ -373,7 +392,9 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // Inland. The terrain in front of this already won the depth test almost
     // everywhere, but the shoreline is where the two surfaces meet at a
     // grazing angle and a vertex can land a little the wrong side of it.
-    clip(i.depth + 0.02f);
+    // Only a coarse cut: depth interpolated from the grid's vertices steps
+    // with the grid. The edge itself is made per pixel, below (edge_fade).
+    clip(i.depth + 0.3f);
 
     // The normal is recomputed HERE rather than interpolated from the
     // vertices. A grid cell in the mid-ground is tens of metres across, so an
@@ -452,6 +473,28 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // that is the classic leak of the foreground into the water.
     float zb = g_depth_in[int2(px)];
     float under_len = zb < 1.0f ? max(linear_depth(zb) - vz, 0.0f) * dist / vz : 1e6f;
+    // The water's edge, per pixel, from the GROUND behind this pixel (the
+    // depth copy) and the swash evaluated right there (water_wave.h): water is
+    // present where that ground lies under sea level plus the swash, and fades
+    // into the scene over its last 8 cm of depth. Both are smooth per pixel,
+    // so the edge follows a true contour of the beach.
+    //
+    // Two attempts drew a staircase. On the beach the sheet sits a few
+    // centimetres over the ground, nearly coplanar with it, and where two such
+    // surfaces cross follows the triangles of both meshes; the vertex-
+    // interpolated clip stepped with the grid too. Fading by the thickness
+    // between the SHEET and the ground only softened the steps: near the shore
+    // the sheet's height is itself interpolated across grid cells, clamped to
+    // the ground at its vertices, so the fade inherited the grid's shape.
+    float edge_fade = 1.0f;
+    {
+        const float3 gp = cam_pos - v * (dist + min(under_len, 1e4f));
+        const float gdepth = sea_level - gp.y;
+        if (zb < 1.0f && gdepth < 1.6f) {
+            const float sw = ww_swash(gp.x, gp.z, time, frame_swash()) * ww_swash_reach(gdepth);
+            edge_fade = saturate((gdepth + sw) / 0.08f);
+        }
+    }
     const float2 tilt = float2(dot(n, cam_right), -dot(n, cam_up));
     float2 ruv = uv + tilt * (refraction * saturate(under_len / 3.0f));
     {
@@ -554,7 +597,10 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // At the shore: a drifting lace that thickens towards the waterline,
     // whole at the edge and in patches by two metres. It was a smooth function
     // of depth, which with the shallows now clear read as a white smear.
-    const float shallow = saturate(1.0f - i.depth / 2.2f);
+    // The last 0.6 m of water, not 2.2: with the swash a sheet runs up the
+    // beach over a few tens of centimetres, and a band keyed to 2.2 m turned
+    // the whole sheet white. Foam at its leading edge, clear water behind.
+    const float shallow = saturate(1.0f - i.depth / 0.6f);
     const float lace = 0.6f * wnoise(i.world.xz * 0.45f + float2(time * 0.13f, time * 0.07f)) +
                        0.4f * wnoise(i.world.xz * 1.7f - float2(time * 0.21f, -time * 0.11f));
     const float shore_foam = smoothstep(1.0f - shallow, 1.25f - shallow, lace) * shallow * i.fade;
@@ -601,5 +647,8 @@ float4 ps_main(VSOut i) : SV_Target0 {
     const float4 ap = aerial(uv, dist);
     col = col * ap.a + ap.rgb * lerp(cam_sky, 1.0f, saturate((dist - 64.0f) / 192.0f));
     col = col * mf.a + mf.rgb;
+    // The scene behind, as the composite left it: haze and all, so the fade
+    // is seamless.
+    col = lerp(g_scene_in[int2(px)].rgb, col, edge_fade);
     return float4(col, 1.0f);
 }

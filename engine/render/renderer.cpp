@@ -69,7 +69,7 @@ struct WaterConstants {
     float frame;          float storm_turbidity; float pad3[2];
     float detail_on;      float detail_var0; float detail_var1; float choppy;
     float wind_v[4];
-    float wind_drift[2];  float pad5[2];
+    float wind_drift[2];  float swash_runup; float pad5;
 };
 static_assert(sizeof(WaterConstants) == 608, "WaterConstants must match water.hlsl");
 
@@ -100,8 +100,11 @@ struct ShadowConstants {
     float far_map[4];      // the far terrain shadow (far_shadow.h): corner x, z, extent; w on
     float forest[4];       // the canopy shell (forest_map.h): corner x, z, extent; w on
     float forest2[4];      // ... the band it fades in over, metres from the camera
+    float swash_a[4];      // the swash (water_wave.h): trains 0..3's amplitudes
+    float swash_b[4];      // ... 4..7's
+    float swash[4];        // sea level, run-up, the frame clock, on
 };
-static_assert(sizeof(ShadowConstants) == 736, "ShadowConstants must match shadow.hlsli");
+static_assert(sizeof(ShadowConstants) == 784, "ShadowConstants must match shadow.hlsli");
 
 // Matches cbuffer ClusterConstants in lights.hlsl.
 struct ClusterConstants {
@@ -1190,6 +1193,15 @@ void Renderer::record_shadows(const ViewConstants& view) {
         sc.forest2[1] = 1.00f * tree_settings_.max_dist;
     }
     if (sc.far_map[3] > 0.5f && std::getenv("BIOMES_FAR_DBG")) sc.far_map[3] = 2.0f;   // the far map in place of the cascades, to judge it
+    // The swash, for the wet sand (mesh.hlsl): the same water the sea draws.
+    for (int k = 0; k < 4; ++k) {
+        sc.swash_a[k] = swash_.amp[k];
+        sc.swash_b[k] = swash_.amp[4 + k];
+    }
+    sc.swash[0] = world_.params().sea_level;
+    sc.swash[1] = swash_.runup;
+    sc.swash[2] = view.time;
+    sc.swash[3] = water_ ? 1.0f : 0.0f;
     fill_light(sc.light);
     // BIOMES_GI_DBG splits DDGI's cost for A/B: 1 samples stale probes and
     // skips the update, 2 updates them and never samples.
@@ -3780,6 +3792,16 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
 void Renderer::update_weather(double t) {
     weather_now_ = weather_.at(t);
     sea_ = weather_.sea(weather_now_);
+    // The swash (water_wave.h): how far up the beach the uprush runs. Stockdon
+    // et al.'s fit for gentle (dissipative) beaches, 0.043 sqrt(H L) over the
+    // sea's significant height and a ~100 m wave: 0.25 m at Hs 0.3, 0.75 at 3.
+    // 0.7 Hs, a steep beach's run-up, put a 2 m sheet up a meadow coast in a
+    // storm. Never less than a 12 cm lap nor more than 1.2 m.
+    for (int k = 0; k < WW_SWASH_TRAINS; ++k) swash_.amp[k] = sea_.amp[k];
+    {
+        const float r = 0.043f * std::sqrt(ww_significant_height(sea_) * 100.0f);
+        swash_.runup = r < 0.12f ? 0.12f : (r > 1.2f ? 1.2f : r);
+    }
     weather_t_ = t;
     const float wv[4] = {weather_now_.wind_dir[0], weather_now_.wind_dir[1],
                          weather_now_.wind_speed, weather_now_.gust};
@@ -4056,9 +4078,9 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         // The same question physics asks of the same function, so the
         // shader's idea of "is the eye above the water here" and the
         // swimmer's are one answer rather than two that usually agree.
-        wc.cam_water = wc.sea_level + ww_height_at(view.cam_pos[0], view.cam_pos[2],
-                                                   view.time, sea_,
-                                                   wc.sea_level - world_.height(view.cam_pos[0], view.cam_pos[2]));
+        wc.cam_water = wc.sea_level + ww_water_at(view.cam_pos[0], view.cam_pos[2],
+                                                  view.time, sea_, swash_,
+                                                  wc.sea_level - world_.height(view.cam_pos[0], view.cam_pos[2]));
         // What the post chain knows, for the haze and the sky (haze.hlsli).
         wc.inv_size[0] = 1.0f / float(width_ ? width_ : 1);
         wc.inv_size[1] = 1.0f / float(height_ ? height_ : 1);
@@ -4088,6 +4110,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         for (int k = 0; k < 4; ++k) wc.wind_v[k] = tree_settings_.wind_v[k];
         wc.wind_drift[0] = tree_settings_.wind_drift[0];
         wc.wind_drift[1] = tree_settings_.wind_drift[1];
+        wc.swash_runup = swash_.runup;
         wc.frame = float(post_frame_ % 64);
         std::memcpy(water_cb_cpu_[frame_], &wc, sizeof wc);
         water_pending_ = true;

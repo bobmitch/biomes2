@@ -166,6 +166,7 @@ public:
     Weather& weather() { return weather_; }
     const WeatherState& weather_state() const { return weather_now_; }
     const WwSea& sea() const { return sea_; }
+    const WwSwash& swash() const { return swash_; }
     void  update_weather(double t);
     void  set_water(bool on) { water_ = on; }
     // Screen-space reflections on the sea (F7, --no-ssr).
@@ -645,6 +646,7 @@ private:
     Weather      weather_;
     WeatherState weather_now_;
     WwSea        sea_ = {};
+    WwSwash      swash_ = {};
     double       weather_t_ = -1.0;
     PostTimes post_times_;
     ComPtr<ID3D12QueryHeap> post_queries_;

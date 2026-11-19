@@ -1787,8 +1787,57 @@ detectors historical.
   (SSR 0.39 of it), ~1.0 ms gale; was 0.25 / 0.38. Walking where the sea is
   incidental: +0.25 ms (the two full-frame copies and the grid).
 - **Not done**: a faint strip just under the horizon where SSR misses land;
-  storm troughs over very shallow water bare the seabed (seen in `--swim`);
   no underwater rendering.
+
+### The shoreline: swash and wet ground
+
+The trains die over the shoal, so the sea's edge used to sit at the
+still-water line in every weather, the sand dry to it in a gale as in a calm.
+One function in `water_wave.h` now gives the water running up the beach and
+back -- `ww_swash` -- and three things read it, so they agree on where the
+water is: the sea's sheet (water.hlsl), the wet ground under it (mesh.hlsl)
+and the swimmer (`ww_water_at`, physics_world.cpp).
+
+- **The sheet**: within 1.5 m of water depth (`ww_swash_reach`) the sea's
+  vertices rise by the swash; the terrain in front hides it where the beach
+  is higher. Its height rides the eight longest trains' elevation at the
+  point over their rms, so the uprush comes in sets and varies along the
+  shore, times ~7 m lobes of fixed noise (a single contour drew a
+  straight-edged slab). Reach: Stockdon's gentle-beach run-up, 0.043
+  sqrt(Hs x 100 m), 0.12 to 1.2 m (`Renderer::update_weather`). 0.7 Hs, a
+  steep beach's, ran a 2 m sheet up a meadow coast in a storm.
+- **Never below the bed**: where wet, the sheet is clamped 3 cm over the
+  ground, so storm troughs over shallow water no longer bare the seabed.
+- **The edge is made per pixel from the GROUND** (`edge_fade` in
+  water.hlsl): the ground point behind the pixel comes from the depth copy,
+  the swash is evaluated right there, and the water fades into the scene
+  over its last 8 cm of depth under sea level + swash -- a true contour of
+  the beach. The sheet's geometry reaches 30 cm of depth past the edge,
+  riding 12 cm over the ground, so there is always water drawn for the
+  pixel test to cut; the clip is only a coarse cut (`i.depth + 0.3`).
+  Two attempts drew a staircase, worst looking along the shore: the sheet
+  a few cm over the beach is nearly coplanar with it, so where they cross
+  follows both meshes' triangles (and the vertex-interpolated clip stepped
+  with the grid); then fading by the thickness between the SHEET and the
+  ground only softened the steps, because near the shore the sheet's own
+  height is interpolated across grid cells.
+- **Foam** keys to the last 0.6 m of water, not 2.2: at 2.2 the whole sheet
+  was white as snow; now foam at its leading edge, clear water behind.
+- **Wet ground** (mesh.hlsl, before lighting; the swash rides in the shadow
+  constants, `l_swash_a/b`, `l_swash`): damp from the waterline to the full
+  run-up + 0.2 m, fading over 0.4 m -- albedo x 0.55, roughness to 0.35 --
+  and a film in the 30 cm the water has just left -- roughness 0.06, the
+  scan's normal flattened. At 0.85 of the run-up the damp band ended about
+  where the sheet stood and barely showed. Grass shows it modestly; this
+  session had no sandy beach to judge it on.
+- **Physics**: water is present where the running sheet covers the ground;
+  `--swim 40 --wind 20` PASS, eye under 2.3%, fewer frames wading (the sheet
+  covers the shallows). The `--swim` turn still shows a strip of grass at the
+  bottom edge, as it did before this change; not run down.
+- Cost: none measurable (the terrain branch only runs within ~1.5 m of sea
+  level; walking 7.96 / 7.74 ms with and without water, as before).
+- Not done: the swash in motion has only been judged in stills; no sandy
+  beach checked; no drying time (wetness is the run-up band, not a history).
 
 ### The sea's ripples and whitecaps
 

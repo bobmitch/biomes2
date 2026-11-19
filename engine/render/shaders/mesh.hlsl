@@ -31,6 +31,7 @@ StructuredBuffer<uint3> g_vertex_wts : register(t3);
 
 #include "engine/render/shaders/scan.hlsli"
 #include "engine/render/shaders/forest.hlsli"
+#include "engine/render/water_wave.h"
 
 cbuffer MeshConstants : register(b0) {
     row_major float4x4 view_proj;
@@ -426,6 +427,33 @@ SceneOut ps_main(VSOut i) {
             shell_sky = kShellSky * (0.5f + pat) * (1.0f - 0.35f * steep);
         } else {
             cw = 0.0f;
+        }
+    }
+
+    // Wet ground at the shore (water_wave.h's swash, the sheet the sea runs up
+    // the beach). The band the uprush reaches every few sets stays damp --
+    // water in the pores: darker, and smoother than dry sand -- and the strip
+    // it has just drained from carries a film: glossy, its grain filled in.
+    // Before, the sand was dry to the still-water line in a gale as in a calm.
+    if (l_swash.w > 0.5f) {
+        const float above = i.world.y - l_swash.x;
+        const float runup = l_swash.y;
+        if (above > -1.5f && above < runup + 0.6f) {
+            WwSwash sw;
+            sw.amp[0] = l_swash_a.x; sw.amp[1] = l_swash_a.y; sw.amp[2] = l_swash_a.z; sw.amp[3] = l_swash_a.w;
+            sw.amp[4] = l_swash_b.x; sw.amp[5] = l_swash_b.y; sw.amp[6] = l_swash_b.z; sw.amp[7] = l_swash_b.w;
+            sw.runup = runup;
+            const float now = ww_swash(i.world.x, i.world.z, l_swash.z, sw);
+            // Damp to the highest run-up and a little over (spray, the
+            // capillary rise in sand), fading over 40 cm: at 0.85 of it the
+            // band ended about where the sheet already stood and barely showed.
+            const float damp = saturate((runup + 0.2f - above) / 0.4f);
+            const float film = above > now ? saturate(1.0f - (above - now) / 0.3f) : 1.0f;
+            const float wet = max(damp, film);
+            albedo *= lerp(1.0f, 0.55f, wet);
+            rough = lerp(rough, min(rough, 0.35f), damp);
+            rough = lerp(rough, 0.06f, film);
+            ns = normalize(lerp(ns, n, 0.8f * film));
         }
     }
 

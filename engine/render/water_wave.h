@@ -27,6 +27,7 @@
 #define ENGINE_WATER_WAVE_H
 
 #define WW_WAVES 32
+#include "engine/render/wind.h"   // a value noise, for the swash's lobes
 
 #ifdef __cplusplus
 #define WW_FN inline
@@ -46,6 +47,7 @@ struct ww_float3 { float x, y, z; };
 #define WW_OUT_F3 ww_float3&
 #define WW_OUT_F float&
 #define WW_IN_SEA const WwSea&
+#define WW_IN_SWASH const WwSwash&
 inline float ww_saturate(float a) { return a < 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a); }
 inline float ww_sin(float a) { return std::sin(a); }
 inline float ww_cos(float a) { return std::cos(a); }
@@ -57,6 +59,7 @@ inline float ww_sqrt(float a) { return std::sqrt(a); }
 #define WW_OUT_F3 out float3
 #define WW_OUT_F out float
 #define WW_IN_SEA WwSea
+#define WW_IN_SWASH WwSwash
 #define ww_saturate saturate
 #define ww_sin sin
 #define ww_cos cos
@@ -397,6 +400,65 @@ WW_FN float ww_height_at(float x, float z, float t, WW_IN_SEA sea, float depth) 
     WW_F3 n;
     const WW_F3 p = ww_surface(r.x, r.y, t, sea, depth, 1.0f, 0.0f, n);
     return p.y;
+}
+
+// --- the swash: water running up the beach and back --------------------------
+//
+// The trains die over the shoal (ww_depth_factor), so on their own the sea's
+// edge sat at the still-water line in every weather, and a gale's coast had
+// the same dry sand to the waterline as a calm day's. Real waves run on up the
+// beach after they break -- the uprush -- and fall back, a sheet of water
+// rising and sinking with each arriving wave.
+//
+// This is that sheet's height over sea level: up to `runup` (from the sea's
+// significant height, Renderer::update_weather), riding up as a long wave's
+// crest arrives and back as its trough does -- the eight longest trains'
+// elevation at the point, over their own rms, so the uprush comes in sets and
+// varies along the shore as the swell does. ww_swash_reach says how much of it
+// a point gets by its depth: all of it at and above the still-water line, none
+// past a metre and a half of water, where the trains carry the sea.
+//
+// One function for the sheet the sea draws (water.hlsl), the wet sand the
+// terrain shades under it (mesh.hlsl) and the water the swimmer wades in
+// (physics_world.cpp): three copies of a shore would disagree about where it
+// is.
+#define WW_SWASH_TRAINS 8
+struct WwSwash {
+    float amp[WW_SWASH_TRAINS];   // the weather's deep-water amplitudes of trains 0..7
+    float runup;                  // the highest the sheet runs, metres over sea level
+};
+
+WW_FN float ww_swash(float x, float z, float t, WW_IN_SWASH sw) {
+    float e = 0.0f, var = 0.0f;
+    for (int i = 0; i < WW_SWASH_TRAINS; i = i + 1) {
+        const float a = sw.amp[i];
+        if (a <= 0.0f) continue;
+        const WW_F2 d = ww_direction(i);
+        const float k = 6.2831853f / ww_wavelength(i);
+        e = e + a * ww_sin(k * (d.x * x + d.y * z) - ww_angular_speed(k) * t);
+        var = var + 0.5f * a * a;
+    }
+    const float ez = var > 1e-12f ? e / ww_sqrt(var) : 0.0f;
+    // Lobes along the shore, ~7 m: a sheet that ran up to one contour drew a
+    // straight-edged slab; real uprush comes in tongues (and cusps the beach).
+    const float lobe = 0.75f + 0.5f * wind_vnoise2(x * (1.0f / 7.0f), z * (1.0f / 7.0f));
+    return sw.runup * lobe * ww_saturate(0.5f + 0.35f * ez);
+}
+
+WW_FN float ww_swash_reach(float depth) {
+    return ww_saturate(1.0f - depth / 1.5f);
+}
+
+// The water's height over sea level at (x, z) where it RESTS over `depth` of
+// water (negative on land), swash included, and never below the bed: in a
+// storm a trough over half a metre of water fell under the seabed and bared
+// it. What physics floats and wades on.
+WW_FN float ww_water_at(float x, float z, float t, WW_IN_SEA sea, WW_IN_SWASH sw, float depth) {
+    const float d = depth > 0.0f ? depth : 0.0f;
+    float h = ww_height_at(x, z, t, sea, d) + ww_swash(x, z, t, sw) * ww_swash_reach(depth);
+    const float bed = 0.03f - depth;
+    if (h < bed) h = bed;
+    return h;
 }
 
 #endif  // ENGINE_WATER_WAVE_H

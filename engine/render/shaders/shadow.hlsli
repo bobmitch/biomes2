@@ -58,6 +58,12 @@ cbuffer ShadowConstants : register(b2) {
     // extent, w on; then the band it fades in over, metres from the camera.
     float4 l_forest;
     float4 l_forest2;
+    // The swash (water_wave.h), for the wet sand under it (mesh.hlsl): the
+    // eight longest trains' amplitudes, then sea level, run-up, the frame
+    // clock, and w on.
+    float4 l_swash_a;
+    float4 l_swash_b;
+    float4 l_swash;
 };
 
 Texture2DArray<float>  g_shadow     : register(t8);

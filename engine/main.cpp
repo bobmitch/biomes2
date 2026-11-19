@@ -187,6 +187,7 @@ void sync_sea(float t) {
     g_renderer.update_weather(t);
     s.state = g_renderer.sea_state();
     s.sea = g_renderer.sea();
+    s.swash = g_renderer.swash();
     s.time = t;
     g_physics.set_sea(s);
 }
@@ -3481,7 +3482,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // with it (only the swell's heading wanders, slowly).
         const WwSea& wsea = g_renderer.sea();
         auto surf_at = [&](float x, float z, float t) {
-            return ww_height_at(x, z, t, wsea, sea - wg.height(x, z));
+            return ww_water_at(x, z, t, wsea, g_renderer.swash(), sea - wg.height(x, z));
         };
         // "Deep" is deep enough that no trough at this sea state can put the
         // floating feet on the bottom: float depth, plus the full amplitude

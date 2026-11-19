@@ -58,6 +58,7 @@ struct SeaParams {
     float level = 0.0f;     // world y of still water
     float state = 0.0f;     // 0 calm .. 1 storm, the weather's dial (reports only)
     WwSea sea = {};         // the weather's sea (water_wave.h): what the swimmer floats on
+    WwSwash swash = {};     // ...and the water running up the beach (ww_swash)
     float time = 0.0f;      // the SAME clock the frame's water draw is given
 };
 
