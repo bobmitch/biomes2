@@ -70,7 +70,8 @@ cbuffer WaterConstants : register(b0) {
     // The weather's wind (weather.h), as grass and trees get it: direction x,
     // z; mean m/s; gustiness. And the metres the air has moved (wind.hlsli).
     float4 wind_v;
-    float2 wind_drift;    float swash_runup;  float pad5;   // the swash's highest run up the beach (water_wave.h)
+    float2 wind_drift;    float swash_runup;  float clouds_on;   // the swash's highest run up the beach (water_wave.h)
+    float4 cloud_shadow;  // ADR-005 C2: the cloud-shadow map's centre x, z, half extent, base altitude (cloud_shadow.hlsli)
 };
 
 // The lit scene and its depth as the composite left them -- copies, because
@@ -87,11 +88,13 @@ SamplerState g_wrap_u : register(s2);
 // The ripples' two tiles (ocean_fft.hlsl): slope x, slope z, J - 1, foam.
 Texture2DArray<float4> g_detail : register(t5);
 SamplerState g_wrap : register(s3);
+Texture2D<float> g_cloud_shadow : register(t6);   // clouds.hlsl cs_shadow
 
 #include "engine/render/shaders/lighting.hlsli"
 #include "engine/render/atmosphere.h"
 #include "engine/render/shaders/haze.hlsli"
 #include "engine/render/shaders/wind.hlsli"
+#include "engine/render/shaders/cloud_shadow.hlsli"
 
 WwSwash frame_swash() {
     WwSwash s;
@@ -459,8 +462,12 @@ float4 ps_main(VSOut i) : SV_Target0 {
 
     // What lights the water's body and its foam: the sun on level water and
     // the sky, as on level ground.
+    // Under the clouds' shadow (ADR-005 C2) the sun leaves the sea's body and
+    // its glint, as it leaves the land in the composite: under a storm deck
+    // the sea went on sparkling.
+    const float cls = clouds_on > 0.5f ? cloud_shadow_at(g_cloud_shadow, g_linear, cloud_shadow, l, i.world) : 1.0f;
     const float diffuse = 0.25f + 0.75f * saturate(dot(n, l));
-    const float3 light_in = (kSunLux * max(kSunDir.y, 0.0f) * diffuse + kPi * kSkyMean) / kPi;
+    const float3 light_in = (kSunLux * (max(kSunDir.y, 0.0f) * diffuse * cls) + kPi * kSkyMean) / kPi;
     // What deep water sends back: the light scattered up out of the body.
     const float3 deep_in = deep_colour * light_in;
 
@@ -589,7 +596,7 @@ float4 ps_main(VSOut i) : SV_Target0 {
     const float3 spec = below ? float3(0, 0, 0) :
         kSunLux * ((shine + 8.0f) / (8.0f * kPi) * pow(saturate(dot(n, h)), shine) *
                    saturate(dot(n, l))) * f_schlick(float3(0.02f, 0.02f, 0.02f), saturate(dot(v, h))) *
-        (1.0f - hit.a);
+        ((1.0f - hit.a) * cls);
 
     // Foam where the water is shallow enough to break, and on the crests once
     // the sea is rough. Both are gated on `fade` so the far field does not

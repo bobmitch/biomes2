@@ -199,11 +199,39 @@ float3 bark_albedo(float3 base, float2 uv, float footprint) {
 // -- a stand-in for bounce between leaves and off the floor under a crown --
 // already in it where the probes did not answer, and gone where they did
 // (lighting.hlsli's gi_fill).
+
+// A film of water on a wet leaf or blade (ADR-005 C4): a sheen of the sun
+// and the sky off its surface, on top of the leaf's own light. Leaves have
+// no specular dry -- a crown seen whole is too rough for one -- but a wet one
+// glints. Cheap on purpose: leaves and blades overdraw heavily, and the
+// full GGX lobe and sky lookup cost 0.55 ms walking at 1440p. A normalised
+// Blinn-Phong lobe and the sky's mean radiance carry what a film shows.
+void wet_leaf_sheen(inout float3 dir, inout float3 amb, float3 n, float3 v, float3 world, float sh, float wet) {
+    if (wet <= 0.0f) return;
+    float3 nn = n;
+    if (dot(nn, v) < 0.0f) nn = -nn;   // a card's face towards the eye
+    const float nv = saturate(dot(nn, v));
+    const float k = 1.0f - nv;
+    const float F = 0.04f + 0.96f * (k * k) * (k * k) * k;
+    const float nl = dot(nn, kSunDir);
+    if (nl > 0.0f && sh > 0.0f) {
+        const float nh = saturate(dot(nn, normalize(kSunDir + v)));
+        const float nh2 = nh * nh, nh4 = nh2 * nh2, nh8 = nh4 * nh4, nh16 = nh8 * nh8;
+        dir += kSunLux * (1.35f * nh16 * nh16 * F * nl * sh * 0.35f * wet);
+    }
+    amb += kSkyMean * (F * 0.2f * wet * gi_sky_visibility(world, nn));
+}
+
 SceneOut shade(float3 albedo_srgb, float3 n, float ao, float3 world, bool foliage, float sh, float4 clip) {
-    const float3 albedo = srgb_to_linear(albedo_srgb);
+    float3 albedo = srgb_to_linear(albedo_srgb);
     const float3 v = normalize(cam_pos - world);
+    // Rain (ADR-005 C4): bark soaks dark and takes a sheen; leaves darken a
+    // little and glint. The crowns are what shelters everything else, so
+    // they take the world's wetness whole.
+    const float wet = l_wet.x;
     float3 dir, amb;
     if (foliage) {
+        albedo *= lerp(1.0f, 0.82f, wet);
         // A crown is lit THROUGH as much as on: wrapped diffuse, light that
         // leaks through the leaves when the sun is behind them, and skylight
         // that reaches the underside. With the ground's plain Lambert term
@@ -212,11 +240,13 @@ SceneOut shade(float3 albedo_srgb, float3 n, float ao, float3 world, bool foliag
         dir = leaf_sun_light(albedo, n, v, 0.6f, 0.7f, sh) * (0.85f * (0.45f + 0.55f * ao));
         amb = albedo / kPi * gi_diffuse(world, n, v) * (0.45f + 0.55f * ao) +
               local_lights_leaf(albedo, n, v, 0.6f, 0.7f, world, clip) * (0.85f * (0.45f + 0.55f * ao));
+        wet_leaf_sheen(dir, amb, n, v, world, sh, wet * (0.45f + 0.55f * ao));
     } else {
+        albedo *= lerp(1.0f, 0.55f, wet);
         // Bark gets more fill than open ground: under a crown, light that
         // bounced off leaves and the floor reaches the shaded side, and with
         // the ground's fill every trunk's shadow side read as black.
-        const Surface s = make_surface(albedo, 0.85f, n, v);
+        const Surface s = make_surface(albedo, lerp(0.85f, 0.4f, wet), n, v);
         dir = sun_light(s, sh) * (0.9f * (0.35f + 0.65f * ao));
         amb = ambient_light(s, world) * ao + local_lights(s, world, clip) * (0.35f + 0.65f * ao);
     }

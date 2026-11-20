@@ -33,6 +33,17 @@ bool Weather::load(const char* archetypes_path, std::string& error) {
         if (w.has("swell_wavelength")) s.swell_wavelength = float(w.number("swell_wavelength"));
         if (w.has("swell_lag_s")) s.swell_lag_s = float(w.number("swell_lag_s"));
         if (w.has("mist_drift")) s.mist_drift = float(w.number("mist_drift"));
+        if (w.has("rain_storm")) {
+            s.rain_storm[0] = float(w.array("rain_storm").at(0).num);
+            s.rain_storm[1] = float(w.array("rain_storm").at(1).num);
+        }
+        if (w.has("dry_s")) s.dry_s = float(w.number("dry_s"));
+        if (w.has("leaf_dry_s")) s.leaf_dry_s = float(w.number("leaf_dry_s"));
+        if (w.has("soak_s")) s.soak_s = float(w.number("soak_s"));
+        if (w.has("puddle_s")) {
+            s.puddle_s[0] = float(w.array("puddle_s").at(0).num);
+            s.puddle_s[1] = float(w.array("puddle_s").at(1).num);
+        }
     } catch (const std::exception& e) {
         error = std::string("archetypes.json weather: ") + e.what();
         return false;
@@ -68,6 +79,25 @@ float Weather::storm_at(double t) const {
     n = (n - 0.5f) * 1.4f + 0.5f;
     n = n < 0.0f ? 0.0f : (n > 1.0f ? 1.0f : n);
     return std::pow(n, 1.15f);
+}
+
+float Weather::rain_for(float storm) const {
+    const float a = settings_.rain_storm[0], b = settings_.rain_storm[1];
+    float x = (storm - a) / (b - a);
+    x = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
+    return x * x * (3.0f - 2.0f * x);
+}
+
+double Weather::steady_soak(float rain) const {
+    // The window below integrates three time constants: 1 - e^-3 of the
+    // infinite integral.
+    return double(rain) * settings_.dry_s * (1.0 - std::exp(-3.0));
+}
+
+void Weather::wet_for(double soak, float& wet, float& puddle) const {
+    wet = float(1.0 - std::exp(-soak / settings_.soak_s));
+    const float p = float((soak - settings_.puddle_s[0]) / settings_.puddle_s[1]);
+    puddle = p < 0.0f ? 0.0f : (p > 1.0f ? 1.0f : p);
 }
 
 float Weather::speed_for(float storm) const {
@@ -138,6 +168,27 @@ WeatherState Weather::at(double t) {
         const float hs = base + 1.2f * (noise(4, t / (settings_.veer_period_s * 2.7)) - 0.5f);
         w.swell_dir[0] = std::cos(hs);
         w.swell_dir[1] = std::sin(hs);
+    }
+
+    // Rain now, and the wet it has left (C4): the rain of the last three
+    // dry_s, each sample weighted by how long ago it fell. A pure function of
+    // t like the sea's lag, so a still and a long run agree; 48 samples, a
+    // minute apart at the default 900 s.
+    w.rain = rain_for(w.storm);
+    {
+        const int n = 48;
+        const double tau = settings_.dry_s;
+        const double step = 3.0 * tau / n;
+        const double tau_l = settings_.leaf_dry_s;
+        double soak = 0.0, leaf = 0.0;
+        for (int i = 0; i < n; ++i) {
+            const double back = step * (double(i) + 0.5);
+            const double r = double(rain_for(storm_at(t - back)));
+            soak += r * std::exp(-back / tau) * step;
+            leaf += r * std::exp(-back / tau_l) * step;
+        }
+        wet_for(soak, w.wet, w.puddle);
+        w.drip = drip_for(leaf);
     }
 
     // Drift: the integral of the wind, advanced from the cached point in

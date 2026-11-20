@@ -52,6 +52,7 @@ cbuffer PostConstants : register(b0) {
     float3 cam_fwd;      float fog_on;       // the mist (L4): fog.hlsl's integrated volume
     float  fog_near;     float fog_log_ratio; float rt_shadows; float rt_sky;   // L5's traced key-light visibility, L6's traced sky
     float4 cloud_shadow; // ADR-005 C2: the cloud-shadow map's centre x, z (cloud-base plane), half extent m, base altitude m
+    float4 wet;          // ADR-005 C4: the rain now, the ripples' clock (s), radians a pixel, w > 0.5 puddles to reflect
 };
 
 Texture2D<float>  g_depth   : register(t0);
@@ -69,6 +70,7 @@ Texture2D<float4> g_ssgi_view : register(t11); // cs_ssgi's output, for --post-d
 Texture2D<float4> g_clouds     : register(t12); // clouds.hlsl, quarter resolution: in-scatter (rgb), transmittance (a)
 Texture2D<float>  g_cloud_dist : register(t13); // ... the cloud's distance, km
 Texture2D<float>  g_cloud_shadow : register(t14); // clouds.hlsl cs_shadow: the key light through the clouds, top-down
+Texture2D<float4> g_puddle  : register(t15); // scene_out.hlsli: standing water's sky reflection (rgb) and weight (a)
 
 RWTexture2D<float>  u_ao    : register(u0);
 RWTexture2D<float4> u_scene : register(u1);
@@ -261,6 +263,7 @@ void cs_ssgi(uint3 id : SV_DispatchThreadID) {
 
 // sky_at, aerial and mist, shared with the sea, which composites after this.
 #include "engine/render/shaders/haze.hlsli"
+#include "engine/render/shaders/cloud_shadow.hlsli"
 
 // --- composite ----------------------------------------------------------------
 
@@ -307,6 +310,108 @@ float contact_shadow(int2 p, float z, float3 P) {
     }
     // Fade out with distance, where the march is too coarse to trust.
     return lerp(lit, 1.0f, saturate((dist - 60.0f) / 20.0f));
+}
+
+// --- puddle reflections (ADR-005 C4) ------------------------------------------
+#include "engine/render/shaders/ripple.hlsli"
+
+// What a puddle at P reflects. The terrain left its sky reflection in the
+// mask (`pm`: rgb the radiance, a the weight -- env_brdf x puddle) and out of
+// its own light. Here the reflected ray, bent by the rain's rings, is marched
+// through the depth buffer in world space -- steps growing 1.3x from 10 cm,
+// out to ~70 m -- refined by bisection where it passes behind a surface, and
+// what it found is read from LAST frame's finished image (TAA's history:
+// lit, hazed, clouds and sea and all), reprojected. A ray that runs off the
+// screen without a hit, but whose direction lands on SKY in this frame, takes
+// the sky there: the clouds overhead in a distant puddle. Anything else keeps
+// the terrain's sky.
+// `how` says which way the answer came, for --post-debug 4: 1 the ray hit,
+// 2 far along the reflected direction, 0 the terrain's sky.
+float3 puddle_reflection(float3 P, float4 pm, out float how) {
+    how = 0.0f;
+    if ((flags & 8u) == 0u) return pm.rgb;   // no history yet
+    const float dist = length(P - cam_pos);
+    const float3 v = (cam_pos - P) / max(dist, 1e-3f);
+    const float3 n = puddle_normal(P.xz, wet.x, wet.y, dist * wet.z);
+    float3 r = reflect(-v, n);
+    r.y = max(r.y, 0.01f);
+    r = normalize(r);
+    float conf = 0.0f;
+    float4 hit = float4(0.0f, 0.0f, 0.0f, 1.0f);   // a point (w 1) or a direction (w 0)
+    float2 huv = 0.5f;
+    float t = 0.1f, tprev = 0.0f;
+    bool left = false;   // the ray left the screen
+    [loop] for (int i = 0; i < 26; ++i) {
+        const float3 q = P + r * t;
+        const float4 cq = mul(float4(q, 1.0f), view_proj);
+        if (cq.w <= near_plane) { left = true; break; }
+        const float2 quv = float2(cq.x / cq.w * 0.5f + 0.5f, 0.5f - cq.y / cq.w * 0.5f);
+        if (any(quv <= 0.0f) || any(quv >= 1.0f)) { left = true; break; }
+        const float zq = g_depth[int2(quv / inv_size)];
+        if (zq < 1.0f) {
+            const float ls = linear_depth(zq);
+            if (cq.w > ls + 0.03f) {
+                // Behind a surface. Thin enough to be the surface the ray
+                // reached, not a wall in front of where it went: refine.
+                if (cq.w - ls < max(0.5f, (t - tprev) * 1.5f)) {
+                    float a = tprev, b = t;
+                    [loop] for (int k = 0; k < 5; ++k) {
+                        const float m = 0.5f * (a + b);
+                        const float4 cm = mul(float4(P + r * m, 1.0f), view_proj);
+                        const float2 muv = float2(cm.x / cm.w * 0.5f + 0.5f, 0.5f - cm.y / cm.w * 0.5f);
+                        const float zm = g_depth[int2(saturate(muv) / inv_size)];
+                        if (zm < 1.0f && cm.w > linear_depth(zm)) b = m; else a = m;
+                    }
+                    hit = float4(P + r * b, 1.0f);
+                    const float4 ch = mul(hit, view_proj);
+                    huv = float2(ch.x / ch.w * 0.5f + 0.5f, 0.5f - ch.y / ch.w * 0.5f);
+                    conf = 1.0f;
+                    how = 1.0f;
+                }
+                break;
+            }
+        }
+        tprev = t;
+        t *= 1.3f;
+    }
+    if (conf <= 0.0f) {
+        // Nothing hit within the march: what lies FAR along the reflected
+        // direction, if this frame shows it -- the sky, or anything further
+        // than the march reached (distant trees, hills, the mist at the
+        // horizon). A grazing ray from a far puddle runs along above the
+        // ground and hits nothing near; without this it took the terrain's
+        // bright horizon sky and the evening's puddles glowed white.
+        const float4 cd = mul(float4(r, 0.0f), view_proj);
+        if (cd.w > 1e-4f) {
+            const float2 duv = float2(cd.x / cd.w * 0.5f + 0.5f, 0.5f - cd.y / cd.w * 0.5f);
+            if (all(duv > 0.0f) && all(duv < 1.0f)) {
+                const float zd = g_depth[int2(duv / inv_size)];
+                if (zd >= 1.0f || (!left && linear_depth(zd) > 0.7f * t)) {
+                    hit = float4(r, 0.0f);
+                    huv = duv;
+                    conf = 1.0f;
+                    how = 2.0f;
+                }
+            }
+        }
+    }
+    if (conf <= 0.0f) return pm.rgb;
+    // Fade where the hit nears the screen's edge, where it is about to be lost.
+    const float2 e = min(huv, 1.0f - huv);
+    conf *= saturate(min(e.x, e.y) / 0.06f);
+    // Into last frame: this frame's clip without the jitter, then TAA's matrix.
+    float4 c0 = mul(hit, view_proj);
+    c0.xy -= jitter_ndc * c0.w;
+    const float4 cp = mul(c0, prev_view_proj);
+    if (cp.w <= 1e-4f) return pm.rgb;
+    const float2 puv = float2(cp.x / cp.w * 0.5f + 0.5f, 0.5f - cp.y / cp.w * 0.5f);
+    if (any(puv <= 0.0f) || any(puv >= 1.0f)) return pm.rgb;
+    // Last frame's history is the one TAA is not writing this frame. (A
+    // ternary between the two textures crashes FXC.)
+    float3 seen;
+    if (hist_cur == 0u) seen = g_hist1.SampleLevel(g_linear, puv, 0).rgb;
+    else                seen = g_hist0.SampleLevel(g_linear, puv, 0).rgb;
+    return lerp(pm.rgb, pm.a * seen, conf);
 }
 
 [numthreads(8, 8, 1)]
@@ -357,13 +462,14 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     // over this point, from the top-down map, slid along the light onto the
     // cloud base's plane. Applied to the DIRECT target only, so terrain, trees
     // and grass all darken in one place and the sky light stays.
-    float cls = 1.0f;
-    if (clouds_on > 0.5f && sun_dir.y > 0.03f) {
-        const float2 q = P.xz + sun_dir.xz * ((cloud_shadow.w - P.y) / sun_dir.y);
-        const float2 suv = (q - cloud_shadow.xy) / (2.0f * cloud_shadow.z) + 0.5f;
-        if (all(suv > 0.0f) && all(suv < 1.0f)) cls = g_cloud_shadow.SampleLevel(g_linear, suv, 0);
-    }
+    const float cls = clouds_on > 0.5f ? cloud_shadow_at(g_cloud_shadow, g_linear, cloud_shadow, sun_dir, P) : 1.0f;
     float3 c = dir * (cs * rtv * cls) + amb * (ao * skv);
+    // Standing water's reflection (ADR-005 C4), before the air in front of it.
+    float pdbg = -1.0f;
+    if (wet.w > 0.5f) {
+        const float4 pm = g_puddle[p];
+        if (pm.a > 1e-4f) c += puddle_reflection(P, pm, pdbg);
+    }
     // The atmosphere between the eye and the surface.
     // The haze assumes sunlit, sky-lit air the whole way. Near the camera
     // the air is lit as the camera is -- in a sealed chamber, not at all --
@@ -388,6 +494,13 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     float mark = 1.0f;
     if (debug > 0.5f && debug < 1.5f) { c = ao.xxx; mark = 0.0f; }
     if (debug > 1.5f && debug < 2.5f) { c = cs.xxx; mark = 0.0f; }
+    // Puddle reflections: green a hit, blue far along the ray, red the
+    // terrain's sky; grey no puddle.
+    if (debug > 3.5f && debug < 4.5f) {
+        c = pdbg < -0.5f ? float3(0.2f, 0.2f, 0.2f)
+          : (pdbg > 1.5f ? float3(0.0f, 0.0f, 1.0f) : (pdbg > 0.5f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f)));
+        mark = 0.0f;
+    }
     // The screen-space bounce's irradiance, as the radiance a white
     // Lambertian surface would send back: exposed like the scene.
     if (debug > 2.5f && debug < 3.5f) c = g_ssgi_view[min(p / 2, int2((width + 1) / 2 - 1, (height + 1) / 2 - 1))].rgb / 3.14159265f;

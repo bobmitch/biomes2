@@ -70,15 +70,17 @@ struct WaterConstants {
     float frame;          float storm_turbidity; float pad3[2];
     float detail_on;      float detail_var0; float detail_var1; float choppy;
     float wind_v[4];
-    float wind_drift[2];  float swash_runup; float pad5;
+    float wind_drift[2];  float swash_runup; float clouds_on;
+    float cloud_shadow[4]; // ADR-005 C2
 };
-static_assert(sizeof(WaterConstants) == 608, "WaterConstants must match water.hlsl");
+static_assert(sizeof(WaterConstants) == 624, "WaterConstants must match water.hlsl");
 
 // Heap slots past the RT denoiser's: the sea's copies of the lit scene and of
 // depth, which it reads while it draws into the one and tests against the
 // other.
 // [81..82] the ripples' tiles (OceanDetail); [83..106] the clouds (Clouds).
-const UINT kWaterSceneSrv = 79, kWaterDepthSrv = 80, kHeapSlots = Clouds::kHeapEnd;
+// [109] the puddle mask (ADR-005 C4: the scene's third target, read by the composite).
+const UINT kWaterSceneSrv = 79, kWaterDepthSrv = 80, kPuddleSrv = Clouds::kHeapEnd, kHeapSlots = kPuddleSrv + 1;
 static_assert(RtDenoise::kHeapEnd <= kWaterSceneSrv, "the sea's heap slots overlap the denoiser's");
 
 // Matches cbuffer ShadowConstants in shadow.hlsli: 368 bytes, in a 512-byte buffer.
@@ -104,8 +106,9 @@ struct ShadowConstants {
     float swash_a[4];      // the swash (water_wave.h): trains 0..3's amplitudes
     float swash_b[4];      // ... 4..7's
     float swash[4];        // sea level, run-up, the frame clock, on
+    float wet[4];          // ADR-005 C4: wetness, puddles, rain, the ripples' clock (wet.hlsli)
 };
-static_assert(sizeof(ShadowConstants) == 784, "ShadowConstants must match shadow.hlsli");
+static_assert(sizeof(ShadowConstants) == 800, "ShadowConstants must match shadow.hlsli");
 
 // Matches cbuffer ClusterConstants in lights.hlsl.
 struct ClusterConstants {
@@ -210,8 +213,9 @@ struct PostConstants {
     float cam_fwd[3];      float fog_on;
     float fog_near;        float fog_log_ratio; float rt_shadows; float rt_sky;
     float cloud_shadow[4]; // ADR-005 C2: the cloud-shadow map's centre x, z, half extent, base altitude
+    float wet[4];          // ADR-005 C4: rain, the ripples' clock, radians a pixel, puddles on
 };
-static_assert(sizeof(PostConstants) == 432, "PostConstants must match post.hlsl");
+static_assert(sizeof(PostConstants) == 448, "PostConstants must match post.hlsl");
 
 // Matches cbuffer FogConstants in fog.hlsl.
 struct FogConstants {
@@ -224,8 +228,9 @@ struct FogConstants {
     float map_extent;   float haze;      float sea_level;    float patch;
     float drift[2];     float phase_g;   float albedo;
     float screen_w;     float screen_h;  float density_scale; float cam_sky;
+    float cloud_shadow[4]; // ADR-005 C2: last frame's cloud-shadow map (extent 0: none yet)
 };
-static_assert(sizeof(FogConstants) == 192, "FogConstants must match fog.hlsl");
+static_assert(sizeof(FogConstants) == 208, "FogConstants must match fog.hlsl");
 // Matches cbuffer RtConstants in rt_shadow.hlsl.
 struct RtConstants {
     float inv_view_proj[16];
@@ -578,9 +583,9 @@ bool Renderer::create_water_pipeline(std::string& error) {
         // Since the sea draws after the composite: t0 the lit scene's copy,
         // t1 depth's copy, t2 the sky-view table, t3 the aerial perspective,
         // t4 the mist -- one table from heap [3], the post chain's base.
-        D3D12_DESCRIPTOR_RANGE wr[6] = {};
-        const UINT w_heap[6] = {kWaterSceneSrv, kWaterDepthSrv, 10, 11, 32, OceanDetail::kSrvSlot};
-        for (UINT k = 0; k < 6; ++k) {
+        D3D12_DESCRIPTOR_RANGE wr[7] = {};
+        const UINT w_heap[7] = {kWaterSceneSrv, kWaterDepthSrv, 10, 11, 32, OceanDetail::kSrvSlot, Clouds::kShadowSrv};
+        for (UINT k = 0; k < 7; ++k) {
             wr[k].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
             wr[k].NumDescriptors = 1;
             wr[k].BaseShaderRegister = k;
@@ -588,7 +593,7 @@ bool Renderer::create_water_pipeline(std::string& error) {
         }
         params[12].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[12].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        params[12].DescriptorTable.NumDescriptorRanges = 6;
+        params[12].DescriptorTable.NumDescriptorRanges = 7;
         params[12].DescriptorTable.pDescriptorRanges = wr;
         D3D12_STATIC_SAMPLER_DESC ss[4] = {};
         ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -929,9 +934,12 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
     pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
     pd.SampleMask = UINT_MAX;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pd.NumRenderTargets = 2;
+    // The scene's three targets: direct, ambient and the puddle mask
+    // (scene_out.hlsli).
+    pd.NumRenderTargets = 3;
     pd.RTVFormats[0] = kSceneFormat;
     pd.RTVFormats[1] = kSceneFormat;
+    pd.RTVFormats[2] = kSceneFormat;
     pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     pd.SampleDesc.Count = 1;
 
@@ -958,6 +966,7 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
     pd.NumRenderTargets = 0;
     pd.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
     pd.RTVFormats[1] = DXGI_FORMAT_UNKNOWN;
+    pd.RTVFormats[2] = DXGI_FORMAT_UNKNOWN;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.RasterizerState.SlopeScaledDepthBias = 2.0f;
@@ -1204,6 +1213,11 @@ void Renderer::record_shadows(const ViewConstants& view) {
     sc.swash[1] = swash_.runup;
     sc.swash[2] = view.time;
     sc.swash[3] = water_ ? 1.0f : 0.0f;
+    // The wet world (C4). The ripples' clock wraps every 1000 s: their phase
+    // is a fraction of a second, and float time loses it hours in.
+    wetness(sc.wet[0], sc.wet[1]);
+    sc.wet[2] = rain_intensity();
+    sc.wet[3] = float(std::fmod(double(view.time), 1000.0));
     fill_light(sc.light);
     // BIOMES_GI_DBG splits DDGI's cost for A/B: 1 samples stale probes and
     // skips the update, 2 updates them and never samples.
@@ -1920,6 +1934,10 @@ bool Renderer::create_fog(std::string& error) {
     if (!clouds_.load("worldgen/data/archetypes.json", error)) return false;
     if (!clouds_.init(device_.Get(), srv_heap_.Get(), trans_tex_.Get(), sky_view_tex_.Get(),
                       width_, height_, error)) return false;
+    // Rain's table starts at the scene depth (heap [3]); the canopy map and
+    // the heightfield GI's height (the last of its scene SRVs) are past it.
+    if (!rain_.init(device_.Get(), kSceneFormat, CanopyMap::kSrvSlot - 3, HeightGi::kSrvScene + 4 - 3, error))
+        return false;
     weather_.set_seed(world_.field_id());
     update_weather(0.0);
 
@@ -2054,7 +2072,7 @@ bool Renderer::create_fog(std::string& error) {
     // and one-descriptor tables for the map, the history, this frame's
     // inject volume read and written, and the integrated volume.
     {
-        D3D12_DESCRIPTOR_RANGE shadow[2] = {};
+        D3D12_DESCRIPTOR_RANGE shadow[3] = {};
         shadow[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         shadow[0].NumDescriptors = 1;
         shadow[0].BaseShaderRegister = 8;
@@ -2062,6 +2080,11 @@ bool Renderer::create_fog(std::string& error) {
         shadow[1].NumDescriptors = 5;
         shadow[1].BaseShaderRegister = 20;
         shadow[1].OffsetInDescriptorsFromTableStart = 24;
+        // t60, the clouds' shadow map (ADR-005 C2).
+        shadow[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        shadow[2].NumDescriptors = 1;
+        shadow[2].BaseShaderRegister = 60;
+        shadow[2].OffsetInDescriptorsFromTableStart = Clouds::kShadowSrv;
         D3D12_DESCRIPTOR_RANGE one[5] = {};
         const D3D12_DESCRIPTOR_RANGE_TYPE kinds[5] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
                                                       D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
@@ -2073,7 +2096,7 @@ bool Renderer::create_fog(std::string& error) {
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[1].Descriptor.ShaderRegister = 2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[2].DescriptorTable.NumDescriptorRanges = 2;
+        p[2].DescriptorTable.NumDescriptorRanges = 3;
         p[2].DescriptorTable.pDescriptorRanges = shadow;
         for (int k = 0; k < 5; ++k) {
             one[k].RangeType = kinds[k];
@@ -2194,7 +2217,12 @@ void Renderer::record_fog() {
     fc.albedo = fs.albedo;
     fc.screen_w = float(width_);
     fc.screen_h = float(height_);
-    fc.density_scale = fog_density_;
+    // Rain thickens the air near the ground (ADR-005 C3): the spray and
+    // the drops past the streaks' box read as a grey veil.
+    fc.density_scale = fog_density_ * (1.0f + 1.5f * rain_intensity());
+    // The mist is lit through the clouds' shadow (ADR-005 C2), last frame's:
+    // the clouds record after the mist. None until the map has been made once.
+    if (clouds_on_ && clouds_.ready() && clouds_.shadow_ready()) clouds_.shadow_params(fc.cloud_shadow);
     fc.cam_sky = gi_active() ? ddgi_.camera_sky() : (hfgi_on_ ? hfgi_.camera_sky() : 1.0f);
     std::memcpy(fog_cb_cpu_[frame_], &fc, sizeof fc);
 
@@ -3226,7 +3254,7 @@ bool Renderer::create_post_targets(std::string& error) {
     if (!post_rtv_heap_) {
         D3D12_DESCRIPTOR_HEAP_DESC hd = {};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        hd.NumDescriptors = 3;   // the two scene targets, and the composited scene the sea draws onto
+        hd.NumDescriptors = 4;   // the two scene targets, the composited scene the sea draws onto, the puddle mask
         if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&post_rtv_heap_)))) {
             error = "post rtv heap";
             return false;
@@ -3262,6 +3290,8 @@ bool Renderer::create_post_targets(std::string& error) {
              D3D12_RESOURCE_STATE_RENDER_TARGET, zero) ||
         !tex(hdr_ambient_, w, h, kSceneFormat, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
              D3D12_RESOURCE_STATE_RENDER_TARGET, sky) ||
+        !tex(puddle_, w, h, kSceneFormat, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+             D3D12_RESOURCE_STATE_RENDER_TARGET, zero) ||
         !tex(scene_, w, h, kSceneFormat, uav | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr) ||
         !tex(scene_copy_, w, h, kSceneFormat, D3D12_RESOURCE_FLAG_NONE, read, nullptr) ||
@@ -3280,6 +3310,8 @@ bool Renderer::create_post_targets(std::string& error) {
     device_->CreateRenderTargetView(hdr_ambient_.Get(), nullptr, r);
     r.ptr += rinc;
     device_->CreateRenderTargetView(scene_.Get(), nullptr, r);
+    r.ptr += rinc;
+    device_->CreateRenderTargetView(puddle_.Get(), nullptr, r);
 
     const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     auto slot = [&](UINT i) {
@@ -3304,6 +3336,7 @@ bool Renderer::create_post_targets(std::string& error) {
     srv(depth_.Get(), DXGI_FORMAT_R32_FLOAT, 3);
     srv(hdr_direct_.Get(), kSceneFormat, 4);
     srv(hdr_ambient_.Get(), kSceneFormat, 5);
+    srv(puddle_.Get(), kSceneFormat, kPuddleSrv);
     srv(ao_.Get(), DXGI_FORMAT_R8_UNORM, 6);
     srv(scene_.Get(), kSceneFormat, 7);
     srv(history_[0].Get(), kSceneFormat, 8);
@@ -3330,7 +3363,12 @@ bool Renderer::create_post_pipelines(std::string& error) {
         sr.NumDescriptors = 9;
         // t9, the mist's integrated volume, sits at heap [32]: 29 past the
         // table's start at [3].
-        D3D12_DESCRIPTOR_RANGE sr2[5] = {sr, {}, {}, {}, {}};
+        D3D12_DESCRIPTOR_RANGE sr2[6] = {sr, {}, {}, {}, {}, {}};
+        // t15, the puddle mask (ADR-005 C4).
+        sr2[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr2[5].NumDescriptors = 1;
+        sr2[5].BaseShaderRegister = 15;
+        sr2[5].OffsetInDescriptorsFromTableStart = kPuddleSrv - 3;
         // t12..t13, the clouds' resolved in-scatter and distance (ADR-005).
         sr2[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr2[4].NumDescriptors = 3;   // t14, the cloud-shadow map, right after (Clouds::kShadowSrv)
@@ -3360,7 +3398,7 @@ bool Renderer::create_post_pipelines(std::string& error) {
         D3D12_ROOT_PARAMETER p[6] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[1].DescriptorTable.NumDescriptorRanges = 5;
+        p[1].DescriptorTable.NumDescriptorRanges = 6;
         p[1].DescriptorTable.pDescriptorRanges = sr2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[2].DescriptorTable.NumDescriptorRanges = 1;
@@ -3555,6 +3593,82 @@ void Renderer::record_water() {
     tr(depth_.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, read);
 }
 
+float Renderer::rain_intensity() const {
+    if (!rain_on_ || mode_ == Mode::Wireframe) return 0.0f;
+    if (rain_override_ >= 0.0f) return rain_override_ > 1.0f ? 1.0f : rain_override_;
+    return clouds_on_ && clouds_.ready() ? weather_now_.rain : 0.0f;
+}
+
+float Renderer::drips() const {
+    if (mode_ == Mode::Wireframe) return 0.0f;
+    if (wet_override_ >= 0.0f) return wet_override_ > 1.0f ? 1.0f : wet_override_;
+    if (!rain_on_) return 0.0f;
+    if (rain_override_ >= 0.0f)
+        return weather_.drip_for(weather_.steady_leaf_soak(rain_override_ > 1.0f ? 1.0f : rain_override_));
+    return clouds_on_ && clouds_.ready() ? weather_now_.drip : 0.0f;
+}
+
+void Renderer::wetness(float& wet, float& puddle) const {
+    wet = puddle = 0.0f;
+    if (mode_ == Mode::Wireframe) return;
+    if (wet_override_ >= 0.0f) {
+        wet = puddle = wet_override_ > 1.0f ? 1.0f : wet_override_;
+        return;
+    }
+    if (!rain_on_) return;
+    // A fixed rain has always been falling: its steady state.
+    if (rain_override_ >= 0.0f) {
+        weather_.wet_for(weather_.steady_soak(rain_override_ > 1.0f ? 1.0f : rain_override_), wet, puddle);
+        return;
+    }
+    if (!clouds_on_ || !clouds_.ready()) return;
+    wet = weather_now_.wet;
+    puddle = weather_now_.puddle;
+}
+
+// Rain (ADR-005 C3) onto the lit scene, after the sea and before TAA. The
+// scene is a render target and the depth readable when this runs.
+void Renderer::record_rain() {
+    Rain::Frame f = {};
+    std::memcpy(f.view_proj, view_proj_, sizeof f.view_proj);
+    invert4(view_proj_, f.inv_view_proj);
+    for (int k = 0; k < 3; ++k) f.cam_pos[k] = cur_cam_[k];
+    f.time = cur_time_;
+    f.intensity = rain_intensity();
+    f.drip = drips();
+    f.wind[0] = weather_now_.wind_dir[0] * weather_now_.wind_speed;
+    f.wind[1] = weather_now_.wind_dir[1] * weather_now_.wind_speed;
+    // A drop refracts the sky above it into the eye and reflects the sky
+    // round it: grey, and brighter than the sky's MEAN -- it gathers the
+    // bright zenith of an overcast and a highlight off its surface. At the
+    // mean it was invisible against the sky and the mist, which are that
+    // grey too. An overcast sky here is as bright as a clear one but
+    // colourless (fill_light), so cloud cover dims it only a little.
+    const float* s = sky_frame_.sky_mean;
+    const float lum = 0.2126f * s[0] + 0.7152f * s[1] + 0.0722f * s[2];
+    const float cov = clouds_on_ && clouds_.ready() ? clouds_.coverage() : 0.0f;
+    const float L = lum * (2.0f - 0.4f * cov);
+    f.light[0] = f.light[1] = f.light[2] = L;
+    f.near_plane = kNearPlane;
+    f.far_plane = kFarPlane;
+    for (int k = 0; k < 3; ++k) f.canopy[k] = canopy_origin_[k];
+    f.canopy[3] = canopy_built_ ? 1.0f : 0.0f;
+    // The splashes stand on the heightfield GI's map of the top surface.
+    hfgi_.constants(hfgi_on_ && hfgi_.ready(), f.hf);
+    f.width = width_;
+    f.height = height_;
+    f.tan_half_fov = cur_tan_;
+    const UINT rinc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = post_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += SIZE_T(2) * rinc;
+    const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_GPU_DESCRIPTOR_HANDLE table = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+    table.ptr += UINT64(3) * inc;
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
+    cmd_->SetDescriptorHeaps(1, heaps);
+    rain_.record(cmd_.Get(), UINT(frame_), f, rtv, table);
+}
+
 // The clouds' frame (ADR-005): the camera, unjittered, this frame's and
 // last; the key light; the sky; the weather.
 void Renderer::record_clouds() {
@@ -3643,6 +3757,16 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     pc.fog_on = (fog_on_ && !wire) ? 1.0f : 0.0f;
     pc.clouds_on = (clouds_on_ && clouds_.ready() && !wire) ? 1.0f : 0.0f;
     clouds_.shadow_params(pc.cloud_shadow);
+    // Puddle reflections (ADR-005 C4): the same rain and ripple clock the
+    // terrain shaded the water with.
+    {
+        float wet_now = 0.0f, puddle_now = 0.0f;
+        wetness(wet_now, puddle_now);
+        pc.wet[0] = rain_intensity();
+        pc.wet[1] = float(std::fmod(double(cur_time_), 1000.0));
+        pc.wet[2] = 2.0f * cur_tan_ / float(height_ ? height_ : 1);
+        pc.wet[3] = puddle_now > 0.0f ? 1.0f : 0.0f;
+    }
     pc.fog_near = kFogNear;
     pc.fog_log_ratio = std::log(kFogFar / kFogNear);
     pc.rt_shadows = (rt_shadows_ && rt_ok_ && !wire) ? 1.0f : 0.0f;
@@ -3725,6 +3849,7 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     tr(depth_.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, read);
     tr(hdr_direct_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
     tr(hdr_ambient_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
+    tr(puddle_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
 
     ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
     cmd_->SetDescriptorHeaps(1, heaps);
@@ -3771,8 +3896,12 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     // Direct x contact + ambient x AO.
     cmd_->SetPipelineState(composite_pso_.Get());
     cmd_->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
-    if (water_pending_) {
-        record_water();
+    // The sea and the rain draw onto the scene as a render target.
+    const bool rain = rain_.ready() && (rain_intensity() > 0.001f || drips() > 0.001f);
+    if (water_pending_) record_water();
+    else if (rain) tr(scene_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (rain) record_rain();
+    if (water_pending_ || rain) {
         // Back to the post chain's bindings, which TAA and the meter use.
         cmd_->SetDescriptorHeaps(1, heaps);
         cmd_->SetComputeRootSignature(post_root_.Get());
@@ -3833,6 +3962,7 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     tr(depth_.Get(), read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     tr(hdr_direct_.Get(), read, D3D12_RESOURCE_STATE_RENDER_TARGET);
     tr(hdr_ambient_.Get(), read, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    tr(puddle_.Get(), read, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
     hist_valid_ = taa_on_ && !wire;
     hist_cur_ ^= 1u;
@@ -3978,11 +4108,17 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     // The scene goes into the two HDR targets; the back buffer only receives
     // the post chain's result (record_post).
     const D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
-    D3D12_CPU_DESCRIPTOR_HANDLE hdr[2];
+    // ...and the puddle mask (ADR-005 C4), which every scene shader writes:
+    // zero unless it is the terrain's standing water, so whatever is drawn
+    // over a puddle takes its reflection away.
+    D3D12_CPU_DESCRIPTOR_HANDLE hdr[3];
+    const UINT rtv_inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     hdr[0] = post_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     hdr[1] = hdr[0];
-    hdr[1].ptr += device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    cmd_->OMSetRenderTargets(2, hdr, FALSE, &dsv);
+    hdr[1].ptr += rtv_inc;
+    hdr[2] = hdr[0];
+    hdr[2].ptr += SIZE_T(3) * rtv_inc;
+    cmd_->OMSetRenderTargets(3, hdr, FALSE, &dsv);
     cmd_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
     cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
@@ -4031,8 +4167,10 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         // reads the sea's coverage from.
         const float sky[4] = {kSkyClearR, kSkyClearG, kSkyClearB, 1.0f};
         const float none[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        const float zero4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         cmd_->ClearRenderTargetView(hdr[0], none, 0, nullptr);
         cmd_->ClearRenderTargetView(hdr[1], sky, 0, nullptr);
+        cmd_->ClearRenderTargetView(hdr[2], zero4, 0, nullptr);
     }
 
     {
@@ -4171,6 +4309,9 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         wc.wind_drift[0] = tree_settings_.wind_drift[0];
         wc.wind_drift[1] = tree_settings_.wind_drift[1];
         wc.swash_runup = swash_.runup;
+        // The clouds' shadow; record_clouds runs before the sea draws.
+        wc.clouds_on = (clouds_on_ && clouds_.ready()) ? 1.0f : 0.0f;
+        clouds_.shadow_params(wc.cloud_shadow);
         wc.frame = float(post_frame_ % 64);
         std::memcpy(water_cb_cpu_[frame_], &wc, sizeof wc);
         water_pending_ = true;

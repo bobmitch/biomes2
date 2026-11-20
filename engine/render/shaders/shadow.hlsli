@@ -64,6 +64,9 @@ cbuffer ShadowConstants : register(b2) {
     float4 l_swash_a;
     float4 l_swash_b;
     float4 l_swash;
+    // The wet world (ADR-005 C4, wet.hlsli): wetness 0..1, puddles 0..1, the
+    // rain now 0..1, the ripples' clock (s, wrapped at 1000).
+    float4 l_wet;
 };
 
 Texture2DArray<float>  g_shadow     : register(t8);

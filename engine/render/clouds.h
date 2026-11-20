@@ -64,6 +64,7 @@ public:
     const CloudSettings& settings() const { return settings_; }
     // The storm's mean coverage, type and precipitation, as last recorded.
     float coverage() const { return coverage_; }
+    bool shadow_ready() const { return shadow_readable_; }
     // The shadow map's centre (x, z in the cloud-base plane), half extent and
     // the base's altitude, as the composite needs them.
     void shadow_params(float out[4]) const {

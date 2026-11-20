@@ -33,6 +33,7 @@ cbuffer FogConstants : register(b0) {
     float  map_extent; float haze;        float sea_level;    float patch;
     float2 drift;      float phase_g;     float albedo;   // drift: metres the patches have moved (weather.h)
     float  screen_w;   float screen_h;    float density_scale; float cam_sky;   // cam_sky: DDGI's share of open sky at the eye
+    float4 cloud_shadow;  // ADR-005 C2: the cloud-shadow map's centre x, z, half extent (0: none), base altitude
 };
 
 Texture2D<float4>   g_fog_map    : register(t0);   // fog.h: density, thinning height, surface y
@@ -41,6 +42,8 @@ Texture3D<float4>   g_inject_in  : register(t2);
 RWTexture3D<float4> u_inject     : register(u0);
 RWTexture3D<float4> u_integrated : register(u1);
 SamplerState        g_lin        : register(s0);
+Texture2D<float>    g_cloud_shadow : register(t60);   // clouds.hlsl cs_shadow, last frame's
+#include "engine/render/shaders/cloud_shadow.hlsli"
 
 static const uint kFX = 160, kFY = 90, kFZ = 128;
 
@@ -119,7 +122,10 @@ void cs_fog_inject(uint3 id : SV_DispatchThreadID) {
     // Radiance arriving at the point, weighted by the phase towards the eye.
     // The cosine is between the light's direction of travel (-l) and the
     // scattered ray's (-d): looking into the light is the forward peak.
-    float3 L = kSunLux * (key_visibility(p) * hg_phase(dot(d, kSunDir), phase_g));
+    // Through the clouds' shadow too (ADR-005 C2): sunbeams through the gaps
+    // in a deck, and no sunlit glow under a closed one.
+    float3 L = kSunLux * (key_visibility(p) * cloud_shadow_at(g_cloud_shadow, g_lin, cloud_shadow, kSunDir, p) *
+                          hg_phase(dot(d, kSunDir), phase_g));
     // The sky above and the ground below, scattered isotropically: the mean
     // radiance over the sphere.
     // Near the camera, only the share of it the probes say reaches the eye:

@@ -24,6 +24,7 @@
 #include "engine/render/weather.h"
 #include "engine/render/ocean_detail.h"
 #include "engine/render/clouds.h"
+#include "engine/render/rain.h"
 #include "engine/render/rt_scene.h"
 #include "engine/render/canopy.h"
 #include "engine/render/ddgi.h"
@@ -178,6 +179,18 @@ public:
     void  set_clouds(bool on) { clouds_on_ = on; }
     bool  clouds() const { return clouds_on_; }
     const Clouds& cloud_layer() const { return clouds_; }
+    // Rain (ADR-005 C3): from the clouds' precipitation, or fixed with
+    // --rain <0..1> (negative: automatic). Shift+F3 / --no-rain.
+    void  set_rain(float k) { rain_override_ = k; }
+    void  set_rain_on(bool on) { rain_on_ = on; }
+    bool  rain_on() const { return rain_on_; }
+    float rain_intensity() const;
+    // The wet world (ADR-005 C4): the surfaces' wetness and the puddles, from
+    // the weather's rain history; fixed with --wet <0..1> (both at once).
+    void  set_wet(float k) { wet_override_ = k; }
+    void  wetness(float& wet, float& puddle) const;
+    // How wet the crowns are: drips under the trees, after the rain too.
+    float drips() const;
     void  set_wave_detail(bool on) { detail_on_ = on; }
     bool  wave_detail() const { return detail_on_; }
     const OceanDetail& ocean() const { return ocean_; }
@@ -574,6 +587,11 @@ private:
     // Volumetric clouds (ADR-005, clouds.h). F3, --no-clouds.
     Clouds clouds_;
     bool clouds_on_ = true;
+    Rain rain_;
+    bool rain_on_ = true;
+    float rain_override_ = -1.0f;
+    float wet_override_ = -1.0f;
+    void record_rain();
     float clouds_cam_[3] = {1e9f, 1e9f, 1e9f};
     void record_clouds();
     bool detail_on_ = true;
@@ -587,6 +605,7 @@ private:
     } water_optics_;
     bool load_water_optics(const char* archetypes_path, std::string& error);
     ComPtr<ID3D12DescriptorHeap> post_rtv_heap_;
+    ComPtr<ID3D12Resource> puddle_;   // the scene's third target: the puddle mask (ADR-005 C4)
     ComPtr<ID3D12RootSignature> post_root_;
     ComPtr<ID3D12PipelineState> ao_pso_, composite_pso_, taa_pso_, final_pso_, ssgi_pso_;
     ComPtr<ID3D12Resource> ssgi_;              // the screen-space bounce (L6): irradiance, distance

@@ -25,6 +25,11 @@
 //   swell     long waves from a storm somewhere else: its own slow heading,
 //             and a height from the storm averaged over a much longer window
 //             (swell_lag), so a swell keeps running after a gale has passed.
+//   rain      0..1, from the storm dial past rain_storm[0] (ADR-005 C3).
+//   wet       0..1, how wet the world's surfaces are (C4): the rain of the
+//             last hour or so, each minute of it fading with age over
+//             dry_s, saturating over soak_s. Puddles come after the ground
+//             is soaked and go before it dries.
 //   drift     where the air has carried a thing since t = 0, in metres --
 //             the integral of the wind. Anything ADVECTED by the wind (the
 //             mist's patches, the gust field) moves by this, never by
@@ -35,6 +40,7 @@
 // ---------------------------------------------------------------------------
 #include "engine/render/water_wave.h"
 
+#include <cmath>
 #include <cstdint>
 #include <string>
 
@@ -54,6 +60,11 @@ struct WeatherSettings {
     float swell_wavelength = 110.0f;
     float swell_lag_s = 600.0f;
     float mist_drift = 0.5f;       // share of the wind's speed the mist drifts at
+    float rain_storm[2] = {0.55f, 0.9f};  // the storm dial where rain starts, and where it is a downpour
+    float dry_s = 900.0f;          // how long rain that has stopped keeps the ground wet (e-folding)
+    float soak_s = 120.0f;         // seconds of downpour that wet the ground through
+    float puddle_s[2] = {240.0f, 600.0f};  // soak (rain-seconds) where puddles start, and the span to full
+    float leaf_dry_s = 300.0f;     // how long the crowns keep dripping after the rain (e-folding)
 };
 
 struct WeatherState {
@@ -65,6 +76,10 @@ struct WeatherState {
     float swell_dir[2] = {1, 0};
     float swell_hs = 0.0f;       // significant height, m
     float drift[2] = {0, 0};     // metres the air has moved since t = 0
+    float rain = 0.0f;           // 0..1, now
+    float wet = 0.0f;            // 0..1, the surfaces (C4)
+    float puddle = 0.0f;         // 0..1, the puddles
+    float drip = 0.0f;           // 0..1, how wet the crowns are: they drip after the rain
 };
 
 class Weather {
@@ -90,6 +105,15 @@ public:
     float storm_at(double t) const;
     float heading_at(double t) const;
     float speed_for(float storm) const;
+    float rain_for(float storm) const;
+    // Wetness and puddles after `soak` rain-seconds (the decayed integral of
+    // the rain), so an override can ask for a steady rain's.
+    void wet_for(double soak, float& wet, float& puddle) const;
+    // The soak a rain held steady at `rain` for ever settles to.
+    double steady_soak(float rain) const;
+    // The crowns' wetness after `soak` rain-seconds of their own, shorter memory.
+    float drip_for(double leaf_soak) const { return float(1.0 - std::exp(-leaf_soak / 60.0)); }
+    double steady_leaf_soak(float rain) const { return double(rain) * settings_.leaf_dry_s; }
 
     // The sea this weather raises: every train's deep-water amplitude.
     WwSea sea(const WeatherState& w) const;

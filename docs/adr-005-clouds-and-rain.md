@@ -1,6 +1,6 @@
 # ADR-005: Volumetric clouds and rain
 
-Status: accepted, 2026-11-19. C1 (the clouds) and the first half of C2 (cloud shadows on the land, overcast sky light) done; the rest of C2 (the sea's glint and the mist under cloud) and C3-C5 to come.
+Status: accepted, 2026-11-19. C1 (the clouds), C2 (cloud shadows on the land, the sea and the mist; overcast sky light), C3 (rain) and C4 (the wet world: wetness and puddles from the weather's own rain history, porosity-driven wet surfaces, puddles in real hollows with ripples, drips) done; C5 to come. C4's puddles reflect the scene in screen space: a puddle mask written by every scene shader, the reflected ray marched in the composite against the depth buffer, the colour from last frame's TAA history. C3 differs from the plan in one place: the canopy test is ADR-004 L6's canopy map (vertical transmittance), not a new top-down depth, so the rain thins under a wood as its sky light does rather than stopping at a hard edge.
 
 ## Context
 

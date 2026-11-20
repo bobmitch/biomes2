@@ -268,8 +268,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (wp == VK_F3) {
-                // The volumetric clouds (ADR-005), for A/B.
-                g_renderer.set_clouds(!g_renderer.clouds());
+                // The volumetric clouds (ADR-005), for A/B; with Shift, the rain (C3).
+                if (GetKeyState(VK_SHIFT) & 0x8000) g_renderer.set_rain_on(!g_renderer.rain_on());
+                else g_renderer.set_clouds(!g_renderer.clouds());
                 return 0;
             }
             if (wp == VK_F4) {
@@ -968,6 +969,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     if (cmdline && std::string(cmdline).find("--no-wave-detail") != std::string::npos) g_renderer.set_wave_detail(false);
     if (cmdline && std::string(cmdline).find("--rt-no-sway") != std::string::npos) g_renderer.set_rt_sway(false);
     if (cmdline && std::string(cmdline).find("--no-clouds") != std::string::npos) g_renderer.set_clouds(false);
+    if (cmdline && std::string(cmdline).find("--no-rain") != std::string::npos) g_renderer.set_rain_on(false);
+    if (cmdline) {
+        const std::string c3 = cmdline;
+        const size_t rn = c3.find("--rain ");
+        if (rn != std::string::npos) g_renderer.set_rain(float(std::atof(c3.c_str() + rn + 7)));
+        const size_t wt = c3.find("--wet ");
+        if (wt != std::string::npos) g_renderer.set_wet(float(std::atof(c3.c_str() + wt + 6)));
+    }
     if (no_lod_hold) g_renderer.set_lod_hold(false);
     {
         const std::string c2 = cmdline ? cmdline : "";
@@ -1424,6 +1433,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                  w.wind_dir[0], w.wind_dir[1], w.gust, w.sea_wind, w.swell_hs, w.swell_dir[0],
                                  w.swell_dir[1], 4.0 * std::sqrt(m0), g_camera.x, g_camera.y, g_camera.z, depth,
                                  depth > 0.0f ? ww_significant_height_lod(sea, depth, 0.0f) : 0.0f);
+                    float wet_now = 0.0f, puddle_now = 0.0f;
+                    g_renderer.wetness(wet_now, puddle_now);
+                    std::fprintf(f, "  rain: %.2f (%s), cloud cover %.2f; ground wetness %.2f, puddles %.2f\n",
+                                 g_renderer.rain_intensity(),
+                                 !g_renderer.rain_on() ? "off" : "from the clouds unless --rain",
+                                 g_renderer.cloud_layer().coverage(), wet_now, puddle_now);
                     {
                         const engine::OceanDetail& od = g_renderer.ocean();
                         std::fprintf(f, "  sea slope (mean square, both axes): Cox-Munk %.4f; trains %.4f, ripples %.4f "

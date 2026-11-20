@@ -144,9 +144,11 @@ bool RockRenderer::init(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12R
     pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
     pd.SampleMask = UINT_MAX;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pd.NumRenderTargets = 2;
+    // The scene's three targets: direct, ambient, the puddle mask.
+    pd.NumRenderTargets = 3;
     pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     pd.RTVFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    pd.RTVFormats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     pd.SampleDesc.Count = 1;
     HRESULT hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso_));
@@ -156,18 +158,20 @@ bool RockRenderer::init(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12R
     pd.PS = {pst->GetBufferPointer(), pst->GetBufferSize()};
     pd.NumRenderTargets = 1;
     pd.RTVFormats[1] = DXGI_FORMAT_UNKNOWN;
+    pd.RTVFormats[2] = DXGI_FORMAT_UNKNOWN;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&top_pso_));
     if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (rocks top-down)", hr); return false; }
-    pd.NumRenderTargets = 2;
+    pd.NumRenderTargets = 3;
     pd.RTVFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    pd.RTVFormats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
     // Under the sun: depth only, both faces (a thin edge seen from the sun
     // must still cast), the terrain caster's slope bias.
     pd.VS = {vss->GetBufferPointer(), vss->GetBufferSize()};
     pd.PS = {nullptr, 0};
     pd.NumRenderTargets = 0;
-    pd.RTVFormats[0] = pd.RTVFormats[1] = DXGI_FORMAT_UNKNOWN;
+    pd.RTVFormats[0] = pd.RTVFormats[1] = pd.RTVFormats[2] = DXGI_FORMAT_UNKNOWN;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.RasterizerState.SlopeScaledDepthBias = 2.0f;
     pd.RasterizerState.DepthBiasClamp = 0.002f;

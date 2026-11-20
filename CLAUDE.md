@@ -77,7 +77,7 @@ Every mode takes `--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), the weather's `--sea-state <0..1>`, `--wind <m/s>`,
 `--wind-dir <deg>` and `--swell <m>` (automatic weather otherwise), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
 `--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`, `--no-rocks`,
-`--no-forest-shell`; `--shot` also
+`--no-forest-shell`, `--no-clouds`, `--no-rain`, `--rain <0..1>`, `--wet <0..1>`; `--shot` also
 takes `--lights <n>` (campfires round the camera) and `--ground` (the
 `--cam` x and z at eye height on the ground). `--flight` also takes `--settle`, `--holes` and
 `--flight-speed <m/s>` and `--flight-from x y z`; `--shot` takes
@@ -91,8 +91,8 @@ the streaming A/B switches `--no-lod-align`,
 `--check-rt` (ADR-004 L0: DXR end to end on one triangle),
 `--tree-lod0 <m>`, `--no-trees`, `--no-shadows`, `--no-foliage`,
 `--foliage-debug 1`, and the post chain's `--no-taa`, `--no-ao`,
-`--no-contact`, `--no-post` and `--post-debug 1|2` (AO alone, contact
-shadows alone), and exposure's `--ev-comp <stops>`, `--ev100 <v>` (fixed,
+`--no-contact`, `--no-post` and `--post-debug 1|2|4` (AO alone, contact
+shadows alone, how each puddle pixel found its reflection), and exposure's `--ev-comp <stops>`, `--ev100 <v>` (fixed,
 no meter), `--tonemap 0|1|2` (raw pre-L1 path / AgX / fitted ACES),
 `--agx-sat` and `--agx-power`. `--sea-shot` only PLACES the camera: pair it with `--shot`,
 or it falls through to the window loop with no window and never exits. `--walk` takes `--uncapped` to time frames at ground
@@ -898,7 +898,7 @@ and keeps AgX's hue handling, which a torch's orange will need.
   is real now and the sea is no better at noon (at sunset its glitter path
   is the best thing in the engine). L7 owns water reflections.
 
-### Volumetric clouds (ADR-005, phases C1 and C2)
+### Volumetric clouds, rain and the wet world (ADR-005, phases C1-C4)
 
 `docs/adr-005-clouds-and-rain.md` is the plan: Schneider's Nubis (Horizon
 Zero Dawn, SIGGRAPH 2015/2017) with Hillaire's integration and multiple
@@ -956,11 +956,132 @@ archetypes.json `clouds` block. F3 / `--no-clouds`.
 - **Cost** at 2560 x 1440: walking +0.1 ms, a flight at 300 m +0.1-0.25 ms
   (median). One gale flight showed a 99th-percentile frame of 22 ms that a
   rerun did not (8.0 ms); the 40 ms worst frames appear with clouds off too.
-- **Not done (later phases)**: the sea's glint and the mist's in-scatter do
-  not see the cloud shadows yet; no rain (C3), wet world (C4) or lightning
-  (C5); 1/16-pixel-a-frame rendering (Decima's cost path); at 50% coverage
+- **The cloud shadow reaches every reader through one function**,
+  `cloud_shadow.hlsli`'s `cloud_shadow_at`: the composite's direct target,
+  the sea's body and glint (`water.hlsl`; under a storm deck the sea had
+  gone on sparkling), and the mist's in-scatter (`fog.hlsl`, t60 in its
+  shadow table -- LAST frame's map, because the clouds record after the
+  mist; none until the map has been made once, `Clouds::shadow_ready`).
+- **Rain (C3)**: `engine/render/rain.{h,cpp}`, `shaders/rain.hlsl`; drawn
+  onto the scene target after the sea and before TAA, alpha-blended, RGB
+  only. Intensity is `Clouds::precipitation()` (the storm dial past 0.55),
+  or `--rain <0..1>`; `--no-rain`, Shift+F3. Nothing stored: a drop is a
+  hash of its index with a FIXED world position wrapped into a box round
+  the camera, so walking does not drag the rain along. Two layers --
+  40k drops in 44 x 24 x 44 m, 60k in 132 x 36 x 132 m (the sheets a
+  downpour shows at distance) -- falling at 8.5 m/s and carried at 0.7 x
+  the 10 m wind. A streak is the path over 45 ms, at least 0.8 px wide with
+  its opacity cut to match; drops nearer than ~4 m fade out (they smeared
+  across the screen as wires). Occlusion is a manual depth test against
+  the scene's depth (the sea's included). **Under crowns** the canopy
+  map's vertical transmittance thins the drops and dims them (they see
+  leaves above, not sky). The mist's density rises x(1 + 1.5 x rain).
+- **Splashes are WORLD points.** The first version picked random screen
+  pixels and read the depth there, so every splash rode along with the
+  view and looked fake. Now each of 2500 has a world (x, z) for its 0.4 s
+  life, wrapped into a 72 m square round the camera like the drops, kept
+  within 36 m. `splash_ground` takes a first height from the heightfield
+  GI's top-surface map (heap [52]; splashes need `hfgi` on, the default),
+  projects it, reads the depth there for the surface plane, and puts the
+  splash where that plane meets its own vertical; it gives up if the
+  depth disagrees (a trunk in front, ground the 2 m map does not describe)
+  or the surface faces away from the sky. The map sees the seabed, the
+  depth the sea, so under sea level the guess is 0 with a wider tolerance.
+  Grass hides them (a depth test with 8 cm of tolerance), as it does real
+  ones. On the sea a ring spreads to ~12 cm; on land only a ~4 cm crown
+  -- rings on leaves read as bubbles. Never under ~1.5 px across, the
+  opacity cut LINEARLY to match, so they still read at 30 m.
+  `BIOMES_RAIN_DBG=1` draws them 0.3 m and opaque, `=2` also skips every
+  check (on the map's height): which check drops them, and whether they
+  hold still while the camera moves (two `--no-taa` shots a metre apart).
+- **A drop must be brighter than the sky's mean.** At the mean luminance
+  the rain vanished against an overcast sky and the mist, which are that
+  grey: the sea view showed a dozen streaks. It is 2 x the mean less 0.4 x
+  cover (a drop gathers the bright zenith and a highlight). Cloud cover
+  barely dims it because this engine's overcast is as bright as a clear sky,
+  only colourless (`fill_light`).
+- Cost: walking at 2560 x 1440 in a downpour 8.09 / 8.13 ms against 8.07 / 8.07
+  without -- within noise. Every `--shot` report has a `rain:` line.
+- **The wet world (C4)**: `shaders/wet.hlsli`, read by the terrain, rocks,
+  trees and grass through `l_wet` in the shadow constants (wetness,
+  puddles, the rain now, a ripple clock wrapped at 1000 s; 800 bytes).
+  - **State is the weather's, from its clock** (`weather.h`): `rain` from
+    the storm dial (`rain_storm`, 0.55-0.9, shared now with the rain pass),
+    and the rain of the last 45 min summed a minute at a time, each sample
+    weighted by exp(-age / `dry_s` 900 s) -- the sea's lag trick, so a
+    still and a long run agree with nothing stored. Wetness saturates over
+    `soak_s` (120 rain-seconds); puddles from 240 rain-seconds to full 600
+    later, and go first as it dries; the crowns' `drip` has its own 300 s
+    memory. A held downpour is soaked with puddles; ~17 min after it stops
+    the ground starts to dry and the trees have stopped dripping. `--rain`
+    gives its steady state; `--wet <k>` sets wetness, puddles and drips.
+    Every shot report's `rain:` line prints them.
+  - **Porosity is the lever** (Lagarde's wet surfaces): soil (ground,
+    0.9) darkens to x0.5 and reads MORE saturated but stays nearly matte;
+    rock (0.3, 0.35 on terrain rock) barely darkens and takes a glossy
+    film (roughness to 0.12-0.2), its fine normal partly filled. Wet soil
+    at roughness 0.35 mirrored the grey sky and the meadow read as frost.
+    Steep faces get 70% (they drain).
+  - **Shelter**: the canopy map's sky visibility (a wood's floor gets
+    45-100%) and the heightfield GI map -- under a top surface a metre and
+    more above, dry. Under an overhang stays dry; in a cave it would too.
+  - **Puddles** stand on flat GROUND (not rock, n.y > 0.93) where a fixed
+    two-scale noise, the scan's own height map and the terrain's REAL
+    hollows (the heightfield map's 4 m Laplacian, 2 m texels) are lowest,
+    the threshold rising with the puddle value: dark (x0.3), roughness
+    0.02, the normal up, and while it rains RINGS -- one drop per 0.4 m
+    cell at a time, 3x3 cells a pixel, faded as the pixel outgrows a 5 cm
+    ring. Most pixels leave before the hollow's four lookups.
+  - **Bark** x0.55 and roughness 0.85 -> 0.4; **leaves and grass** x0.82
+    and a SHEEN: a normalised Blinn-Phong sun lobe and the sky's mean
+    radiance, Fresnel-weighted. The first sheen was the full GGX lobe and
+    sky lookup and cost 0.55 ms walking -- leaves and blades overdraw --
+    and at 0.6 strength greyed whole crowns (edge-on cards, Fresnel).
+  - **Drips**: under crowns, drops the rain's roll rejected come back as
+    drips while the crowns are wet -- up to a third of a downpour's count,
+    slower (0.6 x) and barely blown -- and their splashes, so a wood keeps
+    dripping after the shower.
+  - **Puddles reflect the scene** (screen space). The scene has a THIRD
+    target, the puddle mask (RGBA16F, heap [109], t15 in post): every scene
+    shader writes it through `SceneOut` -- zero unless it is the terrain's
+    standing water -- so grass, a rock or a tree drawn over a puddle clears
+    it, and every scene PSO declares three targets (terrain, rocks, trees'
+    mesh and impostors, foliage). The terrain takes the puddle's share of
+    its sky reflection OUT of its ambient, exactly as `ambient_light` put
+    it in, and leaves it in the mask (rgb) with its weight (a, env_brdf x
+    puddle). `cs_composite` adds it back BEFORE the haze, after marching
+    the reflected ray -- bent by the same rain rings (`ripple.hlsli`,
+    shared) -- through the depth buffer in world space: 26 steps from 10 cm
+    growing 1.3x, a 5-step bisection where it passes behind a surface thin
+    enough to be the one it reached. The colour comes from LAST frame's
+    TAA history, reprojected through TAA's own matrix: lit, hazed, clouds
+    and all. No hit: what lies far along the reflected direction, if the
+    screen shows it there (sky, or anything beyond the march). Only a ray
+    that leaves the screen keeps the terrain's sky. Without the far case a
+    grazing ray from a distant puddle -- which runs above the ground and
+    hits nothing near -- took the bright horizon sky, and an evening's
+    puddles glowed white like snow. `--post-debug 4`: green a hit, blue far
+    along the ray, red the sky.
+  - **FXC crashes ("internal error: compilation aborted unexpectedly") on
+    a ternary between two TEXTURE objects** (`(c ? g_hist1 :
+    g_hist0).Sample`) in this compute shader. Branch instead.
+  - Cost walking at 2560 x 1440, wet against dry under the same weather:
+    8.66 / 8.73 ms against 8.28 -- about +0.4 ms, of which the reflections
+    ~0.2; the third target costs ~0.1 ms everywhere (dry was 8.19 before
+    it). `validate` passed with the `weather` block's new keys
+    (presentation only).
+  - Not done: reflections are screen space -- what is off screen or behind
+    a nearer object is not there; a far hit is fogged twice (its own haze in
+    the history, then the puddle's); grass still grows out of puddles (the foliage bake is cached per tile);
+    nothing runs down a slope or drips off a rock; wetness is the same
+    everywhere the sky reaches -- a beach does not dry faster than a bog.
+- **Not done (later phases)**: lightning (C5); rain on the camera lens;
+  underwater the rain still draws; no rain in the RT or GI passes (nothing needs it);
+  1/16-pixel-a-frame cloud rendering (Decima's cost path); at 50% coverage
   the sky reads nearer overcast than broken, and the base can look like a
-  flat ceiling from the ground -- tuning.
+  flat ceiling from the ground -- tuning. On the badlands cliff at storm
+  0.9 the ground was still in sunlight: the cloud shadow there had a gap,
+  not investigated.
 
 ### The atmosphere and time of day (ADR-004 L2)
 

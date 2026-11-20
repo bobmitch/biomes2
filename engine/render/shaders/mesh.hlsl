@@ -8,6 +8,7 @@
 // ---------------------------------------------------------------------------
 
 #include "engine/render/shaders/shadow.hlsli"
+#include "engine/render/shaders/wet.hlsli"
 #include "engine/render/shaders/scene_out.hlsli"
 #include "engine/render/shaders/local_lights.hlsli"
 
@@ -191,7 +192,7 @@ float3 apply_surface_texture(float3 albedo, float3 p, float3 n) {
 static const float kScanBlendDepth = 0.2f;
 static const float kScanHeightGain = 0.6f;
 
-struct ScanResult { float3 albedo; float rough; float3 n; float ao; bool ok; };
+struct ScanResult { float3 albedo; float rough; float3 n; float ao; float height; bool ok; };
 
 ScanResult scan_surface(VSOut i, float3 n, float level, float3 v, out float psh) {
     ScanResult r = (ScanResult)0;
@@ -264,12 +265,14 @@ ScanResult scan_surface(VSOut i, float3 n, float level, float3 v, out float psh)
         r.albedo += hb * sc[c3].albedo * tint[c3];
         r.rough += hb * saturate(sc[c3].rough * rscale[c3]);
         r.ao += hb * sc[c3].ao;
+        r.height += hb * sc[c3].height;
         nsum += hb * sc[c3].n;
     }
     if (wsum <= 0.0f) return r;
     r.albedo /= wsum;
     r.rough /= wsum;
     r.ao /= wsum;
+    r.height /= wsum;
     r.n = normalize(nsum);
     r.ok = true;
     return r;
@@ -333,6 +336,9 @@ SceneOut ps_main(VSOut i) {
         return scene_flat(float3(0.0f, 1.0f, 1.0f));
     const float3 n = normalize(i.nrm);
     const float3 v = normalize(cam_pos - i.world);
+    // The pixel's footprint, for the rain's ripples to fade by (before any
+    // branch: it takes derivatives).
+    const float foot = length(fwidth(i.world.xz));
 
     // The biome's material (ADR-004 L1): its ground on the level, its rock on
     // anything steeper than about 40 degrees. Was one hard-coded rock and
@@ -430,6 +436,19 @@ SceneOut ps_main(VSOut i) {
         }
     }
 
+    // The wet world (ADR-005 C4, wet.hlsli): rain soaks the ground -- soil
+    // darkens most, rock takes a glossy film -- and puddles stand in the
+    // hollows of flat ground, ringed while it rains. Sheltered under crowns
+    // and overhangs.
+    float pud = 0.0f;
+    if (l_wet.x > 0.0f) {
+        const float shelter = wet_shelter(i.world);
+        const float wet = l_wet.x * shelter * lerp(0.7f, 1.0f, saturate(n.y));
+        wet_surface(albedo, rough, ns, n, lerp(0.35f, 0.9f, level), wet);
+        pud = puddle_amount(i.world, n, sr.ok ? sr.height : 0.5f, level, shelter);
+        puddle_surface(albedo, rough, ns, i.world, pud, foot);
+    }
+
     // Wet ground at the shore (water_wave.h's swash, the sheet the sea runs up
     // the beach). The band the uprush reaches every few sets stays damp --
     // water in the pores: darker, and smoother than dry sand -- and the strip
@@ -477,6 +496,20 @@ SceneOut ps_main(VSOut i) {
     // each with its own occlusion. The scan's occlusion is ambient only.
     float3 dir = sun_light(s, sh);
     float3 amb = ambient_light(s, i.world) * ao + local_lights(s, i.world, i.clip);
+    // Standing water's reflection leaves the ambient for the puddle mask
+    // (scene_out.hlsli): the composite marches it through the depth buffer
+    // and lays what it finds -- trees, terrain, clouds -- in place of this
+    // sky, which stays the fallback where the ray leaves the screen. Taken
+    // out exactly as ambient_light put it in, without the AO: a mirror is
+    // not occluded by the creases round it.
+    float4 pmask = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (pud > 0.0f) {
+        const float nv = max(dot(ns, v), 1e-4f);
+        const float3 env = env_brdf(float3(0.04f, 0.04f, 0.04f), rough, nv);
+        const float3 refl = env * gi_specular(i.world, ns, v, rough) * pud;
+        amb -= refl * ao;
+        pmask = float4(refl, env.x * pud);
+    }
     if (cw > 0.0f) {
         // The shell's sun comes from the FAR terrain shadow, which holds the
         // terrain and the lifted shell but no trees -- not from the cascades.
@@ -489,7 +522,9 @@ SceneOut ps_main(VSOut i) {
         const float3 lamb = leaf_alb / kPi * gi_diffuse(i.world, leaf_n, v) * shell_sky;
         dir = lerp(dir, ldir, cw);
         amb = lerp(amb, lamb, cw);
+        pmask *= 1.0f - cw;
     }
-    return scene_out(dir, amb,
-                     i.world, cam_pos, far_plane);
+    SceneOut o = scene_out(dir, amb, i.world, cam_pos, far_plane);
+    o.puddle = pmask;
+    return o;
 }

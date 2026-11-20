@@ -454,14 +454,40 @@ FolOut vs_blade(uint vid_all : SV_VertexID, uint iid : SV_InstanceID) {
 // and transmitted sun of lighting.hlsli, and the GI interface's diffuse,
 // per vertex, with the fallback's fill for light scattered between blades
 // where the probes did not answer (with_gi; trees.hlsl's shade the same).
+
+// A film of water on a wet leaf or blade (ADR-005 C4): a sheen of the sun
+// and the sky off its surface, on top of the leaf's own light. Leaves have
+// no specular dry -- a crown seen whole is too rough for one -- but a wet one
+// glints. Cheap on purpose: leaves and blades overdraw heavily, and the
+// full GGX lobe and sky lookup cost 0.55 ms walking at 1440p. A normalised
+// Blinn-Phong lobe and the sky's mean radiance carry what a film shows.
+void wet_leaf_sheen(inout float3 dir, inout float3 amb, float3 n, float3 v, float3 world, float sh, float wet) {
+    if (wet <= 0.0f) return;
+    float3 nn = n;
+    if (dot(nn, v) < 0.0f) nn = -nn;   // a card's face towards the eye
+    const float nv = saturate(dot(nn, v));
+    const float k = 1.0f - nv;
+    const float F = 0.04f + 0.96f * (k * k) * (k * k) * k;
+    const float nl = dot(nn, kSunDir);
+    if (nl > 0.0f && sh > 0.0f) {
+        const float nh = saturate(dot(nn, normalize(kSunDir + v)));
+        const float nh2 = nh * nh, nh4 = nh2 * nh2, nh8 = nh4 * nh4, nh16 = nh8 * nh8;
+        dir += kSunLux * (1.35f * nh16 * nh16 * F * nl * sh * 0.35f * wet);
+    }
+    amb += kSkyMean * (F * 0.2f * wet * gi_sky_visibility(world, nn));
+}
+
 SceneOut shade_foliage(float4 clip, float3 albedo_srgb, float3 n, float ao, float3 world, float3 toward_eye,
                        float contact = 0.0f, float ssao = 0.4f) {
-    const float3 albedo = srgb_to_linear(albedo_srgb);
+    // Rain (ADR-005 C4): wet blades a little darker, and glinting.
+    const float wet = l_wet.x;
+    const float3 albedo = srgb_to_linear(albedo_srgb) * lerp(1.0f, 0.82f, wet);
     const float sh = shadow_factor(world, float3(0.0f, 1.0f, 0.0f));
-    return scene_out(leaf_sun_light(albedo, n, toward_eye, 0.5f, 0.7f, sh) * (1.09f * ao),
-                     albedo / kPi * gi_diffuse(world, n, toward_eye) * ao +
-                     local_lights_leaf(albedo, n, toward_eye, 0.5f, 0.7f, world, clip) * ao,
-                     world, cam_pos, far_plane, contact, ssao);
+    float3 dir = leaf_sun_light(albedo, n, toward_eye, 0.5f, 0.7f, sh) * (1.09f * ao);
+    float3 amb = albedo / kPi * gi_diffuse(world, n, toward_eye) * ao +
+                 local_lights_leaf(albedo, n, toward_eye, 0.5f, 0.7f, world, clip) * ao;
+    wet_leaf_sheen(dir, amb, n, toward_eye, world, sh, wet * ao);
+    return scene_out(dir, amb, world, cam_pos, far_plane, contact, ssao);
 }
 
 SceneOut ps_blade(FolOut i, bool front : SV_IsFrontFace) {

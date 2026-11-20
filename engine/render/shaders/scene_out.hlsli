@@ -20,6 +20,11 @@
 struct SceneOut {
     float4 direct  : SV_Target0;
     float4 ambient : SV_Target1;
+    // The puddle mask (ADR-005 C4): the sky reflection the terrain took OUT
+    // of its ambient for standing water (rgb, nits) and the reflection's
+    // weight (a). Zero from every other surface, so one drawn over a puddle
+    // takes its reflection away. The composite marches the reflected ray.
+    float4 puddle  : SV_Target2;
 };
 
 // No fog here since L2: the atmosphere's aerial perspective is applied to
@@ -39,6 +44,7 @@ SceneOut scene_out(float3 direct, float3 ambient, float3 world, float3 cam, floa
     SceneOut o;
     o.direct = float4(min(direct, kSceneMaxNits), contact);
     o.ambient = float4(min(ambient, kSceneMaxNits), ao);
+    o.puddle = float4(0.0f, 0.0f, 0.0f, 0.0f);
     return o;
 }
 
@@ -51,6 +57,7 @@ SceneOut scene_flat(float3 c) {
     SceneOut o;
     o.direct = float4(0.0f, 0.0f, 0.0f, 0.0f);
     o.ambient = float4(c, -1.0f);
+    o.puddle = float4(0.0f, 0.0f, 0.0f, 0.0f);
     return o;
 }
 

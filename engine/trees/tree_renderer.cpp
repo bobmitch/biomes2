@@ -396,8 +396,9 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (trees)", hr); return false; }
         return true;
     };
-    if (!make_pso("vs_mesh", "ps_mesh", 2, mesh_pso_)) return false;
-    if (!make_pso("vs_impostor", "ps_impostor", 2, imp_pso_)) return false;
+    // The scene's three targets (direct, ambient, the puddle mask).
+    if (!make_pso("vs_mesh", "ps_mesh", 3, mesh_pso_)) return false;
+    if (!make_pso("vs_impostor", "ps_impostor", 3, imp_pso_)) return false;
     if (!make_pso("vs_bake", "ps_bake", 2, bake_pso_, false, DXGI_FORMAT_R8G8B8A8_UNORM)) return false;
     if (!make_pso("vs_mesh_shadow", "ps_mesh_shadow", 0, mesh_shadow_pso_, true)) return false;
     if (!make_pso("vs_impostor_shadow", "ps_impostor_shadow", 0, imp_shadow_pso_, true)) return false;

@@ -162,6 +162,7 @@ if(BIOMES2_ENGINE)
     engine/render/weather.cpp
     engine/render/ocean_detail.cpp
     engine/render/clouds.cpp
+    engine/render/rain.cpp
     engine/render/rt_scene.cpp
     engine/render/canopy.cpp
     engine/render/ddgi.cpp
