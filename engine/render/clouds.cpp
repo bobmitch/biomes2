@@ -262,9 +262,13 @@ void Clouds::record(ID3D12GraphicsCommandList* cmd, UINT frame, const Frame& f) 
         cmd->ResourceBarrier(1, &rb);
     };
     // The storm decides the sky: a calm day's few fair-weather cumulus, a
-    // gale's nearly closed deck of cumulonimbus, rain from the darkest of it.
+    // gale's closed deck of cumulonimbus, rain from the darkest of it. The
+    // deck closes by storm 0.85, where the rain is a downpour (weather.h's
+    // rain_storm 0.55-0.9): showers start under a broken sky with the sun
+    // between them, and a downpour is not left with sunny patches.
     const float s = f.storm < 0.0f ? 0.0f : (f.storm > 1.0f ? 1.0f : f.storm);
-    coverage_ = 0.12f + 0.8f * std::pow(s, 1.3f);
+    const float sc = s / 0.85f > 1.0f ? 1.0f : s / 0.85f;
+    coverage_ = 0.12f + 0.88f * std::pow(sc, 1.3f);
     type_ = 0.35f + 0.65f * smooth01(0.45f, 0.95f, s);
     precip_ = smooth01(0.55f, 0.9f, s);
 

@@ -225,14 +225,22 @@ float cloud_density(float3 p, float4 wx, bool fine) {
     const float low = b.g * 0.625f + b.b * 0.25f + b.a * 0.125f;
     float c = saturate(remap(b.r, -(1.0f - low), 1.0f, 0.0f, 1.0f));
     c *= height_profile(hf, wx.g);
-    // Coverage as a threshold on the shaped field (Schneider). The field
-    // rarely passes 0.7 once its height profile is applied, so the threshold
-    // is scaled to that: with Schneider's plain 1 - coverage nothing at all
-    // stood under half cover, and a map that varied round 0.5 left whole
-    // regions of the sky empty. 0.3 is scattered cumulus, 0.5 broken, 0.9 a
-    // deck.
+    // Coverage as a threshold on the shaped field, set by MEASUREMENT
+    // (BIOMES_CLOUDS_DBG=4 writes the field's peak along each sun ray into
+    // the shadow map, and the shot report prints its percentiles). This
+    // field is FLAT: its peak lies between 0.80 and 0.90 for 80% of the sky,
+    // whatever the weather. Schneider's threshold, then 0.7 x (1 - coverage),
+    // sat below all of it, so coverage was really decided by a density scale
+    // and the edge erosion, and a little more of either closed the sky --
+    // 44% coverage was an unbroken deck, and the shadow map's 10% floor hid
+    // it. Now the threshold is the field's own quantile, so the share of sky
+    // covered is the coverage: Q(f) ~ 0.80 + 0.125 (f - 0.1), cut at
+    // 1 - coverage, and pulled under the field's floor as the deck closes.
+    // Past it the cloud ramps to full density over 0.06, so the erosion
+    // below shapes edges instead of deleting thin clouds whole.
     const float cov = wx.r;
-    c = saturate(remap(c, 0.7f * (1.0f - cov), 1.0f, 0.0f, 1.0f)) * saturate(cov * 1.5f);
+    const float cut = 0.895f - 0.125f * cov - 0.08f * pow(cov, 8.0f);
+    c = saturate((c - cut) / 0.06f);
     if (c <= 0.0f || !fine) return c;
     // Erode the edges: billowy below, wispy above.
     const float3 d = g_detail.SampleLevel(g_wrap, q / detail_scale + float3(0.0f, time * 0.004f, 0.0f), 0).rgb;
@@ -414,14 +422,47 @@ void cs_shadow(uint3 id : SV_DispatchThreadID) {
     if (key_dir.y < 0.03f) { u_shadow[id.xy] = 1.0f; return; }
     const float2 xz = shadow_map.xy + ((float2(id.xy) + 0.5f) / float(n) * 2.0f - 1.0f) * shadow_map.z;
     const float3 start = float3(xz.x, base_alt, xz.y);
-    const float len = min(kMaxTop / key_dir.y, 12000.0f);
+    // Through the layer as tall as the weather makes it (the map varies the
+    // type by up to 0.15), not always the 8 km a cumulonimbus would need:
+    // 16 steps over 8 km put two or three in a 1.4 km cumulus layer.
+    const float len = min(type_top(saturate(cloud_type + 0.15f)) / key_dir.y, 12000.0f);
     const float dt = len / 16.0f;
+    // BIOMES_CLOUDS_DBG=4: the shaped field's PEAK along the ray, before the
+    // coverage threshold -- the distribution the threshold has to cut, read
+    // back as percentiles in the shot report.
+    if (pad0 > 3.5f && pad0 < 4.5f) {
+        float peak = 0.0f;
+        [loop] for (int s4 = 0; s4 < 16; ++s4) {
+            const float3 p = start + key_dir * ((float(s4) + 0.5f) * dt);
+            const float4 wx = weather_at(p);
+            const float alt = altitude_of(p) - base_alt;
+            const float hf = alt / type_top(wx.g);
+            if (hf <= 0.0f || hf >= 1.0f) continue;
+            const float3 q = p - float3(drift.x, 0.0f, drift.y) - float3(wind_dir.x, 0.0f, wind_dir.y) * (shear * hf);
+            const float4 b = g_base.SampleLevel(g_wrap, float3(q.x, alt, q.z) / base_scale, 0);
+            const float low = b.g * 0.625f + b.b * 0.25f + b.a * 0.125f;
+            peak = max(peak, saturate(remap(b.r, -(1.0f - low), 1.0f, 0.0f, 1.0f)) * height_profile(hf, wx.g));
+        }
+        u_shadow[id.xy] = peak;
+        return;
+    }
     float tau = 0.0f;
     [loop] for (int s = 0; s < 16; ++s) {
         const float3 p = start + key_dir * ((float(s) + 0.5f) * dt);
-        tau += cloud_density(p, weather_at(p), false) * dt;
+        // WITH the detail erosion, as the clouds are seen: without it the
+        // faint fringe the erosion cuts away stood everywhere, and at 600 m
+        // a step any fringe made a column opaque -- 22% cover cast shadow
+        // over every texel of the map.
+        tau += cloud_density(p, weather_at(p), true) * dt;
     }
-    u_shadow[id.xy] = lerp(0.1f, 1.0f, exp(-tau * sigma));
+    // The key light's DIRECT beam through the layer, and nothing else. It
+    // had a floor of 10% "for light scattered through", but the composite
+    // multiplies the direct target -- a beam that casts sharp shadows -- so
+    // 10% of a 100 klx sun under a storm deck was 10 klx of hard-shadowed
+    // sunlight beside a 14 klx sky: the badlands lay in plain sun under a
+    // closed sky. What a cloud scatters through comes out DIFFUSE, and the
+    // overcast sky term (fill_light) already stands for it.
+    u_shadow[id.xy] = exp(-tau * sigma);
 }
 
 // --- temporal ---------------------------------------------------------------

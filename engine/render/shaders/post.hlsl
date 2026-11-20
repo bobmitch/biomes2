@@ -494,6 +494,8 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     float mark = 1.0f;
     if (debug > 0.5f && debug < 1.5f) { c = ao.xxx; mark = 0.0f; }
     if (debug > 1.5f && debug < 2.5f) { c = cs.xxx; mark = 0.0f; }
+    // The clouds' shadow on the key light (ADR-005 C2): white sun, dark shade.
+    if (debug > 4.5f && debug < 5.5f) { c = cls.xxx; mark = 0.0f; }
     // Puddle reflections: green a hit, blue far along the ray, red the
     // terrain's sky; grey no puddle.
     if (debug > 3.5f && debug < 4.5f) {

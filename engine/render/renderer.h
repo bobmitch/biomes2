@@ -428,6 +428,16 @@ public:
         float worst_at[2] = {0, 0};                // texel (x, y)
     };
     const SkyCheck& last_sky_check() const { return sky_check_; }
+    // The clouds' shadow map from the last capture() (ADR-005 C2): the share
+    // of its 12 x 12 km where the key light's beam gets through (T > 0.5),
+    // and its mean transmittance -- how cloudy the ground's light is, over
+    // far more sky than one view shows.
+    struct CloudShadowReport {
+        bool  valid = false;
+        float sunlit = 0.0f, mean_t = 0.0f;
+        float pct[5] = {0, 0, 0, 0, 0};   // the map's 10th, 25th, 50th, 75th, 90th percentiles
+    };
+    const CloudShadowReport& last_cloud_shadow() const { return cloud_shadow_report_; }
 
     // What the device can do (ADR-004): ray-tracing tier, shader model.
     const DeviceCaps& caps() const { return caps_; }
@@ -755,6 +765,7 @@ private:
     unsigned long long last_post_tick_ = 0;
     ExposureReport exposure_report_;
     SkyCheck sky_check_;
+    CloudShadowReport cloud_shadow_report_;
     TreeField        tree_field_;
     RockField        rock_field_;
     RockRenderer     rocks_;

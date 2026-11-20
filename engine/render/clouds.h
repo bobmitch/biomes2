@@ -65,6 +65,8 @@ public:
     // The storm's mean coverage, type and precipitation, as last recorded.
     float coverage() const { return coverage_; }
     bool shadow_ready() const { return shadow_readable_; }
+    // The cloud-shadow map (R16F, kRead state between frames), for capture()'s report.
+    ID3D12Resource* shadow_texture() const { return shadow_.Get(); }
     // The shadow map's centre (x, z in the cloud-base plane), half extent and
     // the base's altitude, as the composite needs them.
     void shadow_params(float out[4]) const {

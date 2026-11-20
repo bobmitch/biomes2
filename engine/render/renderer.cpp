@@ -4975,6 +4975,38 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
         cmd_->ResourceBarrier(1, &t);
     }
 
+    // The clouds' shadow map, for the report's sunlit share.
+    ComPtr<ID3D12Resource> cs_rb;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT cfp = {};
+    if (clouds_on_ && clouds_.ready() && clouds_.shadow_ready()) {
+        ID3D12Resource* cst = clouds_.shadow_texture();
+        const D3D12_RESOURCE_DESC cdsc = cst->GetDesc();
+        UINT64 ctotal = 0;
+        device_->GetCopyableFootprints(&cdsc, 0, 1, 0, &cfp, nullptr, nullptr, &ctotal);
+        D3D12_RESOURCE_DESC cb = bd;
+        cb.Width = ctotal;
+        if (SUCCEEDED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &cb, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                       nullptr, IID_PPV_ARGS(&cs_rb)))) {
+            D3D12_RESOURCE_BARRIER t = {};
+            t.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            t.Transition.pResource = cst;
+            t.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            t.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            t.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            cmd_->ResourceBarrier(1, &t);
+            D3D12_TEXTURE_COPY_LOCATION cd = {}, cs = {};
+            cd.pResource = cs_rb.Get();
+            cd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            cd.PlacedFootprint = cfp;
+            cs.pResource = cst;
+            cs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            cmd_->CopyTextureRegion(&cd, 0, 0, 0, &cs, nullptr);
+            std::swap(t.Transition.StateBefore, t.Transition.StateAfter);
+            cmd_->ResourceBarrier(1, &t);
+        }
+    }
+
     // The exposure meter: what the histogram saw and what it chose.
     ComPtr<ID3D12Resource> meter_rb;
     {
@@ -5079,6 +5111,43 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
             sky_check_.valid = sky_check_.texels > 0;
             D3D12_RANGE nr = {0, 0};
             sky_rb->Unmap(0, &nr);
+        }
+    }
+
+    cloud_shadow_report_ = CloudShadowReport();
+    if (cs_rb) {
+        unsigned char* cp = nullptr;
+        if (SUCCEEDED(cs_rb->Map(0, nullptr, reinterpret_cast<void**>(&cp)))) {
+            auto h2f = [](unsigned short h) {
+                const unsigned e = (h >> 10) & 31u, m = h & 1023u;
+                if (e == 0) return float(m) / 16777216.0f;
+                return std::ldexp(float(m | 1024u), int(e) - 25);
+            };
+            double sum = 0.0;
+            size_t lit = 0, n = 0;
+            std::vector<float> vals;
+            vals.reserve(size_t(cfp.Footprint.Width) * cfp.Footprint.Height);
+            for (UINT y = 0; y < cfp.Footprint.Height; ++y) {
+                const unsigned short* row = reinterpret_cast<const unsigned short*>(
+                    cp + size_t(cfp.Offset) + size_t(y) * cfp.Footprint.RowPitch);
+                for (UINT x = 0; x < cfp.Footprint.Width; ++x) {
+                    const float v = h2f(row[x]);
+                    sum += v;
+                    lit += v > 0.5f ? 1 : 0;
+                    ++n;
+                    vals.push_back(v);
+                }
+            }
+            if (n) {
+                std::sort(vals.begin(), vals.end());
+                const float q[5] = {0.1f, 0.25f, 0.5f, 0.75f, 0.9f};
+                for (int k = 0; k < 5; ++k) cloud_shadow_report_.pct[k] = vals[size_t(q[k] * float(n - 1))];
+                cloud_shadow_report_.valid = true;
+                cloud_shadow_report_.sunlit = float(double(lit) / double(n));
+                cloud_shadow_report_.mean_t = float(sum / double(n));
+            }
+            D3D12_RANGE nr = {0, 0};
+            cs_rb->Unmap(0, &nr);
         }
     }
 

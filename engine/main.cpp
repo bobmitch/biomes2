@@ -1479,6 +1479,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                  ss.cutout_cards, ss.cutout_tris, ss.cutout_needle_tris, ss.cutout_ms,
                                  ss.cutout_bytes / 1048576.0, ss.instances_cutouts);
                 }
+                const engine::Renderer::CloudShadowReport& csr = g_renderer.last_cloud_shadow();
+                if (csr.valid)
+                    std::fprintf(f, "cloud shadow: %.1f%% of its 12 x 12 km sunlit (beam T > 0.5), mean T %.3f; "
+                                    "percentiles 10/25/50/75/90: %.3f %.3f %.3f %.3f %.3f\n",
+                                 csr.sunlit * 100.0f, csr.mean_t, csr.pct[0], csr.pct[1], csr.pct[2], csr.pct[3], csr.pct[4]);
                 const engine::Renderer::SkyCheck& sk = g_renderer.last_sky_check();
                 if (sk.valid)
                     std::fprintf(f, "sky table GPU vs CPU: %d texels, mean %.3f%%, worst %.3f%% at (%.0f, %.0f)\n",

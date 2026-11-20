@@ -91,8 +91,8 @@ the streaming A/B switches `--no-lod-align`,
 `--check-rt` (ADR-004 L0: DXR end to end on one triangle),
 `--tree-lod0 <m>`, `--no-trees`, `--no-shadows`, `--no-foliage`,
 `--foliage-debug 1`, and the post chain's `--no-taa`, `--no-ao`,
-`--no-contact`, `--no-post` and `--post-debug 1|2|4` (AO alone, contact
-shadows alone, how each puddle pixel found its reflection), and exposure's `--ev-comp <stops>`, `--ev100 <v>` (fixed,
+`--no-contact`, `--no-post` and `--post-debug 1|2|4|5` (AO alone, contact
+shadows alone, how each puddle pixel found its reflection, the clouds' shadow on the key light), and exposure's `--ev-comp <stops>`, `--ev100 <v>` (fixed,
 no meter), `--tonemap 0|1|2` (raw pre-L1 path / AgX / fitted ACES),
 `--agx-sat` and `--agx-power`. `--sea-shot` only PLACES the camera: pair it with `--shot`,
 or it falls through to the window loop with no window and never exits. `--walk` takes `--uncapped` to time frames at ground
@@ -918,11 +918,22 @@ archetypes.json `clouds` block. F3 / `--no-clouds`.
   cumulonimbus 8); base shape remapped by its Worley octaves x a height
   profile by type, coverage as a threshold, edges eroded by the detail
   volume, sheared downwind with height. Beyond the map, the storm's mean.
-- **Coverage is calibrated to the field**: threshold 0.7 x (1 - coverage).
-  Schneider's plain 1 - coverage let nothing stand under half cover, and a
-  map varying round 0.5 left the whole sky over the world EMPTY while clouds
-  showed past +-64 km, where the mean took over -- that looked like a broken
-  map; `BIOMES_CLOUDS_DBG=1` paints the weather map over the screen.
+- **Coverage is the field's own QUANTILE, measured.** The shaped field
+  (Perlin-Worley remapped, times the height profile) is FLAT: its peak along
+  a sun ray lies between 0.80 and 0.90 over 80% of the sky in any weather
+  (`BIOMES_CLOUDS_DBG=4` writes that peak into the shadow map and the shot
+  report prints its percentiles). So the threshold is cut at the field's
+  (1 - coverage) quantile, 0.895 - 0.125 x cov - 0.08 x cov^8 (the last term
+  closes the deck), and past it a cloud ramps to full density over 0.06, so
+  the detail erosion shapes edges rather than deleting thin clouds. The
+  history: Schneider's plain 1 - coverage let nothing stand under half
+  cover; then 0.7 x (1 - coverage) sat BELOW the whole field, so coverage was
+  really set by a density scale and the erosion, the sky went from scattered
+  to closed between coverage 0.2 and 0.4, and "50% reads as overcast" was
+  this. Sunlit share of the shadow map at noon now: coverage 0.17 85%, 0.35
+  70%, 0.45 60%, 0.56 45%, 0.68 20%, 0.80 2%, closed from 0.93. The storm's
+  coverage reaches 1 at storm 0.85 (`clouds.cpp`), where the rain is a
+  downpour. `BIOMES_CLOUDS_DBG=1` paints the weather map over the screen.
 - **How bad the weather is belongs to the TIME, not the place**: the storm
   dial sets coverage and type for the whole sky, and the map only varies them
   +-0.15. At +-0.55 its low spots were clear holes kilometres wide, and with
@@ -944,8 +955,8 @@ archetypes.json `clouds` block. F3 / `--no-clouds`.
   below by height in the cloud; energy-conserving steps, out at T 1%.
   Far clouds fade into the sky-view table over `haze_km`.
 - **C2, the light under cloud**: a 512^2 cloud-shadow map, +-6 km, of the
-  key light's transmittance through the layer (16 taps, no detail, a floor
-  of 10% for light scattered through), indexed in the cloud BASE's plane so
+  key light's DIRECT beam through the layer (16 taps through the layer's
+  real height, with the detail erosion, no floor), indexed in the cloud BASE's plane so
   a ground point finds its texel by sliding along the light -- one map for
   every terrain height. The composite multiplies the DIRECT target by it, so
   terrain, trees and grass darken in one place and no lit pipeline changed.
@@ -1077,11 +1088,23 @@ archetypes.json `clouds` block. F3 / `--no-clouds`.
     everywhere the sky reaches -- a beach does not dry faster than a bog.
 - **Not done (later phases)**: lightning (C5); rain on the camera lens;
   underwater the rain still draws; no rain in the RT or GI passes (nothing needs it);
-  1/16-pixel-a-frame cloud rendering (Decima's cost path); at 50% coverage
-  the sky reads nearer overcast than broken, and the base can look like a
-  flat ceiling from the ground -- tuning. On the badlands cliff at storm
-  0.9 the ground was still in sunlight: the cloud shadow there had a gap,
-  not investigated.
+  1/16-pixel-a-frame cloud rendering (Decima's cost path); the base can
+  look like a flat ceiling from the ground -- tuning.
+- **"The sun through a gap in the storm" was the shadow's 10% FLOOR, not a
+  gap.** The badlands lay in hard sun at storm 0.9 under a closed deck.
+  `--post-debug 5` (the cloud shadow on the key light) read exactly 0.1 on
+  every ground pixel: the floor was meant as "light scattered through", but
+  the composite multiplies the DIRECT target, so 10% of a 100 klx sun was
+  10 klx of sharp-shadowed beam beside a 14 klx sky, and auto-exposure
+  brightened it back. Scattered light comes out diffuse; the overcast sky
+  term stands for it. With the floor gone the map turned out opaque at
+  EVERY coverage, which the floor had hidden: the shadow march skipped the
+  detail erosion, so the faint fringe the eye never sees made every 600 m
+  step opaque. Hence the erosion in the march, the taps fitted to the
+  layer, and the coverage recalibration above. The shot report's `cloud
+  shadow:` line (sunlit share of the whole map, mean T) is the instrument --
+  one view's pixels sample too little sky to tell drift from calibration.
+  Cost: walking within noise, clouds on or off.
 
 ### The atmosphere and time of day (ADR-004 L2)
 
