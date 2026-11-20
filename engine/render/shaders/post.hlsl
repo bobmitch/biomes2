@@ -48,9 +48,10 @@ cbuffer PostConstants : register(b0) {
     float3 sky_sun_dir;  float ssgi_radius;     // the sun and moon themselves, for their disks; the bounce's reach, m (0 off)
     float3 sky_moon_dir; float ssgi_thickness;  // the thickness assumed behind each depth sample, m
     float3 sun_disk;     float cam_sky;      // disk radiance seen from the camera, nits; cam_sky: DDGI's share of open sky at the eye
-    float3 moon_disk;    float pad5;
+    float3 moon_disk;    float clouds_on;   // ADR-005: the clouds' resolved textures at t12, t13
     float3 cam_fwd;      float fog_on;       // the mist (L4): fog.hlsl's integrated volume
     float  fog_near;     float fog_log_ratio; float rt_shadows; float rt_sky;   // L5's traced key-light visibility, L6's traced sky
+    float4 cloud_shadow; // ADR-005 C2: the cloud-shadow map's centre x, z (cloud-base plane), half extent m, base altitude m
 };
 
 Texture2D<float>  g_depth   : register(t0);
@@ -65,6 +66,9 @@ Texture3D<float4> g_ap      : register(t8);   // atmosphere.hlsl: in-scatter (rg
 Texture3D<float4> g_fog     : register(t9);   // fog.hlsl: in-scatter (rgb), transmittance (a), to each slice's far side
 Texture2D<float2> g_rtvis   : register(t10);  // rt_shadow.hlsl: x the key light's visibility, y the sky's, traced
 Texture2D<float4> g_ssgi_view : register(t11); // cs_ssgi's output, for --post-debug 3 (UAV-bound in cs_ssgi itself)
+Texture2D<float4> g_clouds     : register(t12); // clouds.hlsl, quarter resolution: in-scatter (rgb), transmittance (a)
+Texture2D<float>  g_cloud_dist : register(t13); // ... the cloud's distance, km
+Texture2D<float>  g_cloud_shadow : register(t14); // clouds.hlsl cs_shadow: the key light through the clouds, top-down
 
 RWTexture2D<float>  u_ao    : register(u0);
 RWTexture2D<float4> u_scene : register(u1);
@@ -323,7 +327,13 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
         const float3 d = normalize(world_at(uv, 1.0f) - cam_pos);
         const float vis = saturate(amb.g / kSkyClearG);
         const float4 apf = aerial(uv, far_plane);
-        float3 c = dir * apf.a + apf.rgb * (1.0f - vis) + sky_at(d) * vis;
+        // The clouds (ADR-005) in front of the sky, the sun's disk behind them.
+        float3 sky = sky_at(d);
+        if (clouds_on > 0.5f) {
+            const float4 cl = g_clouds.SampleLevel(g_linear, uv, 0);
+            sky = sky * cl.a + cl.rgb;
+        }
+        float3 c = dir * apf.a + apf.rgb * (1.0f - vis) + sky * vis;
         // The whole depth of the mist: it hides the horizon, as it should.
         const float4 mf = mist(uv, 1e9f);
         u_scene[p] = float4(c * mf.a + mf.rgb, 1.0f);
@@ -343,7 +353,17 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     // canopy. It scales all of the ambient target, so a local light under a
     // tree is dimmed with the sky until DDGI separates them.
     const float skv = rt_sky > 0.5f ? g_rtvis[p].y : 1.0f;
-    float3 c = dir * (cs * rtv) + amb * (ao * skv);
+    // The clouds' shadow (ADR-005 C2): the key light through the cloud layer
+    // over this point, from the top-down map, slid along the light onto the
+    // cloud base's plane. Applied to the DIRECT target only, so terrain, trees
+    // and grass all darken in one place and the sky light stays.
+    float cls = 1.0f;
+    if (clouds_on > 0.5f && sun_dir.y > 0.03f) {
+        const float2 q = P.xz + sun_dir.xz * ((cloud_shadow.w - P.y) / sun_dir.y);
+        const float2 suv = (q - cloud_shadow.xy) / (2.0f * cloud_shadow.z) + 0.5f;
+        if (all(suv > 0.0f) && all(suv < 1.0f)) cls = g_cloud_shadow.SampleLevel(g_linear, suv, 0);
+    }
+    float3 c = dir * (cs * rtv * cls) + amb * (ao * skv);
     // The atmosphere between the eye and the surface.
     // The haze assumes sunlit, sky-lit air the whole way. Near the camera
     // the air is lit as the camera is -- in a sealed chamber, not at all --
@@ -354,6 +374,14 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     const float dist = length(P - cam_pos);
     const float4 ap = aerial(uv, dist);
     c = c * ap.a + ap.rgb * lerp(cam_sky, 1.0f, saturate((dist - 64.0f) / 192.0f));
+    // A cloud nearer than the surface (a mountain behind low cloud) lies over it.
+    if (clouds_on > 0.5f) {
+        const float cd = g_cloud_dist.SampleLevel(g_linear, uv, 0) * 1000.0f;
+        if (cd > 0.0f && cd < dist) {
+            const float4 cl = g_clouds.SampleLevel(g_linear, uv, 0);
+            c = c * cl.a + cl.rgb;
+        }
+    }
     // Then the mist, which is nearer than the bulk of the air.
     const float4 mf = mist(uv, dot(P - cam_pos, cam_fwd));
     c = c * mf.a + mf.rgb;

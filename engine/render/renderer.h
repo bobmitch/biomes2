@@ -23,6 +23,7 @@
 #include "engine/render/fog.h"
 #include "engine/render/weather.h"
 #include "engine/render/ocean_detail.h"
+#include "engine/render/clouds.h"
 #include "engine/render/rt_scene.h"
 #include "engine/render/canopy.h"
 #include "engine/render/ddgi.h"
@@ -174,6 +175,9 @@ public:
     bool  ssr() const { return ssr_on_; }
     // The RT scene's trees lean with their meshes (tree_sway.h); off for A/B.
     void  set_rt_sway(bool on) { rt_sway_ = on; }
+    void  set_clouds(bool on) { clouds_on_ = on; }
+    bool  clouds() const { return clouds_on_; }
+    const Clouds& cloud_layer() const { return clouds_; }
     void  set_wave_detail(bool on) { detail_on_ = on; }
     bool  wave_detail() const { return detail_on_; }
     const OceanDetail& ocean() const { return ocean_; }
@@ -567,6 +571,11 @@ private:
     // The ripples: two FFT tiles a frame (ocean_detail.h). F4, --no-wave-detail.
     OceanDetail ocean_;
     bool rt_sway_ = true;
+    // Volumetric clouds (ADR-005, clouds.h). F3, --no-clouds.
+    Clouds clouds_;
+    bool clouds_on_ = true;
+    float clouds_cam_[3] = {1e9f, 1e9f, 1e9f};
+    void record_clouds();
     bool detail_on_ = true;
     float ocean_t_ = -1.0f;
     // archetypes.json's "water": what the sea's body does to light.

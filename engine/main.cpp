@@ -267,6 +267,11 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_renderer.weather().set_heading(h);
                 return 0;
             }
+            if (wp == VK_F3) {
+                // The volumetric clouds (ADR-005), for A/B.
+                g_renderer.set_clouds(!g_renderer.clouds());
+                return 0;
+            }
             if (wp == VK_F4) {
                 // The sea's ripples (FFT detail), for A/B.
                 g_renderer.set_wave_detail(!g_renderer.wave_detail());
@@ -962,6 +967,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     if (cmdline && std::string(cmdline).find("--no-ssr") != std::string::npos) g_renderer.set_ssr(false);
     if (cmdline && std::string(cmdline).find("--no-wave-detail") != std::string::npos) g_renderer.set_wave_detail(false);
     if (cmdline && std::string(cmdline).find("--rt-no-sway") != std::string::npos) g_renderer.set_rt_sway(false);
+    if (cmdline && std::string(cmdline).find("--no-clouds") != std::string::npos) g_renderer.set_clouds(false);
     if (no_lod_hold) g_renderer.set_lod_hold(false);
     {
         const std::string c2 = cmdline ? cmdline : "";

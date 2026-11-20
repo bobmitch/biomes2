@@ -898,6 +898,70 @@ and keeps AgX's hue handling, which a torch's orange will need.
   is real now and the sea is no better at noon (at sunset its glitter path
   is the best thing in the engine). L7 owns water reflections.
 
+### Volumetric clouds (ADR-005, phases C1 and C2)
+
+`docs/adr-005-clouds-and-rain.md` is the plan: Schneider's Nubis (Horizon
+Zero Dawn, SIGGRAPH 2015/2017) with Hillaire's integration and multiple
+scattering, then rain. `engine/render/clouds.{h,cpp}`, `shaders/clouds.hlsl`;
+archetypes.json `clouds` block. F3 / `--no-clouds`.
+
+- **Passes** (compute, before the composite, after the atmosphere's tables):
+  noise volumes once at startup (128^3 tileable Perlin-Worley + Worley
+  octaves, 32^3 Worley detail); a 512^2 weather map every frame over +-64 km
+  (coverage, type, precipitation from the storm dial and a 2D noise carried
+  at `drift_factor` x the ground wind's drift); the cloud-shadow map; the
+  march at quarter resolution each axis, jittered per frame; a temporal
+  resolve reprojected by each pixel's cloud distance and clamped to the new
+  3x3, written into a fixed `out` the composite reads (heap [83..108]).
+- **Field**: a spherical shell on the atmosphere's planet (y = 0 on its
+  surface), base 1.5 km, the top by type (stratus 0.4 km, cumulus 1.8,
+  cumulonimbus 8); base shape remapped by its Worley octaves x a height
+  profile by type, coverage as a threshold, edges eroded by the detail
+  volume, sheared downwind with height. Beyond the map, the storm's mean.
+- **Coverage is calibrated to the field**: threshold 0.7 x (1 - coverage).
+  Schneider's plain 1 - coverage let nothing stand under half cover, and a
+  map varying round 0.5 left the whole sky over the world EMPTY while clouds
+  showed past +-64 km, where the mean took over -- that looked like a broken
+  map; `BIOMES_CLOUDS_DBG=1` paints the weather map over the screen.
+- **How bad the weather is belongs to the TIME, not the place**: the storm
+  dial sets coverage and type for the whole sky, and the map only varies them
+  +-0.15. At +-0.55 its low spots were clear holes kilometres wide, and with
+  the clouds barely drifted early in a session one sat over spawn: the sky
+  looked closed at the horizon and open above you wherever you stood (a
+  player's report). `BIOMES_CLOUDS_DBG=2` charts the real cover top-down --
+  a ray straight up from the ground under every pixel over +-10 km, bright
+  clear, dark cloud -- which the view from the ground cannot show (straight
+  up it looks between the clouds, at the horizon through all of them); `=3`
+  paints the camera's own rays' transmittance.
+- **Check where a looking-up camera stands**: `--ground` over water puts it on
+  the seabed, and the sky through the water's underside shows no clouds --
+  which read as a second cloud bug until the shot report said "over 3.8 m of
+  water".
+- **Lighting**: a 6-tap growing cone march to the key light (sun or moon);
+  the light reaching each sample from the atmosphere's transmittance table;
+  dual-lobe Henyey-Greenstein; four Hillaire octaves of multiple
+  scattering; Schneider's powder; ambient from the sky above and the ground
+  below by height in the cloud; energy-conserving steps, out at T 1%.
+  Far clouds fade into the sky-view table over `haze_km`.
+- **C2, the light under cloud**: a 512^2 cloud-shadow map, +-6 km, of the
+  key light's transmittance through the layer (16 taps, no detail, a floor
+  of 10% for light scattered through), indexed in the cloud BASE's plane so
+  a ground point finds its texel by sliding along the light -- one map for
+  every terrain height. The composite multiplies the DIRECT target by it, so
+  terrain, trees and grass darken in one place and no lit pipeline changed.
+  And `fill_light` greys the sky terms (not the ground's bounce) towards
+  their luminance by coverage^2 x 0.9: an overcast sky is as bright as a
+  clear one but colourless.
+- The sea's reflections read the composited sky, so clouds reflect.
+- **Cost** at 2560 x 1440: walking +0.1 ms, a flight at 300 m +0.1-0.25 ms
+  (median). One gale flight showed a 99th-percentile frame of 22 ms that a
+  rerun did not (8.0 ms); the 40 ms worst frames appear with clouds off too.
+- **Not done (later phases)**: the sea's glint and the mist's in-scatter do
+  not see the cloud shadows yet; no rain (C3), wet world (C4) or lightning
+  (C5); 1/16-pixel-a-frame rendering (Decima's cost path); at 50% coverage
+  the sky reads nearer overcast than broken, and the base can look like a
+  flat ceiling from the ground -- tuning.
+
 ### The atmosphere and time of day (ADR-004 L2)
 
 Hillaire 2020 on Bruneton's Earth, with a real day's aerosol. The model is

@@ -4,6 +4,7 @@
 #include "engine/render/lighting_units.h"
 #include "engine/render/atmosphere.h"
 #include "worldgen/assign/json_lite.h"
+#include "engine/render/clouds.h"
 
 #include <d3dcompiler.h>
 #include <algorithm>
@@ -76,8 +77,8 @@ static_assert(sizeof(WaterConstants) == 608, "WaterConstants must match water.hl
 // Heap slots past the RT denoiser's: the sea's copies of the lit scene and of
 // depth, which it reads while it draws into the one and tests against the
 // other.
-// [81..82] the ripples' tiles (OceanDetail).
-const UINT kWaterSceneSrv = 79, kWaterDepthSrv = 80, kHeapSlots = 83;
+// [81..82] the ripples' tiles (OceanDetail); [83..106] the clouds (Clouds).
+const UINT kWaterSceneSrv = 79, kWaterDepthSrv = 80, kHeapSlots = Clouds::kHeapEnd;
 static_assert(RtDenoise::kHeapEnd <= kWaterSceneSrv, "the sea's heap slots overlap the denoiser's");
 
 // Matches cbuffer ShadowConstants in shadow.hlsli: 368 bytes, in a 512-byte buffer.
@@ -205,11 +206,12 @@ struct PostConstants {
     float sky_sun_dir[3];  float ssgi_radius;
     float sky_moon_dir[3]; float ssgi_thickness;
     float sun_disk[3];     float cam_sky;
-    float moon_disk[3];    float pad5;
+    float moon_disk[3];    float clouds_on;
     float cam_fwd[3];      float fog_on;
     float fog_near;        float fog_log_ratio; float rt_shadows; float rt_sky;
+    float cloud_shadow[4]; // ADR-005 C2: the cloud-shadow map's centre x, z, half extent, base altitude
 };
-static_assert(sizeof(PostConstants) == 416, "PostConstants must match post.hlsl");
+static_assert(sizeof(PostConstants) == 432, "PostConstants must match post.hlsl");
 
 // Matches cbuffer FogConstants in fog.hlsl.
 struct FogConstants {
@@ -1915,6 +1917,9 @@ bool Renderer::create_fog(std::string& error) {
     if (!weather_.load("worldgen/data/archetypes.json", error)) return false;
     if (!load_water_optics("worldgen/data/archetypes.json", error)) return false;
     if (!ocean_.init(device_.Get(), srv_heap_.Get(), error)) return false;
+    if (!clouds_.load("worldgen/data/archetypes.json", error)) return false;
+    if (!clouds_.init(device_.Get(), srv_heap_.Get(), trans_tex_.Get(), sky_view_tex_.Get(),
+                      width_, height_, error)) return false;
     weather_.set_seed(world_.field_id());
     update_weather(0.0);
 
@@ -2720,6 +2725,20 @@ void Renderer::fill_light(float out[7][4]) const {
         for (int k = 0; k < 3; ++k) out[i][k] = src[i][k];
         out[i][3] = 0.0f;
     }
+    // Under cloud (ADR-005 C2) the sky light loses its colour, not its
+    // strength: an overcast sky is about as bright as a clear one, but grey,
+    // and it is the clouds' own base the land is lit by. Each sky term goes to
+    // its luminance as the deck closes; the sun itself is taken away per pixel
+    // by the cloud-shadow map in the composite.
+    if (clouds_on_ && clouds_.ready()) {
+        const float cov = clouds_.coverage();
+        const float g = cov * cov * 0.9f;
+        for (int i = 2; i < 7; ++i) {
+            if (i == 3) continue;   // the ground's bounce keeps the ground's colour
+            const float y = 0.2126f * out[i][0] + 0.7152f * out[i][1] + 0.0722f * out[i][2];
+            for (int k = 0; k < 3; ++k) out[i][k] = out[i][k] + (y - out[i][k]) * g;
+        }
+    }
 }
 
 bool Renderer::create_atmosphere(std::string& error) {
@@ -3195,6 +3214,7 @@ void Renderer::resize(UINT width, UINT height) {
     create_rtvs(ignored);
     create_depth(ignored);
     create_post_targets(ignored);
+    if (clouds_.ready()) clouds_.resize(width_, height_, ignored);
     if (rt_ok_) rt_den_.resize(width_, height_, ignored);
     hist_valid_ = false;
 }
@@ -3310,7 +3330,12 @@ bool Renderer::create_post_pipelines(std::string& error) {
         sr.NumDescriptors = 9;
         // t9, the mist's integrated volume, sits at heap [32]: 29 past the
         // table's start at [3].
-        D3D12_DESCRIPTOR_RANGE sr2[4] = {sr, {}, {}, {}};
+        D3D12_DESCRIPTOR_RANGE sr2[5] = {sr, {}, {}, {}, {}};
+        // t12..t13, the clouds' resolved in-scatter and distance (ADR-005).
+        sr2[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr2[4].NumDescriptors = 3;   // t14, the cloud-shadow map, right after (Clouds::kShadowSrv)
+        sr2[4].BaseShaderRegister = 12;
+        sr2[4].OffsetInDescriptorsFromTableStart = Clouds::kOutSrv - 3;
         // t11, the screen-space bounce (L6), at heap [45], for --post-debug 3.
         sr2[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr2[3].NumDescriptors = 1;
@@ -3335,7 +3360,7 @@ bool Renderer::create_post_pipelines(std::string& error) {
         D3D12_ROOT_PARAMETER p[6] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[1].DescriptorTable.NumDescriptorRanges = 4;
+        p[1].DescriptorTable.NumDescriptorRanges = 5;
         p[1].DescriptorTable.pDescriptorRanges = sr2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[2].DescriptorTable.NumDescriptorRanges = 1;
@@ -3530,6 +3555,37 @@ void Renderer::record_water() {
     tr(depth_.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, read);
 }
 
+// The clouds' frame (ADR-005): the camera, unjittered, this frame's and
+// last; the key light; the sky; the weather.
+void Renderer::record_clouds() {
+    Clouds::Frame f = {};
+    invert4(view_proj_nj_, f.inv_view_proj);
+    std::memcpy(f.prev_view_proj, prev_vp_, sizeof f.prev_view_proj);
+    float jump = 0.0f;
+    for (int k = 0; k < 3; ++k) {
+        f.cam_pos[k] = cur_cam_[k];
+        const float dk = cur_cam_[k] - clouds_cam_[k];
+        jump += dk * dk;
+        clouds_cam_[k] = cur_cam_[k];
+        f.key_dir[k] = sky_frame_.key_dir[k];
+        f.key_lux_top[k] = sky_frame_.key_is_moon ? sky_frame_.moon_lux_top[k] : sky_frame_.sun_lux_top[k];
+        f.sky_mean[k] = sky_frame_.sky_mean[k];
+        f.ground[k] = sky_frame_.ground[k];
+    }
+    f.time = cur_time_;
+    f.cam_alt_km = sky_frame_.cam_alt_km;
+    f.storm = weather_now_.storm;
+    f.wind_dir[0] = weather_now_.wind_dir[0];
+    f.wind_dir[1] = weather_now_.wind_dir[1];
+    f.drift[0] = weather_now_.drift[0];
+    f.drift[1] = weather_now_.drift[1];
+    // A camera that jumped (Tab, a teleport, the first frame) starts over.
+    f.history_valid = jump < 400.0f;
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
+    cmd_->SetDescriptorHeaps(1, heaps);
+    clouds_.record(cmd_.Get(), UINT(frame_), f);
+}
+
 void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     const bool wire = mode_ == Mode::Wireframe;
     // Last time this frame index ran, its stamps were resolved; its fence
@@ -3585,6 +3641,8 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     pc.cam_alt_km = sky_frame_.cam_alt_km;
     for (int k = 0; k < 3; ++k) pc.cam_fwd[k] = cur_fwd_[k];
     pc.fog_on = (fog_on_ && !wire) ? 1.0f : 0.0f;
+    pc.clouds_on = (clouds_on_ && clouds_.ready() && !wire) ? 1.0f : 0.0f;
+    clouds_.shadow_params(pc.cloud_shadow);
     pc.fog_near = kFogNear;
     pc.fog_log_ratio = std::log(kFogFar / kFogNear);
     pc.rt_shadows = (rt_shadows_ && rt_ok_ && !wire) ? 1.0f : 0.0f;
@@ -3662,6 +3720,8 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
         cmd_->EndQuery(post_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q0 + 2);
         cmd_->EndQuery(post_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q0 + 3);
     }
+    // The clouds (ADR-005), before the composite that lays them over the sky.
+    if (clouds_on_ && clouds_.ready() && !wire) record_clouds();
     tr(depth_.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, read);
     tr(hdr_direct_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
     tr(hdr_ambient_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
