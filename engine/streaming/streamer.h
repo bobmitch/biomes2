@@ -49,8 +49,8 @@ namespace engine {
 // problem. Five reaches +/-900 m, and on a 20 km disc that is 0.8% of the
 // world's area -- enough while Track B was looking at a sine heightfield, and
 // not enough the moment M1 put the real generator underneath it. Layers 2 and
-// 3 exist to produce islandness (7.2 landmasses a seed, the spawn mass holding
-// about three quarters of the land) and the design says explicitly that
+// 3 exist to produce islandness (8.1 landmasses a seed, the spawn mass holding
+// about two thirds of the land) and the design says explicitly that
 // whether a world reads as a continent or an archipelago is a feel call made
 // by LOOKING. From the ground at +/-900 m there is no coastline in sight but
 // your own.

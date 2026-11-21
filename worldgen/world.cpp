@@ -1105,4 +1105,116 @@ SeedWorld build_world(uint64_t world_seed,
     return w;
 }
 
+namespace {
+
+// The calmest biome's share of the blend at a point; several of its cells
+// can be among the four.
+float calm_weight(const SeedWorld& w, const WorldParams& wp, int calm, float x, float z) {
+    int   bio[4];
+    float bw[4];
+    const int nb = biome_mix(w, wp, x, z, bio, bw);
+    float s = 0.0f;
+    for (int k = 0; k < nb; ++k) if (bio[k] == calm) s = s + bw[k];
+    return s;
+}
+
+}  // namespace
+
+SpawnPoint find_spawn(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table) {
+    const float kStep      = 16.0f;   // search grid, metres
+    const float kSpawnCore = 0.75f;   // calmest weight at the point
+    const float kRingCalm  = 0.5f;    // ... and at each ring point
+    const float kRing      = 60.0f;   // ring radius, metres
+    const float kDry       = 1.5f;    // metres above sea at the point
+    const float kRingDry   = 0.5f;    // ... and on the ring
+    const float kMaxGrade  = 0.25f;   // rise over run, point to each ring point
+    const float kTrunk     = 2.5f;    // metres clear of any trunk
+
+    SpawnPoint out;
+    if (table.size() == 0) return out;
+    int calm = 0;
+    for (size_t b = 1; b < table.size(); ++b)
+        if (table[b].danger_preferred < table[static_cast<size_t>(calm)].danger_preferred)
+            calm = static_cast<int>(b);
+    out.biome = calm;
+
+    const float R  = wp.radius;
+    const float sea = table.sea_level;
+    // Eight ring directions without trigonometry: the axes and the diagonals.
+    const float d = 0.70710678f;
+    const float rx[8] = {1.0f, d, 0.0f, -d, -1.0f, -d, 0.0f, d};
+    const float rz[8] = {0.0f, d, 1.0f, d, 0.0f, -d, -1.0f, -d};
+
+    auto height_at = [&](float x, float z) {
+        const float r = std::sqrt(x * x + z * z) / R;
+        return terrain_height(w, wp, table, x, z, r);
+    };
+    auto passes = [&](float x, float z, float& ground) {
+        if (calm_weight(w, wp, calm, x, z) < kSpawnCore) return false;
+        ground = height_at(x, z);
+        if (ground < sea + kDry) return false;
+        for (int k = 0; k < 8; ++k) {
+            const float px = x + rx[k] * kRing, pz = z + rz[k] * kRing;
+            if (calm_weight(w, wp, calm, px, pz) < kRingCalm) return false;
+            const float h = height_at(px, pz);
+            if (h < sea + kRingDry) return false;
+            const float dh = h - ground;
+            if (dh > kMaxGrade * kRing || -dh > kMaxGrade * kRing) return false;
+        }
+        float rw = 0.0f, rd = 0.0f;
+        const float dr = nearest_river(w, wp, x, z, rw, rd);
+        if (dr < rw + 10.0f) return false;
+        const float cell = table.trees.cell;
+        const int ci = static_cast<int>(std::floor(x / cell));
+        const int cj = static_cast<int>(std::floor(z / cell));
+        for (int j = cj - 1; j <= cj + 1; ++j) {
+            for (int i = ci - 1; i <= ci + 1; ++i) {
+                TreeInstance t;
+                if (!tree_at_cell(w, wp, table, i, j, t)) continue;
+                const float tx = t.x - x, tz = t.z - z;
+                if (tx * tx + tz * tz < kTrunk * kTrunk) return false;
+            }
+        }
+        return true;
+    };
+
+    // Square rings of grid points outward from the origin. A point found in
+    // ring k may not be the nearest -- ring k + 1's middle is nearer than
+    // ring k's corner -- so the search carries on until a ring cannot hold
+    // anything nearer. Ties go to the first point visited.
+    float best_d2 = 3.4e38f;
+    bool  found = false;
+    float fb_w = -1.0f, fb_d2 = 3.4e38f;
+    const int kmax = static_cast<int>(R / kStep);
+    for (int k = 0; k <= kmax; ++k) {
+        const float inner = static_cast<float>(k) * kStep;
+        if (found && inner * inner > best_d2) break;
+        for (int j = -k; j <= k; ++j) {
+            for (int i = -k; i <= k; ++i) {
+                if (i != -k && i != k && j != -k && j != k) continue;   // the ring only
+                const float x = static_cast<float>(i) * kStep;
+                const float z = static_cast<float>(j) * kStep;
+                const float d2 = x * x + z * z;
+                if (d2 > 0.9f * 0.9f * R * R || d2 >= best_d2) continue;
+                float g = 0.0f;
+                if (passes(x, z, g)) {
+                    best_d2 = d2; found = true;
+                    out.x = x; out.z = z; out.ground = g; out.strict = true;
+                    out.weight = calm_weight(w, wp, calm, x, z);
+                } else if (!found) {
+                    const float cw = calm_weight(w, wp, calm, x, z);
+                    if (cw > fb_w || (cw == fb_w && d2 < fb_d2)) {
+                        const float h = height_at(x, z);
+                        if (h >= sea + kDry) {
+                            fb_w = cw; fb_d2 = d2;
+                            out.x = x; out.z = z; out.ground = h; out.weight = cw;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
 }  // namespace worldgen

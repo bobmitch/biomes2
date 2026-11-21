@@ -84,10 +84,11 @@ struct WorldParams {
     float sea_level         = 0.0f;
     // Stand-in only: shifts the continent mask to hit the 55% land target.
     // In the real generator this is sea level, which is a world constant.
-    // Solved globally for a 35% MEAN land fraction, then baked. Seeds run
-    // about 31-41% around it, and that spread is where the islandness is:
-    // the archipelagos are its low tail, not a separate mode.
-    float land_offset       = -0.0248f;
+    // Solved globally for a 32% MEAN land fraction, then baked (v16; 35% and
+    // -0.0248 before). Seeds run about 28-36% around it, and that spread is
+    // where the islandness is: the archipelagos are its low tail, not a
+    // separate mode. validate --land-sweep / --land-target re-solve it.
+    float land_offset       = -0.0540f;
 
     // layer 1
     float danger_w          = 0.60f;      // the feel parameter; see tools/validate/README.md
@@ -458,5 +459,22 @@ float terrain_density(const SeedWorld& w, const WorldParams& wp,
 // One seed, from scatter through quota assignment to drainage.
 SeedWorld build_world(uint64_t world_seed, const WorldParams& wp,
                       const ArchetypeTable& table, const AssignParams& ap);
+
+// --- the player's start ------------------------------------------------------
+// The point nearest the world's centre that stands well inside the CALMEST
+// biome (lowest danger_preferred -- nothing here knows its name): its blend
+// weight at least kSpawnCore there and a majority on a ring round it, dry,
+// gentle ground on that ring too, clear of rivers and of tree trunks. A pure
+// function of the seed. Downstream of the golden hash -- it moves nothing --
+// but it uses only + - * / and sqrt anyway, so every OS starts in one place.
+// If no point qualifies, the land point where the calmest biome weighs most.
+struct SpawnPoint {
+    float x = 0.0f, z = 0.0f;
+    float ground = 0.0f;     // terrain height there
+    float weight = 0.0f;     // the calmest biome's blend weight there
+    int   biome = -1;        // the calmest biome's index
+    bool  strict = false;    // true when every test passed; false is the fallback
+};
+SpawnPoint find_spawn(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table);
 
 }  // namespace worldgen

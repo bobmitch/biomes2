@@ -66,7 +66,13 @@ namespace worldgen {
 //      their size, not 0.40: set from the centre, an outcrop on a hillside
 //      showed its whole face downhill and read as a block standing on the
 //      slope rather than bedrock coming out of it.
-static const int kGeneratorVersion = 15;
+//  16  the home biome is wooded and the world a little more islandy. meadows'
+//      trees.cover 0.20 -> 0.85, so about a quarter of it is clearing rather
+//      than four fifths (layer 8 keeps 20.2% of its candidate cells against
+//      5.1%), and wetland's 0.45 -> 0.60; land_offset re-solved for a 32% mean land fraction, not 35%:
+//      8.1 landmasses a seed rather than 7.2, the spawn mass holding 67% of
+//      the land rather than 74% (200 seeds).
+static const int kGeneratorVersion = 16;
 
 }  // namespace worldgen
 

@@ -58,7 +58,7 @@
       "fog": {"density": 0.0012, "height": 90.0}, "material_id": 0, "water_level_offset": 0.0,
       "rocks": {"boulders": 0.04, "outcrops": 0.05, "cover": 0.25},
       "ground": {"grass": 1.00, "cover": 0.85, "height": [0.25, 0.60], "color": [0.28, 0.44, 0.11], "dry_color": [0.58, 0.52, 0.26], "dry": 0.15, "narrow": 0, "flowers": 0.10, "bushes": 0.012},
-      "trees": {"density": 0.30, "cover": 0.20, "species": {"oak": 3, "birch": 2, "maple": 1}}
+      "trees": {"density": 0.30, "cover": 0.85, "species": {"oak": 3, "birch": 2, "maple": 1}}
     },
     {
       "name": "forest",
@@ -80,7 +80,7 @@
       "fog": {"density": 0.0025, "height": 60.0}, "material_id": 2, "water_level_offset": 0.0,
       "rocks": {"boulders": 0.02, "outcrops": 0.00, "cover": 0.20},
       "ground": {"grass": 0.95, "cover": 0.80, "height": [0.55, 1.15], "color": [0.30, 0.42, 0.15], "dry_color": [0.55, 0.50, 0.28], "dry": 0.25, "narrow": 1, "flowers": 0.02, "bushes": 0.03},
-      "trees": {"density": 0.35, "cover": 0.45, "species": {"willow": 3, "alder": 3, "birch": 2}}
+      "trees": {"density": 0.35, "cover": 0.60, "species": {"willow": 3, "alder": 3, "birch": 2}}
     },
     {
       "name": "highland",

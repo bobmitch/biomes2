@@ -1565,6 +1565,7 @@ int main(int argc, char** argv) {
     bool entrances_probe = false;
     bool tree_quantiles = false;
     bool tree_reasons = false;
+    bool spawns = false;
     bool tree_sites = false;
     uint64_t tree_sites_seed = 0;
     bool entrance_section = false;
@@ -1607,6 +1608,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--entrances"))               entrances_probe = true;
         else if (!std::strcmp(argv[i], "--tree-quantiles"))          tree_quantiles = true;
         else if (!std::strcmp(argv[i], "--tree-reasons"))            tree_reasons = true;
+        else if (!std::strcmp(argv[i], "--spawns"))                  spawns = true;
         else if (!std::strcmp(argv[i], "--tree-sites") && i + 1 < argc) {
             tree_sites = true;
             tree_sites_seed = std::strtoull(argv[++i], nullptr, 10);
@@ -1843,6 +1845,29 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (spawns) {
+        // Where find_spawn puts the player, per seed: the engine's start.
+        std::vector<float> dist;
+        int strict = 0;
+        double ms = 0.0;
+        for (int s = 0; s < nseeds; ++s) {
+            const uint64_t seed = 0x5EEDull * 1000003ull + static_cast<uint64_t>(s);
+            const SeedWorld sw = build_world(seed, wp, table, ap);
+            const auto t0 = std::chrono::steady_clock::now();
+            const SpawnPoint sp = find_spawn(sw, wp, table);
+            ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            const float d = std::sqrt(sp.x * sp.x + sp.z * sp.z);
+            dist.push_back(d);
+            if (sp.strict) ++strict;
+            std::printf("  seed %3d  (%7.0f, %7.0f)  %5.0f m from centre, ground %5.1f m, calm weight %.2f%s\n",
+                        s, sp.x, sp.z, d, sp.ground, sp.weight, sp.strict ? "" : "  FALLBACK");
+        }
+        std::sort(dist.begin(), dist.end());
+        std::printf("start point over %d seeds: %d strict; distance from centre median %.0f m, max %.0f m; "
+                    "search %.1f ms a seed\n", nseeds, strict, dist[dist.size() / 2], dist.back(), ms / nseeds);
+        return 0;
+    }
+
     if (tree_quantiles) {
         // The patch noise's distribution, which tree_cover_threshold in
         // field.h bakes. For cover c the threshold is the value the noise
@@ -1986,7 +2011,7 @@ int main(int argc, char** argv) {
     if (land_sweep) {
         // The band worth choosing from. 56 is roughly where we ship; the low
         // end is where quota granularity starts to bite.
-        const float targets[] = {0.50f, 0.45f, 0.40f, 0.35f, 0.30f};
+        const float targets[] = {0.40f, 0.35f, 0.32f, 0.30f, 0.28f};
         std::printf("land fraction sweep, %d seeds per row, offset solved GLOBALLY for the mean\n",
                     nseeds);
         land_report_header();
@@ -2269,8 +2294,8 @@ int main(int argc, char** argv) {
         // A mean target plus a per-seed band, not a tight per-seed target.
         // The spread IS the islandness, so squeezing every seed onto the
         // mean would remove the archipelagos along with it.
-        const bool land_mean_ok = std::fabs(s.mean_land_frac - 0.35f) <= 0.02f;
-        std::snprintf(d, sizeof(d), "mean %.1f%% (target 35 +/- 2), seeds %.1f-%.1f%% "
+        const bool land_mean_ok = std::fabs(s.mean_land_frac - 0.32f) <= 0.02f;
+        std::snprintf(d, sizeof(d), "mean %.1f%% (target 32 +/- 2), seeds %.1f-%.1f%% "
                       "(band 26-45), %d outside",
                       100.0 * s.mean_land_frac, 100.0 * s.min_land_frac,
                       100.0 * s.max_land_frac, s.land_failures);

@@ -72,6 +72,17 @@ never worked. To drive cmake directly:
 cmake -S . -B build/cmake -G Ninja && cmake --build build/cmake
 ```
 
+**Spawn** is `worldgen::find_spawn`: the point nearest the centre that
+stands well inside the CALMEST biome (lowest `danger_preferred`; weight
+>= 0.75 there and a majority on a 60 m ring), on dry, gentle ground, clear of
+rivers and trunks. The engine opens the window over it, and `--walk`,
+`--flight`, `--fell`, `--tab-test`, `--lights-report` and `--shot`'s default
+vantage (70 m behind it, 22 m up) all start from it; `build/startup.txt`
+names it. `validate --spawns` lists it per seed (24 of 24 strict, median
+215 m from the centre, ~3 ms). It moves nothing in the golden hash.
+Before v16 every one of those started at a fixed (0, 0) or (10, -70), which
+on the default seed was wetland.
+
 `validate.exe`, `view.exe` and `engine.exe` all read data by paths relative to
 the repository root, so run them from there. `engine.exe --shot <path>` renders
 one frame at a fixed camera and writes a BMP without opening a window.
@@ -1951,9 +1962,10 @@ threshold as a literal `X%`. Whether a world should read as one continent or
 an archipelago is a feel call made on the contact sheet, not an assertion.
 `tools/validate/README.md` §8 has the measurement. **Land fraction is the
 lever** (`--land-target`, `--land-sweep`, and a slider in `view.exe` reading in
-percent). It is now a **35% mean** — below the percolation threshold, so a
-typical seed is an archipelago of about 7 landmasses with the spawn mass
-holding roughly three quarters of the land, and the worst seeds far less.
+percent). It is now a **32% mean** (v16; 35% before) — below the percolation
+threshold, so a typical seed is an archipelago of about 8 landmasses with the
+spawn mass holding roughly two thirds of the land, and the worst seeds far
+less. `validate --land-sweep` tabulates the neighbouring settings.
 The offset behind it is solved GLOBALLY for the mean and baked as a literal:
 solving per seed would flatten the spread the islandness comes from.
 

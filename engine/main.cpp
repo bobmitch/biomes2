@@ -57,6 +57,9 @@ engine::Renderer  g_renderer;
 engine::Camera    g_camera;
 engine::PhysicsWorld g_physics;
 engine::TreeFelling  g_felling;
+// Where the player starts: worldgen::find_spawn, the most central point well
+// inside the calmest biome. Every mode that starts "at spawn" starts here.
+worldgen::SpawnPoint g_spawn;
 bool  g_walk = false;
 bool  g_want_chop = false;
 bool  g_want_save = false, g_want_load = false;
@@ -1389,6 +1392,24 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 1;
     }
     g_felling.init(&g_renderer, &g_physics);
+    {
+        const double ts = engine::startup_now_ms();
+        const engine::WorldGpu& wg = g_renderer.world();
+        g_spawn = worldgen::find_spawn(wg.world(), wg.params(), wg.table());
+        // The window opens over the start, 40 m up, looking along +z at it.
+        g_camera.x = g_spawn.x;
+        g_camera.z = g_spawn.z - 60.0f;
+        g_camera.y = g_spawn.ground + 40.0f;
+        if (FILE* sf = std::fopen("build/startup.txt", "a")) {
+            std::fprintf(sf, "%9.0f ms  spawn at (%.0f, %.1f, %.0f), %.0f m from the centre, "
+                             "calmest biome %d at weight %.2f%s\n",
+                         engine::startup_now_ms() - ts, g_spawn.x, g_spawn.ground, g_spawn.z,
+                         std::sqrt(g_spawn.x * g_spawn.x + g_spawn.z * g_spawn.z),
+                         g_spawn.biome, g_spawn.weight,
+                         g_spawn.strict ? "" : " (FALLBACK: no point passed every test)");
+            std::fclose(sf);
+        }
+    }
     if (start_overlay) g_renderer.set_mode(engine::Mode::Wireframe);
     if (sea_state >= 0.0f) g_renderer.set_sea_state(sea_state);
     if (wind_mps >= 0.0f) g_renderer.weather().set_wind(wind_mps);
@@ -1585,7 +1606,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // --sea-shot has already placed the camera on a coast; do not stamp
         // the fixed vantage over it.
         if (!sea_shot) {
-            g_camera.x = 10.0f; g_camera.y = 46.0f; g_camera.z = -70.0f;
+            // The fixed vantage, relative to the start: 70 m behind it
+            // and 22 m up, looking at it.
+            g_camera.x = g_spawn.x + 10.0f; g_camera.z = g_spawn.z - 70.0f;
+            g_camera.y = g_renderer.world().height(g_camera.x, g_camera.z) + 22.0f;
             g_camera.yaw = 0.15f; g_camera.pitch = -0.42f;
             if (shot_altitude > 0.0) {
                 g_camera.y = float(shot_altitude);
@@ -3405,8 +3429,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (cl.find("--time") == std::string::npos) g_renderer.set_time_of_day(23.0f);
         g_renderer.set_vsync(false);
         const engine::WorldGpu& wg = g_renderer.world();
-        g_camera.x = 0.0f; g_camera.z = 0.0f;
-        g_camera.y = wg.height(0.0f, 0.0f) + 1.7f;
+        g_camera.x = g_spawn.x; g_camera.z = g_spawn.z;
+        g_camera.y = wg.height(g_camera.x, g_camera.z) + 1.7f;
         g_camera.yaw = 0.15f; g_camera.pitch = -0.12f;
         std::remove("build/lights_report.txt");
         // A running clock: flames flicker and the carried torch wanders, so
@@ -3536,8 +3560,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         };
 
         // Let the tree field fill round spawn before choosing.
-        g_camera.x = 0.0f; g_camera.z = 0.0f;
-        g_camera.y = wg.height(0.0f, 0.0f) + 2.0f;
+        g_camera.x = g_spawn.x; g_camera.z = g_spawn.z;
+        g_camera.y = wg.height(g_camera.x, g_camera.z) + 2.0f;
         for (int i = 0; i < 600 && !g_renderer.tree_field().settled(); ++i) { frame(0.0f); Sleep(5); }
         for (int i = 0; i < 5; ++i) frame(0.0f);
 
@@ -3801,8 +3825,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const engine::WorldGpu& wg = g_renderer.world();
         double fly_ms_sum = 0.0;
         unsigned long long fly_frames = 0;
-        g_camera.x = 0.0f; g_camera.z = 0.0f;
-        g_camera.y = wg.height(0.0f, 0.0f) + 40.0f;
+        g_camera.x = g_spawn.x; g_camera.z = g_spawn.z;
+        g_camera.y = wg.height(g_camera.x, g_camera.z) + 40.0f;
         g_camera.yaw = 1.0f; g_camera.pitch = -0.3f;
 
         LARGE_INTEGER tf, t0, tp;
@@ -4274,7 +4298,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         g_renderer.set_vsync(!walk_uncapped);
         std::vector<double> walk_ms;
         g_walk = true;
-        g_physics.place_character(0.0f, Spawn::above(0.0f, 0.0f), 0.0f);
+        g_physics.place_character(g_spawn.x, Spawn::above(g_spawn.x, g_spawn.z), g_spawn.z);
         g_physics.character_position(g_feet);
         g_camera.pitch = -0.2f;
         // --cam-dist <m>: the third-person camera's distance; 0 is the old
@@ -4490,7 +4514,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // at 60 Hz the camera covers a metre a frame and streaming has real
         // work to do, while uncapped it covers a fraction of a millimetre.
         g_renderer.set_vsync(flight_vsync);
-        g_camera.x = 0.0f; g_camera.y = 34.0f; g_camera.z = 0.0f;
+        g_camera.x = g_spawn.x; g_camera.z = g_spawn.z;
+        g_camera.y = g_spawn.ground + 10.0f;
         // --flight-from x y z: start somewhere else -- rough ground is where
         // the slot pool ran dry, and the origin is gentle.
         {
