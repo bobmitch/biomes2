@@ -30,16 +30,10 @@ cbuffer ShadowConstants : register(b2) {
     // Local lights' froxel clusters (ADR-004 L3, local_lights.hlsli).
     float4 l_cluster;          // tiles x, tiles y, slices, lights this frame
     float4 l_cluster2;         // near, slices / ln(far / near), screen width, screen height
-    float4 l_cam_fwd;          // the camera's forward, for a pixel's view depth
+    float4 l_cam_fwd;          // the camera's forward, for a pixel's view depth; w unused (was "RT shadows on")
     // The canopy map (ADR-004 L6, canopy.hlsli): its min corner x, z, the
     // height its crown heights are relative to; w 0 none, 1 built, 2 applied.
     float4 l_canopy;
-    // DDGI (ADR-004 L6, ddgi.hlsli): per cascade (base grid x, y, z, spacing);
-    // l_ddgi3.x on.
-    float4 l_ddgi0;
-    float4 l_ddgi1;
-    float4 l_ddgi2;
-    float4 l_ddgi3;
     // The screen-space bounce (ssgi.hlsli): last frame's jittered view-
     // projection and camera; w on.
     row_major float4x4 l_prev_vp;
@@ -185,16 +179,18 @@ float cascade_visibility(float3 world, float3 n) {
     return s;
 }
 
-// What a surface shader multiplies its key light by. Under --rt-shadows
-// (ADR-004 L5, l_cam_fwd.w set) it is 1: the surface writes unshadowed
-// direct light and the composite multiplies in the ray-traced visibility.
+// What a surface shader multiplies its key light by: the cascades (and the
+// far terrain shadow past them). Ray-traced shadows replaced this until they
+// were removed (git tag rt-last).
 float shadow_factor(float3 world, float3 n) {
-    if (l_cam_fwd.w > 0.5f) return 1.0f;
     return cascade_visibility(world, n);
 }
 
 #include "engine/render/shaders/canopy.hlsli"
-#include "engine/render/shaders/ddgi.hlsli"
+// A static linear clamp sampler at s3 in every lit pipeline's root signature,
+// once DDGI's (ddgi.hlsli, removed with hardware RT); the forest map, the
+// heightfield GI, the screen-space bounce and the wet world sample through it.
+SamplerState g_gi_linear : register(s3);
 #include "engine/render/shaders/ssgi.hlsli"
 #include "engine/render/shaders/hfgi.hlsli"
 

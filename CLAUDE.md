@@ -68,10 +68,9 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
 `--band-report`, `--sea-report`, `--swim`, `--blend-report`, `--tab-test`,
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
-references), `--rt-report` (ADR-004 L5: the ray-tracing scene at three
-views, and L6's sky visibility with and without crowns), `--leak-test`
-(ADR-004 L6: a sealed chamber, unlit and torch-lit, DDGI against the
-fallback), `--gi-report` (DDGI at three views), `--lights-report` (ADR-004 L3: local lights at night, six
+references), `--leak-test`
+(ADR-004 L6: a sealed chamber, unlit and torch-lit, the heightfield GI against
+the bare fallback), `--lights-report` (ADR-004 L3: local lights at night, six
 configurations timed) and `--fell` (with `--fell-save` / `--fell-verify`).
 Every mode takes `--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), the weather's `--sea-state <0..1>`, `--wind <m/s>`,
@@ -91,7 +90,6 @@ the streaming A/B switches `--no-lod-align`,
 `--no-lod-hold`, `--no-prioritise`, `--adaptive-budget` and
 `--lod-fade <frames>`, and the tree switches `--tree-distance <m>`,
 `--tree-debug 1|2|3|4` (tint by level; only LOD 0 / LOD 1 / impostors),
-`--check-rt` (ADR-004 L0: DXR end to end on one triangle),
 `--tree-lod0 <m>`, `--no-trees`, `--no-shadows`, `--no-foliage`,
 `--foliage-debug 1`, and the post chain's `--no-taa`, `--no-ao`,
 `--no-contact`, `--no-post` and `--post-debug 1|2|4|5` (AO alone, contact
@@ -509,8 +507,8 @@ confirmed it twice.
 
 - **The authored colour stays.** A scan's albedo is RETINTED by authored /
   scan mean (both linear), and its roughness scaled to the authored value,
-  so a biome looks the colour it was tuned to and the GI, the RT scene and
-  the heightfield's top-down pass -- which still read the per-vertex
+  so a biome looks the colour it was tuned to and the GI and the
+  heightfield's top-down pass -- which still read the per-vertex
   blended colour -- see the same mean. The scan brings structure only.
 - **Per-vertex material WEIGHTS**, not colours, drive it: the mesher writes
   a second parallel buffer, `g_vertex_wts`, one byte per biome and one for
@@ -624,7 +622,7 @@ SUNLIT close-up.
 archetypes.json `shape.roots`: beech 1.5, oak 1.3, willow 1.1, maple and
 spruce 1.0, fir, alder and snag 0.9, pine 0.8, birch 0.5, scrub 0.
 Presentation only (validate's golden hashes unchanged); walking cost within
-noise. The flare is bark, in the RT scene and the casters like the trunk.
+noise. The flare is bark, in the casters like the trunk.
 
 **Distant leaf cards are solid clusters, not a halftone.** Once a card is
 too small for its leaves (`blur * 6`, ~30 m on), its coverage used to be
@@ -645,11 +643,9 @@ had 7-8 and three, so it drew a different number of randoms and every
 branch after the first moved. Now both levels have the same branches and
 the same three strands, each from a generator of its own (`srng`, one
 draw from the tree's), so the far level's fewer, longer cards hang where
-the near level's do. Cost: +0.25 ms walking in a willow wood; the RT
-cutouts 1.87 -> 2.07 M triangles, 292 -> 323 MB. Sky through the
+the near level's do. Cost: +0.25 ms walking in a willow wood. Sky through the
 crowns' upper third of a woodland still: 10.7% before, 10.6% after. Lit pass
-only -- the shadow casters and `leaf_cutout.cpp`'s port keep
-`leaf_coverage`. Walking cost within noise. The level cross-fades and far
+only -- the shadow casters keep `leaf_coverage`. Walking cost within noise. The level cross-fades and far
 fade still dither on the screen (walking per frame), and the grass's clump
 cards fade against the blades the same way.
 
@@ -753,8 +749,7 @@ EXPECTATION rather than its draw.
   Colour match unchanged (87.8, 117.0, 65.3); flight cost unchanged.
 - **Not done**: GPU-generated far cards (500-1500 m, for single trees on a
   skyline from the air) -- the shell was expected to carry most of it, and
-  does; the RT scene and DDGI do not see the shell (it starts where they
-  stop mattering); no altitude gate was needed.
+  does; no altitude gate was needed.
 
 ### Rocks
 
@@ -827,14 +822,8 @@ level's top.
   every local light's shadow faces (the GPU culls it per face; +0.03-0.07
   ms in `--lights-report`) and the heightfield GI's top-down pass, with
   `ps_rock_top`'s albedo -- the scan's smallest mip times the retint, the
-  authored rock colour exactly. **The RT scene** has a BLAS per model from
-  its far level, appended to the tree buffers with its info at
-  `kRockInfoBase` (1024) + model, and an instance per rock within 300 m in
-  the trees' mask: InstanceID `0x200000 | rgb565(sqrt(albedo)) << 4 |
-  model`, so `gi_trace` decodes the biome's rock colour and the face normal
-  with no new binding. RT shadows and DDGI see rocks; `--rt-report` counts
-  them. **The far shadow does not**: it applies past 1.36 km at 8 m texels,
-  and rocks stream to ~760 m.
+  authored rock colour exactly. **The far shadow does not**: it applies
+  past 1.36 km at 8 m texels, and rocks stream to ~760 m.
 - **Not done**: grass grows through a rock's footprint -- the bake would
   need the rocks bound and its cached tiles re-baked when rocks stream in
   after them, so it waits; the LOD switch pops (no cross-fade, by choice
@@ -842,8 +831,9 @@ level's top.
 - **A pre-existing cascade artifact** turned up beside a badlands boulder:
   blocky texel-sized squares of shadow on gently sloped sand at 16:00
   (`--cam 2452 123 3366 0.99 -0.2 --time 16`), there with rocks and
-  parallax off and gone under `--rt-shadows` -- shadow acne in a middle
-  cascade, not investigated.
+  parallax off -- shadow acne in a middle cascade, not investigated. RT
+  shadows hid it while they were the default; with the cascades the only
+  shadows again, it is back.
 
 ### Ground cover
 
@@ -918,10 +908,10 @@ the clamp. Every authored colour in the engine is still sRGB-encoded as typed;
 terrain materials). `lighting.hlsli` has the BRDF (Lambert + GGX, Smith
 height-correlated, Schlick, F0 0.04) and the ADR's shading-facing GI
 interface -- `gi_diffuse`, `gi_specular`, `gi_sky_visibility` -- with its
-no-RT fallback: sky irradiance from above, the ground's bounce from below.
-Terrain, trees, grass and the sea all light through it. Trees and grass
-keep a little extra fill as a STAND-IN for inter-leaf bounce; DDGI (L6)
-should remove those multipliers.
+fallback: sky irradiance from above, the ground's bounce from below, which
+the heightfield GI replaces where its map reaches. Terrain, trees, grass
+and the sea all light through it. Trees and grass keep a little extra fill
+as a STAND-IN for inter-leaf bounce (`gi_fill`).
 
 **Auto-exposure** meters a 256-bin log2 histogram of what TAA produced and
 puts the mean of its 10-90% band at middle grey 0.18, adapting like an eye
@@ -1198,7 +1188,7 @@ archetypes.json `clouds` block. F3 / `--no-clouds`.
     flash casts no shadows of its own; the sea's glint does not see it; no
     sheet lightning across the cloud tops seen from above.
 - **Not done (later phases)**: rain on the camera lens;
-  underwater the rain still draws; no rain in the RT or GI passes (nothing needs it);
+  underwater the rain still draws;
   1/16-pixel-a-frame cloud rendering (Decima's cost path); the base can
   look like a flat ceiling from the ground -- tuning.
 - **"The sun through a gap in the storm" was the shadow's 10% FLOOR, not a
@@ -1358,196 +1348,45 @@ atmosphere's aerial perspective, and its far end over the sky.
   been, or weather that rolls in. The hook is `FogMap` -- one density
   function, read in one place -- and ADR-004's L4 section lists the options.
 
-### The ray-tracing scene (ADR-004 L5)
+### Hardware ray tracing: REMOVED (git tag `rt-last`)
 
-DXR 1.1 inline RayQuery. **Denoised RT key-light shadows are the DEFAULT
-wherever DXR 1.1 is** (`Renderer::init` turns them on after `create_rt`);
-without it the cascades and PCSS, as before. `--no-rt-shadows` (`R` in the
-window) for the cascades -- it also stops building the RT scene when
-neither `--rt-sky` nor DDGI wants it; `--rt-shadows` still parses and
-changes nothing. Every headless mode now runs with RT shadows unless told
-otherwise, so a figure measured before this is a cascades figure;
-`--rt-report` measures. `engine/render/rt_scene.{h,cpp}` keeps a BLAS per
-drawn chunk at LOD 0-3 (+-512 m, the cascades' reach) -- pointing at the
-whole vertex pool and the slot's own index range, because the pool's
-indices are absolute -- and one per tree model from its LOD 1 mesh (bark
-opaque, leaf cards non-opaque); the TLAS is rebuilt every frame from the
-drawn chunks and the standing trees in range. `gi_trace.hlsli` is the
-ADR's tracer interface: `gi_occluded` and `gi_trace` (hit, normal,
-albedo), SM 6.5, compiled with DXC. `rt_shadow.hlsl` is the pass.
+ADR-004 L5/L6 built a DXR 1.1 ray-tracing tier: denoised RT key-light
+shadows (the default for a while), a traced sky visibility through crown
+volumes, DDGI probes, opaque leaf cutouts for the shadow ray, and the
+`--rt-report` / `--gi-report` / `--check-rt` instruments. **It was removed**:
+it cost ~1.2 ms of a 1440p walking frame (8.2 -> 7.0 ms without it) plus
+~300-600 MB of BLAS, TLAS and scratch, and every future dynamic thing --
+built structures, animated creatures, particles -- would have needed its own
+BLAS upkeep, where the cascades shadow anything that is drawn into them.
+Shadows are the cascades with PCSS and the far terrain shadow; diffuse GI is
+the heightfield GI with the canopy map.
 
-- **DXR 1.1 has no indirect build**, so a chunk's index count must reach the
-  CPU before its BLAS: read back three of RtScene's OWN ticks after it is
-  meshed (a still's warm-up records frames without advancing the renderer's
-  frame index), at most 32 builds a frame. **Three, not two**: a chunk is
-  noted before the tick its frame takes, and "two on" read the slot's old
-  zero before that frame's counter copy landed -- 834 of 858 chunks at spawn
-  were judged empty for good.
-- **Chunks are queued by looking, not by being told.** Headless modes fill
-  residency in a loop that meshes without recording a scene, so an event
-  queue never heard of those chunks. The TLAS pass walks every drawn slot
-  and queues any whose BLAS (or empty verdict) is not for its current key.
-- **A GPU hang reads back as zeros everywhere.** The first run's counts,
-  stats and timers were all 0 and looked like a queue bug;
-  `GetDeviceRemovedReason` said `DXGI_ERROR_DEVICE_HUNG`. The cause was the
-  tree builds' scratch going into the deferred-release list stamped 0 for
-  "not seen yet" -- which the release loop, running first, read as ancient,
-  freeing it while the build ran. Bisected with `BIOMES_RT_DBG` (1 no
-  trace, 2 no terrain BLAS, 4 no trees in the TLAS, 8 no scene at all, 16
-  no tree BLAS). `--rt-report` now says whether the device is alive.
-- **Leaf cards are alpha-tested in the ray query** with the raster's own
-  `leaf_coverage` at the card's uv (per-vertex uv, kind and seed uploaded
-  beside the positions). A flat 55% transmission per card was tried first:
-  a dawn sun crosses so many cards that the wood's floor lost every trunk
-  shadow under a uniform dimness.
-- **The key-light shadow ray meets leaves as opaque CUTOUTS**, not cards
-  (`engine/trees/leaf_cutout.{h,cpp}`; `--rt-card-leaves` for A/B). At
-  startup each model's LOD 1 cards are cut along that same pattern (blur
-  0.1, kept at 0.5) into triangles: a broad leaf is a pentagon found by
-  bisecting its own coverage along five rays from its centre, grown by
-  sqrt(2 pi / (5 sin 72 deg)) to the leaf's area; needles are marching
-  squares in the sheared frame (|u - 0.5|, 9v + 6|u - 0.5|) where every
-  stroke is an axis-aligned band. One more BLAS per model holds them AND
-  the bark, instanced beside each tree under mask 0x8, which rocks carry
-  too; the shadow ray traces terrain | 0x8 only. Every other ray keeps the
-  cards. 1.87 M triangles, 292 MB of BLAS, cut in ~180 ms on every core.
-  At 2560 x 1440 (trace + denoise): the 17:30 wood 6.09 -> 4.87 ms, the
-  wood from 45 m 4.96 -> 4.03, the close floor 4.21 -> 3.48; BLAS + TLAS
-  +0.06 ms. The floor at EV100 13 46.7 against the cards' 46.4, and
-  agreement with the cascades within a point on every `--rt-report` view.
-  - **This GPU (RX 7900 XT, RDNA3) traverses in shader code**, so the
-    usual "skip the any-hit calls, opaque is 2-4x faster" does not hold:
-    a non-opaque candidate in an inline RayQuery is a branch in the same
-    loop. `BIOMES_RT_LEAVES` split the old cost in the wood: every card
-    opaque 2.53 ms, cards culled 3.22, the alpha test with a trivial
-    pattern 4.87, the real one 5.75 -- the pattern itself 0.4-1.3 ms of it.
-    Dense geometry costs real traversal: the first cut (8 rays, a fine
-    needle grid) was 4.0 M triangles, 623 MB, and traced SLOWER than
-    the coarse one; a coarser still let rays run further and was slower
-    again.
-  - **The first build saved a tenth, not a fifth**: the cutouts sat
-    beside the cards while the shadow ray still entered each tree's own
-    BLAS for its bark, walking every card's BVH nodes to cull them. Bark
-    went into the cutouts' BLAS and the ray stopped seeing mask 0x2.
-  - `BIOMES_RT_LEAVES` overrides the leaf path: 1 every card opaque, 2
-    cards culled, 3 the alpha test with a trivial pattern, 4 the cards.
-  - `leaf_coverage_cpu` is a hand port of `leaf.hlsli`'s `leaf_coverage`:
-    change one, change both, or the shadows are cut from old leaves.
-- **Terrain shadow rays start from Hanika's lifted point** ("Hacking the
-  Shadow Terminator"): the pixel's own triangle comes from a terrain-only
-  primary ray, and the start is lifted onto the curve its vertex normals
-  imply. Smooth normals over facets up to 8 m wide streaked every grazing
-  slope with self-shadow before it.
-- **Penumbra**: each shadow ray aims at a different point on the sun's (or
-  moon's) disk per pixel and frame, and TAA integrates the true penumbra.
-- **`--rt-report`** at three views: primary rays meet the drawn terrain
-  within 1% of the depth buffer on 93% of the badlands hillside (the rest
-  is trees, water and LOD 4+), nearer only 0.5%; `gi_trace`'s normals within
-  2.5-3.2 degrees of the depth buffer's near the camera; shadow agreement
-  with the cascades 94% on the hillside, 76-79% in woodland, where the
-  traced canopy is the leaf pattern and the cascades' is coarser.
-- **Cost**: BLAS + TLAS 0.18-0.23 ms steady; the shadow ray 0.29 ms on bare
-  ground to 1.4 ms through a forest (alpha-tested leaves). The cascades still
-  render under `--rt-shadows` -- the mist reads them -- so this is an A/B,
-  not a replacement yet. Memory: 94-270 MB of terrain BLAS, two 94 MB TLAS
-  sized for 67k instances, 103 MB scratch.
-- **The shadow is denoised** (`engine/render/rt_denoise.{h,cpp}`,
-  `shaders/rt_denoise.hlsl`; on with `--rt-shadows`, `--no-rt-denoise` /
-  `F8` for A/B). One ray a pixel a frame is grain that TAA cannot remove --
-  it clips history to each pixel's 3x3 neighbourhood, and a 1-sample
-  shadow's neighbourhood holds 0 and 1 -- so the shadow is filtered on its
-  own between the trace and the composite, SVGF's shape for a scalar: a
-  temporal pass through TAA's own clip-to-last-frame matrix (this frame's
-  jitter off, last frame's on, so the history stays on last frame's grid),
-  a long mean and second moment up to 24 frames, a fast 3-frame mean that
-  cuts the long one short where they part (anti-lag), and disocclusion by
-  the distance stored with the history; then four edge-aware a-trous
-  passes (steps 1, 2, 4, 8) written back into the visibility's x. Heap
-  [72..78], UAVs only, ~35 MB at 1280 x 720, ~140 MB at 2560 x 1440.
-  - **Full resolution is the default; two cheaper traces were tried.**
-    *Half resolution for everything* (one ray per 2x2 quad, rotating,
-    denoised on the quads, upsampled by distance) cut the RT pass ~4x at
-    2560 x 1440 (the 17:30 wood 5.7 -> 1.6 ms) and looked right in stills,
-    but BOILED on trees in motion, Lumen-like: a quad's history mixes four
-    pixels' leaves and a swaying crown keeps resetting it. Removed.
-    *Sparse terrain* (`--rt-sparse-terrain`, Shift+F8) keeps trees at
-    every pixel and traces terrain -- what the trace's terrain-only primary
-    ray says is terrain -- at one pixel of each quad a frame (`kRtQuad`,
-    the same table in `rt_shadow.hlsl` and `rt_denoise.hlsl`); a skipped
-    pixel carries its history and one with none is filled by the a-trous.
-    It must be TWO dispatches -- the quads' pixels, then the rest, which
-    leave after the terrain test -- because skipping three pixels in four
-    inside one dispatch saved a fifth, not three quarters: a wave waits for
-    its slowest lane. Two passes: close floor 4.0 -> 2.5 ms, the wood 5.9
-    -> 5.7, the forest from the air 6.1 -> 6.6, and walking 7.85 ms
-    against full resolution's 7.63 -- grass is not terrain to the trace,
-    and it covers the ground. Off by default.
-  - **Under RT shadows the near two cascades are not drawn**
-    (`first_cascade`, `l_shadow_frame.z`): no surface reads them, and the
-    mist's one tap starts at the third, fitted round the camera at 0.19 m
-    texels. They are marked invalid and redraw the frame RT goes off; the
-    RT instruments keep all four. Walking at 1440p, full-resolution RT
-    7.95-8.15 -> 7.60-7.63 ms.
-  - Edge-stopping is SVGF's, made gentler on converged pixels: 1.5 sigma
-    of the MEAN's variance (the sample's over n), a depth tolerance of 5%
-    of the local plane's prediction, and a pass runs only while its step
-    is within 8 / sqrt(frames) pixels (ReBLUR's shrinking reach). The
-    history test is 3% + 0.3 m, loose enough for swaying crowns. These
-    were chasing crowns that looked soft beside raw RT; together they
-    moved the image about 1 luma, and the softness turned out to be the
-    point: raw RT under TAA keeps 1-sample sparkle (TAA's 3x3 clip lets
-    it through), which reads as leaf detail. A wrong lead worth knowing:
-    `--no-taa` stills render ONE frame, so they show the denoiser with no
-    history at all.
-  - **The disk samples are an R2 sequence in time, offset per pixel by a
-    hash**, not interleaved gradient noise: IGN's diagonal structure
-    survived accumulation as hatching the filter could not tell from
-    shadow. Raw (`--no-rt-denoise`) is now white grain under TAA.
-  - Instruments: `BIOMES_DEN_DBG=1` the temporal pass alone, `=2` each
-    pixel's history length in place of the shadow (white is 24 frames);
-    `BIOMES_DEN_NOHIST=1` no history ever -- a just-disoccluded pixel, the
-    spatial filter alone, which is what motion shows at edges.
-  - Measured: still-frame flicker on the close floor view (`--cam -30 0 -60
-    3.14 -1.0 --ground --time 16 --no-foliage --shake 60`): cascades
-    1.77-3.50, RT raw 2.3-5.6, RT denoised 0.76-0.95; the 17:30 wood with
-    grass, cascades 2.12-2.90, raw 3.86-4.86, denoised 1.58-2.38.
-    Walking at **2560 x 1440** (`--walk 15 --uncapped --res 2560 1440`):
-    no shadows 4.49, PCSS 6.20-6.25, RT denoised 7.60-7.63 with the near
-    cascades skipped. The RT pass in stills: close floor 4.0 ms, the 17:30
-    wood 5.9, the forest from the air 6.1 -- the denoiser ~0.9 of each,
-    the rest the trace, most of it alpha-tested leaf cards.
-  - **RT woods are darker than the cascades' and it is the trace, not the
-    denoiser**: raw and denoised agree from the air; the RT scene shades
-    crowns with every tree's LOD 1 cards (see the 76-79% agreement).
+Everything is in the tag: `git show rt-last:engine/render/rt_scene.cpp`,
+`git checkout rt-last -- <path>` for a file, or `git log rt-last` for its
+history -- `rt_scene`, `rt_denoise`, `rt_check`, `ddgi`, `leaf_cutout`,
+`gi_trace.hlsli`, `rt_shadow.hlsl`, `ddgi_update.hlsl`, and this file's old
+sections on them. What it taught that still applies without it:
 
-### Canopy shade: crown volumes and a traced sky (ADR-004 L6, step 1)
+- **This GPU (RX 7900 XT, RDNA3) traverses in shader code**: a non-opaque
+  candidate in an inline RayQuery is a branch in the same loop, so "opaque
+  is 2-4x faster" does not hold, and dense geometry costs real traversal.
+- **One sample a pixel a frame is grain TAA cannot remove** (it clips to
+  the 3x3 neighbourhood, which holds 0 and 1); it needs its own temporal
+  filter. Half-resolution traces boiled on swaying trees.
+- **A leak test needs the air too**: the haze and the mist assume sunlit
+  air, so a sealed chamber glowed until their in-scatter near the eye was
+  scaled by the GI's share of open sky at the camera (`cs_hf_camera` now).
+- **Hanika's lifted shadow-ray origin** ("Hacking the Shadow Terminator")
+  cured self-shadow streaks on smooth-normalled coarse facets -- worth
+  remembering for any future screen- or ray-space shadow.
+- **What a probe GI's "off" probe means decides its leak**: falling through
+  to a coarser cascade handed daylight into a sealed room.
 
-`--rt-sky` (Shift+R) scales the AMBIENT target by a traced sky visibility:
-one cosine-weighted ray a pixel a frame through `gi_transmittance`
-(`gi_trace.hlsli`), which is 0 at any opaque hit and Beer-Lambert through
-the CROWN VOLUMES -- one procedural unit-sphere BLAS, instanced per standing
-tree as an ellipsoid round its crown (mask 0x4, InstanceID `0x400000 |
-model`), with the species' `leaf_density` from archetypes.json as the leaf
-area density (extinction 0.5 x LAD). `--no-crowns` keeps terrain and trunks
-only, for A/B; `--rt-sky-rays <n>` traces more.
+### Canopy shade: the canopy map (ADR-004 L6, step 2)
 
-- **Crowns are for diffuse rays only.** The key-light shadow (`gi_occluded`,
-  mask 0x3) never sees them, so the alpha-tested cards keep every sunfleck.
-- **A ray skips the crown it starts inside** unless it starts on terrain:
-  charging a leaf for the whole crown behind it drew every crown dark from
-  outside. A ray heading down stands for the ground's bounce and does not
-  see terrain, or every trunk in an open field would lose half its light.
-- `--rt-report` prints the sky visibility with and without crowns and the
-  cost: wood 0.90 -> 0.50, spawn 0.93 -> 0.59, +1.5 ms in a dense wood at
-  full resolution. The ambient target also holds LOCAL light, which this
-  dims too until DDGI separates them.
-
-### Canopy shade without RT: the canopy map (ADR-004 L6, step 2)
-
-On by default (`--no-canopy`, `B` for A/B); the traced sky replaces it
-under `--rt-sky`. `engine/render/canopy.{h,cpp}` splats every standing
-tree's crown ellipsoid (`crown_volume` in `tree_mesh.h`, the same volumes
-the RT scene traces) into a 512 m camera-centred map of 1 m texels on the
+On by default (`--no-canopy`, `B` for A/B). `engine/render/canopy.{h,cpp}`
+splats every standing tree's crown ellipsoid (`crown_volume` in
+`tree_mesh.h`) into a 512 m camera-centred map of 1 m texels on the
 GPU -- vertical optical depth, tau-weighted crown bottom and top, vertical
 transmittance -- then blurs it a-trous into five wider slices
 (`canopy.hlsl`). `canopy.hlsli`, included by `shadow.hlsli`, reads it in
@@ -1556,7 +1395,7 @@ transmittance -- then blurs it a-trous into five wider slices
 heap [38] (t25), a THIRD range of every lit pipeline's shadow table; its
 corner and reference height ride in `l_canopy` (ShadowConstants, 432 bytes).
 
-- **It is judged against the traced crowns.** `--rt-report` traces 16
+- **It was judged against traced crowns** (while RT existed: `rt-last`). 16
   crowns-only rays a pixel and compares terrain pixels inside 200 m: wood
   0.32 traced / 0.37 map (mean per-pixel error 0.066), spawn 0.51 / 0.48
   (0.077), bare hillside 1.00 / 1.00. One ray a pixel made the "error"
@@ -1577,105 +1416,9 @@ corner and reference height ride in `l_canopy` (ShadowConstants, 432 bytes).
 - At EV100 13 the shaded half of the woodland floor goes from luma 82.6 to
   62.2 (the traced sky: 58.5); crowns seen from above keep their tops.
 
-### DDGI probes (ADR-004 L6, step 3)
+### Heightfield GI (ADR-004 L6, step 5) -- the diffuse GI
 
-Ray-traced probe GI, **OFF by default** since its +2.8 ms walking was judged
-too dear (`--gi`, `I`; `--gi-report` and `--leak-test` switch it on
-themselves). Off, `gi_diffuse` is the heightfield GI (below) with the
-canopy map. It stays as the reference anything cheaper is measured
-against.
-`engine/render/ddgi.{h,cpp}`, `shaders/ddgi_update.hlsl` (the update),
-`ddgi.hlsli` (the reader), `ddgi_common.hlsli` (the layout both share).
-Three camera-centred cascades of 24 x 12 x 24 probes, 2, 8 and 32 m apart,
-addressed by world grid coordinate and stored at it mod the dims, so they
-scroll; a slot whose stored coordinate is not the one it should hold is
-"not yet traced" and is never sampled. 128 rays a probe, a quarter of the
-probes a frame, hysteresis 0.92; 8x8 irradiance and 16x16 depth-moment
-tiles, gutters written by the blend from group memory.
-
-- **Probe rays** go through `gi_trace_probe`: the nearest OPAQUE hit
-  (terrain, bark; cards culled) and the crowns' optical depth before it.
-  A miss is the sky (below the horizon, the lit ground); a hit is lit by
-  the key light (a `gi_transmittance` ray), the first 8 local lights through
-  their shadow atlas, and last frame's probes (every further bounce). A
-  terrain face seen from behind is rock: distance negative, no radiance.
-- **Probes in rock** (more than a quarter of rays backfacing) step through
-  the nearest wall or switch OFF and trace 32 rays; probes with nothing in
-  reach go IDLE (32 rays). 22-57% of a cascade is rock, and at spawn from
-  46 m up all but 53 of cascade 0 are idle.
-- **The leak is decided by what an off probe means.** First version: a
-  point whose cascade-0 neighbours were all off fell through to cascade 1,
-  whose nearest probes stand outside in daylight; the Chebyshev floor (0.05)
-  and the weights' normalisation handed their light back -- 210 nits in a
-  sealed chamber. Now only NOT-YET-TRACED or idle neighbours justify asking
-  a coarser cascade; all-off is "walled in", irradiance 0.
-- **The air leaked too.** The atmosphere's aerial perspective and the
-  mist's sky term assume sunlit, sky-lit air: 3.4 and 10 nits in the
-  chamber with the walls black. `cs_ddgi_camera` measures the probes' share
-  of an open sky's light at the eye (six directions), the CPU reads it back
-  two frames late (`Ddgi::camera_sky`), and post and fog scale their
-  in-scattering by it over the first 64 m, back to full by 256 m. A fade
-  starting at the eye left 6% of the haze at 4 m: 0.2 nits, the residue.
-- **`--leak-test`**: a 4 m sphere dug 10 m under flat ground; it settles
-  1200 frames inside, then measures each config, outside LAST. Sealed and
-  unlit 0.001 nits (the histogram's floor) with or without mist, the
-  chamber's 19 cascade-0 probes all ACTIVE, against 566 on the fallback and
-  2,985 outside; a carried torch's bounce adds 1.08x its direct light,
-  which in a closed chamber means walls of albedo 0.07 -- the meadow
-  material it was dug from. Luminance is read from the meter's histogram
-  (`band_nits`): the meter's own target stops at EV100 -2. It prints, per
-  config, what the probes say at the eye and the chamber's probe states.
-- **Its first pass was an accident, twice over.** (1) `field_normal`
-  ignored the player's edits, so every DUG surface had the undug rock's
-  normal -- "up" ten metres down -- and the chamber's ceiling and walls
-  faced into rock: every probe inside read "in rock", switched off, and
-  the walled-in rule returned black, which is what a sealed chamber should
-  look like. The raster has shaded dug surfaces with those normals since
-  edits existed. A cell that touches an edit now takes its gradient from
-  its own eight (edited) corners. (2) A still's residency loop meshed
-  without telling the RT scene, whose drawn-slot scan only catches changed
-  KEYS; a dig re-meshes the same key, so the BLAS kept the undug rock.
-  `capture()` now calls `note_meshed`. The probe states line is what
-  showed both: "19 off in rock" in a hole dug for the purpose.
-- **Re-entry transient:** stepping out of the chamber and back scrolls its
-  probes out of cascade 0 and swaps the LODs round it; the fresh probes
-  catch light through the half-rebuilt scene and it decays at 0.92 an
-  update -- 10 lux at the eye after 240 frames, under 0.01 after ~1000.
-  Not fixed.
-- **Sky rays were thrown away for the first version.** A miss stored
-  distance 1e27 and an untraced ray 2e27, and the readers skip anything at
-  or past HALF of the latter -- exactly a miss. The probes saw only the
-  ground and its bounce: facing up in open air a third of the sky's light
-  and a twentieth of its blue, and shaded birch trunks read olive (RGB 36,
-  48, 8). `kDdgiUnused` is 1e30 now; the trunk is (35, 53, 29) and the
-  probes' sky colour matches the fallback's facing up (B/G 1.54 v 1.50).
-  `--gi-report` prints the probes' six-way irradiance at the eye beside
-  the fallback's, which is how it was found.
-- **`--gi-report`**: luminance with DDGI against the fallback (bare
-  hillside 1.03, wood 0.72, spawn 0.87), update ms, the eye's six-way
-  irradiance against the fallback's, per-cascade active / off in rock /
-  idle / not yet traced.
-- **The bounce is warm in the badlands and it is physical**: shaded sand
-  takes ~14% of sunlit sand's red (linear), where half a hemisphere of
-  sunlit sand at that albedo predicts ~18%; the probe rays decode albedo as
-  the raster does. The fallback's grey ground bounce never had it.
-- **Trees and grass read the probes per VERTEX** (`g_gi_vertex` in
-  `lighting.hlsli`, set from an interpolant); `gi_diffuse` also leaves
-  `g_gi_all` for `gi_specular`, so a probe-lit cave reflects no sky.
-- **The 1.3x fill on trees and grass is gone where the probes answer**
-  (`gi_fill`): it stood in for bounce between leaves and blades and off the
-  floor, which the probes compute. The fallback keeps it.
-- **Cost, walking** (`--walk 15 --uncapped`): 2.46 -> 5.24 ms. Split with
-  `BIOMES_GI_DBG` (1 samples stale probes and skips the update, 2 updates
-  and never samples): the update ~1.1 ms, sampling ~1.0 ms (terrain per
-  pixel -- removing trees or grass does not change the delta), the RT scene
-  now built every frame ~0.65 ms. Not optimised yet.
-- **Not done:** the mist's sky term per froxel rather than at the camera;
-  logs and stumps are not in the TLAS; the re-entry transient.
-
-### Heightfield GI (ADR-004 L6, step 5) -- the default diffuse GI
-
-On by default (`--no-hfgi`, `Z`); DDGI replaces it where on. The world is
+On by default (`--no-hfgi`, `Z`). The world is
 mostly 2.5D, and the light that matters -- the sky the terrain round a
 point leaves, the light that terrain bounces at it -- comes as often from
 off screen as on. `engine/render/height_gi.{h,cpp}`, `shaders/height_gi.hlsl`
@@ -1701,7 +1444,7 @@ off screen as on. `engine/render/height_gi.{h,cpp}`, `shaders/height_gi.hlsl`
   8, 16 m out) and takes that column's light, faded over 12 m. None: walled
   in, no sky and no bounce. "Below means covered" alone drew every
   overhang's underside black.
-- **The air**: `cs_hf_camera` is the heightfield's `cs_ddgi_camera` -- the
+- **The air**: `cs_hf_camera` (DDGI's `cs_ddgi_camera` before it) -- the
   map's share of an open sky at the eye, read back, scaling the haze and
   the mist near the camera. Without it the sealed chamber's walls were
   black and its air 13.8 nits.
@@ -1710,7 +1453,9 @@ off screen as on. `engine/render/height_gi.{h,cpp}`, `shaders/height_gi.hlsl`
   trunk (83, 93, 69) -> (57, 75, 54) (DDGI 35, 53, 29). `--leak-test`'s
   no-RT config: sealed and unlit **0.001 nits** (the histogram's floor),
   where the bare fallback leaks 566. **Cost +0.05 ms walking** (2.36 ->
-  2.41), against DDGI's +2.8.
+  2.41), against DDGI's +2.8. The DDGI figures above are from `rt-last`.
+  After RT's removal, `--leak-test`: sealed 0.001 nits with and without
+  mist, the bare fallback 424, outside 709.
 - **Not done**: crowns as bouncers (the canopy map dims the sky, nothing
   sends the leaves' green), local lights in the bounce, anything past
   256 m, and true caves seen from inside a big cavern (it sees only the
@@ -1787,9 +1532,6 @@ lit tables), [46] UAV; `--post-debug 3` shows it.
   island's trees).
 
 ### Shadows
-
-(Without DXR, or with `--no-rt-shadows`. Under RT shadows -- the default
--- only the far two cascades are drawn, for the mist.)
 
 Sun shadows, **four cascades out to 28, 100, 380 m and 1.6 km**, cast by
 the terrain and the trees and received by both through one function,
@@ -2290,29 +2032,18 @@ the block added.
   ahead); `--sea-report` tabulates wind, swell, depth and six hours of
   automatic weather, and asserts the mean, the inversion, growth with depth
   and no wave taller than 1.1 x its depth.
-- **Trees in the wind, everywhere they are drawn or traced.** The sway is
-  `engine/render/tree_sway.h` and the gusts `engine/render/wind.h`, both
-  compiled as C++ AND HLSL (`wind.hlsli` only adapts them), so the mesh
-  `trees.hlsl` bends and the instance the RT scene leans move by one formula
-  in one gust. `small` is a Windows macro (`#define small char`): not a
+- **Trees in the wind.** The sway is `engine/render/tree_sway.h` and the
+  gusts `engine/render/wind.h`, both compiled as C++ AND HLSL (`wind.hlsli`
+  only adapts them) -- so the CPU could lean the RT scene's instances by the
+  formula `trees.hlsl` bends the mesh with, while RT existed (`rt-last`). `small` is a Windows macro (`#define small char`): not a
   variable name in a header the C++ side includes.
-  - **RT**: every standing tree's instances -- cards, leaf cutouts, crown
-    ellipsoid -- are SHEARED by the crown's offset (`RtScene::set_sway`, in
-    the TLAS rebuild it already did every frame): an instance transform is
-    affine, the mesh bends as h^2, so the shear is the least-squares line
-    through h^2 over the crown pinned at the base (`TS_SHEAR_FIT` 0.8).
-    `--rt-report` at 20 m/s, key-light agreement with the (swaying)
-    cascades in the two woodland views: 75.8 / 78.7% upright, 76.5 / 81.0%
-    leaning, 77.8 / 81.4% in calm air. Cost: nothing measurable (1440p walk,
-    7,419 instances). `--rt-no-sway` for A/B. DDGI's probe rays and the
-    traced sky see the same instances.
   - **Impostors** move rigidly by the offset at h^2 = 0.45 (the crown's
     mass), main and shadow passes alike.
   - **Species bend**: archetypes.json `shape.bend` (presentation only),
     scaling lean and swing: birch 1.4, willow 1.3, alder 1.1, maple 1.0,
     beech 0.9, oak 0.85, pine 0.75, scrub 0.7, fir 0.6, spruce 0.55, snag
-    0.25. In `SpeciesLook` for the GPU, `TreeLook` for the RT scene.
-  - Not done: the canopy map (1 m crowns for the no-RT sky shade) is static;
+    0.25. In `SpeciesLook` for the GPU, `TreeLook` on the CPU.
+  - Not done: the canopy map (1 m crowns for the sky shade) is static;
     leaf flutter is raster only (centimetres).
 - **Not done**: no rain, cloud or fetch shelter behind islands.
 

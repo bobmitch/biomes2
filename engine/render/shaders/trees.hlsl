@@ -308,9 +308,7 @@ MeshOut mesh_vertex(uint vid, uint iid, bool lit) {
         // Wind (tree_sway.h), worked out in WORLD space and turned into the
         // model's frame at the end, so every tree bends the way the air goes
         // whatever its yaw. The local speed is the gust field at the trunk,
-        // so a gust front crosses a wood tree by tree. The same function on
-        // the CPU leans this tree's ray-tracing instance (rt_scene.cpp), so
-        // its traced shadow sways with it. The cards flutter on top, rising
+        // so a gust front crosses a wood tree by tree. The cards flutter on top, rising
         // with the local speed and levelling off.
         const float h = saturate(p.y / max(mi.top, 1.0f));
         float u;

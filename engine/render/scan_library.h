@@ -59,7 +59,7 @@ public:
                 float tint[3], float& depth_m) const;
     bool ready() const { return layers_ > 0; }
     // Each biome's authored rock albedo, linear, rgb per biome (the seabed
-    // last): what a ray hitting a rock of that biome sees (rt_scene.h).
+    // last): what the heightfield GI's top-down pass sees of a rock.
     const std::vector<float>& rock_albedo() const { return rock_albedo_; }
     UINT layers() const { return layers_; }
     // What init found, for startup.txt: sets loaded, missing, MB uploaded.

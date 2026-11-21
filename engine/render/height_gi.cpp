@@ -146,7 +146,7 @@ bool HeightGi::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::strin
             ss[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         }
         ss[0].ShaderRegister = 0;
-        ss[1].ShaderRegister = 3;   // hfgi.hlsli samples through ddgi.hlsli's s3
+        ss[1].ShaderRegister = 3;   // hfgi.hlsli samples through s3 (shadow.hlsli g_gi_linear)
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
         rsd.NumParameters = 5;
         rsd.pParameters = p;

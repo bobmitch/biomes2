@@ -151,12 +151,10 @@ if(BIOMES2_ENGINE)
     engine/svdag/brick_pager.cpp
     engine/field/world_gpu.cpp
     engine/trees/tree_mesh.cpp
-    engine/trees/leaf_cutout.cpp
     engine/trees/tree_field.cpp
     engine/trees/tree_renderer.cpp
     engine/trees/felling.cpp
     engine/foliage/foliage_renderer.cpp
-    engine/render/rt_check.cpp
     engine/render/sky.cpp
     engine/render/fog.cpp
     engine/render/weather.cpp
@@ -164,12 +162,9 @@ if(BIOMES2_ENGINE)
     engine/render/clouds.cpp
     engine/render/rain.cpp
     engine/render/lightning.cpp
-    engine/render/rt_scene.cpp
     engine/render/canopy.cpp
-    engine/render/ddgi.cpp
     engine/render/height_gi.cpp
     engine/render/far_shadow.cpp
-    engine/render/rt_denoise.cpp
     engine/render/scan_library.cpp
     engine/render/forest_map.cpp
     engine/rocks/rock_mesh.cpp

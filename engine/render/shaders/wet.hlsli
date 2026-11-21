@@ -39,7 +39,7 @@ float wet_top(float2 xz) {
     if (l_hf.w < 0.5f) return kHfNone;
     const float2 uv = float2((xz.x - l_hf.x) / kHfExtent, 1.0f - (xz.y - l_hf.y) / kHfExtent);
     if (any(uv <= 0.0f) || any(uv >= 1.0f)) return kHfNone;
-    return g_hf_height.SampleLevel(g_ddgi_linear, uv, 0.0f);
+    return g_hf_height.SampleLevel(g_gi_linear, uv, 0.0f);
 }
 
 float wet_shelter(float3 world) {

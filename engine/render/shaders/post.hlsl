@@ -47,10 +47,10 @@ cbuffer PostConstants : register(b0) {
     float  agx_power;   float cam_alt_km;   // AgX look; the camera's altitude for the sky table
     float3 sky_sun_dir;  float ssgi_radius;     // the sun and moon themselves, for their disks; the bounce's reach, m (0 off)
     float3 sky_moon_dir; float ssgi_thickness;  // the thickness assumed behind each depth sample, m
-    float3 sun_disk;     float cam_sky;      // disk radiance seen from the camera, nits; cam_sky: DDGI's share of open sky at the eye
+    float3 sun_disk;     float cam_sky;      // disk radiance seen from the camera, nits; cam_sky: the heightfield GI's share of open sky at the eye
     float3 moon_disk;    float clouds_on;   // ADR-005: the clouds' resolved textures at t12, t13
     float3 cam_fwd;      float fog_on;       // the mist (L4): fog.hlsl's integrated volume
-    float  fog_near;     float fog_log_ratio; float rt_shadows; float rt_sky;   // L5's traced key-light visibility, L6's traced sky
+    float  fog_near;     float fog_log_ratio; float2 pad_rt;   // pad_rt: was RT shadows / RT sky (rt-last)   // L5's traced key-light visibility, L6's traced sky
     float4 cloud_shadow; // ADR-005 C2: the cloud-shadow map's centre x, z (cloud-base plane), half extent m, base altitude m
     float4 wet;          // ADR-005 C4: the rain now, the ripples' clock (s), radians a pixel, w > 0.5 puddles to reflect
     float4 storm;        // ADR-005 C5: x the storm deck's dimming of the sky's light, 1 none
@@ -66,7 +66,6 @@ Texture2D<float4> g_hist1   : register(t6);
 Texture2D<float4> g_skyview : register(t7);   // atmosphere.hlsl: the sky round the camera
 Texture3D<float4> g_ap      : register(t8);   // atmosphere.hlsl: in-scatter (rgb), transmittance (a)
 Texture3D<float4> g_fog     : register(t9);   // fog.hlsl: in-scatter (rgb), transmittance (a), to each slice's far side
-Texture2D<float2> g_rtvis   : register(t10);  // rt_shadow.hlsl: x the key light's visibility, y the sky's, traced
 Texture2D<float4> g_ssgi_view : register(t11); // cs_ssgi's output, for --post-debug 3 (UAV-bound in cs_ssgi itself)
 Texture2D<float4> g_clouds     : register(t12); // clouds.hlsl, quarter resolution: in-scatter (rgb), transmittance (a)
 Texture2D<float>  g_cloud_dist : register(t13); // ... the cloud's distance, km
@@ -452,20 +451,12 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     const float cmask = g_direct[p].a;
     const float cs = ((flags & 4u) != 0u && cmask > 0.01f && dot(dir, dir) > 1e-6f)
                    ? lerp(1.0f, contact_shadow(p, z, P), 0.7f * saturate(cmask)) : 1.0f;   // never fully black: sky light still reaches a crease
-    // Under --rt-shadows the surfaces wrote their direct light unshadowed
-    // (shadow.hlsli) and the traced visibility takes the cascades' place.
-    const float rtv = rt_shadows > 0.5f ? g_rtvis[p].x : 1.0f;
-    // Under --rt-sky (L6) the ambient takes the traced sky visibility --
-    // terrain, trunks and the crowns' volumes -- which is the shade under a
-    // canopy. It scales all of the ambient target, so a local light under a
-    // tree is dimmed with the sky until DDGI separates them.
-    const float skv = rt_sky > 0.5f ? g_rtvis[p].y : 1.0f;
     // The clouds' shadow (ADR-005 C2): the key light through the cloud layer
     // over this point, from the top-down map, slid along the light onto the
     // cloud base's plane. Applied to the DIRECT target only, so terrain, trees
     // and grass all darken in one place and the sky light stays.
     const float cls = clouds_on > 0.5f ? cloud_shadow_at(g_cloud_shadow, g_linear, cloud_shadow, sun_dir, P) : 1.0f;
-    float3 c = dir * (cs * rtv * cls) + amb * (ao * skv);
+    float3 c = dir * (cs * cls) + amb * ao;
     // Standing water's reflection (ADR-005 C4), before the air in front of it.
     float pdbg = -1.0f;
     if (wet.w > 0.5f) {

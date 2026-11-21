@@ -17,7 +17,6 @@
 #include "engine/trees/tree_field.h"
 #include "engine/trees/tree_renderer.h"
 #include "engine/foliage/foliage_renderer.h"
-#include "engine/render/rt_check.h"
 #include "engine/render/sky.h"
 #include "engine/render/local_lights.h"
 #include "engine/render/fog.h"
@@ -26,12 +25,9 @@
 #include "engine/render/clouds.h"
 #include "engine/render/rain.h"
 #include "engine/render/lightning.h"
-#include "engine/render/rt_scene.h"
 #include "engine/render/canopy.h"
-#include "engine/render/ddgi.h"
 #include "engine/render/height_gi.h"
 #include "engine/render/far_shadow.h"
-#include "engine/render/rt_denoise.h"
 #include "engine/render/scan_library.h"
 #include "engine/render/forest_map.h"
 #include "engine/rocks/rock_field.h"
@@ -176,7 +172,6 @@ public:
     void  set_ssr(bool on) { ssr_on_ = on; }
     bool  ssr() const { return ssr_on_; }
     // The RT scene's trees lean with their meshes (tree_sway.h); off for A/B.
-    void  set_rt_sway(bool on) { rt_sway_ = on; }
     void  set_clouds(bool on) { clouds_on_ = on; }
     bool  clouds() const { return clouds_on_; }
     const Clouds& cloud_layer() const { return clouds_; }
@@ -340,55 +335,21 @@ public:
     struct PostTimes { float atmosphere = 0, mist_inject = 0, mist_integrate = 0, post_total = 0; };
     const PostTimes& post_times() const { return post_times_; }
 
-    // The ray-tracing scene (ADR-004 L5). Off until asked for: --rt-shadows
-    // (R in the window) traces the key light's shadow in place of the
-    // cascades; the RT instruments run whenever it is on.
-    bool rt_available() const { return rt_ok_; }
-    void set_rt_shadows(bool on);
-    bool rt_shadows() const { return rt_shadows_; }
-    // The traced shadow's denoiser (rt_denoise.h; --no-rt-denoise, F8).
-    void set_rt_denoise(bool on) { rt_denoise_on_ = on; }
-    bool rt_denoise() const { return rt_denoise_on_; }
-    // Terrain traced at one pixel of each 2x2 a frame, everything else every
-    // pixel (rt_denoise.h; --rt-sparse-terrain, Shift+F8). Off by default:
-    // it pays only where bare terrain fills the screen, and grass is not
-    // terrain to the trace -- walking at 1440p it was slower than full.
-    void set_rt_sparse_terrain(bool on) { rt_sparse_terrain_ = on; }
-    // --rt-card-leaves: the key-light shadow ray alpha-tests the leaf cards
-    // as before the cutouts (rt_scene.h), which are then not built. Before
-    // the first frame.
-    void set_rt_card_leaves(bool on) { rt_.cutouts_ = !on; }
-    bool rt_sparse_terrain() const { return rt_sparse_terrain_; }
-    void set_rt_active(bool on);   // the scene and the trace, without replacing the cascades
-    void set_rt_checks(bool on) { rt_checks_ = on; }   // the CSM and normal instruments (--rt-report)
-    // L6: the ambient scaled by a traced sky visibility -- terrain, trunks and
-    // the crown volumes (--rt-sky, Shift+R). The mask picks what the rays see
-    // (RtScene::kMask*), for A/B; the crowns enter the TLAS only when it
-    // includes them.
-    void set_rt_sky(bool on);
-    bool rt_sky() const { return rt_sky_; }
-    void set_rt_sky_mask(unsigned mask);
-    void set_rt_sky_rays(int n) { rt_sky_rays_ = n < 1 ? 1 : (n > 16 ? 16 : n); }
-    // L6's no-RT canopy shade: the canopy map (canopy.h) in gi_sky_visibility.
-    // On by default; the traced sky takes over while --rt-sky is on.
+    // Hardware ray tracing (ADR-004 L5/L6: RT shadows, their denoiser, the
+    // traced sky, DDGI, leaf cutouts) was REMOVED; git tag `rt-last` holds it.
+    // Shadows are the cascades and PCSS, GI the heightfield's.
+    // L6's canopy shade: the canopy map (canopy.h) in gi_sky_visibility.
     void set_canopy(bool on) { canopy_on_ = on; }
     bool canopy() const { return canopy_on_; }
     unsigned canopy_trees() const { return canopy_.trees_last_frame(); }
     unsigned long long canopy_builds() const { return canopy_.builds(); }
-    // DDGI (ADR-004 L6): ray-traced probe GI. OFF by default since its
-    // +2.8 ms walking was judged too dear (--gi, I); kept as the reference
-    // the screen-space GI is measured against. Off, gi_diffuse is the
-    // fallback with the canopy map and screen-space bounce.
-    void set_gi(bool on);
-    bool gi() const { return gi_on_; }
-    bool gi_active() const { return gi_on_ && rt_ok_ && ddgi_.ready() && mode_ != Mode::Wireframe; }
     // The screen-space bounce (ADR-004 L6's no-RT experiment): OFF by
     // default (--ssgi, X). It measured 1-2% more light in shade for 0.3 ms --
     // the bounce that matters here comes from terrain and canopy off screen
-    // or behind the camera. Read by gi_diffuse where DDGI does not answer.
+    // or behind the camera.
     void set_ssgi(bool on) { ssgi_on_ = on; if (!on) ssgi_valid_ = false; }
-    // The heightfield GI (ADR-004 L6, height_gi.h): the default diffuse GI
-    // where DDGI is off (--no-hfgi, Z).
+    // The heightfield GI (ADR-004 L6, height_gi.h): the diffuse GI
+    // (--no-hfgi, Z).
     void set_hfgi(bool on) { hfgi_on_ = on; }
     // Parallax occlusion on the scans' height (pom.hlsli; --no-pom, P).
     void set_pom(bool on) { pom_on_ = on; }
@@ -398,32 +359,6 @@ public:
     // The far terrain shadow past the cascades (far_shadow.h; --no-far-shadow).
     void set_far_shadow(bool on) { far_on_ = on; }
     bool ssgi() const { return ssgi_on_; }
-    float gi_ms() const { return ddgi_ms_; }
-    // Whether the probes see local lights (--leak-test's A/B: the torch's
-    // bounce against its direct light alone).
-    void set_gi_local_lights(bool on) { gi_local_lights_ = on; }
-    unsigned long long gi_updates() const { return ddgi_.updates(); }
-    UINT64 gi_bytes() const { return ddgi_.bytes(); }
-    const Ddgi::CameraIrradiance& gi_camera_irradiance() const { return ddgi_.camera_irradiance(); }
-    float gi_camera_sky() const { return ddgi_.camera_sky(); }
-    bool gi_counts(Ddgi::Counts& out, std::string& error, const float centre[3] = nullptr, float radius = 0.0f) {
-        wait_for_gpu();
-        return ddgi_.count(queue_.Get(), out, error, centre, radius);
-    }
-    const RtScene::Stats& rt_scene_stats() const { return rt_.stats(); }
-    const RtScene& rt_scene() const { return rt_; }
-    struct RtStats {
-        uint32_t lit_lit = 0, shadow_shadow = 0, rt_only = 0, csm_only = 0;
-        uint32_t primary_agree = 0, primary_nearer = 0, primary_farther = 0;
-        float normal_err_deg = 0.0f;
-        float sky_mean = 0.0f, sky_near_mean = 0.0f;   // L6: traced sky visibility, inside the cascades' reach / 60 m
-        uint32_t sky_pixels = 0, sky_near_pixels = 0;
-        // The canopy map against the traced sky on the same terrain pixels.
-        float canopy_rt_mean = 0.0f, canopy_map_mean = 0.0f, canopy_mae = 0.0f;
-        uint32_t canopy_pixels = 0;
-        float build_ms = 0.0f, trace_ms = 0.0f;   // GPU, smoothed
-    };
-    const RtStats& rt_stats() const { return rt_stats_; }
 
     // What the meter saw in the last capture(): the histogram and the
     // exposure it chose. bins[k] covers log2 nits kLumLogMin + k * step.
@@ -455,8 +390,6 @@ public:
     };
     const CloudShadowReport& last_cloud_shadow() const { return cloud_shadow_report_; }
 
-    // What the device can do (ADR-004): ray-tracing tier, shader model.
-    const DeviceCaps& caps() const { return caps_; }
     ID3D12Device*       device() const { return device_.Get(); }
     ID3D12CommandQueue* queue() const { return queue_.Get(); }
 
@@ -609,7 +542,6 @@ private:
     bool ssr_on_ = true;
     // The ripples: two FFT tiles a frame (ocean_detail.h). F4, --no-wave-detail.
     OceanDetail ocean_;
-    bool rt_sway_ = true;
     // Volumetric clouds (ADR-005, clouds.h). F3, --no-clouds.
     Clouds clouds_;
     bool clouds_on_ = true;
@@ -674,36 +606,11 @@ private:
     bool create_fog(std::string& error);
     bool create_fog_pipelines(std::string& error);
     void record_fog();
-    // The ray-tracing scene (ADR-004 L5).
-    bool create_rt(std::string& error);
-    void record_rt_trace();
     bool capture_raw_ = false;
-    RtScene rt_;
-    Ddgi ddgi_;
-    bool gi_on_ = false, gi_local_lights_ = true;
-    void record_ddgi();
-    void read_ddgi_time();
-    ComPtr<ID3D12QueryHeap> ddgi_queries_;
-    ComPtr<ID3D12Resource>  ddgi_query_rb_;
-    bool  ddgi_query_pending_[kFrameCount] = {};
-    float ddgi_ms_ = 0.0f;
     CanopyMap canopy_;
     bool canopy_on_ = true, canopy_built_ = false;
     unsigned long long tree_list_version_ = 0;   // bumped whenever tree_all_ is rebuilt
     float canopy_origin_[3] = {0.0f, 0.0f, 0.0f};
-    bool rt_ok_ = false, rt_shadows_ = false, rt_active_ = false, rt_seed_ = false, rt_checks_ = false;
-    bool rt_sky_ = false;
-    unsigned rt_sky_mask_ = RtScene::kMaskTerrain | RtScene::kMaskTrees | RtScene::kMaskCrowns;
-    int rt_sky_rays_ = 1;
-    RtStats rt_stats_;
-    ComPtr<ID3D12RootSignature> rt_root_;
-    ComPtr<ID3D12PipelineState> rt_pso_, rt_clear_pso_;
-    ComPtr<ID3D12Resource> rt_vis_, rt_stats_buf_, rt_stats_rb_[kFrameCount], rt_cb_[kFrameCount];
-    void* rt_cb_cpu_[kFrameCount] = {};
-    bool  rt_stats_pending_[kFrameCount] = {};
-    ComPtr<ID3D12QueryHeap> rt_queries_;
-    ComPtr<ID3D12Resource>  rt_query_rb_;
-    bool  rt_query_pending_[kFrameCount] = {};
     FogMap fog_map_;
     Weather      weather_;
     WeatherState weather_now_;
@@ -773,14 +680,10 @@ private:
     float cur_tan_ = 1.0f, cur_aspect_ = 1.0f, cur_time_ = 0.0f;
     float jitter_[2] = {0, 0};
     float prev_jitter_[2] = {0, 0};   // last frame's, for the shadow denoiser's reprojection
-    RtDenoise rt_den_;
-    bool rt_denoise_on_ = true;
-    bool rt_sparse_terrain_ = false;
     UINT  hist_cur_ = 0;
     bool  hist_valid_ = false;
     unsigned long long post_frame_ = 0;
     bool  taa_on_ = true, ao_on_ = true, contact_on_ = true;
-    DeviceCaps caps_;
     CrackCount cracks_;
     float post_debug_ = 0.0f;
     float ev_comp_ = 0.0f, ev100_fixed_ = -1000.0f, agx_saturation_ = 1.4f, agx_power_ = 1.35f;

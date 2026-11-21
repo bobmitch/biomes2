@@ -203,7 +203,8 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         srange[2].NumDescriptors = 1;
         srange[2].BaseShaderRegister = 25;
         srange[2].OffsetInDescriptorsFromTableStart = 38;
-        // ADR-004 L6: the DDGI probes at [40..42] (t26..t28).
+        // [40..42] (t26..t28): DDGI's probes until hardware RT was removed
+        // (rt-last); the range stays declared, nothing reads it.
         srange[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         srange[3].NumDescriptors = 3;
         srange[3].BaseShaderRegister = 26;
@@ -265,7 +266,7 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         cmp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        // s3: DDGI's linear sampler (ddgi.hlsli), visible to the vertex
+        // s3: the lit pipelines' linear sampler (shadow.hlsli g_gi_linear), visible to the vertex
         // shaders too -- trees and grass read the probes per vertex.
         D3D12_STATIC_SAMPLER_DESC lin = {};
         lin.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;

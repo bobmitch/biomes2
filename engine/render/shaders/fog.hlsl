@@ -32,7 +32,7 @@ cbuffer FogConstants : register(b0) {
     float  near_z;     float log_ratio;   uint history_valid; float time_factor;
     float  map_extent; float haze;        float sea_level;    float patch;
     float2 drift;      float phase_g;     float albedo;   // drift: metres the patches have moved (weather.h)
-    float  screen_w;   float screen_h;    float density_scale; float cam_sky;   // cam_sky: DDGI's share of open sky at the eye
+    float  screen_w;   float screen_h;    float density_scale; float cam_sky;   // cam_sky: the heightfield GI's share of open sky at the eye
     float4 cloud_shadow;  // ADR-005 C2: the cloud-shadow map's centre x, z, half extent (0: none), base altitude
 };
 

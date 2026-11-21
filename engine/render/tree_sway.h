@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // How far the wind moves a standing tree's crown: compiled as C++ AND HLSL,
-// so the mesh trees.hlsl bends and the instance the RT scene leans
-// (rt_scene.cpp) move by one formula in one gust (wind.h).
+// so the CPU can ask what trees.hlsl bends the mesh by (the RT scene leaned
+// its instances by it until hardware RT was removed: git tag rt-last).
 //
 // The offset at the TOP of the tree, in world metres: x and z go down the tree
 // as h^2 (h the height over the top), y -- the crown dropping as it leans --

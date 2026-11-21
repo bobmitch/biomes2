@@ -11,7 +11,7 @@
 //
 // Included by shadow.hlsli, whose constants carry the map (l_hf); its
 // textures are a sixth range of the lit pipelines' shadow table, heap
-// [48..52] (t38..t42), sampled through ddgi.hlsli's linear sampler (s3).
+// [48..52] (t38..t42), sampled through the lit pipelines' linear sampler (s3, shadow.hlsli).
 // ---------------------------------------------------------------------------
 #ifndef ENGINE_HFGI_HLSLI
 #define ENGINE_HFGI_HLSLI
@@ -36,7 +36,7 @@ void hfgi_sample(float3 world, float3 n, out float vis_e, out float3 bounce, out
     const float2 uv = float2((world.x - l_hf.x) / kHfExtent, 1.0f - (world.z - l_hf.y) / kHfExtent);
     const float2 e = min(uv, 1.0f - uv);
     if (min(e.x, e.y) <= 0.0f) return;
-    const float h = g_hf_height.SampleLevel(g_ddgi_linear, uv, 0.0f);
+    const float h = g_hf_height.SampleLevel(g_gi_linear, uv, 0.0f);
     if (h < kHfNone * 0.5f) return;
     cover = saturate(min(e.x, e.y) * 16.0f);
     float2 suv = uv;
@@ -57,7 +57,7 @@ void hfgi_sample(float3 world, float3 n, out float vis_e, out float3 bounce, out
                 const float2 q = world.xz + float2(cos(ang), sin(ang)) * rad;
                 const float2 quv = float2((q.x - l_hf.x) / kHfExtent, 1.0f - (q.y - l_hf.y) / kHfExtent);
                 if (any(quv < 0.0f) || any(quv > 1.0f)) continue;
-                const float hq = g_hf_height.SampleLevel(g_ddgi_linear, quv, 0.0f);
+                const float hq = g_hf_height.SampleLevel(g_gi_linear, quv, 0.0f);
                 if (hq > kHfNone * 0.5f && hq < world.y - 0.5f && rad < best) {
                     best = rad;
                     suv = quv;
@@ -67,10 +67,10 @@ void hfgi_sample(float3 world, float3 n, out float vis_e, out float3 bounce, out
         }
         k = saturate(1.0f - best / 12.0f) * (best < 1e8f ? 1.0f : 0.0f);
     }
-    vis_e = hf_irradiance(g_hf_vis.SampleLevel(g_ddgi_linear, suv, 0.0f), n) * k;
-    bounce = float3(hf_irradiance(g_hf_r.SampleLevel(g_ddgi_linear, suv, 0.0f), n),
-                    hf_irradiance(g_hf_g.SampleLevel(g_ddgi_linear, suv, 0.0f), n),
-                    hf_irradiance(g_hf_b.SampleLevel(g_ddgi_linear, suv, 0.0f), n)) * k;
+    vis_e = hf_irradiance(g_hf_vis.SampleLevel(g_gi_linear, suv, 0.0f), n) * k;
+    bounce = float3(hf_irradiance(g_hf_r.SampleLevel(g_gi_linear, suv, 0.0f), n),
+                    hf_irradiance(g_hf_g.SampleLevel(g_gi_linear, suv, 0.0f), n),
+                    hf_irradiance(g_hf_b.SampleLevel(g_gi_linear, suv, 0.0f), n)) * k;
     if (dh >= -1.5f) {
         // Above it: towards an open hemisphere with height.
         const float f = saturate(dh / 40.0f);

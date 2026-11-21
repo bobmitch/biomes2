@@ -324,13 +324,6 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (wp == 'L') { g_renderer.set_shadows(!g_renderer.shadows()); return 0; }
-            // The traced shadow's denoiser (rt_denoise.h), for A/B under R.
-            // Shift+F8: terrain traced sparsely (one pixel per 2x2 a frame) or every pixel.
-            if (wp == VK_F8) {
-                if (GetKeyState(VK_SHIFT) & 0x8000) g_renderer.set_rt_sparse_terrain(!g_renderer.rt_sparse_terrain());
-                else g_renderer.set_rt_denoise(!g_renderer.rt_denoise());
-                return 0;
-            }
             if (wp == 'G') { g_renderer.set_foliage(!g_renderer.foliage_on()); return 0; }
             if (wp == 'Y') { g_renderer.set_taa(!g_renderer.taa()); return 0; }
             if (wp == 'O') { g_renderer.set_ao(!g_renderer.ao()); return 0; }
@@ -363,17 +356,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == 'C') { g_renderer.clear_lights(); return 0; }
             // The mist (ADR-004 L4), for A/B.
             if (wp == 'N') { g_renderer.set_fog(!g_renderer.fog()); return 0; }
-            // Ray-traced key-light shadows in place of the cascades (L5).
-            // Shift+R: the traced sky visibility, canopy shade (L6).
-            if (wp == 'R') {
-                if (GetKeyState(VK_SHIFT) & 0x8000) g_renderer.set_rt_sky(!g_renderer.rt_sky());
-                else g_renderer.set_rt_shadows(!g_renderer.rt_shadows());
-                return 0;
-            }
-            // The canopy map's shade, the no-RT path (L6), for A/B.
+            // The canopy map's shade (L6), for A/B.
             if (wp == 'B') { g_renderer.set_canopy(!g_renderer.canopy()); return 0; }
-            // DDGI, the RT tier's GI (L6), for A/B against the fallback.
-            if (wp == 'I') { g_renderer.set_gi(!g_renderer.gi()); return 0; }
             // The screen-space bounce (L6), for A/B.
             if (wp == 'X') { g_renderer.set_ssgi(!g_renderer.ssgi()); return 0; }
             // The heightfield GI (L6), for A/B.
@@ -886,12 +870,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                              hl.find("--blend-report") != std::string::npos;
     const bool fell_mode = hl.find("--fell") != std::string::npos;
     const bool lights_mode = hl.find("--lights-report") != std::string::npos;
-    const bool rt_report_mode = hl.find("--rt-report") != std::string::npos;
-    const bool rt_check_mode = hl.find("--check-rt") != std::string::npos;
     const bool leak_mode = hl.find("--leak-test") != std::string::npos;
-    const bool gi_report_mode = hl.find("--gi-report") != std::string::npos;
-    const bool headless = report_mode || fell_mode || lights_mode || rt_report_mode || rt_check_mode || leak_mode ||
-                          gi_report_mode ||
+    const bool headless = report_mode || fell_mode || lights_mode || leak_mode ||
                           !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
@@ -945,15 +925,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 1;
     }
     g_felling.init(&g_renderer, &g_physics);
-    if (rt_check_mode) {
-        // ADR-004 L0: does hardware ray tracing work end to end here?
-        std::remove("build/rt_check.txt");
-        const bool ok = engine::run_rt_check(g_renderer.device(), g_renderer.queue(), g_renderer.caps(),
-                                             "build/rt_check.txt");
-        g_renderer.shutdown();
-        g_physics.shutdown();
-        return ok ? 0 : 1;
-    }
     if (start_overlay) g_renderer.set_mode(engine::Mode::Wireframe);
     if (sea_state >= 0.0f) g_renderer.set_sea_state(sea_state);
     if (wind_mps >= 0.0f) g_renderer.weather().set_wind(wind_mps);
@@ -967,7 +938,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     if (no_water) g_renderer.set_water(false);
     if (cmdline && std::string(cmdline).find("--no-ssr") != std::string::npos) g_renderer.set_ssr(false);
     if (cmdline && std::string(cmdline).find("--no-wave-detail") != std::string::npos) g_renderer.set_wave_detail(false);
-    if (cmdline && std::string(cmdline).find("--rt-no-sway") != std::string::npos) g_renderer.set_rt_sway(false);
     if (cmdline && std::string(cmdline).find("--no-clouds") != std::string::npos) g_renderer.set_clouds(false);
     if (cmdline && std::string(cmdline).find("--no-rain") != std::string::npos) g_renderer.set_rain_on(false);
     if (cmdline && std::string(cmdline).find("--no-lightning") != std::string::npos) g_renderer.set_lightning(false);
@@ -1021,24 +991,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (c2.find("--no-light-shadows") != std::string::npos) g_renderer.set_light_shadows(false);
         // The mist (ADR-004 L4): off, or thicker or thinner than authored.
         if (c2.find("--no-fog") != std::string::npos) g_renderer.set_fog(false);
-        // The ray-tracing scene (ADR-004 L5).
-        // RT shadows are on by default where DXR 1.1 is; --no-rt-shadows for
-        // the cascades (PCSS). --rt-shadows is kept, and changes nothing.
-        if (c2.find("--no-rt-shadows") != std::string::npos) g_renderer.set_rt_shadows(false);
-        else if (c2.find("--rt-shadows") != std::string::npos) g_renderer.set_rt_shadows(true);
-        if (c2.find("--no-rt-denoise") != std::string::npos) g_renderer.set_rt_denoise(false);
-        if (c2.find("--rt-sparse-terrain") != std::string::npos) g_renderer.set_rt_sparse_terrain(true);
-        if (c2.find("--rt-card-leaves") != std::string::npos) g_renderer.set_rt_card_leaves(true);
-        if (c2.find("--rt-sky") != std::string::npos) g_renderer.set_rt_sky(true);
-        {
-            const size_t k = c2.find("--rt-sky-rays ");
-            if (k != std::string::npos) g_renderer.set_rt_sky_rays(std::atoi(c2.c_str() + k + 14));
-        }
         if (c2.find("--no-canopy") != std::string::npos) g_renderer.set_canopy(false);
-        // --gi: the DDGI reference (off by default). Matched as a whole word:
-        // --gi-report and --no-gi contain it.
-        if ((" " + c2 + " ").find(" --gi ") != std::string::npos) g_renderer.set_gi(true);
-        if (c2.find("--no-gi") != std::string::npos) g_renderer.set_gi(false);
         if ((" " + c2 + " ").find(" --ssgi ") != std::string::npos) g_renderer.set_ssgi(true);
         if (c2.find("--no-ssgi") != std::string::npos) g_renderer.set_ssgi(false);
         if (c2.find("--no-hfgi") != std::string::npos) g_renderer.set_hfgi(false);
@@ -1046,9 +999,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (c2.find("--no-pom") != std::string::npos) g_renderer.set_pom(false);
         if (c2.find("--no-rocks") != std::string::npos) g_renderer.set_rocks(false);
         if (c2.find("--no-forest-shell") != std::string::npos) g_renderer.set_forest_shell(false);
-        if (c2.find("--no-crowns") != std::string::npos)
-            g_renderer.set_rt_sky_mask(engine::RtScene::kMaskTerrain | engine::RtScene::kMaskTrees);
-        if (c2.find("--rt-report") != std::string::npos) { g_renderer.set_rt_active(true); g_renderer.set_rt_checks(true); }
         const size_t fdn = c2.find("--fog-density");
         if (fdn != std::string::npos) g_renderer.set_fog_density(float(std::atof(c2.c_str() + fdn + 13)));
         // Time of day (ADR-004 L2), hours: --time 6.5 is half past six.
@@ -1483,22 +1433,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 std::fprintf(f, "gpu: atmosphere %.3f ms, mist inject %.3f ms, mist integrate %.3f ms, "
                                 "post chain in all %.3f ms (smoothed over the still's frames)\n",
                              pt.atmosphere, pt.mist_inject, pt.mist_integrate, pt.post_total);
-                if (g_renderer.gi_active())
-                    std::fprintf(f, "gpu: DDGI probe update %.3f ms (3 cascades, a quarter of 20736 probes a frame, %.1f MB)\n",
-                                 g_renderer.gi_ms(), g_renderer.gi_bytes() / 1048576.0);
-                else
-                    std::fprintf(f, "gi: DDGI off (%s)\n", g_renderer.gi() ? "no ray tracing" : "the default; --gi turns it on");
-                if (g_renderer.rt_shadows() || g_renderer.rt_sky()) {
-                    const engine::Renderer::RtStats& rs = g_renderer.rt_stats();
-                    std::fprintf(f, "gpu: ray tracing -- BLAS + TLAS build %.3f ms, trace (key light%s) %.3f ms\n",
-                                 rs.build_ms, g_renderer.rt_sky() ? " + sky" : "", rs.trace_ms);
-                    const engine::RtScene::Stats& ss = g_renderer.rt_scene_stats();
-                    std::fprintf(f, "rt leaves: %s; %u cards, %u cutout triangles (%u of them needles), cut in %.0f ms, "
-                                 "%.1f MB BLAS, %u instances\n",
-                                 g_renderer.rt_scene().has_cutouts() ? "opaque cutouts" : "alpha-tested cards",
-                                 ss.cutout_cards, ss.cutout_tris, ss.cutout_needle_tris, ss.cutout_ms,
-                                 ss.cutout_bytes / 1048576.0, ss.instances_cutouts);
-                }
                 const engine::Renderer::CloudShadowReport& csr = g_renderer.last_cloud_shadow();
                 if (csr.valid)
                     std::fprintf(f, "cloud shadow: %.1f%% of its 12 x 12 km sunlit (beam T > 0.5), mean T %.3f; "
@@ -2623,108 +2557,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
-    // The meter's histogram as a luminance: the mean of its 10-90% band in
-    // log2, as the meter weighs it, but without its EV100 -2 floor.
-    auto band_nits = [](const engine::Renderer::ExposureReport& ex) -> double {
-        if (!ex.valid || ex.bins.empty()) return -1.0;
-        double total = 0.0;
-        for (unsigned b : ex.bins) total += b;
-        const double step = (ex.log_max - ex.log_min) / double(ex.bins.size());
-        double seen = 0.0, acc = 0.0, w = 0.0;
-        for (size_t b = 0; b < ex.bins.size(); ++b) {
-            const double lo = seen / total, hi = (seen + ex.bins[b]) / total;
-            seen += ex.bins[b];
-            const double in = (std::min)(hi, 0.9) - (std::max)(lo, 0.1);
-            if (in <= 0.0) continue;
-            acc += in * (ex.log_min + (double(b) + 0.5) * step);
-            w += in;
-        }
-        return w > 0.0 ? std::exp2(acc / w) : -1.0;
-    };
-
-    if (gi_report_mode) {
-        // --gi-report (ADR-004 L6): DDGI at three views -- what the probes
-        // cost, how many stand in rock, and the picture's luminance against
-        // the no-RT fallback. Where the sky is open the two should nearly
-        // agree (the probes add the terrain's bounce, and see the horizon the
-        // fallback assumes); under trees the probes should be darker.
-        std::remove("build/gi_report.txt");
-        FILE* f = std::fopen("build/gi_report.txt", "w");
-        if (!f) return 1;
-        const engine::WorldGpu& wg = g_renderer.world();
-        struct View { const char* name; float x, y, z, yaw, pitch, hours; bool ground; };
-        const View views[] = {
-            {"spawn at 14:00, from 46 m", 10.0f, 46.0f, -70.0f, 0.15f, -0.42f, 14.0f, false},
-            {"a wood at 09:00, at eye height", -30.0f, 0.0f, -60.0f, 4.71f, 0.05f, 9.0f, true},
-            {"the badlands hillside at 17:00", 2420.0f, 118.0f, 3390.0f, 0.6f, -0.25f, 17.0f, false},
-        };
-        std::fprintf(f, "gi report (ADR-004 L6): DDGI, 3 cascades of 24x12x24 probes at 2/8/32 m, 128 rays, a quarter a frame\n\n");
-        // DDGI is off by default; the report is about it, so it is on here.
-        const bool gi_was = true;
-        for (const View& vw : views) {
-            g_camera.x = vw.x; g_camera.z = vw.z;
-            g_camera.y = vw.ground ? wg.height(vw.x, vw.z) + 1.7f : vw.y;
-            g_camera.yaw = vw.yaw; g_camera.pitch = vw.pitch;
-            g_renderer.set_time_of_day(vw.hours);
-            engine::ViewConstants v = {};
-            fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
-            std::string err;
-            double lum[2] = {0.0, 0.0};
-            float ms = 0.0f;
-            engine::Ddgi::Counts counts;
-            engine::Ddgi::CameraIrradiance cam_irr = {};
-            for (int pass = 0; pass < 2; ++pass) {
-                g_renderer.set_gi(pass == 0 && gi_was);
-                g_renderer.capture(v, "build/gi_report.bmp", err);
-                for (int i = 0; i < 240; ++i) g_renderer.step_offscreen(v);
-                char path[64];
-                std::snprintf(path, sizeof path, "build/gi_report_%d_%s.bmp", int(&vw - views), pass == 0 ? "ddgi" : "fallback");
-                g_renderer.capture(v, path, err);
-                lum[pass] = band_nits(g_renderer.last_exposure());
-                if (pass == 0) {
-                    ms = g_renderer.gi_ms();
-                    g_renderer.gi_counts(counts, err);
-                    cam_irr = g_renderer.gi_camera_irradiance();
-                }
-            }
-            std::fprintf(f, "%s -- (%.0f, %.1f, %.0f)\n", vw.name, g_camera.x, g_camera.y, g_camera.z);
-            std::fprintf(f, "  luminance (meter's 10-90%% band): DDGI %.4g nits, fallback %.4g nits, ratio %.3f\n",
-                         lum[0], lum[1], lum[1] > 0.0 ? lum[0] / lum[1] : 0.0);
-            std::fprintf(f, "  probe update %.3f ms a frame (GPU)\n", ms);
-            // At the eye, per side: the probes' irradiance and the fallback's,
-            // in lux, and the probes' blue over green against the fallback's --
-            // where the bounce's colour shows.
-            {
-                const char* side[6] = {"+x", "-x", "up", "down", "+z", "-z"};
-                for (int k = 0; k < 6; ++k) {
-                    const float* E = cam_irr.E[k];
-                    const float* O = cam_irr.open[k];
-                    std::fprintf(f, "  at the eye, facing %-4s probes (%7.0f, %7.0f, %7.0f) cover %.2f   fallback (%7.0f, %7.0f, %7.0f)"
-                                    "   B/G %.2f vs %.2f\n",
-                                 side[k], E[0], E[1], E[2], E[3], O[0], O[1], O[2],
-                                 E[1] > 0.0f ? E[2] / E[1] : 0.0f, O[1] > 0.0f ? O[2] / O[1] : 0.0f);
-                }
-            }
-            for (int c = 0; c < engine::Ddgi::kCascades; ++c)
-                std::fprintf(f, "  cascade %d (%2.0f m): %5d active, %5d off in rock, %5d idle in open air, %5d not yet traced\n",
-                             c, engine::Ddgi::kSpacing[c], counts.active[c], counts.inactive[c], counts.idle[c],
-                             counts.pending[c]);
-            std::fprintf(f, "\n");
-        }
-        g_renderer.set_gi(gi_was);
-        std::fclose(f);
-        g_renderer.shutdown();
-        g_physics.shutdown();
-        return 0;
-    }
-
     if (leak_mode) {
-        // --leak-test (ADR-004 L6): the failure every probe GI is judged by.
+        // --leak-test (ADR-004 L6): the failure every GI is judged by.
         // A sphere of air dug 10 m under flat ground -- sealed, its roof six
         // metres of rock -- and the camera in it: with no light inside, its
         // luminance must be ~0, and a torch must fill it. Measured as the
-        // exposure meter's mean (nits, 10-90% band) after the probes have
-        // had 240 frames, each config against the same chamber.
+        // exposure meter's mean (nits, 10-90% band) after 240 frames, each
+        // config against the same chamber.
         std::remove("build/leak_report.txt");
         FILE* f = std::fopen("build/leak_report.txt", "w");
         if (!f) return 1;
@@ -2761,34 +2600,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         std::fprintf(f, "leak test (ADR-004 L6): a sphere of air r %.1f m, centre %.1f m under flat ground at (%.0f, %.1f, %.0f); "
                         "roof %.1f m of rock\n",
                      kR, kDepth, cx, cy, cz, kDepth - kR);
-        std::fprintf(f, "DDGI %s\n\n", g_renderer.gi_active() || g_renderer.gi() ? "available" : "unavailable");
-        // `bounce` false: the probes do not see local lights, so the torch is
-        // its direct light alone; against `bounce` true, that is the fill.
-        // `hf`: the heightfield GI, the no-RT path; with neither it nor DDGI
-        // the bare two-hemisphere fallback is what leaked 566 nits.
-        struct Cfg { const char* name; bool inside, gi, torch, fog, bounce, hf; };
-        // Outside LAST: stepping out and back scrolls the chamber's probes out
-        // of cascade 0 and swaps the chunks round it to other LODs, and the
-        // fresh probes catch light through the half-rebuilt scene that then
-        // decays at 0.92 an update -- a re-entry transient, measured apart.
+        std::fprintf(f, "\n");
+        // `hf`: the heightfield GI; without it the bare two-hemisphere
+        // fallback is what leaked 566 nits. (DDGI's probe configurations went
+        // with hardware RT: git tag rt-last.)
+        struct Cfg { const char* name; bool inside, torch, fog, hf; };
         const Cfg cfgs[] = {
-            {"sealed, DDGI", true, true, false, true, true, true},
-            {"sealed, DDGI, no mist", true, true, false, false, true, true},
-            {"sealed, no RT: heightfield GI", true, false, false, true, true, true},
-            {"sealed, bare fallback (--no-gi --no-hfgi)", true, false, false, true, true, false},
-            {"sealed, DDGI, torch, no mist", true, true, true, false, true, true},
-            {"sealed, DDGI, torch, no mist, probes blind to it", true, true, true, false, false, true},
-            {"sealed, heightfield GI, torch", true, false, true, true, true, true},
-            {"outside, standing on the ground above", false, true, false, true, true, true},
+            {"sealed, heightfield GI", true, false, true, true},
+            {"sealed, heightfield GI, no mist", true, false, false, true},
+            {"sealed, bare fallback (--no-hfgi)", true, false, true, false},
+            {"sealed, heightfield GI, torch", true, true, true, true},
+            {"outside, standing on the ground above", false, false, true, true},
         };
-        const bool gi_was = true;   // DDGI is off by default; this test is about it
-        g_renderer.set_gi(true);
-        double dark_gi = -1.0, dark_clear = -1.0, torch_gi = -1.0, torch_direct = -1.0, fallback = -1.0, heightfield = -1.0;
-        // Settle inside first. The chamber is re-meshed and its BLAS rebuilt
-        // over the first frames, and probes that saw daylight through the
-        // half-built chamber decay at 0.92 an update: the first config
-        // measured right after entering read 10 lux at the eye, the later
-        // ones under 1. A long settle once, then each config its own frames.
+        double dark = -1.0, dark_clear = -1.0, fallback = -1.0, torch = -1.0;
+        // Settle inside first: the chamber is re-meshed over the first frames.
         {
             g_camera.x = cx; g_camera.y = cy; g_camera.z = cz;
             g_camera.yaw = 0.0f; g_camera.pitch = -0.35f;
@@ -2796,13 +2621,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
             std::string err;
             g_renderer.capture(v, "build/leak.bmp", err);
-            for (int i = 0; i < 1200; ++i) g_renderer.step_offscreen(v);
+            for (int i = 0; i < 300; ++i) g_renderer.step_offscreen(v);
         }
         for (const Cfg& c : cfgs) {
-            g_renderer.set_gi(c.gi && gi_was);
             g_renderer.set_carried_torch(c.torch);
             g_renderer.set_fog(c.fog);
-            g_renderer.set_gi_local_lights(c.bounce);
             g_renderer.set_hfgi(c.hf);
             if (c.inside) {
                 g_camera.x = cx; g_camera.y = cy; g_camera.z = cz;
@@ -2814,8 +2637,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             engine::ViewConstants v = {};
             fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
             std::string err;
-            // The first capture streams and meshes the chamber and builds its
-            // BLAS; then the probes get 240 frames; then the measured still.
             g_renderer.capture(v, "build/leak.bmp", err);
             for (int i = 0; i < leak_frames; ++i) g_renderer.step_offscreen(v);
             char path[64];
@@ -2843,186 +2664,19 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             }
             std::fprintf(f, "  %-40s %s mean %.4g nits (EV100 %.2f) -> %s\n", c.name, ok ? "" : "CAPTURE FAILED", nits,
                          ex.ev100, path);
-            if (c.gi) {
-                // What the probes say reaches the eye: the mist and the haze
-                // take their share of open sky from this.
-                const engine::Ddgi::CameraIrradiance& ci = g_renderer.gi_camera_irradiance();
-                std::fprintf(f, "      at the eye: sky share %.5f; probes up (%.3g, %.3g, %.3g) down (%.3g, %.3g, %.3g) lux, "
-                                "cover %.2f\n",
-                             g_renderer.gi_camera_sky(), ci.E[2][0], ci.E[2][1], ci.E[2][2], ci.E[3][0], ci.E[3][1],
-                             ci.E[3][2], ci.E[2][3]);
-                if (c.inside) {
-                    // The chamber's own probes: cascade 0's grid points inside
-                    // the sphere, less half a spacing so none sits in its wall.
-                    engine::Ddgi::Counts in_ch;
-                    const float centre[3] = {cx, cy, cz};
-                    g_renderer.gi_counts(in_ch, err, centre, kR - 1.0f);
-                    std::fprintf(f, "      the chamber's cascade-0 probes: %d active, %d off in rock, %d idle, %d not yet traced\n",
-                                 in_ch.active[0], in_ch.inactive[0], in_ch.idle[0], in_ch.pending[0]);
-                }
-            }
-            if (c.inside && c.gi && !c.torch && c.fog) dark_gi = nits;
-            if (c.inside && c.gi && !c.torch && !c.fog) dark_clear = nits;
-            if (c.inside && c.gi && c.torch && c.bounce) torch_gi = nits;
-            if (c.inside && c.gi && c.torch && !c.bounce) torch_direct = nits;
-            if (c.inside && !c.gi && !c.torch && !c.hf) fallback = nits;
-            if (c.inside && !c.gi && !c.torch && c.hf) heightfield = nits;
+            if (c.inside && !c.torch && c.fog && c.hf) dark = nits;
+            if (c.inside && !c.torch && !c.fog && c.hf) dark_clear = nits;
+            if (c.inside && !c.torch && !c.hf) fallback = nits;
+            if (c.inside && c.torch) torch = nits;
         }
-        g_renderer.set_gi(gi_was);
         g_renderer.set_carried_torch(false);
         g_renderer.set_fog(true);
-        g_renderer.set_gi_local_lights(true);
         g_renderer.set_hfgi(true);
         // A full moon puts ~0.01 nits on a meadow; sealed and unlit must be
-        // well under that. The torch's own light is (torch - dark); the
-        // probes' share of it is what they add over the direct light.
-        const double t_all = torch_gi - dark_clear, t_dir = torch_direct - dark_clear;
-        std::fprintf(f, "\nverdict: sealed and unlit, DDGI %.3g nits with mist, %.3g without (%s); without RT, the "
-                        "heightfield GI %.3g (%s) -- under 0.01, a moonlit meadow; the bare fallback leaks %.4g\n",
-                     dark_gi, dark_clear, dark_gi >= 0.0 && dark_gi < 0.01 ? "PASS" : "LEAKS", heightfield,
-                     heightfield >= 0.0 && heightfield < 0.01 ? "PASS" : "LEAKS", fallback);
-        // In a closed chamber every bounce returns albedo r of the light, so
-        // the total is 1/(1 - r) of the direct: the factor implies the walls'
-        // albedo, which is the material the chamber was dug from.
-        const double fill = t_dir > 0.0 ? t_all / t_dir : 0.0;
-        std::fprintf(f, "         the torch: %.3g nits direct, %.3g with the probes' bounce -- %.2fx, which a closed chamber "
-                        "gives walls of albedo %.2f (%s)\n",
-                     t_dir, t_all, fill, fill > 0.0 ? 1.0 - 1.0 / fill : 0.0, fill > 1.02 ? "FILLS" : "DOES NOT FILL");
-        std::fclose(f);
-        g_renderer.shutdown();
-        g_physics.shutdown();
-        return 0;
-    }
-
-    if (rt_report_mode) {
-        // --rt-report (ADR-004 L5): the ray-tracing scene, measured at three
-        // views once its BLAS backlog has drained -- what it holds and costs,
-        // whether its terrain is the terrain that was drawn (a primary ray
-        // against the depth buffer), and how its key-light shadow agrees with
-        // the cascades'.
-        g_renderer.set_vsync(false);
-        const engine::WorldGpu& wg = g_renderer.world();
-        std::remove("build/rt_report.txt");
-        FILE* f = std::fopen("build/rt_report.txt", "w");
-        if (!f) return 1;
-        if (!g_renderer.rt_available()) {
-            std::fprintf(f, "ray tracing unavailable on this device (needs DXR 1.1 and DXC)\n");
-            std::fclose(f);
-            g_renderer.shutdown();
-            g_physics.shutdown();
-            return 0;
-        }
-        float clock = 0.0f;
-        auto frame = [&]() -> bool {
-            MSG m = {};
-            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
-            RECT cr;
-            GetClientRect(hwnd, &cr);
-            const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
-            if (w < 1.0f || h < 1.0f) return false;
-            clock += 1.0f / 60.0f;
-            engine::ViewConstants v = {};
-            fill_view(g_camera, w, h, clock, v);
-            g_renderer.render(v);
-            return true;
-        };
-        struct View { const char* name; float x, y, z, yaw, pitch, hours; bool ground; };
-        const View views[] = {
-            {"a wood at dawn, facing the sun", -30.0f, 0.0f, -60.0f, 4.71f, 0.05f, 7.0f, true},
-            {"spawn at 14:00", 10.0f, 46.0f, -70.0f, 0.15f, -0.42f, 14.0f, false},
-            {"the rough hillside at 17:00", 2420.0f, 118.0f, 3390.0f, 0.6f, -0.25f, 17.0f, false},
-        };
-        std::fprintf(f, "rt report (ADR-004 L5): DXR 1.1 inline RayQuery, BLAS per LOD 0-3 chunk and per tree model\n\n");
-        for (const View& vw : views) {
-            g_camera.x = vw.x; g_camera.z = vw.z;
-            g_camera.y = vw.ground ? wg.height(vw.x, vw.z) + 1.7f : vw.y;
-            g_camera.yaw = vw.yaw; g_camera.pitch = vw.pitch;
-            g_renderer.set_time_of_day(vw.hours);
-            int fill = 0;
-            unsigned max_built = 0;
-            for (; fill < 1500; ++fill) {
-                if (!frame()) break;
-                const engine::RtScene::Stats& rs = g_renderer.rt_scene_stats();
-                if (rs.built_this_frame > max_built) max_built = rs.built_this_frame;
-                if (fill > 60 && g_renderer.stats().pending == 0 && g_renderer.tree_field().settled() &&
-                    rs.pending == 0 && rs.drawn_without_blas == 0) break;
-            }
-            for (int i = 0; i < 120; ++i) frame();
-            const engine::RtScene::Stats& rs = g_renderer.rt_scene_stats();
-            const engine::Renderer::RtStats& st = g_renderer.rt_stats();
-            const double cmp = double(st.lit_lit) + st.shadow_shadow + st.rt_only + st.csm_only;
-            const double prim = double(st.primary_agree) + st.primary_nearer + st.primary_farther;
-            std::fprintf(f, "%s -- (%.0f, %.1f, %.0f)\n", vw.name, g_camera.x, g_camera.y, g_camera.z);
-            std::fprintf(f, "  settled in %d frames, at most %u BLAS built in one\n", fill, max_built);
-            // A hung GPU reads back as zeros everywhere -- counts, stats, timers
-            // -- which first looked like a BLAS queue bug. Say so up front.
-            std::fprintf(f, "  device: %s\n", g_renderer.device()->GetDeviceRemovedReason() == S_OK
-                                                  ? "alive" : "REMOVED -- every number below is void");
-            std::fprintf(f, "  queue so far: %llu noted, %llu built, %llu empty, %llu dropped as remeshed, %llu as moved\n",
-                         (unsigned long long)rs.noted, (unsigned long long)rs.built_total, (unsigned long long)rs.empty,
-                         (unsigned long long)rs.dropped_remeshed, (unsigned long long)rs.dropped_moved);
-            std::fprintf(f, "  BLAS: %u terrain, %u tree models; %.1f MB, TLAS %.1f MB (two), scratch %.1f MB\n",
-                         rs.terrain_blas, rs.tree_blas, rs.blas_bytes / 1048576.0, rs.tlas_bytes / 1048576.0,
-                         rs.scratch_bytes / 1048576.0);
-            std::fprintf(f, "  TLAS: %u chunk instances, %u trees, %u crowns, %u rocks; %u drawn LOD 0-3 chunks without a BLAS; %u pending\n",
-                         rs.instances_terrain, rs.instances_trees, rs.instances_crowns, rs.instances_rocks,
-                         rs.drawn_without_blas, rs.pending);
-            std::fprintf(f, "  leaf cutouts (the key-light shadow's leaves): %s; %u cards cut into %u triangles in %.0f ms, "
-                         "%.1f MB of BLAS, %u instances\n",
-                         g_renderer.rt_scene().has_cutouts() ? "on" : "OFF, the shadow ray alpha-tests the cards",
-                         rs.cutout_cards, rs.cutout_tris, rs.cutout_ms, rs.cutout_bytes / 1048576.0, rs.instances_cutouts);
-            std::fprintf(f, "  GPU: BLAS + TLAS build %.3f ms a frame (steady), shadow trace and checks %.3f ms\n",
-                         st.build_ms, st.trace_ms);
-            if (prim > 0)
-                std::fprintf(f, "  primary ray vs depth (terrain): agree %.2f%%, RT nearer %.3f%%, RT farther or missed %.2f%%; "
-                                "normal error %.2f deg where they agree within 40 m\n",
-                             100.0 * st.primary_agree / prim, 100.0 * st.primary_nearer / prim,
-                             100.0 * st.primary_farther / prim, st.normal_err_deg);
-            if (cmp > 0)
-                std::fprintf(f, "  key-light shadow vs cascades (%.0f lit-facing pixels inside 468 m): agree %.2f%% "
-                                "(lit %.2f%%, shadowed %.2f%%); RT shadowed only %.2f%%, cascades shadowed only %.2f%%\n\n",
-                             cmp, 100.0 * (st.lit_lit + st.shadow_shadow) / cmp, 100.0 * st.lit_lit / cmp,
-                             100.0 * st.shadow_shadow / cmp, 100.0 * st.rt_only / cmp, 100.0 * st.csm_only / cmp);
-
-            // The sky (L6): mean visibility over the surface pixels, with the
-            // crowns, with terrain and trunks only, and the trace's cost each
-            // way -- off is the L5 trace alone. One ray a pixel a frame.
-            struct SkyCfg { const char* name; bool on; unsigned mask; };
-            const SkyCfg cfgs[] = {
-                {"off (key light only)", false, 0x7u},
-                {"terrain + trunks", true, 0x3u},
-                {"terrain + trunks + crowns", true, 0x7u},
-                {"crowns only", true, 0x4u},
-            };
-            for (const SkyCfg& c : cfgs) {
-                // The map is compared per pixel, so the traced side needs
-                // enough rays to be an answer rather than a sample.
-                g_renderer.set_rt_sky_rays(c.mask == 0x4u ? 16 : 1);
-                g_renderer.set_rt_sky_mask(c.mask);
-                g_renderer.set_rt_sky(c.on);
-                for (int i = 0; i < 240; ++i) frame();
-                const engine::Renderer::RtStats& s2 = g_renderer.rt_stats();
-                const engine::RtScene::Stats& r2 = g_renderer.rt_scene_stats();
-                if (c.on)
-                    std::fprintf(f, "  sky %-26s visibility %.3f inside 468 m (%u px), %.3f inside 60 m (%u px); "
-                                    "trace %.3f ms, build %.3f ms, %u crowns\n",
-                                 c.name, s2.sky_mean, s2.sky_pixels, s2.sky_near_mean, s2.sky_near_pixels,
-                                 s2.trace_ms, s2.build_ms, r2.instances_crowns);
-                else
-                    std::fprintf(f, "  sky %-26s trace %.3f ms, build %.3f ms\n", c.name, s2.trace_ms, s2.build_ms);
-                // The canopy map (L6's no-RT path) is judged against crowns
-                // alone: terrain horizons and trunks are not what it models.
-                if (c.on && c.mask == 0x4u)
-                    std::fprintf(f, "  canopy map vs traced crowns (16 rays), %u terrain px inside 200 m: traced %.3f, map %.3f, mean |difference| %.3f; "
-                                    "%u trees in the map\n",
-                                 s2.canopy_pixels, s2.canopy_rt_mean, s2.canopy_map_mean, s2.canopy_mae,
-                                 g_renderer.canopy_trees());
-            }
-            g_renderer.set_rt_sky(false);
-            g_renderer.set_rt_sky_rays(1);
-            g_renderer.set_rt_sky_mask(0x7u);
-            std::fprintf(f, "\n");
-        }
+        // well under that.
+        std::fprintf(f, "\nverdict: sealed and unlit, the heightfield GI %.3g nits with mist, %.3g without (%s) -- under "
+                        "0.01, a moonlit meadow; the bare fallback leaks %.4g; a carried torch %.3g\n",
+                     dark, dark_clear, dark >= 0.0 && dark < 0.01 && dark_clear < 0.01 ? "PASS" : "LEAKS", fallback, torch);
         std::fclose(f);
         g_renderer.shutdown();
         g_physics.shutdown();

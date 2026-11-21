@@ -198,7 +198,8 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         sr[2].NumDescriptors = 1;
         sr[2].BaseShaderRegister = 25;
         sr[2].OffsetInDescriptorsFromTableStart = 38;
-        // ADR-004 L6: the DDGI probes at [40..42] (t26..t28).
+        // [40..42] (t26..t28): DDGI's probes until hardware RT was removed
+        // (rt-last); the range stays declared, nothing reads it.
         sr[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr[3].NumDescriptors = 3;
         sr[3].BaseShaderRegister = 26;
@@ -237,7 +238,7 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         cmp.MaxLOD = D3D12_FLOAT32_MAX;
         cmp.ShaderRegister = 1;
         cmp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        // s3: DDGI's linear sampler (ddgi.hlsli), visible to the vertex
+        // s3: the lit pipelines' linear sampler (shadow.hlsli g_gi_linear), visible to the vertex
         // shaders too -- trees and grass read the probes per vertex.
         D3D12_STATIC_SAMPLER_DESC lin = {};
         lin.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
