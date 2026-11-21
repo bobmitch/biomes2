@@ -930,6 +930,54 @@ EXPECTATION rather than its draw.
   skyline from the air) -- the shell was expected to carry most of it, and
   does; no altitude gate was needed.
 
+### Micro-relief and flat sites (v17)
+
+Calm land read as one smooth sheet: the profiles' finest octave is ~110 m,
+so meadows and wetland were long even slopes. `validate --flatness` is the
+instrument -- the height range over pads of 10, 20 and 40 m radius at
+random land points, per dominant biome: the share under 0.5 / 1 / 2 m and
+the median.
+
+- **Micro-relief is part of layer 4.** ONE field (`layer4_detail`,
+  archetypes.json `detail`: 72 m, 3 octaves, gain 0.5, its own feature
+  seed) shared by every biome, each scaling it by its own `detail` metres
+  before the heights are blended -- which is blending heights, never noise
+  parameters. Meadows 4.0, wetland 2.8, forest 2.4; meadows' flatness 1.6
+  -> 1.3, wetland's 2.4 -> 1.8. The fbm's typical swing is about a quarter
+  of its amplitude: 1.8 m moved the median 0.2 m and did nothing visible.
+  Faded by voxel like every octave (LOD agreement still 0.39); the GPU's
+  amplitude is `g_arch` row 2's `w` (it was spare) and the field's shape is
+  in the world constants. Meadows' 20 m pads level to 0.5 m went 1.2% ->
+  0.3% of the land, 10 m pads 9.0% -> 1.9%; the median over a 10 m pad
+  1.4 -> 2.2 m. Rolling, not hills.
+- **Flat sites are layer 5b** (`build_flats`, after the rivers): one
+  candidate per 320 m cell, jittered inside its middle 56% so no two touch
+  (the load checks that), kept by the blended biome's `flats` chance where
+  the land is already gentle (max_grade 0.08 across the pad and out to the
+  shoulder), dry, and 15 m clear of every channel. The pad is pulled to the
+  mean of its own heights (`flat_apply`, field.h) and eases back over a
+  shoulder of 0.6 x radius, at least 10 m. `terrain_height` applies it
+  after the river carve; nothing upstream of `build_flats` sees one.
+  Trees and rocks keep 3 m past the shoulder (`TREE_FLAT`, `ROCK_FLAT`),
+  so every site is a glade. ~19 a seed: meadows 9.8, wetland 6.7, forest
+  2.5; radius 14-36 m, mean 26.
+- **On the GPU the sites ride in the RIVER buffers**, after the segments,
+  as entries with a negative width -- (x, z, radius, shoulder), (-1,
+  level) -- binned on the river grid's geometry. The mesher's root
+  signature is at 60 of 64 DWORDs: three more root UAVs would not fit.
+  `real_nearest_river` skips them, `real_apply_flats` reads the point's own
+  bin. `--probe-field --probe-at x z` compares a chunk anywhere: on the
+  default seed's nearest site the pad is exact and the shoulder 4 um.
+- **Hashed by buffer** (id, x, z, radius, level, in the per-layer slot 2):
+  a site is tens of metres across and the hash grid samples every 156 m.
+- `validate`'s **flat sites** check: every pad level to 2 cm through
+  `terrain_height` (measured 0.000), every shoulder under 0.6 rise over run
+  (0.49), every configured biome grows some and no unconfigured one more
+  than a trace. `startup.txt` names the count and the nearest to spawn.
+- **Cost**: `--walk 10 --uncapped` at 720p, v16 built beside it and run
+  alternately: 4.39 / 4.40 ms against 4.28 / 4.33 -- about +0.08 ms (the
+  shared fbm in every field call). Validate's throughput unchanged.
+
 ### Rocks
 
 **Placement is layer 9, in `worldgen/`, under the golden hash (v14, set

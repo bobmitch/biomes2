@@ -200,30 +200,55 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
             p[8] = table_[i].cave_density;
             p[9] = table_[i].cave_depth_min;
             p[10] = table_[i].cave_depth_max;
+            p[11] = table_[i].detail_amp;
         }
         UPLOAD(archetypes_, a.data(), a.size() * 4, "archetype buffer");
     }
 
-    // --- rivers and their bins --------------------------------------------
+    // --- rivers, flat sites, and their bins ------------------------------
+    // Layer 5b's flat sites ride in the river buffers, after the segments, as
+    // entries with a NEGATIVE width: (x, z, radius, shoulder) and (-1, level).
+    // The mesher's root signature has 60 of its 64 DWORDs spent, so three
+    // more root UAVs would not fit, and the sites are binned on the river
+    // grid's geometry anyway. real_nearest_river skips them; real_terrain_
+    // height applies the ones in the point's own bin, as world.cpp does.
     {
-        std::vector<float> seg(world_.rivers.size() * 8, 0.0f);
-        for (size_t i = 0; i < world_.rivers.size(); ++i) {
+        const size_t nr = world_.rivers.size();
+        const size_t nf = world_.flats.size();
+        std::vector<float> seg((nr + nf) * 8, 0.0f);
+        for (size_t i = 0; i < nr; ++i) {
             float* p = &seg[i * 8];
             p[0] = world_.rivers[i].ax; p[1] = world_.rivers[i].az;
             p[2] = world_.rivers[i].bx; p[3] = world_.rivers[i].bz;
             p[4] = world_.rivers[i].width; p[5] = world_.rivers[i].depth;
         }
+        for (size_t i = 0; i < nf; ++i) {
+            float* p = &seg[(nr + i) * 8];
+            p[0] = world_.flats[i].x; p[1] = world_.flats[i].z;
+            p[2] = world_.flats[i].radius; p[3] = world_.flats[i].shoulder;
+            p[4] = -1.0f; p[5] = world_.flats[i].level;
+        }
+        if (seg.empty()) seg.assign(8, 0.0f);
         UPLOAD(rivers_, seg.data(), seg.size() * 4, "river buffer");
 
         const int N = world_.rgrid_n;
         std::vector<unsigned> offsets(static_cast<size_t>(N) * N + 1, 0u);
         std::vector<unsigned> items;
+        const bool have_fgrid = world_.fgrid.size() == static_cast<size_t>(N) * N;
         for (size_t i = 0; i < static_cast<size_t>(N) * N; ++i) {
-            offsets[i + 1] = offsets[i] + static_cast<unsigned>(world_.rgrid[i].size());
+            size_t count = world_.rgrid[i].size();
             for (size_t j = 0; j < world_.rgrid[i].size(); ++j) {
                 items.push_back(static_cast<unsigned>(world_.rgrid[i][j]));
             }
+            if (have_fgrid) {
+                for (size_t j = 0; j < world_.fgrid[i].size(); ++j) {
+                    items.push_back(static_cast<unsigned>(nr + static_cast<size_t>(world_.fgrid[i][j])));
+                }
+                count += world_.fgrid[i].size();
+            }
+            offsets[i + 1] = offsets[i] + static_cast<unsigned>(count);
         }
+        if (items.empty()) items.push_back(0u);
         UPLOAD(river_offsets_, offsets.data(), offsets.size() * 4, "river offsets");
         UPLOAD(river_items_, items.data(), items.size() * 4, "river items");
     }
@@ -291,6 +316,10 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
     constants_.entrance_bin_size = world_.egrid_cell;
     constants_.cell_count = ncells;
     constants_.biome_count = nbiomes;
+    constants_.detail_period = table_.detail.period;
+    constants_.detail_octaves = table_.detail.octaves;
+    constants_.detail_gain = table_.detail.gain;
+    constants_.s_detail = world_.s_detail;
 
     // A constant buffer's size must be a multiple of 256 bytes.
     const UINT cb_bytes = (sizeof(WorldConstants) + 255u) & ~255u;

@@ -20,6 +20,7 @@ static BiomeProfile profile_of(const BiomeArchetype& a) {
     p.gain           = a.gain;
     p.ridge_blend    = a.ridge_blend;
     p.flatness       = a.flatness;
+    p.detail_amp     = a.detail_amp;
     p.overhang_strength = a.overhang_strength;
     p.cave_density      = a.cave_density;
     p.cave_depth_min    = a.cave_depth_min;
@@ -123,6 +124,11 @@ float terrain_base(const SeedWorld& w, const WorldParams& wp,
     float d5 = 3.4e38f;
     const int found = w.lookup.nearest4(w.pts, wx, wz, idx, dist, &d5);
 
+    // The micro-relief once, for every biome: each scales it by its own
+    // detail_amp, so blending the heights blends the amplitudes exactly.
+    const float dn = layer4_detail(x, z, table.detail.period, table.detail.octaves,
+                                   table.detail.gain, w.s_detail, voxel);
+
     float h[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float wt[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float wall = 0.0f;
@@ -137,7 +143,8 @@ float terrain_base(const SeedWorld& w, const WorldParams& wp,
         const int b = w.biome[idx[k]];
         if (b < 0) continue;
         const BiomeArchetype& a = table[b];
-        h[k] = layer4_profile(x, z, wp.biome_freq, profile_of(a), w.s_height, voxel);
+        h[k] = layer4_profile(x, z, wp.biome_freq, profile_of(a), w.s_height, voxel)
+             + a.detail_amp * dn;
         wt[k] = wk;
     }
 
@@ -181,11 +188,35 @@ float nearest_river(const SeedWorld& w, const WorldParams& wp,
 // carving the surface the rivers were traced on would feed back on itself.
 float terrain_height(const SeedWorld& w, const WorldParams& wp,
                      const ArchetypeTable& table, float x, float z, float r, float voxel) {
-    const float h = terrain_base(w, wp, table, x, z, r, voxel);
+    float h = terrain_base(w, wp, table, x, z, r, voxel);
     float rw = 0.0f, rd = 0.0f;
     const float dist = nearest_river(w, wp, x, z, rw, rd);
-    if (dist >= rw) return h;
-    return river_carve(h, dist, rw, rd);
+    if (dist < rw) h = river_carve(h, dist, rw, rd);
+    // Layer 5b after the carve. A site keeps clear of every channel, so the
+    // order only matters to say which wins: the site.
+    const int fs = flat_site_at(w, x, z, 0.0f);
+    if (fs >= 0) {
+        const SeedWorld::FlatSite& f = w.flats[static_cast<size_t>(fs)];
+        h = flat_apply(h, x, z, f.x, f.z, f.radius, f.shoulder, f.level);
+    }
+    return h;
+}
+
+int flat_site_at(const SeedWorld& w, float x, float z, float margin) {
+    if (w.flats.empty() || w.fgrid.empty()) return -1;
+    // The disc's radius from the river grid's own geometry, as build_flats
+    // binned with: the same arithmetic both sides, so a point finds its bin.
+    const float R = 0.5f * w.rgrid_cell * static_cast<float>(w.rgrid_n);
+    const int   gx = std::min(w.rgrid_n - 1, std::max(0, static_cast<int>((x + R) / w.rgrid_cell)));
+    const int   gz = std::min(w.rgrid_n - 1, std::max(0, static_cast<int>((z + R) / w.rgrid_cell)));
+    const std::vector<int>& bin = w.fgrid[static_cast<size_t>(gz) * w.rgrid_n + gx];
+    for (size_t m = 0; m < bin.size(); ++m) {
+        const SeedWorld::FlatSite& f = w.flats[static_cast<size_t>(bin[m])];
+        const float dx = x - f.x, dz = z - f.z;
+        const float o = f.radius + f.shoulder + margin;
+        if (dx * dx + dz * dz < o * o) return bin[m];
+    }
+    return -1;
 }
 
 // Layer 6. The per-biome cave and overhang parameters are blended across the
@@ -215,6 +246,7 @@ float terrain_density(const SeedWorld& w, const WorldParams& wp,
     p.gain = 0.5f;
     p.ridge_blend = 0.0f;
     p.flatness = 1.0f;
+    p.detail_amp = 0.0f;
     p.overhang_strength = 0.0f;
     p.cave_density = 0.0f;
     p.cave_depth_min = 0.0f;
@@ -376,6 +408,8 @@ bool tree_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTabl
     if (density <= 0.0f) TREE_NO(TREE_CLEARING);
     const float u_keep = tree_unit(tree_hash(i, j, w.s_trees, 2u));
     if (u_keep >= density) TREE_NO(TREE_ROLL);
+    // A flat site is a glade: kept clear, with room past its shoulder.
+    if (flat_site_at(w, x, z, table.flats.tree_clear) >= 0) TREE_NO(TREE_FLAT);
 
     // The ground. Shore, slope and river first: they need only heights.
     const float r = std::sqrt(x * x + z * z) / wp.radius;
@@ -523,6 +557,7 @@ bool rock_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTabl
     const float size = rc.size_min + (rc.size_max - rc.size_min) * (u_s * u_s * u_s);
     const float rad = 0.45f * size;
 
+    if (flat_site_at(w, x, z, table.flats.tree_clear + rad) >= 0) ROCK_NO(ROCK_FLAT);
     const float r = std::sqrt(x * x + z * z) / wp.radius;
     const float h = terrain_height(w, wp, table, x, z, r);
     if (h < table.sea_level + rt.shore) ROCK_NO(ROCK_SHORE);
@@ -1001,6 +1036,8 @@ SeedWorld build_world(uint64_t world_seed,
     w.s_tree_patch = feature_seed(world_seed, FEATURE_TREE_PATCH);
     w.s_rocks = feature_seed(world_seed, FEATURE_ROCKS);
     w.s_rock_patch = feature_seed(world_seed, FEATURE_ROCK_PATCH);
+    w.s_detail = feature_seed(world_seed, FEATURE_DETAIL);
+    w.s_flats = feature_seed(world_seed, FEATURE_FLATS);
     const uint32_t s_cont = w.s_cont, s_dang = w.s_dang, s_wx = w.s_wx, s_wz = w.s_wz;
     const uint32_t s_cell = feature_seed(world_seed, FEATURE_CELLS);
 
@@ -1099,10 +1136,131 @@ SeedWorld build_world(uint64_t world_seed,
     // biome assignment.
     build_rivers(w, wp, table);
 
+    // Layer 5b: level sites, clear of the channels just traced.
+    build_flats(w, wp, table);
+
     // Layer 7 after that again: the descent walks against the finished
     // density, which needs the carved heightfield under it.
     build_entrances(w, wp, table);
     return w;
+}
+
+// --- layer 5b: flat sites -----------------------------------------------------
+// One candidate per cell, a pure function of the cell like a tree: jitter,
+// keep roll, radius. Kept only where the land is already gentle -- the pad
+// levels the last metre or two, it does not cut a terrace into a hillside --
+// dry, and clear of every channel. The level is the mean of the pad's own
+// heights, so cut and fill balance.
+void build_flats(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table) {
+    w.flats.clear();
+    w.fgrid.clear();
+    const FlatTable& ft = table.flats;
+    if (!ft.present || w.rgrid_n <= 0) return;
+    bool any = false;
+    for (size_t b = 0; b < table.size(); ++b) if (table[b].flat_chance > 0.0f) any = true;
+    if (!any) return;
+
+    const float R = wp.radius;
+    const float sea = table.sea_level;
+    // Sixteen directions without trigonometry: the axes, the diagonals and
+    // the eight between them (cos and sin of 22.5 degrees as literals).
+    const float c1 = 0.92387953f, s1 = 0.38268343f, d = 0.70710678f;
+    const float dx16[16] = {1.0f, c1, d, s1, 0.0f, -s1, -d, -c1, -1.0f, -c1, -d, -s1, 0.0f, s1, d, c1};
+    const float dz16[16] = {0.0f, s1, d, c1, 1.0f, c1, d, s1, 0.0f, -s1, -d, -c1, -1.0f, -c1, -d, -s1};
+    auto height_at = [&](float x, float z) {
+        return terrain_height(w, wp, table, x, z, std::sqrt(x * x + z * z) / R);
+    };
+
+    const int n = static_cast<int>(std::ceil(R / ft.cell));
+    for (int j = -n; j < n; ++j) {
+        for (int i = -n; i < n; ++i) {
+            // Jitter inside the middle 56% of the cell: with the outer edge
+            // under 0.22 cell (checked at load), two sites never touch.
+            const float ux = tree_unit(tree_hash(i, j, w.s_flats, 0u));
+            const float uz = tree_unit(tree_hash(i, j, w.s_flats, 1u));
+            const float x = (static_cast<float>(i) + 0.22f + 0.56f * ux) * ft.cell;
+            const float z = (static_cast<float>(j) + 0.22f + 0.56f * uz) * ft.cell;
+            if (x * x + z * z > 0.81f * R * R) continue;
+
+            int   bio[4];
+            float bw[4];
+            const int nb = biome_mix(w, wp, x, z, bio, bw);
+            if (nb == 0) continue;
+            float chance = 0.0f;
+            int dom = 0;
+            for (int k = 0; k < nb; ++k) {
+                chance = chance + bw[k] * table[bio[k]].flat_chance;
+                if (bw[k] > bw[dom]) dom = k;
+            }
+            if (tree_unit(tree_hash(i, j, w.s_flats, 2u)) >= chance) continue;
+
+            const float ur = tree_unit(tree_hash(i, j, w.s_flats, 3u));
+            const float radius = ft.radius_min + (ft.radius_max - ft.radius_min) * ur;
+            const float sh = radius * ft.shoulder;
+            const float shoulder = sh > ft.shoulder_min ? sh : ft.shoulder_min;
+            const float outer = radius + shoulder;
+
+            // Clear of every channel, edge to edge. Two statements: see the
+            // river exclusion in tree_at_cell.
+            float rw = 0.0f, rd = 0.0f;
+            const float river_d = nearest_river(w, wp, x, z, rw, rd);
+            if (river_d < rw + outer + ft.river_clear) continue;
+
+            // The pad: centre, half radius, radius. Its mean is the level.
+            const float hc = height_at(x, z);
+            float sum = hc, lo = hc, hi = hc;
+            int cnt = 1;
+            for (int ring = 1; ring <= 2; ++ring) {
+                const float rr = radius * 0.5f * static_cast<float>(ring);
+                for (int a = 0; a < 16; ++a) {
+                    const float h = height_at(x + dx16[a] * rr, z + dz16[a] * rr);
+                    sum = sum + h;
+                    if (h < lo) lo = h;
+                    if (h > hi) hi = h;
+                    ++cnt;
+                }
+            }
+            const float level = sum / static_cast<float>(cnt);
+            if (lo < sea + ft.shore) continue;
+            // Already gentle: across the pad, and out to the shoulder's edge,
+            // where the eased ring has to meet the land again.
+            if (hi - lo > ft.max_grade * 2.0f * radius) continue;
+            bool ok = true;
+            for (int a = 0; a < 16 && ok; ++a) {
+                const float h = height_at(x + dx16[a] * outer, z + dz16[a] * outer);
+                const float dh = h - level;
+                if (h < sea + 0.5f * ft.shore) ok = false;
+                if (dh > ft.max_grade * outer || -dh > ft.max_grade * outer) ok = false;
+            }
+            if (!ok) continue;
+
+            SeedWorld::FlatSite f;
+            f.x = x;
+            f.z = z;
+            f.radius = radius;
+            f.shoulder = shoulder;
+            f.level = level;
+            f.id = flat_id(i, j);
+            f.biome = bio[dom];
+            w.flats.push_back(f);
+        }
+    }
+
+    // Binned on the river grid's geometry, into every bin the site or its
+    // tree clearance touches, so a lookup reads one bin.
+    const float Rg = 0.5f * w.rgrid_cell * static_cast<float>(w.rgrid_n);
+    w.fgrid.assign(static_cast<size_t>(w.rgrid_n) * w.rgrid_n, std::vector<int>());
+    for (size_t s = 0; s < w.flats.size(); ++s) {
+        const SeedWorld::FlatSite& f = w.flats[s];
+        const float pad = f.radius + f.shoulder + ft.tree_clear + 8.0f;
+        const int i0 = std::max(0, static_cast<int>((f.x - pad + Rg) / w.rgrid_cell));
+        const int i1 = std::min(w.rgrid_n - 1, static_cast<int>((f.x + pad + Rg) / w.rgrid_cell));
+        const int j0 = std::max(0, static_cast<int>((f.z - pad + Rg) / w.rgrid_cell));
+        const int j1 = std::min(w.rgrid_n - 1, static_cast<int>((f.z + pad + Rg) / w.rgrid_cell));
+        for (int jj = j0; jj <= j1; ++jj)
+            for (int ii = i0; ii <= i1; ++ii)
+                w.fgrid[static_cast<size_t>(jj) * w.rgrid_n + ii].push_back(static_cast<int>(s));
+    }
 }
 
 namespace {

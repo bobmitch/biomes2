@@ -1407,6 +1407,22 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                          std::sqrt(g_spawn.x * g_spawn.x + g_spawn.z * g_spawn.z),
                          g_spawn.biome, g_spawn.weight,
                          g_spawn.strict ? "" : " (FALLBACK: no point passed every test)");
+            // Layer 5b: how many level sites the seed has, and the nearest.
+            const std::vector<worldgen::SeedWorld::FlatSite>& fl = wg.world().flats;
+            size_t best = fl.size();
+            float bd2 = 3.4e38f;
+            for (size_t i = 0; i < fl.size(); ++i) {
+                const float dx = fl[i].x - g_spawn.x, dz = fl[i].z - g_spawn.z;
+                if (dx * dx + dz * dz < bd2) { bd2 = dx * dx + dz * dz; best = i; }
+            }
+            if (best < fl.size()) {
+                std::fprintf(sf, "           flat sites: %zu; nearest to spawn at (%.0f, %.1f, %.0f), "
+                                 "radius %.0f m, shoulder %.0f m, %.0f m away\n",
+                             fl.size(), fl[best].x, fl[best].level, fl[best].z,
+                             fl[best].radius, fl[best].shoulder, std::sqrt(bd2));
+            } else {
+                std::fprintf(sf, "           flat sites: none\n");
+            }
             std::fclose(sf);
         }
     }
@@ -2403,7 +2419,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // A chunk straddling the surface near the origin, where the centre
         // floor guarantees land.
         const float surface = 0.20f * 140.0f;
-        const float origin[3] = {-8.0f, surface - 8.0f, -8.0f};
+        float origin[3] = {-8.0f, surface - 8.0f, -8.0f};
+        // --probe-at x z: the chunk centred on the ground there instead.
+        {
+            const std::string pc = cmdline ? cmdline : "";
+            const size_t pa = pc.find("--probe-at");
+            float px = 0.0f, pz = 0.0f;
+            if (pa != std::string::npos && std::sscanf(pc.c_str() + pa + 10, "%f %f", &px, &pz) == 2) {
+                const float gy = g_renderer.world().height(px, pz);
+                origin[0] = px - 8.0f; origin[1] = gy - 8.0f; origin[2] = pz - 8.0f;
+            }
+        }
         std::string e;
         g_renderer.probe_field(origin, 0.5f, "build/field_probe.txt", e);
         if (debug_layer) g_renderer.drain_debug_messages("build/d3d12_validation.txt");

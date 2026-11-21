@@ -53,13 +53,18 @@ cbuffer WorldConstants : register(b1) {
     float w_entrance_bin_size;
     int   w_cell_count;
     int   w_biome_count;
+
+    float w_detail_period;
+    int   w_detail_octaves;
+    float w_detail_gain;
+    uint  w_s_detail;
 };
 
 RWStructuredBuffer<float4> g_cells        : register(u11);   // xy position, z biome
 RWStructuredBuffer<uint>   g_cell_off     : register(u12);
 RWStructuredBuffer<uint>   g_cell_item    : register(u13);
 RWStructuredBuffer<float4> g_arch         : register(u14);   // kArchRows per biome
-RWStructuredBuffer<float4> g_rivers       : register(u15);   // 2 per segment
+RWStructuredBuffer<float4> g_rivers       : register(u15);   // 2 per segment; flat sites after, width < 0
 RWStructuredBuffer<uint>   g_river_off    : register(u16);
 RWStructuredBuffer<uint>   g_river_item   : register(u17);
 RWStructuredBuffer<float4> g_ent          : register(u18);   // 2 per segment
@@ -86,6 +91,7 @@ BiomeProfile profile_of(int b) {
     p.cave_density = a2.x;
     p.cave_depth_min = a2.y;
     p.cave_depth_max = a2.z;
+    p.detail_amp = a2.w;
     return p;
 }
 
@@ -98,6 +104,7 @@ BiomeProfile empty_profile() {
     p.gain = 0.5f;
     p.ridge_blend = 0.0f;
     p.flatness = 1.0f;
+    p.detail_amp = 0.0f;
     p.overhang_strength = 0.0f;
     p.cave_density = 0.0f;
     p.cave_depth_min = 0.0f;
@@ -179,6 +186,10 @@ float real_terrain_base(float x, float z, float r, float voxel) {
     const int found = cell_nearest4(wx, wz, idx, dist, d5);
     if (found == 0) return layer4_height(continent, w_continent_scale, 0.0f, w_sea_level);
 
+    // The micro-relief once; each biome scales it (world.cpp's terrain_base).
+    const float dn = layer4_detail(x, z, w_detail_period, w_detail_octaves, w_detail_gain,
+                                   w_s_detail, voxel);
+
     float h[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float wt[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const int ids[4] = {idx.x, idx.y, idx.z, idx.w};
@@ -197,7 +208,8 @@ float real_terrain_base(float x, float z, float r, float voxel) {
         // Heights are blended across the boundary, never noise parameters:
         // interpolating octave counts produces mush exactly where the player
         // is looking.
-        h[k] = layer4_profile(x, z, w_biome_freq, profile_of(b), w_s_height, voxel);
+        const BiomeProfile pb = profile_of(b);
+        h[k] = layer4_profile(x, z, w_biome_freq, pb, w_s_height, voxel) + pb.detail_amp * dn;
     }
 
     const float blended = layer4_blend(h[0], wt[0], h[1], wt[1], h[2], wt[2], h[3], wt[3], wall);
@@ -224,6 +236,7 @@ float real_nearest_river(float x, float z, out float out_w, out float out_d) {
                 const uint s = g_river_item[m];
                 const float4 a = g_rivers[s * 2u + 0u];
                 const float4 b = g_rivers[s * 2u + 1u];
+                if (b.x < 0.0f) continue;   // a flat site, not a channel
                 const float d = river_segment_distance(x, z, a.x, a.y, a.z, a.w);
                 if (d < best) { best = d; out_w = b.x; out_d = b.y; }
             }
@@ -232,12 +245,31 @@ float real_nearest_river(float x, float z, out float out_w, out float out_d) {
     return best;
 }
 
+// Layer 5b over a height: the flat sites binned where the point is (in the
+// river bins, width < 0). Sites never overlap, so at most one moves it.
+float real_apply_flats(float h, float x, float z) {
+    const int N = w_river_grid;
+    if (N <= 0) return h;
+    const int gx = clamp((int)((x + w_radius) / w_river_bin_size), 0, N - 1);
+    const int gz = clamp((int)((z + w_radius) / w_river_bin_size), 0, N - 1);
+    const uint bin = (uint)(gz * N + gx);
+    const uint o0 = g_river_off[bin], o1 = g_river_off[bin + 1u];
+    for (uint m = o0; m < o1; ++m) {
+        const uint s = g_river_item[m];
+        const float4 b = g_rivers[s * 2u + 1u];
+        if (b.x >= 0.0f) continue;
+        const float4 a = g_rivers[s * 2u + 0u];
+        h = flat_apply(h, x, z, a.x, a.y, a.z, a.w, b.y);
+    }
+    return h;
+}
+
 float real_terrain_height(float x, float z, float r, float voxel) {
-    const float h = real_terrain_base(x, z, r, voxel);
+    float h = real_terrain_base(x, z, r, voxel);
     float rw, rd;
     const float dist = real_nearest_river(x, z, rw, rd);
-    if (dist >= rw) return h;
-    return river_carve(h, dist, rw, rd);
+    if (dist < rw) h = river_carve(h, dist, rw, rd);
+    return real_apply_flats(h, x, z);
 }
 
 // Signed distance to the nearest entrance shaft wall.

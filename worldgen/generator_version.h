@@ -72,7 +72,16 @@ namespace worldgen {
 //      5.1%), and wetland's 0.45 -> 0.60; land_offset re-solved for a 32% mean land fraction, not 35%:
 //      8.1 landmasses a seed rather than 7.2, the spawn mass holding 67% of
 //      the land rather than 74% (200 seeds).
-static const int kGeneratorVersion = 16;
+//  17  calm land is less uniform, and level ground is rare and deliberate.
+//      Layer 4 gains micro-relief: one shared 3-octave field from 72 m
+//      down, scaled per biome (meadows 4.0 m, wetland 2.8, forest 2.4), and
+//      meadows' flatness 1.6 -> 1.3, wetland's 2.4 -> 1.8. Layer 5b, flat
+//      sites: one candidate per 320 m cell, kept by biome chance where the
+//      land is already gentle, dry and clear of rivers, its pad pulled level
+//      to the mean of its own heights with an eased shoulder; trees and rocks
+//      keep off. Sites are smaller than the hash grid, so they are hashed by
+//      their buffer.
+static const int kGeneratorVersion = 17;
 
 }  // namespace worldgen
 

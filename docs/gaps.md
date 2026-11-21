@@ -121,6 +121,12 @@ Last gathered: 2026-11-21, after the exploration fog.
   fault, but their cause is not settled. [The engine's own checks]
 - `--adaptive-budget`'s CPU cost that grows with chunks a frame was never
   found. [Gotchas: the per-frame mesh budget]
+- **Flat sites are not marked or used by anything yet**: no map marker, no
+  spawn preference, no build mode. `SeedWorld::flats` is the list.
+  [Micro-relief and flat sites]
+- **The forest map and canopy shell do not know the sites**: past the
+  trees' draw distance a site's glade is covered by the shell's canopy
+  (sites are 1-3 of its 20 m texels). [Micro-relief and flat sites]
 
 ## The player character
 

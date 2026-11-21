@@ -70,6 +70,12 @@ struct WorldConstants {
     float entrance_bin_size;
     int   cell_count;
     int   biome_count;
+
+    // Layer 4's shared micro-relief (each biome's amplitude is in g_arch).
+    float    detail_period;
+    int      detail_octaves;
+    float    detail_gain;
+    unsigned s_detail;
 };
 
 class WorldGpu {

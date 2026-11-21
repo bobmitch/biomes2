@@ -179,7 +179,7 @@ bool ForestMap::build(const WorldGpu& world, const std::vector<TreeLook>& looks,
     // wood and layer 8 grew none, what rejected the cells.
     if (std::getenv("BIOMES_FOREST_CHECK")) {
         static const char* kReason[worldgen::TREE_REJECT_COUNT] = {
-            "kept", "outside", "no land", "clearing", "roll", "shore", "slope", "river", "altitude", "fit roll", "surface"};
+            "kept", "outside", "no land", "clearing", "roll", "shore", "slope", "river", "altitude", "fit roll", "surface", "flat site"};
         double sum_exp = 0.0, sum_real = 0.0;
         int texels = 0, wrong_wood = 0, missing_wood = 0;
         long long wrong_why[worldgen::TREE_REJECT_COUNT] = {0}, all_why[worldgen::TREE_REJECT_COUNT] = {0};

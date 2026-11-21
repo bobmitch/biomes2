@@ -85,6 +85,12 @@ struct SeedResult {
     std::vector<double> rock_area[2];
     int   golden_rocks = 0;           // rocks that went into the hash
     int   rocks_unseated = 0;         // pinned rocks whose ground is not air over rock
+    // Layer 5b: flat sites, per biome, and how level they came out.
+    std::vector<int> flat_by_biome;
+    int   flat_count = 0;
+    float flat_worst_pad = 0.0f;      // metres of height range over any pad
+    float flat_worst_rim = 0.0f;      // steepest rise over run across any shoulder
+    float flat_mean_radius = 0.0f;
     uint64_t hash = 0;
     // The same hash, split by layer, computed alongside it: grid (layers 0,
     // 1, 4-6 sampled), biomes (layer 3), entrances (7), trees (8), rocks (9). When the
@@ -608,6 +614,21 @@ static SeedResult eval_seed(uint64_t world_seed,
             h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(e.ra * 64.0f)));
             lh[2] = fnv1a(lh[2], static_cast<uint64_t>(static_cast<int64_t>(e.ax * 64.0f)));
         }
+        // Layer 5b by its buffer too, for the same reason: a site is tens of
+        // metres across and the grid samples every 156 m. In the entrances'
+        // per-layer slot (2), which is "the buffers of small features".
+        h = fnv1a(h, static_cast<uint64_t>(w.flats.size()));
+        lh[2] = fnv1a(lh[2], static_cast<uint64_t>(w.flats.size()));
+        for (size_t m = 0; m < w.flats.size(); ++m) {
+            const SeedWorld::FlatSite& f = w.flats[m];
+            const uint64_t q[5] = {
+                static_cast<uint64_t>(f.id),
+                static_cast<uint64_t>(static_cast<int64_t>(f.x * 64.0f)),
+                static_cast<uint64_t>(static_cast<int64_t>(f.z * 64.0f)),
+                static_cast<uint64_t>(static_cast<int64_t>(f.radius * 64.0f)),
+                static_cast<uint64_t>(static_cast<int64_t>(f.level * 64.0f))};
+            for (int k = 0; k < 5; ++k) { h = fnv1a(h, q[k]); lh[2] = fnv1a(lh[2], q[k]); }
+        }
         // Layer 8 by its instances, like layer 7: a tree is a few metres
         // across and the grid above samples every 156 m, so sampling would
         // be blind to it. A 64 m tile at each of the first 24 land cells'
@@ -740,6 +761,49 @@ static SeedResult eval_seed(uint64_t world_seed,
         }
     }
 
+    // Layer 5b: every site's pad must be level, and its shoulder a slope a
+    // player can walk. Sixteen directions, sampled through terrain_height --
+    // the function everything else reads -- not the stored level.
+    {
+        out.flat_by_biome.assign(table.size(), 0);
+        out.flat_count = static_cast<int>(w.flats.size());
+        const float c1 = 0.92387953f, s1 = 0.38268343f, dg = 0.70710678f;
+        const float dx16[16] = {1.0f, c1, dg, s1, 0.0f, -s1, -dg, -c1, -1.0f, -c1, -dg, -s1, 0.0f, s1, dg, c1};
+        const float dz16[16] = {0.0f, s1, dg, c1, 1.0f, c1, dg, s1, 0.0f, -s1, -dg, -c1, -1.0f, -c1, -dg, -s1};
+        const float R = wp.radius;
+        auto hat = [&](float x, float z) {
+            return terrain_height(w, wp, table, x, z, std::sqrt(x * x + z * z) / R);
+        };
+        double rsum = 0.0;
+        for (size_t m = 0; m < w.flats.size(); ++m) {
+            const SeedWorld::FlatSite& f = w.flats[m];
+            if (f.biome >= 0 && static_cast<size_t>(f.biome) < table.size()) ++out.flat_by_biome[static_cast<size_t>(f.biome)];
+            rsum += f.radius;
+            const float hc = hat(f.x, f.z);
+            float lo = hc, hi = hc;
+            for (int a = 0; a < 16; ++a) {
+                for (int ring = 1; ring <= 2; ++ring) {
+                    const float rr = f.radius * (ring == 1 ? 0.5f : 0.98f);
+                    const float h = hat(f.x + dx16[a] * rr, f.z + dz16[a] * rr);
+                    lo = std::min(lo, h);
+                    hi = std::max(hi, h);
+                }
+                // The shoulder in eight steps, plus one past it.
+                float prev = hat(f.x + dx16[a] * f.radius, f.z + dz16[a] * f.radius);
+                const float step = f.shoulder / 8.0f;
+                for (int k = 1; k <= 9; ++k) {
+                    const float rr = f.radius + step * static_cast<float>(k);
+                    const float h = hat(f.x + dx16[a] * rr, f.z + dz16[a] * rr);
+                    const float g = std::fabs(h - prev) / step;
+                    if (g > out.flat_worst_rim) out.flat_worst_rim = g;
+                    prev = h;
+                }
+            }
+            if (hi - lo > out.flat_worst_pad) out.flat_worst_pad = hi - lo;
+        }
+        out.flat_mean_radius = w.flats.empty() ? 0.0f : static_cast<float>(rsum / w.flats.size());
+    }
+
     // Spearman over biomes that got cells.
     {
         std::vector<int> idx;
@@ -830,6 +894,10 @@ struct Summary {
     int   rock_failures = 0;
     int   rocks_unseated = 0;
     float mean_golden_rocks = 0.0f;
+    std::vector<double> flat_per_seed;  // per biome, mean sites a seed
+    double mean_flats = 0.0;
+    float  flat_worst_pad = 0.0f, flat_worst_rim = 0.0f, flat_mean_radius = 0.0f;
+    int    flat_failures = 0;
     float min_home_share = 2.0f;     // islandness: measured, not asserted
     float mean_home_share = 0.0f;
     float mean_landmasses = 0.0f;
@@ -940,6 +1008,12 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
         }
         sm.mean_golden_rocks += r.golden_rocks;
         sm.rocks_unseated += r.rocks_unseated;
+        if (sm.flat_per_seed.size() < table.size()) sm.flat_per_seed.assign(table.size(), 0.0);
+        for (size_t b = 0; b < r.flat_by_biome.size() && b < table.size(); ++b) sm.flat_per_seed[b] += r.flat_by_biome[b];
+        sm.mean_flats += r.flat_count;
+        sm.flat_mean_radius += r.flat_mean_radius;
+        sm.flat_worst_pad = std::max(sm.flat_worst_pad, r.flat_worst_pad);
+        sm.flat_worst_rim = std::max(sm.flat_worst_rim, r.flat_worst_rim);
         sm.min_home_share = std::min(sm.min_home_share, r.home_share);
         sm.mean_home_share += r.home_share;
         sm.mean_landmasses += r.landmasses;
@@ -976,6 +1050,25 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
     sm.mean_river_segments *= inv;
     sm.mean_golden_trees *= inv;
     sm.mean_golden_rocks *= inv;
+    // Flat sites: every pad level to 2 cm through terrain_height, every
+    // shoulder walkable (rise over run under 0.6, ~31 degrees), every biome
+    // configured with sites gets some, and none configured without gets more
+    // than a trace from a neighbour's blend.
+    sm.mean_flats *= inv;
+    sm.flat_mean_radius = static_cast<float>(sm.flat_mean_radius * inv);
+    for (size_t b = 0; b < sm.flat_per_seed.size(); ++b) sm.flat_per_seed[b] *= inv;
+    if (table.flats.present) {
+        int fails = 0;
+        if (sm.flat_worst_pad > 0.02f) ++fails;
+        if (sm.flat_worst_rim > 0.6f) ++fails;
+        double most = 0.0;
+        for (size_t b = 0; b < sm.flat_per_seed.size(); ++b) most = std::max(most, sm.flat_per_seed[b]);
+        for (size_t b = 0; b < sm.flat_per_seed.size(); ++b) {
+            if (table[b].flat_chance > 0.0f && sm.flat_per_seed[b] <= 0.0) ++fails;
+            if (table[b].flat_chance <= 0.0f && sm.flat_per_seed[b] > 0.05 * most) ++fails;
+        }
+        sm.flat_failures = fails;
+    }
     // Rocks: every biome configured with a class grows some of it (mean over
     // the seeds it appeared in), none configured without grows more than a
     // trace from a neighbour's blend, and every pinned rock is seated.
@@ -1566,6 +1659,7 @@ int main(int argc, char** argv) {
     bool tree_quantiles = false;
     bool tree_reasons = false;
     bool spawns = false;
+    bool flatness = false;
     bool tree_sites = false;
     uint64_t tree_sites_seed = 0;
     bool entrance_section = false;
@@ -1609,6 +1703,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--tree-quantiles"))          tree_quantiles = true;
         else if (!std::strcmp(argv[i], "--tree-reasons"))            tree_reasons = true;
         else if (!std::strcmp(argv[i], "--spawns"))                  spawns = true;
+        else if (!std::strcmp(argv[i], "--flatness"))                flatness = true;
         else if (!std::strcmp(argv[i], "--tree-sites") && i + 1 < argc) {
             tree_sites = true;
             tree_sites_seed = std::strtoull(argv[++i], nullptr, 10);
@@ -1793,7 +1888,7 @@ int main(int argc, char** argv) {
         // Where layer 8's candidates go, per biome of the sampled cell's site:
         // the same 32 m squares the trees check samples, over a few seeds.
         const char* names[TREE_REJECT_COUNT] = {"kept", "outside", "no land", "clearing",
-            "roll", "shore", "slope", "river", "altitude", "fit roll", "surface"};
+            "roll", "shore", "slope", "river", "altitude", "fit roll", "surface", "flat site"};
         const size_t nb = table.size();
         std::vector<std::vector<double> > hist(nb, std::vector<double>(TREE_REJECT_COUNT, 0.0));
         std::vector<double> hsum(nb, 0.0), hn(nb, 0.0);
@@ -1865,6 +1960,74 @@ int main(int argc, char** argv) {
         std::sort(dist.begin(), dist.end());
         std::printf("start point over %d seeds: %d strict; distance from centre median %.0f m, max %.0f m; "
                     "search %.1f ms a seed\n", nseeds, strict, dist[dist.size() / 2], dist.back(), ms / nseeds);
+        return 0;
+    }
+
+    if (flatness) {
+        // How flat each biome is at a building's scale: the height RANGE over
+        // a pad (its centre and 16 points on rings at half and full radius),
+        // at random land points credited to the dominant biome. A pad under
+        // 0.5 m of range is buildable as it stands.
+        const float pads[3] = {10.0f, 20.0f, 40.0f};   // pad radius, metres
+        const size_t nb = table.size();
+        std::vector<std::vector<float> > by[3];
+        for (int q = 0; q < 3; ++q) by[q].assign(nb, std::vector<float>());
+        const float dg = 0.70710678f;
+        const float rx[8] = {1.0f, dg, 0.0f, -dg, -1.0f, -dg, 0.0f, dg};
+        const float rz[8] = {0.0f, dg, 1.0f, dg, 0.0f, -dg, -1.0f, -dg};
+        for (int s = 0; s < nseeds; ++s) {
+            const uint64_t seed = 0x5EEDull * 1000003ull + static_cast<uint64_t>(s);
+            const SeedWorld sw = build_world(seed, wp, table, ap);
+            Rng rng(seed ^ 0xF1A7ull);
+            const float R = wp.radius;
+            auto hat = [&](float x, float z) {
+                return terrain_height(sw, wp, table, x, z, std::sqrt(x * x + z * z) / R);
+            };
+            for (int k = 0; k < 3000; ++k) {
+                const float x = (rng.uniform() * 2.0f - 1.0f) * 0.9f * R;
+                const float z = (rng.uniform() * 2.0f - 1.0f) * 0.9f * R;
+                if (x * x + z * z > 0.81f * R * R) continue;
+                int bio[4];
+                float bw[4];
+                const int n = biome_mix(sw, wp, x, z, bio, bw);
+                if (n == 0) continue;
+                int dom = 0;
+                for (int m = 1; m < n; ++m) if (bw[m] > bw[dom]) dom = m;
+                const float h0 = hat(x, z);
+                if (h0 < table.sea_level + 0.5f) continue;
+                for (int q = 0; q < 3; ++q) {
+                    float lo = h0, hi = h0;
+                    for (int ring = 1; ring <= 2; ++ring) {
+                        const float rr = pads[q] * 0.5f * static_cast<float>(ring);
+                        for (int a = 0; a < 8; ++a) {
+                            const float h = hat(x + rx[a] * rr, z + rz[a] * rr);
+                            lo = std::min(lo, h);
+                            hi = std::max(hi, h);
+                        }
+                    }
+                    by[q][static_cast<size_t>(bio[dom])].push_back(hi - lo);
+                }
+            }
+        }
+        std::printf("height range over a pad, %d seeds: share of land points whose pad "
+                    "is under 0.5 / 1 / 2 m, and the median range (m)\n", nseeds);
+        std::printf("%-10s %7s   %-28s %-28s %-28s\n", "biome", "points",
+                    "pad radius 10 m", "pad radius 20 m", "pad radius 40 m");
+        for (size_t b = 0; b < nb; ++b) {
+            std::printf("%-10s %7zu", table[b].name.c_str(), by[0][b].size());
+            for (int q = 0; q < 3; ++q) {
+                std::vector<float>& v = by[q][b];
+                if (v.empty()) { std::printf("   %-28s", "-"); continue; }
+                std::sort(v.begin(), v.end());
+                const double c = static_cast<double>(v.size());
+                const double f05 = (std::lower_bound(v.begin(), v.end(), 0.5f) - v.begin()) / c;
+                const double f1  = (std::lower_bound(v.begin(), v.end(), 1.0f) - v.begin()) / c;
+                const double f2  = (std::lower_bound(v.begin(), v.end(), 2.0f) - v.begin()) / c;
+                std::printf("   %5.1f%% %5.1f%% %5.1f%% med %4.1f",
+                            100.0 * f05, 100.0 * f1, 100.0 * f2, v[v.size() / 2]);
+            }
+            std::printf("\n");
+        }
         return 0;
     }
 
@@ -2368,6 +2531,20 @@ int main(int argc, char** argv) {
                           per.c_str(), s.rocks_unseated, s.mean_golden_rocks);
             line("rocks", s.rock_failures == 0, d);
         }
+        if (table.flats.present) {
+            std::string per;
+            for (size_t b = 0; b < s.flat_per_seed.size(); ++b) {
+                if (s.flat_per_seed[b] < 0.05 && table[b].flat_chance <= 0.0f) continue;
+                char one[64];
+                std::snprintf(one, sizeof(one), "%s%s %.1f", per.empty() ? "" : ", ",
+                              table[b].name.c_str(), s.flat_per_seed[b]);
+                per += one;
+            }
+            std::snprintf(d, sizeof(d), "%.1f sites/seed (%s), mean radius %.0f m; worst pad range "
+                          "%.3f m (limit 0.02), steepest shoulder %.2f rise/run (limit 0.6)",
+                          s.mean_flats, per.c_str(), s.flat_mean_radius, s.flat_worst_pad, s.flat_worst_rim);
+            line("flat sites", s.flat_failures == 0, d);
+        }
         if (caves_enabled(table)) {
             std::snprintf(d, sizeof(d), "%.1f shafts/seed (min %d, floor 8), reaching cave air "
                           "%.0f m down; %d mouths sealed, %d sampled segments still solid",
@@ -2410,7 +2587,7 @@ int main(int argc, char** argv) {
                          land_mean_ok &&
                          s.river_failures == 0 && s.lod_failures == 0 &&
                          s.seam_failures == 0 && s.tree_failures == 0 &&
-                         s.rock_failures == 0 &&
+                         s.rock_failures == 0 && s.flat_failures == 0 &&
                          // It printed FAIL and never failed the run: the
                          // entrance check was missing from this conjunction.
                          s.entrance_failures == 0 &&
