@@ -22,7 +22,7 @@ Texture2D<float4> g_hf_vis    : register(t38);   // sky visibility, SH
 Texture2D<float4> g_hf_r      : register(t39);   // bounce radiance, SH, red
 Texture2D<float4> g_hf_g      : register(t40);
 Texture2D<float4> g_hf_b      : register(t41);
-Texture2D<float>  g_hf_height : register(t42);   // the top surface's height
+Texture2D<float2> g_hf_height : register(t42);   // the top surface's height, its curvature over 6 m
 
 // `vis_e`: the sky's share as an irradiance factor -- pi for a point that
 // sees a whole open hemisphere about n, as kSkyMean * vis_e is the sky's
@@ -36,7 +36,7 @@ void hfgi_sample(float3 world, float3 n, out float vis_e, out float3 bounce, out
     const float2 uv = float2((world.x - l_hf.x) / kHfExtent, 1.0f - (world.z - l_hf.y) / kHfExtent);
     const float2 e = min(uv, 1.0f - uv);
     if (min(e.x, e.y) <= 0.0f) return;
-    const float h = g_hf_height.SampleLevel(g_gi_linear, uv, 0.0f);
+    const float h = g_hf_height.SampleLevel(g_gi_linear, uv, 0.0f).x;
     if (h < kHfNone * 0.5f) return;
     cover = saturate(min(e.x, e.y) * 16.0f);
     float2 suv = uv;
@@ -57,7 +57,7 @@ void hfgi_sample(float3 world, float3 n, out float vis_e, out float3 bounce, out
                 const float2 q = world.xz + float2(cos(ang), sin(ang)) * rad;
                 const float2 quv = float2((q.x - l_hf.x) / kHfExtent, 1.0f - (q.y - l_hf.y) / kHfExtent);
                 if (any(quv < 0.0f) || any(quv > 1.0f)) continue;
-                const float hq = g_hf_height.SampleLevel(g_gi_linear, quv, 0.0f);
+                const float hq = g_hf_height.SampleLevel(g_gi_linear, quv, 0.0f).x;
                 if (hq > kHfNone * 0.5f && hq < world.y - 0.5f && rad < best) {
                     best = rad;
                     suv = quv;

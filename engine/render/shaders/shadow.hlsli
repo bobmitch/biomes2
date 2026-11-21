@@ -65,6 +65,13 @@ cbuffer ShadowConstants : register(b2) {
     // from and its luminous intensity now (cd, 0 none); its colour.
     float4 l_flash;
     float4 l_flash_col;
+    // Bare ground (mesh.hlsl, GroundLook): macro variation's strength, the
+    // scan's fade to its mean (start, end, metres), unused; unused; the
+    // ground scan hex-tiled (x > 0.5), far detail's strength and its scale
+    // over the tile, unused.
+    float4 l_look;
+    float4 l_look2;
+    float4 l_look3;
 };
 
 Texture2DArray<float>  g_shadow     : register(t8);

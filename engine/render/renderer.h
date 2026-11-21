@@ -391,6 +391,8 @@ public:
     void set_fog(bool on) { fog_on_ = on; fog_hist_valid_ = false; }
     bool fog() const { return fog_on_; }
     void set_fog_density(float k) { fog_density_ = k; }
+    // Bare ground past the near field (scan_library.h GroundLook): live.
+    GroundLook& ground_look() { return ground_look_; }
     float fog_density() const { return fog_density_; }
     const FogMap& fog_map() const { return fog_map_; }
     // The fog's authored settings, live: the layers and the mist's top are
@@ -696,6 +698,7 @@ private:
     bool   post_query_pending_[kFrameCount] = {};
     bool   fog_on_ = true, fog_hist_valid_ = false, fog_uploaded_ = false;
     float  fog_density_ = 1.0f;
+    GroundLook ground_look_;
     UINT   fog_cur_ = 0;
     ComPtr<ID3D12Resource> fog_map_tex_, fog_map_up_, fog_inject_[2], fog_integrated_;
     ComPtr<ID3D12Resource> fog_cb_[kFrameCount];

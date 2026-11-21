@@ -594,9 +594,56 @@ confirmed it twice.
 - **Cost**, walking (`--walk 15 --uncapped`, packs present vs moved aside):
   2.75 / 2.89 ms against 2.69 / 2.72; startup +132 ms; 247 MB of textures
   at 1K. The flight's median rose to 2.50 ms with far more terrain on screen.
-- **Not done**: anti-tiling beyond what the mips and the retint give (no
-  repetition shows from 160 m up on the badlands), BC compression (4x less
-  memory), scans for the grass, leaves and placed rocks, silhouettes.
+- **Not done**: anti-tiling on rock (see the next section for the ground),
+  BC compression (4x less memory), scans for the grass, leaves and placed
+  rocks, silhouettes.
+
+**Bare ground: hex-tiling and far detail** (archetypes.json `ground_look`,
+the tuning panel's Terrain group, `--no-ground-look` for A/B). A 2.5 m
+scan repeated on one square lattice read as rows from ~10 m out and a
+wallpaper grid over a clearing. Three parts (`scan.hlsli`, `mesh.hlsl`):
+
+- **Hex-tiling** (Mikkelsen, "Practical Real-Time Hex-Tiling", JCGT 2022,
+  `hex_sample`): a hex lattice over the uv, every hex its own random
+  offset and rotation (the rotation from the hash as a direction, no
+  trigonometry), three hexes per pixel blended by barycentric weight^7
+  biased by luminance; the normal map's xy turned back by each rotation.
+  Only for the heaviest GROUND candidate, only in its dominant triplanar
+  plane -- everywhere was +1.1 ms at 1440p -- and a corner under 1% of the
+  heaviest weight is not fetched, so most pixels take one sample. No
+  ground parallax under it: the march reads the height map straight and
+  would not match a turned scan (ground parallax was 3-5 cm to ~10 m).
+- **Far detail** (`scan_far_ratio`): the same scan at 5.3 x its tile,
+  hex-tiled, as a colour ratio to its own mean, multiplied over the near
+  scan from 10 m out (`far_detail` 1.2): clumps, bare patches and colour
+  shifts over metres, from the photograph rather than from noise. Two mips
+  coarser than the footprint asks: it is structure, the near scan is grain.
+- **Macro variation** (`ground_macro`): value noise at 97 and 41 m, a 63 m
+  dry/lush noise (dry warmer and paler, towards straw or dust -- going to
+  the luminance read as grey ash), and the terrain's curvature: hollows
+  darker and lusher, crests paler. The curvature is a channel of the
+  heightfield GI's map (R32G32: height, curvature over 6 m), written once
+  a texel by `cs_hf_light`; five height reads a pixel cost 0.15 ms.
+- **What did not work, and why it is gone.** The first attempt FADED the
+  scan to its mean from 30-110 m and laid noise and a far-grass colour on
+  top. It removed the grid by removing the detail: the ground past 50 m was
+  a flat colour, which read worse than the repetition, and the 10-50 m rows
+  were untouched. The fade remains only as a far LOD (350-700 m, under the
+  haze). Far grass changed nothing visible in meadows and cost 0.1 ms;
+  removed. Value-noise octaves at 17 and 7 m went when the far detail took
+  that band: every noise in this shader is paid by every pixel.
+- **Measured**: `tools/profile/tiling.py` on straight-down stills (the
+  autocorrelation at the tile's lattice lags after a high-pass, against
+  half-period lags): from 20 m up 0.416 -> 0.001, 60 m 0.240 -> -0.016,
+  140 m 0.105 -> -0.024 (baselines 0.00-0.05). Cost at 1440p: the terrain
+  pass +0.18 ms in a walk-like view; walking 6.69 / 6.53 against 6.36 /
+  6.30 ms. Profile THE WALK'S view, not an eye-level still: the third
+  person camera sees far more ground at 5-40 m, and an eye-level profile
+  understated the first version's cost by half.
+- **Flags**: `--no-hex`, `--far-detail <k>`, `--macro-var <k>`,
+  `--detail-fade a b`. Not `--ground-...`: `--ground` is a flag and
+  `find()` matches it inside one -- an A/B still was taken at eye height
+  for that.
 
 **Parallax occlusion** (`engine/render/shaders/pom.hlsli`; `P`, `--no-pom`)
 on the scans' height channel, terrain and bark. No silhouettes and no depth
@@ -607,6 +654,8 @@ bark 1.5-3 cm.
 
 - **Terrain**: the heaviest of the four candidates, in the triplanar plane
   the normal faces most; its shift moves every candidate's sample point.
+  Not when that candidate is hex-tiled ground (in practice, rock only):
+  the march reads the height map straight, under a scan turned per hex.
   Only where one plane clearly dominates (`dom`): where two weigh alike the
   dominant one flips pixel to pixel and the shift with it. Every triplanar
   fetch now takes EXPLICIT gradients from the unshifted position, or the

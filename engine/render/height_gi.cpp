@@ -49,7 +49,7 @@ bool HeightGi::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::strin
     cd.DepthStencil.Depth = 1.0f;
     if (!tex(albedo_, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, kRead, &cz) ||
         !tex(depth_, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, kRead, &cd) ||
-        !tex(height_, DXGI_FORMAT_R32_FLOAT, uav, kRead, nullptr) ||
+        !tex(height_, DXGI_FORMAT_R32G32_FLOAT, uav, kRead, nullptr) ||
         !tex(rad_, DXGI_FORMAT_R16G16B16A16_FLOAT, uav, kRead, nullptr)) {
         error = "heightfield gi targets";
         return false;
@@ -108,11 +108,11 @@ bool HeightGi::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::strin
         device->CreateUnorderedAccessView(r, nullptr, &ud, cpu(slot));
     };
     for (int k = 0; k < 4; ++k) srv(sh_[k].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, kSrvScene + UINT(k));
-    srv(height_.Get(), DXGI_FORMAT_R32_FLOAT, kSrvScene + 4);
+    srv(height_.Get(), DXGI_FORMAT_R32G32_FLOAT, kSrvScene + 4);   // height, curvature (6 m)
     srv(albedo_.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, kSrvTop + 0);
     srv(depth_.Get(), DXGI_FORMAT_R32_FLOAT, kSrvTop + 1);
     srv(rad_.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, kSrvTop + 2);
-    uavd(height_.Get(), DXGI_FORMAT_R32_FLOAT, kUav + 0);
+    uavd(height_.Get(), DXGI_FORMAT_R32G32_FLOAT, kUav + 0);
     uavd(rad_.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, kUav + 1);
     for (int k = 0; k < 4; ++k) uavd(sh_[k].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, kUav + 2 + UINT(k));
 

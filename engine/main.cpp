@@ -779,6 +779,22 @@ void register_tunables() {
     // Fog. The height layers as their sea-level VISIBILITY (the 2% contrast
     // distance, 3.912 / sigma) and their thickness (the e-folding height);
     // the shader still takes sigma.
+    // Bare ground past the near field (scan_library.h GroundLook): the
+    // authored values are archetypes.json's ground_look.
+    const char* GL = "Terrain";
+    engine::GroundLook& gl = R.ground_look();
+    range("ground_variation", GL, "Ground: macro variation", 0.0f, 2.0f, 0.05f, "x",
+          [&gl] { return gl.variation; }, [&gl](float v) { gl.variation = v; });
+    range("ground_fade_from", GL, "Ground: scan fades from", 0.0f, 400.0f, 5.0f, "m",
+          [&gl] { return gl.fade[0]; }, [&gl](float v) { gl.fade[0] = v; });
+    range("ground_fade_to", GL, "Ground: scan is its mean by", 10.0f, 1000.0f, 5.0f, "m",
+          [&gl] { return gl.fade[1]; }, [&gl](float v) { gl.fade[1] = v; });
+    toggle("ground_hex", GL, "Ground: hex-tiling", [&gl] { return gl.hex; }, [&gl](bool b) { gl.hex = b; });
+    range("ground_far_detail", GL, "Ground: far detail", 0.0f, 1.5f, 0.05f, "x",
+          [&gl] { return gl.far_detail; }, [&gl](float v) { gl.far_detail = v; });
+    range("ground_far_scale", GL, "Ground: far detail scale", 2.0f, 20.0f, 0.1f, "x tile",
+          [&gl] { return gl.far_scale; }, [&gl](float v) { gl.far_scale = v; });
+
     const char* F = "Fog";
     toggle("mist", F, "Mist (near, patchy)", [&] { return R.fog(); }, [&](bool b) { R.set_fog(b); });
     range("mist_density", F, "Mist density", 0.0f, 5.0f, 0.05f, "x", [&] { return R.fog_density(); },
@@ -1453,6 +1469,30 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (c2.find("--no-far-shadow") != std::string::npos) g_renderer.set_far_shadow(false);
         if (c2.find("--no-pom") != std::string::npos) g_renderer.set_pom(false);
         if (c2.find("--no-rocks") != std::string::npos) g_renderer.set_rocks(false);
+        // Bare ground (GroundLook): --no-ground-look is the scans as they
+        // were; the others set one part. Not "--ground-...": --ground is
+        // taken (the camera at eye height), and a find() for it matches.
+        {
+            engine::GroundLook& gl = g_renderer.ground_look();
+            if (c2.find("--no-ground-look") != std::string::npos) {
+                gl.variation = 0.0f;
+                gl.fade[0] = 1e6f;
+                gl.fade[1] = 2e6f;
+                gl.hex = false;
+                gl.far_detail = 0.0f;
+            }
+            if (c2.find("--no-hex") != std::string::npos) gl.hex = false;
+            const size_t fd = c2.find("--far-detail ");
+            if (fd != std::string::npos) gl.far_detail = float(std::atof(c2.c_str() + fd + 13));
+            const size_t gv = c2.find("--macro-var ");
+            if (gv != std::string::npos) gl.variation = float(std::atof(c2.c_str() + gv + 12));
+            const size_t gf = c2.find("--detail-fade ");
+            if (gf != std::string::npos) {
+                char* e = nullptr;
+                gl.fade[0] = std::strtof(c2.c_str() + gf + 14, &e);
+                gl.fade[1] = std::strtof(e, nullptr);
+            }
+        }
         if (c2.find("--no-forest-shell") != std::string::npos) g_renderer.set_forest_shell(false);
         const size_t fdn = c2.find("--fog-density");
         if (fdn != std::string::npos) g_renderer.set_fog_density(float(std::atof(c2.c_str() + fdn + 13)));

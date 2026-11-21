@@ -195,20 +195,29 @@ static const float kScanHeightGain = 0.6f;
 
 struct ScanResult { float3 albedo; float rough; float3 n; float ao; float height; bool ok; };
 
-ScanResult scan_surface(VSOut i, float3 n, float level, float3 v, out float psh) {
-    ScanResult r = (ScanResult)0;
-    psh = 1.0f;
-    const float3 dpx = ddx(i.world), dpy = ddy(i.world);
+// The two heaviest biomes at the pixel and their weights (the second 0 when
+// it is under 2%).
+void top_two(VSOut i, out uint m0, out uint m1, out float b0, out float b1) {
     const float wts[12] = {i.w0.x, i.w0.y, i.w0.z, i.w0.w, i.w1.x, i.w1.y, i.w1.z, i.w1.w,
                            i.w2.x, i.w2.y, i.w2.z, i.w2.w};
-    uint m0 = 0u, m1 = 0u;
-    float b0 = -1.0f, b1 = -1.0f;
+    m0 = 0u; m1 = 0u;
+    b0 = -1.0f; b1 = -1.0f;
     [unroll] for (uint m = 0u; m < 12u; ++m) {
         const float w = wts[m];
         if (w > b0) { m1 = m0; b1 = b0; m0 = m; b0 = w; }
         else if (w > b1) { m1 = m; b1 = w; }
     }
     if (b1 < 0.02f) b1 = 0.0f;
+}
+
+// `dpx`, `dpy`: the world position's screen derivatives, taken by the caller
+// before any branch -- this runs only inside the detail fade.
+ScanResult scan_surface(VSOut i, float3 n, float level, float3 v, float3 dpx, float3 dpy, out float psh) {
+    ScanResult r = (ScanResult)0;
+    psh = 1.0f;
+    uint m0, m1;
+    float b0, b1;
+    top_two(i, m0, m1, b0, b1);
     const float tot = b0 + b1;
     if (tot <= 0.0f) return r;
     const ScanMaterial M0 = g_scan_mat[m0], M1 = g_scan_mat[m1];
@@ -235,24 +244,33 @@ ScanResult scan_surface(VSOut i, float3 n, float level, float3 v, out float psh)
     }
     // Parallax (pom.hlsli): the heaviest candidate's height map, in the
     // plane the normal faces most; its shift moves every candidate's sample
-    // point, and its self-shadow darkens the key light.
+    // point, and its self-shadow darkens the key light. Not on hex-tiled
+    // ground: the march reads the height map straight, and under a scan
+    // turned and offset per hex its shift would not match what is drawn.
+    // Ground parallax is 3-5 cm out to ~10 m, barely seen under grass.
+    const bool hex = l_look3.x > 0.5f;
+    int cd = 0;
+    [unroll] for (int c4 = 1; c4 < 4; ++c4) if (wc[c4] > wc[cd]) cd = c4;
     {
-        int cd = 0;
-        [unroll] for (int c4 = 1; c4 < 4; ++c4) if (wc[c4] > wc[cd]) cd = c4;
         ScanMaterial MD = M1;
         if (cd < 2) MD = M0;
         const bool gd = (cd & 1) == 0;
-        p += scan_pom_shift(gd ? MD.ground_layer : MD.rock_layer, gd ? MD.ground_inv_tile : MD.rock_inv_tile,
-                            gd ? MD.ground_depth : MD.rock_depth, p, n, v, bw, dpx, dpy,
-                            length(cam_pos - i.world), psh);
+        if (!(gd && hex))
+            p += scan_pom_shift(gd ? MD.ground_layer : MD.rock_layer, gd ? MD.ground_inv_tile : MD.rock_inv_tile,
+                                gd ? MD.ground_depth : MD.rock_depth, p, n, v, bw, dpx, dpy,
+                                length(cam_pos - i.world), psh);
     }
+    // Hex-tiling for the heaviest GROUND candidate only: the second biome's
+    // share at a boundary and the rock on a slope show no grid worth three
+    // fetches.
+    const int cg = wc[2] > wc[0] ? 2 : 0;
     [unroll] for (int c5 = 0; c5 < 4; ++c5) {
         if (wc[c5] <= 0.0f) continue;
         ScanMaterial M = M1;
         if (c5 < 2) M = M0;
         const bool ground = (c5 & 1) == 0;
         sc[c5] = scan_triplanar(ground ? M.ground_layer : M.rock_layer,
-                                ground ? M.ground_inv_tile : M.rock_inv_tile, p, n, bw, dpx, dpy);
+                                ground ? M.ground_inv_tile : M.rock_inv_tile, p, n, bw, dpx, dpy, hex && c5 == cg);
     }
     float top = -1e9f;
     [unroll] for (int c2 = 0; c2 < 4; ++c2)
@@ -275,8 +293,93 @@ ScanResult scan_surface(VSOut i, float3 n, float level, float3 v, out float psh)
     r.ao /= wsum;
     r.height /= wsum;
     r.n = normalize(nsum);
+    // Far detail: the heaviest GROUND candidate's own scan at a much larger
+    // scale, as a colour ratio over the blend -- structure over tens of
+    // metres, coming in from 10 m out as the near scan's own goes to its mips.
+    const float wfar = l_look3.y * smoothstep(10.0f, 40.0f, length(cam_pos - i.world)) * level;
+    if (wfar > 0.0f) {
+        ScanMaterial MG = M1;
+        if (cg < 2) MG = M0;
+        if (wc[cg] > 0.0f)
+            r.albedo *= lerp(float3(1.0f, 1.0f, 1.0f),
+                             scan_far_ratio(MG.ground_layer, MG.ground_inv_tile, l_look3.z, p, n, bw, dpx, dpy), wfar);
+    }
     r.ok = true;
     return r;
+}
+
+// The scans' own MEANS, for ground past the detail fade: each candidate's
+// 1 x 1 mip (exactly the mean the retint maps to the authored colour) times
+// its tint, weighted as scan_surface weights them but without the height
+// blend, which averages out at this distance. One fetch a candidate, where
+// scan_surface takes a parallax march and up to three planes a candidate.
+ScanResult scan_mean(VSOut i, float level) {
+    ScanResult r = (ScanResult)0;
+    uint m0, m1;
+    float b0, b1;
+    top_two(i, m0, m1, b0, b1);
+    const float tot = b0 + b1;
+    if (tot <= 0.0f) return r;
+    const ScanMaterial M0 = g_scan_mat[m0], M1 = g_scan_mat[m1];
+    if (M0.ground_layer < 0.0f || M0.rock_layer < 0.0f || (b1 > 0.0f && (M1.ground_layer < 0.0f || M1.rock_layer < 0.0f)))
+        return r;
+    const float wc[4] = {b0 / tot * level, b0 / tot * (1.0f - level), b1 / tot * level, b1 / tot * (1.0f - level)};
+    float wsum = 0.0f;
+    [unroll] for (int c = 0; c < 4; ++c) {
+        if (wc[c] < 0.005f) continue;
+        ScanMaterial M = M1;   // FXC takes no ternary on a struct
+        if (c < 2) M = M0;
+        const bool ground = (c & 1) == 0;
+        const float layer = ground ? M.ground_layer : M.rock_layer;
+        const float4 a = g_scan_a.SampleLevel(g_scan_samp, float3(0.5f, 0.5f, layer), 16.0f);
+        const float4 b = g_scan_b.SampleLevel(g_scan_samp, float3(0.5f, 0.5f, layer), 16.0f);
+        const float rs = ground ? M.ground_rough / M.ground_scan_rough : M.rock_rough / M.rock_scan_rough;
+        r.albedo += wc[c] * a.rgb * (ground ? M.ground_tint : M.rock_tint);
+        r.rough += wc[c] * saturate(b.z * rs);
+        r.ao += wc[c] * b.w;
+        r.height += wc[c] * a.a;
+        wsum += wc[c];
+    }
+    if (wsum <= 0.0f) return r;
+    r.albedo /= wsum;
+    r.rough /= wsum;
+    r.ao /= wsum;
+    r.height /= wsum;
+    r.ok = true;
+    return r;
+}
+
+// Macro variation: what bare ground does over hundreds of metres, which
+// neither scale of the scan carries. Value noise at 97 and 41 m for
+// brightness, a 63 m noise for dry and lush patches, and the terrain's own
+// shape from the heightfield GI's map (hfgi.hlsli, 512 m round the camera):
+// hollows a little darker and lusher, crests paler and drier. `strength` 1
+// is the authored amount. The 17 and 7 m octaves went when the far detail
+// layer (scan_far_ratio) came to carry that band from the scan itself: in
+// the terrain shader every noise is paid by every pixel.
+float3 ground_macro(float3 albedo, float3 world, float strength) {
+    if (strength <= 0.0f) return albedo;
+    const float2 q = world.xz;
+    // Value noise sits near its middle; x2.2 takes the sum to about +-0.5
+    // at its usual extremes.
+    const float b = 2.2f * (0.6f * value_noise(q / 97.0f) + 0.4f * value_noise(q / 41.0f + 13.1f) - 0.5f);
+    float dry = smoothstep(0.38f, 0.66f, value_noise(q / 63.0f + 5.3f));
+    // The shape: the heightfield map's own curvature channel, one read
+    // (height_gi.hlsl computes it per texel at each rebuild). Reading five
+    // heights here per pixel cost 0.15 ms of a 1440p frame at eye level.
+    const float shape = clamp(hf_curvature(q), -0.6f, 0.6f);
+    dry = saturate(dry + 0.8f * shape);
+    // About +-0.3 of a stop from the noise at its usual range, +-0.2 from
+    // the shape.
+    const float gain = exp2(strength * (0.6f * b + 0.35f * shape));
+    // Dry: warmer and paler -- towards straw on grassland, towards dust on
+    // earth -- a little desaturated; lush: deeper and cooler. A first dry
+    // tone went to the luminance and read as grey ash on a meadow.
+    const float lum = dot(albedo, float3(0.2126f, 0.7152f, 0.0722f));
+    const float3 dried = lerp(albedo, float3(lum, lum, lum), 0.2f) * float3(1.3f, 1.12f, 0.72f);
+    const float3 lush = albedo * float3(0.82f, 0.95f, 0.8f);
+    const float3 tone = lerp(lush, dried, dry);
+    return max(lerp(albedo, tone, saturate(0.7f * strength)) * gain, 0.0f);
 }
 
 // The canopy shell's crowns (forest.hlsli): a jittered dome per cell, the
@@ -353,9 +456,30 @@ SceneOut ps_main(VSOut i) {
     // T: 0 flat, 1 the scans (noise detail where a material has none), 2 the
     // metric grid, 3 scans and grid.
     const bool scans = (texture_mode > 0.5f && texture_mode < 1.5f) || texture_mode > 2.5f;
+    // Past the near field the scan fades into its own mean (GroundLook): a
+    // 2.5 m scan repeated over a clearing reads as a grid from ~40 m, and
+    // past the fade it is not sampled at all. The macro variation below is
+    // what gives that ground its structure instead.
+    const float dist = length(cam_pos - i.world);
+    const float detail = 1.0f - smoothstep(l_look.y, l_look.z, dist);
+    const float3 dpx = ddx(i.world), dpy = ddy(i.world);
     ScanResult sr = (ScanResult)0;
     float psh = 1.0f;   // the scans' parallax self-shadow
-    if (scans) sr = scan_surface(i, n, level, v, psh);
+    if (scans && detail > 0.0f) sr = scan_surface(i, n, level, v, dpx, dpy, psh);
+    if (scans && detail < 1.0f) {
+        const ScanResult sm = scan_mean(i, level);
+        if (sm.ok && sr.ok) {
+            sr.albedo = lerp(sm.albedo, sr.albedo, detail);
+            sr.rough = lerp(sm.rough, sr.rough, detail);
+            sr.ao = lerp(sm.ao, sr.ao, detail);
+            sr.height = lerp(sm.height, sr.height, detail);
+            sr.n = normalize(lerp(n, sr.n, detail));
+            psh = lerp(1.0f, psh, detail);
+        } else if (sm.ok) {
+            sr = sm;
+            sr.n = n;
+        }
+    }
     if (sr.ok) {
         albedo = sr.albedo;
         rough = sr.rough;
@@ -365,6 +489,8 @@ SceneOut ps_main(VSOut i) {
     } else {
         albedo = apply_surface_texture(mat.rgb, i.world, n);
     }
+    // Macro variation, on ground more than on rock.
+    if (texture_mode < 1.5f) albedo = ground_macro(albedo, i.world, l_look.x * lerp(0.4f, 1.0f, level));
 
     // The canopy shell (forest.hlsli): far forest as a surface of crowns,
     // shaded the way trees.hlsl shades leaves -- wrapped diffuse and light

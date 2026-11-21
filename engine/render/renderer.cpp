@@ -111,8 +111,11 @@ struct ShadowConstants {
     float wet[4];          // ADR-005 C4: wetness, puddles, rain, the ripples' clock (wet.hlsli)
     float flash[4];        // ADR-005 C5: a lightning flash's point and intensity, cd (flash.hlsli)
     float flash_col[4];
+    float look[4];         // bare ground (GroundLook): variation, detail fade start, end; unused
+    float look2[4];        // unused
+    float look3[4];        // ... hex-tiling on, far detail strength, far detail scale; unused
 };
-static_assert(sizeof(ShadowConstants) == 768, "ShadowConstants must match shadow.hlsli");
+static_assert(sizeof(ShadowConstants) == 816, "ShadowConstants must match shadow.hlsli");
 
 // Matches cbuffer ClusterConstants in lights.hlsl.
 struct ClusterConstants {
@@ -1225,6 +1228,13 @@ void Renderer::record_shadows(const ViewConstants& view) {
     wetness(sc.wet[0], sc.wet[1]);
     sc.wet[2] = rain_intensity();
     sc.wet[3] = float(std::fmod(double(view.time), 1000.0));
+    // Bare ground past the near field (GroundLook, mesh.hlsl).
+    sc.look[0] = ground_look_.variation;
+    sc.look[1] = ground_look_.fade[0];
+    sc.look[2] = (std::max)(ground_look_.fade[1], ground_look_.fade[0] + 1.0f);
+    sc.look3[0] = ground_look_.hex ? 1.0f : 0.0f;
+    sc.look3[1] = ground_look_.far_detail;
+    sc.look3[2] = (std::max)(ground_look_.far_scale, 1.0f);
     // Lightning (C5).
     if (strike_.active) {
         for (int k = 0; k < 3; ++k) sc.flash[k] = strike_.flash_pt[k];
@@ -2690,6 +2700,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
             std::vector<std::string> bark;
             for (const TreeLook& l : looks) if (!l.bark_scan.empty()) bark.push_back(l.bark_scan);
             if (!scans_.init(device_.Get(), queue_.Get(), srv_heap_.Get(), mids, bark, error)) return false;
+            ground_look_ = scans_.ground_look();
             for (TreeLook& l : looks)
                 if (!l.bark_scan.empty()) scans_.lookup(l.bark_scan, l.bark, l.bark_layer, l.bark_inv_tile, l.bark_tint, l.bark_depth);
             startup_log().push_back(std::make_pair("phase: scans -- " + scans_.note(), startup_now_ms() - ts));

@@ -27,7 +27,7 @@ Texture2D<float>  g_top_depth  : register(t1);
 Texture2D<float4> g_hf_rad     : register(t2);
 SamplerState      g_clamp      : register(s0);
 
-RWTexture2D<float>  u_height : register(u0);
+RWTexture2D<float2> u_height : register(u0);   // the top height, and its curvature over 6 m
 RWTexture2D<float4> u_rad    : register(u1);
 RWTexture2D<float4> u_vis    : register(u2);
 RWTexture2D<float4> u_r      : register(u3);
@@ -54,7 +54,7 @@ void cs_hf_light(uint3 id : SV_DispatchThreadID) {
     const int2 t = int2(id.xy);
     const float h = top_height(t);
     if (h < kHfNone * 0.5f) {
-        u_height[id.xy] = kHfNone;
+        u_height[id.xy] = float2(kHfNone, 0.0f);
         u_rad[id.xy] = float4(0.0f, 0.0f, 0.0f, 0.0f);
         return;
     }
@@ -107,7 +107,17 @@ void cs_hf_light(uint3 id : SV_DispatchThreadID) {
         E += float3(hf_irradiance(g_hf_r.Load(int3(t, 0)), n), hf_irradiance(g_hf_g.Load(int3(t, 0)), n),
                     hf_irradiance(g_hf_b.Load(int3(t, 0)), n));
     }
-    u_height[id.xy] = h;
+    // The curvature for the ground's macro variation (mesh.hlsl): the
+    // height over the mean of four points 6 m round, + a crest, - a hollow.
+    // Here once a texel per rebuild, where the terrain shader read five
+    // points of the map for every pixel (0.15 ms at 1440p).
+    float curv = 0.0f;
+    {
+        const float c0 = top_height(t + int2(3, 0)), c1 = top_height(t - int2(3, 0));
+        const float c2 = top_height(t + int2(0, 3)), c3 = top_height(t - int2(0, 3));
+        if (min(min(c0, c1), min(c2, c3)) > kHfNone * 0.5f) curv = h - 0.25f * (c0 + c1 + c2 + c3);
+    }
+    u_height[id.xy] = float2(h, curv);
     u_rad[id.xy] = float4(albedo / kPi * E, 1.0f);
 }
 
@@ -146,7 +156,7 @@ void hf_band(float a, float b, float cphi, float sphi, float dphi, float wc, out
 void cs_hf_gather(uint3 id : SV_DispatchThreadID) {
     if (id.x >= kHfSize || id.y >= kHfSize) return;
     const int2 t = int2(id.xy);
-    const float h = g_hf_height.Load(int3(t, 0));
+    const float h = g_hf_height.Load(int3(t, 0)).x;
     if (h < kHfNone * 0.5f) {
         u_vis[id.xy] = float4(0.0f, 0.0f, 0.0f, 0.0f);
         u_r[id.xy] = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -171,7 +181,7 @@ void cs_hf_gather(uint3 id : SV_DispatchThreadID) {
             d *= 1.25f;
             const float2 uv = xz_uv(xz + dir * d);
             if (any(uv < 0.0f) || any(uv > 1.0f)) break;
-            const float hs = g_hf_height.SampleLevel(g_clamp, uv, 0.0f);
+            const float hs = g_hf_height.SampleLevel(g_clamp, uv, 0.0f).x;
             if (hs < kHfNone * 0.5f) continue;
             const float th = atan2(hs - hr, d);
             if (th <= hor) continue;
