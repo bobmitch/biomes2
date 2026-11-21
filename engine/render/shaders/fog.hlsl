@@ -34,6 +34,7 @@ cbuffer FogConstants : register(b0) {
     float2 drift;      float phase_g;     float albedo;   // drift: metres the patches have moved (weather.h)
     float  screen_w;   float screen_h;    float density_scale; float cam_sky;   // cam_sky: the heightfield GI's share of open sky at the eye
     float4 cloud_shadow;  // ADR-005 C2: the cloud-shadow map's centre x, z, half extent (0: none), base altitude
+    float4 mist_top;      // the exploration fog: the patches thin above x m by e-folding y m (peaks stay clear)
 };
 
 Texture2D<float4>   g_fog_map    : register(t0);   // fog.h: density, thinning height, surface y
@@ -85,6 +86,11 @@ float fog_density(float3 p) {
     const float3 q = (p - float3(drift.x, 0.0f, drift.y)) / patch * float3(1.0f, 3.0f, 1.0f);
     const float n = 0.65f * vnoise3(q) + 0.35f * vnoise3(q * 3.1f + 17.0f);
     d *= saturate(1.6f * n - 0.15f);
+    // The patches lie in the low land. The mist follows the ground, so over
+    // a summit it was as thick as over a valley floor and peaks inside the
+    // froxels' 6 km came out as hazy as the plain: thin it with altitude,
+    // as the exploration fog (haze.hlsli) is thin up there.
+    if (mist_top.y > 0.0f) d *= exp(-max(p.y - sea_level - mist_top.x, 0.0f) / mist_top.y);
     return (d + haze) * density_scale;
 }
 

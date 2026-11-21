@@ -941,6 +941,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     if (cmdline && std::string(cmdline).find("--no-clouds") != std::string::npos) g_renderer.set_clouds(false);
     if (cmdline && std::string(cmdline).find("--no-rain") != std::string::npos) g_renderer.set_rain_on(false);
     if (cmdline && std::string(cmdline).find("--no-lightning") != std::string::npos) g_renderer.set_lightning(false);
+    if (cmdline && std::string(cmdline).find("--no-height-fog") != std::string::npos) g_renderer.set_height_fog(false);
+    if (cmdline) {
+        const std::string c4 = cmdline;
+        const size_t hk = c4.find("--height-fog ");
+        if (hk != std::string::npos) g_renderer.set_height_fog_scale(float(std::atof(c4.c_str() + hk + 13)));
+    }
     if (cmdline) {
         const std::string c3 = cmdline;
         const size_t rn = c3.find("--rain ");
@@ -1402,6 +1408,21 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                          st.age * 1000.0f, st.candela, st.channel, st.distance / 343.0f);
                         else
                             std::fprintf(f, "  lightning: none this frame\n");
+                    }
+                    {
+                        // The exploration fog's visibility (haze.hlsli), from
+                        // its own layers alone (the froxel mist's patches add
+                        // to it near the ground): the 2% contrast distance,
+                        // 3.912 / sigma, along a level line at a few heights.
+                        const float sl = g_renderer.world().params().sea_level;
+                        auto vis = [&](float y) {
+                            const float s = g_renderer.height_fog_sigma(y);
+                            return s > 0.0f ? 3.912f / s : 0.0f;
+                        };
+                        std::fprintf(f, "  height fog: valley %.2f; level visibility at the eye (%.0f m) %.0f m, at 20 m "
+                                        "%.0f m, at 300 m %.0f m, at 600 m %.0f m\n",
+                                     g_renderer.height_fog_valley(), g_camera.y - sl, vis(g_camera.y), vis(sl + 20.0f),
+                                     vis(sl + 300.0f), vis(sl + 600.0f));
                     }
                     float wet_now = 0.0f, puddle_now = 0.0f;
                     g_renderer.wetness(wet_now, puddle_now);

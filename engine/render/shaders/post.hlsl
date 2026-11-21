@@ -54,6 +54,9 @@ cbuffer PostConstants : register(b0) {
     float4 cloud_shadow; // ADR-005 C2: the cloud-shadow map's centre x, z (cloud-base plane), half extent m, base altitude m
     float4 wet;          // ADR-005 C4: the rain now, the ripples' clock (s), radians a pixel, w > 0.5 puddles to reflect
     float4 storm;        // ADR-005 C5: x the storm deck's dimming of the sky's light, 1 none
+    float4 hfog_a;       // the exploration fog (haze.hlsli): ground sigma, scale height; valley sigma, scale height
+    float4 hfog_b;       // ... deep sigma, scale height; base altitude; w on
+    float4 hfog_c;       // ... greying, dimming, albedo, the eye's sky share
 };
 
 Texture2D<float>  g_depth   : register(t0);
@@ -285,17 +288,33 @@ float ao_upsample(int2 p, float z) {
     return acc / wsum;
 }
 
+// Contact shadows are for SMALL occluders -- a blade, a pebble, a root --
+// that the cascades are too coarse for. The march must not find the surface
+// it starts on. It did, on any slope a low sun grazes: the ray started 2 cm
+// along the light, hugged the surface for its whole length, and the depth
+// buffer -- one depth per pixel, ~15 cm wide at 60 m -- came out "in front"
+// of it in pixel-sized steps, a field of dark squares in bands across the
+// badlands' sand at 16:00 (long blamed on the cascades). So the ray starts
+// above the surface along its own normal by a pixel and a half of footprint,
+// a hit must clear the surface by more than a footprint, and the effect
+// fades where the light grazes, which N.L and the cascades already darken.
 float contact_shadow(int2 p, float z, float3 P) {
     const float dist = length(P - cam_pos);
     if (dist > 80.0f) return 1.0f;
     const float3 L = normalize(sun_dir);
+    const float3 n = normal_at(p, P);
+    const float nl = dot(n, L);
+    if (nl <= 0.02f) return 1.0f;
+    const float foot = dist * wet.z;   // metres a pixel spans here (wet.z: radians a pixel)
     const int steps = 14;
     const float len = contact_len * (1.0f + dist / 40.0f);
     const float j = ign(float2(p) + float(frame % 16u) * 5.588238f);
+    const float3 P0 = P + n * (1.5f * foot + 0.01f);
+    const float thick_min = 0.02f + foot;
     float lit = 1.0f;
     [loop] for (int s = 1; s <= steps; ++s) {
         const float t = (float(s) - j) / float(steps) * len;
-        const float3 Q = P + L * (t + 0.02f);
+        const float3 Q = P0 + L * (t + 0.02f);
         const float4 c = mul(float4(Q, 1.0f), view_proj);
         if (c.w <= 0.0f) break;
         const float2 ndc = c.xy / c.w;
@@ -306,9 +325,11 @@ float contact_shadow(int2 p, float z, float3 P) {
         const float diff = ray_z - scene_z;
         // In front of the ray by a little, not by a lot: a thin occluder
         // like a blade or a branch, not the far side of a hill behind it.
-        if (diff > 0.02f && diff < 0.2f + 0.005f * dist) { lit = 0.0f; break; }
+        if (diff > thick_min && diff < 0.2f + 0.005f * dist + foot) { lit = 0.0f; break; }
     }
-    // Fade out with distance, where the march is too coarse to trust.
+    // Fade out with distance, where the march is too coarse to trust, and
+    // where the light grazes the surface.
+    lit = lerp(1.0f, lit, saturate((nl - 0.02f) / 0.12f));
     return lerp(lit, 1.0f, saturate((dist - 60.0f) / 20.0f));
 }
 
@@ -440,6 +461,11 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
         }
         // Under a storm deck the air between is lit by the deck, not the sun.
         float3 c = dir * apf.a + (apf.rgb * (1.0f - vis) + sky * vis) * storm.x;
+        // The exploration fog to infinity: the low sky and anything low in it
+        // (distant cloud near the horizon) fade into the fog's horizon; the
+        // sky overhead, through little of it, stays clear.
+        const float4 hf = height_fog(cam_pos, d, 1e6f);
+        c = c * hf.a + hf.rgb;
         // The whole depth of the mist: it hides the horizon, as it should.
         const float4 mf = mist(uv, 1e9f);
         u_scene[p] = float4(c * mf.a + mf.rgb, 1.0f);   // the mist's sky term is dimmed already (fill_light)
@@ -480,6 +506,12 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
             const float4 cl = g_clouds.SampleLevel(g_linear, uv, 0);
             c = c * cl.a + cl.rgb;
         }
+    }
+    // The exploration fog (haze.hlsli): the layered height fog that hides
+    // the low land at range and leaves the peaks standing out of it.
+    {
+        const float4 hf = height_fog(cam_pos, (P - cam_pos) / max(dist, 1e-3f), dist);
+        c = c * hf.a + hf.rgb;
     }
     // Then the mist, which is nearer than the bulk of the air.
     const float4 mf = mist(uv, dot(P - cam_pos, cam_fwd));

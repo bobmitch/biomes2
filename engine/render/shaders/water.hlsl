@@ -72,6 +72,9 @@ cbuffer WaterConstants : register(b0) {
     float4 wind_v;
     float2 wind_drift;    float swash_runup;  float clouds_on;   // the swash's highest run up the beach (water_wave.h)
     float4 cloud_shadow;  // ADR-005 C2: the cloud-shadow map's centre x, z, half extent, base altitude (cloud_shadow.hlsli)
+    float4 hfog_a;        // the exploration fog (haze.hlsli), as post.hlsl
+    float4 hfog_b;
+    float4 hfog_c;
 };
 
 // The lit scene and its depth as the composite left them -- copies, because
@@ -388,7 +391,8 @@ float3 sky_reflection(float3 R) {
     const bool on = c.w > 0.0f && all(raw == ruv);
     if (on && g_depth_in.SampleLevel(g_point, ruv, 0) >= 1.0f) return g_scene_in.SampleLevel(g_linear, ruv, 0).rgb;
     const float4 m = mist(ruv, 1e9f);
-    return sky_view_at(R) * m.a + m.rgb;
+    const float4 hf = height_fog(cam_pos, R, 1e6f);
+    return (sky_view_at(R) * hf.a + hf.rgb) * m.a + m.rgb;
 }
 
 float4 ps_main(VSOut i) : SV_Target0 {
@@ -653,6 +657,10 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // reflection carries the haze to what it hit.
     const float4 ap = aerial(uv, dist);
     col = col * ap.a + ap.rgb * lerp(cam_sky, 1.0f, saturate((dist - 64.0f) / 192.0f));
+    {
+        const float4 hf = height_fog(cam_pos, -v, dist);
+        col = col * hf.a + hf.rgb;
+    }
     col = col * mf.a + mf.rgb;
     // The scene behind, as the composite left it: haze and all, so the fade
     // is seamless.

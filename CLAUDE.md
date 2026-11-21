@@ -22,6 +22,10 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `tools/textures/` | `fetch_scans.py`: downloads the scans and packs them for the engine. |
 | `engine/` | Track B runtime (D3D12, `docs/adr-003-*`). Since M1 it evaluates the REAL field: `engine/field/real_field.hlsl` is the caller's side of ADR-001's line (which cells, rivers and shafts are near a point), and `world_gpu.{h,cpp}` uploads them. |
 
+Open gaps -- things built but not finished, and things seen but not fixed
+-- are gathered in `docs/gaps.md`; add to it when a section here grows a
+"Not done".
+
 **`worldgen/` is everything upstream of the golden hash; `tools/` is
 everything downstream.** That line is what makes invariant 9 checkable — the
 metrics legitimately use `atan`, and they are on the far side of it.
@@ -77,7 +81,8 @@ pre-L2 sun), the weather's `--sea-state <0..1>`, `--wind <m/s>`,
 `--wind-dir <deg>` and `--swell <m>` (automatic weather otherwise), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
 `--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`, `--no-rocks`,
 `--no-forest-shell`, `--no-clouds`, `--no-rain`, `--rain <0..1>`, `--wet <0..1>`,
-`--no-lightning`; `--shot` also
+`--no-lightning`, `--no-height-fog` and `--height-fog <k>` (a multiplier on the
+exploration fog); `--shot` also
 takes `--lights <n>` (campfires round the camera), `--lightning <dist m>
 <bearing deg> [1]` (a strike for the still, at the peak of its first stroke,
 the bearing from the camera's forward; 1 in the cloud) and `--ground` (the
@@ -828,12 +833,13 @@ level's top.
   need the rocks bound and its cached tiles re-baked when rocks stream in
   after them, so it waits; the LOD switch pops (no cross-fade, by choice
   for now). Shots do not run physics: the collision probe is in `--walk`.
-- **A pre-existing cascade artifact** turned up beside a badlands boulder:
-  blocky texel-sized squares of shadow on gently sloped sand at 16:00
-  (`--cam 2452 123 3366 0.99 -0.2 --time 16`), there with rocks and
-  parallax off -- shadow acne in a middle cascade, not investigated. RT
-  shadows hid it while they were the default; with the cascades the only
-  shadows again, it is back.
+- **"Cascade acne" beside a badlands boulder was the CONTACT shadow**:
+  blocky squares in bands on gently sloped sand at 16:00 (`--cam 2452 123
+  3366 0.99 -0.2 --time 16`), long filed as acne in a middle cascade. A 5x
+  depth bias changed nothing; `--no-shadows`, `--no-pom`, `--texture 0`,
+  `--no-hfgi`, `--no-foliage` and `--no-ao` left it; `--no-contact` removed
+  it. Fixed in the post chain's `contact_shadow` (see the frame section).
+  Turn things off one at a time before believing which pass a pattern is.
 
 ### Ground cover
 
@@ -890,12 +896,24 @@ Scene shaders write TWO R16G16B16A16F targets through `scene_out.hlsli`: the
 sun's direct light, and everything else (sky, bounce, fog). Then
 `post.hlsl`: horizon-based AO at half resolution from depth; a composite of
 direct x screen-space contact shadow (a 0.5 m march towards the sun through
-depth) + ambient x AO; TAA (Halton 2,3 jitter over 8 frames, reprojection by
+depth, for small occluders the cascades are too coarse for) + ambient x AO; TAA (Halton 2,3 jitter over 8 frames, reprojection by
 depth with the unjittered previous matrix, YCoCg variance clipping, 1:9
 blend); the exposure meter; then exposure, a light contrast-adaptive
 sharpen and AgX into the back buffer. Y / O / J toggle TAA, AO and contact
 shadows. A still renders 16 frames so TAA converges. Cost: ~0.3 ms a frame
 at ground level, 0.09 of it the effects.
+
+**The contact march must not find its own surface.** It started 2 cm
+along the light, so on any slope a low sun grazes it hugged the surface
+for its whole length, and the depth buffer -- one depth a pixel, ~15 cm
+wide at 60 m -- came out "in front" of it in pixel-sized steps: a field of
+dark squares in bands. Now it starts 1.5 pixel footprints above the surface
+along the depth buffer's own normal (`normal_at`), a hit must clear the
+surface by more than a footprint (`wet.z` carries the pixel angle), and the
+effect fades where N.L is under ~0.14, which the cascades already darken.
+It was most of the cascades' flicker too: the close-floor `--shake 60` view
+went from 1.77-3.50 mean luma change a frame to 0.51-1.04 (RT's denoised
+shadow, before its removal, 0.76-0.95). Walking cost within noise.
 
 ### Light in physical units (ADR-004 L1)
 
@@ -1348,6 +1366,59 @@ atmosphere's aerial perspective, and its far end over the sky.
   been, or weather that rolls in. The hook is `FogMap` -- one density
   function, read in one place -- and ADR-004's L4 section lists the options.
 
+### The exploration fog: layered height fog
+
+How far the land can be seen is a game decision, not only an atmospheric
+one: climbing a hill must not show the shape of the island or what lies on
+the ground far off, while peaks and high things stay visible enough to want
+to go to. `haze.hlsli`'s `height_fog`, applied in `cs_composite` to every
+surface and to the sky (to infinity), and by the sea over itself and its sky
+reflection. archetypes.json `fog.layers`; `--no-height-fog`,
+`--height-fog <k>`.
+
+- **Extinction falls off with ALTITUDE above sea level, not with height
+  above the ground.** Three layers, sigma at sea level x exp(-h / H):
+  ground 0.0023 / 70 m (the lowland's ~1.5 km), valley 0.015 / 40 m
+  (dawn's sea of fog), deep 0.0001 / 1000 m (peaks fade by ~20 km). From
+  the lowland every near-level sight line runs through the dense air; a
+  summit rises out of it; from a hill above the layer the lowland a few km
+  off is hidden, because the line down to it crosses km of the dense air,
+  while the ground below, seen steeply, is not. The terrain-following mist
+  could do none of this: it thinned over a hilltop as much as over a
+  valley, so climbing cleared the view -- that was the complaint.
+- **Analytic**: an exponential layer's optical depth along a straight ray
+  has a closed form (`hfog_layer`), exact at any range, sky included, with
+  the stretch below the base at the base's density. The froxel mist keeps
+  the near field's patches, shafts and torch glow, and now thins above 60 m
+  by e-folding 120 m (`mist_top`): left alone it fogged summits inside its
+  6 km as thickly as the plain, and at dawn hid the far peak entirely.
+- **Its colour is the sky's own horizon in that azimuth**, so the land
+  fades into the horizon -- warm towards the sun (the table's Mie glow),
+  cool away, dark at night -- greyed by cover^2 x 0.9 and dimmed by
+  `storm_dim` as the sky light is. Looking DOWN it blends to the horizon
+  averaged over four azimuths: azimuth alone stood a pillar of the sun's
+  glow in the fog at dusk. Near the eye it takes the heightfield GI's share
+  of open sky (a sealed chamber does not glow).
+- **The valley layer** follows the mist's dawn and dusk bumps over a midday
+  floor of 8% (`valley_noon`) and is blown away by wind, (1 - U / 6 m/s)^2
+  (`valley_wind`). Rain thickens every layer as it does the mist.
+- **Measured** (the shot report's `height fog:` line: the layers' own 2%
+  contrast distance, 3.912 / sigma, along a level line; the froxel patches
+  add near the ground): at 20 m above sea 1.8 km at noon, 0.7 km at 07:00,
+  0.86 km in a storm; at 300 m 37 km, 600 m 71 km. The views: spawn's wood
+  closes in within a few hundred metres; from 300 m over the badlands at
+  noon the far summit stands as a silhouette while the coast and lowland
+  sink into the layer; at dawn a sea of fog; the sea-level view of the
+  island's far headland, clear before, is gone into the haze.
+- **Cost**: walking at 1440p 7.05 / 7.04 ms against 6.98 / 6.99 without.
+- **Not done**: the base is sea level everywhere, so a high plateau is
+  clear air (highland, glacier sit at 90-110 m base, relief to 300+) --
+  a regional base from the fog map, blurred over a few km, is the next
+  lever if plateaus see too far; the lightning flash and local lights do
+  not light this fog (the froxel mist carries them); the far terrain rings,
+  far shadow and canopy shell still draw to their old reach, which the fog
+  now hides -- a draw-distance cut would pay for it.
+
 ### Hardware ray tracing: REMOVED (git tag `rt-last`)
 
 ADR-004 L5/L6 built a DXR 1.1 ray-tracing tier: denoised RT key-light
@@ -1551,7 +1622,12 @@ the terrain and the trees and received by both through one function,
   the near cascades' leaf cards.
 - **Time-sliced** (`cascades_due`): cascade 0 every frame, 1 every second,
   2 and 3 every fourth, interleaved -- two drawn a frame. Each keeps the
-  matrix its map was drawn with. Four cascades every frame at 4096 was +1.4
+  matrix its map was drawn with. **A moving caster past 28 m therefore
+  shadows at 30 or 15 Hz.** Nothing moves out there yet; when creatures,
+  built structures or particles do, the fix is the usual one: keep each
+  cascade's static map as a cached copy and draw the dynamic casters over
+  a copy of it every frame (a copy of a 4096^2 D32 slice is ~0.05 ms), so
+  static cost stays sliced and moving things never lag. Four cascades every frame at 4096 was +1.4
   ms walking; sliced at 4096, +0.7; with the per-cascade sizes, **+0.1**
   (2.41 -> 2.51 ms) for four times the reach.
 - **Filtering (PCSS)**: a 12-tap blocker search, the penumbra from the

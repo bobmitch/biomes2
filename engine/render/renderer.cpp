@@ -72,8 +72,9 @@ struct WaterConstants {
     float wind_v[4];
     float wind_drift[2];  float swash_runup; float clouds_on;
     float cloud_shadow[4]; // ADR-005 C2
+    float hfog[3][4];      // the exploration fog (haze.hlsli)
 };
-static_assert(sizeof(WaterConstants) == 624, "WaterConstants must match water.hlsl");
+static_assert(sizeof(WaterConstants) == 672, "WaterConstants must match water.hlsl");
 
 // Heap slots past the RT denoiser's: the sea's copies of the lit scene and of
 // depth, which it reads while it draws into the one and tests against the
@@ -215,8 +216,9 @@ struct PostConstants {
     float cloud_shadow[4]; // ADR-005 C2: the cloud-shadow map's centre x, z, half extent, base altitude
     float wet[4];          // ADR-005 C4: rain, the ripples' clock, radians a pixel, puddles on
     float storm[4];        // ADR-005 C5: x the storm deck's dimming of the sky's light (storm_dim)
+    float hfog[3][4];      // the exploration fog (haze.hlsli): layers, base and on, colour
 };
-static_assert(sizeof(PostConstants) == 464, "PostConstants must match post.hlsl");
+static_assert(sizeof(PostConstants) == 512, "PostConstants must match post.hlsl");
 
 // Matches cbuffer FogConstants in fog.hlsl.
 struct FogConstants {
@@ -230,8 +232,9 @@ struct FogConstants {
     float drift[2];     float phase_g;   float albedo;
     float screen_w;     float screen_h;  float density_scale; float cam_sky;
     float cloud_shadow[4]; // ADR-005 C2: last frame's cloud-shadow map (extent 0: none yet)
+    float mist_top[4];     // the exploration fog: the patches thin above x m, e-folding y m
 };
-static_assert(sizeof(FogConstants) == 208, "FogConstants must match fog.hlsl");
+static_assert(sizeof(FogConstants) == 224, "FogConstants must match fog.hlsl");
 // Matches cbuffer RtConstants in rt_shadow.hlsl.
 struct RtConstants {
     float inv_view_proj[16];
@@ -1734,6 +1737,8 @@ void Renderer::record_fog() {
     fc.haze = fs.haze;
     fc.sea_level = world_.params().sea_level;
     fc.patch = fs.patch;
+    fc.mist_top[0] = hfog_on_ ? fs.mist_top[0] : 0.0f;
+    fc.mist_top[1] = hfog_on_ ? fs.mist_top[1] : 0.0f;
     // The mist drifts at a share of the wind (weather.h's drift integral).
     fc.drift[0] = weather_now_.drift[0] * weather_.settings().mist_drift;
     fc.drift[1] = weather_now_.drift[1] * weather_.settings().mist_drift;
@@ -2297,6 +2302,31 @@ void Renderer::fill_light(float out[7][4]) const {
         for (int i = 2; i < 7; ++i)
             for (int k = 0; k < 3; ++k) out[i][k] *= dim;
     }
+}
+
+// The exploration fog's constants (haze.hlsli): its three layers' extinction
+// at sea level and scale heights, the valley layer by the hour and the wind,
+// all thickened by rain as the mist is; the base; and its colour's greying
+// and dimming under the deck, and the eye's share of open sky.
+void Renderer::height_fog_constants(float out[3][4], bool on) const {
+    for (int r = 0; r < 3; ++r) for (int k = 0; k < 4; ++k) out[r][k] = 0.0f;
+    if (!on || !hfog_on_ || !fog_on_ || !fog_map_.built()) return;
+    const FogSettings& fs = fog_map_.settings();
+    const float wet = fog_density_ * (1.0f + 1.5f * rain_intensity());
+    const float valley = fog_map_.valley_factor(time_hours_, weather_now_.wind_speed);
+    out[0][0] = fs.ground[0] * wet * hfog_scale_;
+    out[0][1] = fs.ground[1];
+    out[0][2] = fs.valley[0] * valley * wet * hfog_scale_;
+    out[0][3] = fs.valley[1];
+    out[1][0] = fs.deep[0] * wet * hfog_scale_;
+    out[1][1] = fs.deep[1];
+    out[1][2] = world_.params().sea_level;
+    out[1][3] = 1.0f;
+    const float cov = clouds_on_ && clouds_.ready() ? clouds_.coverage() : 0.0f;
+    out[2][0] = cov * cov * 0.9f;
+    out[2][1] = storm_dim();
+    out[2][2] = fs.albedo;
+    out[2][3] = hfgi_on_ ? hfgi_.camera_sky() : 1.0f;
 }
 
 float Renderer::storm_dim() const {
@@ -3327,6 +3357,7 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
         pc.wet[3] = puddle_now > 0.0f ? 1.0f : 0.0f;
     }
     pc.storm[0] = storm_dim();
+    height_fog_constants(pc.hfog, !wire);
     pc.fog_near = kFogNear;
     pc.fog_log_ratio = std::log(kFogFar / kFogNear);
     pc.ssgi_radius = ssgi_on_ && !wire ? ssgi_radius_ : 0.0f;
@@ -3833,6 +3864,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         wc.swash_runup = swash_.runup;
         // The clouds' shadow; record_clouds runs before the sea draws.
         wc.clouds_on = (clouds_on_ && clouds_.ready()) ? 1.0f : 0.0f;
+        height_fog_constants(wc.hfog, mode_ != Mode::Wireframe);
         clouds_.shadow_params(wc.cloud_shadow);
         wc.frame = float(post_frame_ % 64);
         std::memcpy(water_cb_cpu_[frame_], &wc, sizeof wc);

@@ -32,6 +32,20 @@ bool FogMap::build(const WorldGpu& world, const char* archetypes_path, std::stri
             settings_.patch = float(g.number("patch"));
             settings_.phase_g = float(g.number("phase_g"));
             settings_.albedo = float(g.number("albedo"));
+            if (g.has("layers")) {
+                const jsonlite::Value& l = g.at("layers");
+                auto pair = [&](const char* k, float out[2]) {
+                    if (!l.has(k)) return;
+                    out[0] = float(l.array(k).at(0).num);
+                    out[1] = float(l.array(k).at(1).num);
+                };
+                pair("ground", settings_.ground);
+                pair("valley", settings_.valley);
+                pair("deep", settings_.deep);
+                pair("mist_top", settings_.mist_top);
+                if (l.has("valley_noon")) settings_.valley_noon = float(l.number("valley_noon"));
+                if (l.has("valley_wind")) settings_.valley_wind = float(l.number("valley_wind"));
+            }
         }
     } catch (const std::exception& e) {
         error = std::string("archetypes.json fog: ") + e.what();
@@ -85,6 +99,26 @@ float FogMap::time_factor(float hours) const {
     const float m = (hours - 6.5f) / 1.6f;
     const float e = (hours - 20.0f) / 2.0f;
     return 1.0f + settings_.morning * std::exp(-m * m) + 0.4f * settings_.morning * std::exp(-e * e);
+}
+
+float FogMap::valley_factor(float hours, float wind_mps) const {
+    // The same dawn and dusk bumps as the mist, normalised to 1 at dawn,
+    // over a midday floor.
+    const float m = (hours - 6.5f) / 1.6f;
+    const float e = (hours - 20.0f) / 2.0f;
+    float f = std::exp(-m * m) + 0.4f * std::exp(-e * e);
+    f = settings_.valley_noon + (1.0f - settings_.valley_noon) * (f > 1.0f ? 1.0f : f);
+    // A valley fog is still air: a breeze thins it, a wind clears it.
+    float w = 1.0f - wind_mps / settings_.valley_wind;
+    w = w < 0.0f ? 0.0f : w;
+    return f * w * w;
+}
+
+float FogMap::height_sigma(float y, float sea_level, float valley) const {
+    const float h = y - sea_level > 0.0f ? y - sea_level : 0.0f;
+    return settings_.ground[0] * std::exp(-h / settings_.ground[1]) +
+           settings_.valley[0] * valley * std::exp(-h / settings_.valley[1]) +
+           settings_.deep[0] * std::exp(-h / settings_.deep[1]);
 }
 
 float FogMap::base_density(float x, float y, float z) const {
