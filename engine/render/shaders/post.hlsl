@@ -53,6 +53,7 @@ cbuffer PostConstants : register(b0) {
     float  fog_near;     float fog_log_ratio; float rt_shadows; float rt_sky;   // L5's traced key-light visibility, L6's traced sky
     float4 cloud_shadow; // ADR-005 C2: the cloud-shadow map's centre x, z (cloud-base plane), half extent m, base altitude m
     float4 wet;          // ADR-005 C4: the rain now, the ripples' clock (s), radians a pixel, w > 0.5 puddles to reflect
+    float4 storm;        // ADR-005 C5: x the storm deck's dimming of the sky's light, 1 none
 };
 
 Texture2D<float>  g_depth   : register(t0);
@@ -438,10 +439,11 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
             const float4 cl = g_clouds.SampleLevel(g_linear, uv, 0);
             sky = sky * cl.a + cl.rgb;
         }
-        float3 c = dir * apf.a + apf.rgb * (1.0f - vis) + sky * vis;
+        // Under a storm deck the air between is lit by the deck, not the sun.
+        float3 c = dir * apf.a + (apf.rgb * (1.0f - vis) + sky * vis) * storm.x;
         // The whole depth of the mist: it hides the horizon, as it should.
         const float4 mf = mist(uv, 1e9f);
-        u_scene[p] = float4(c * mf.a + mf.rgb, 1.0f);
+        u_scene[p] = float4(c * mf.a + mf.rgb, 1.0f);   // the mist's sky term is dimmed already (fill_light)
         return;
     }
     const float3 P = world_at(uv, z);
@@ -479,7 +481,7 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     // haze 4 m into a sealed chamber: 0.2 nits, the whole residue.)
     const float dist = length(P - cam_pos);
     const float4 ap = aerial(uv, dist);
-    c = c * ap.a + ap.rgb * lerp(cam_sky, 1.0f, saturate((dist - 64.0f) / 192.0f));
+    c = c * ap.a + ap.rgb * (lerp(cam_sky, 1.0f, saturate((dist - 64.0f) / 192.0f)) * storm.x);
     // A cloud nearer than the surface (a mountain behind low cloud) lies over it.
     if (clouds_on > 0.5f) {
         const float cd = g_cloud_dist.SampleLevel(g_linear, uv, 0) * 1000.0f;
@@ -651,10 +653,25 @@ void cs_exposure(uint3 id : SV_DispatchThreadID) {
         const float rate = target > prev.x ? 3.0f : 1.0f;
         adapted = prev.x + (target - prev.x) * (1.0f - exp2(-dt * rate));
     }
-    float ev100 = adapted + 3.0f;
-    if (ev100_fixed > -100.0f) { ev100 = ev100_fixed; adapted = ev100 - 3.0f; }
+    // A lightning flash (ADR-005 C5): the eye does not adapt to a tenth of a
+    // second of light, so the meter HOLDS where it was -- else the frame
+    // after a stroke came out dark and the flash read as a dip. But at night
+    // the held exposure is a moonlit one, and a 10 klx flash is fifteen stops
+    // over it: pure white. So for the flash's own frames only, the picture may
+    // stop down as far as keeps the flash 2.5 stops over middle grey -- a
+    // brilliant landscape, not a white screen. In a daytime storm a flash
+    // adds less than that and the hold stands. The stored state stays the
+    // held one, so the frame after the flash is back where it was.
+    float shown = adapted;
+    if (valid && (expo_flags & 2u) != 0u) {
+        shown = max(prev.x, target - 2.5f);
+        adapted = prev.x;
+        target = prev.w;
+    }
+    float ev100 = shown + 3.0f;
+    if (ev100_fixed > -100.0f) { ev100 = ev100_fixed; adapted = ev100 - 3.0f; shown = adapted; }
     // The metered mean lands on middle grey, 0.18, before the tonemap.
-    const float exposure = 0.18f * exp2(ev_comp) / exp2(adapted);
+    const float exposure = 0.18f * exp2(ev_comp) / exp2(shown);
     u_expo[0] = float4(adapted, exposure, ev100, target);
     u_expo[1] = float4(exp2(lo_log), exp2(hi_log), float(total), 1.0f);
 }

@@ -77,8 +77,11 @@ Every mode takes `--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), the weather's `--sea-state <0..1>`, `--wind <m/s>`,
 `--wind-dir <deg>` and `--swell <m>` (automatic weather otherwise), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
 `--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`, `--no-rocks`,
-`--no-forest-shell`, `--no-clouds`, `--no-rain`, `--rain <0..1>`, `--wet <0..1>`; `--shot` also
-takes `--lights <n>` (campfires round the camera) and `--ground` (the
+`--no-forest-shell`, `--no-clouds`, `--no-rain`, `--rain <0..1>`, `--wet <0..1>`,
+`--no-lightning`; `--shot` also
+takes `--lights <n>` (campfires round the camera), `--lightning <dist m>
+<bearing deg> [1]` (a strike for the still, at the peak of its first stroke,
+the bearing from the camera's forward; 1 in the cloud) and `--ground` (the
 `--cam` x and z at eye height on the ground). `--flight` also takes `--settle`, `--holes` and
 `--flight-speed <m/s>` and `--flight-from x y z`; `--shot` takes
 `--slot-report` and `--shake <frames>` (a still camera through that many
@@ -898,7 +901,7 @@ and keeps AgX's hue handling, which a torch's orange will need.
   is real now and the sea is no better at noon (at sunset its glitter path
   is the best thing in the engine). L7 owns water reflections.
 
-### Volumetric clouds, rain and the wet world (ADR-005, phases C1-C4)
+### Volumetric clouds, rain, the wet world and lightning (ADR-005, C1-C5)
 
 `docs/adr-005-clouds-and-rain.md` is the plan: Schneider's Nubis (Horizon
 Zero Dawn, SIGGRAPH 2015/2017) with Hillaire's integration and multiple
@@ -1086,7 +1089,54 @@ archetypes.json `clouds` block. F3 / `--no-clouds`.
     the history, then the puddle's); grass still grows out of puddles (the foliage bake is cached per tile);
     nothing runs down a slope or drips off a rock; wetness is the same
     everywhere the sky reaches -- a beach does not dry faster than a bog.
-- **Not done (later phases)**: lightning (C5); rain on the camera lens;
+- **Lightning (C5)**: `engine/render/lightning.{h,cpp}`,
+  `shaders/lightning.hlsl` (the bolt), `shaders/flash.hlsli` (its light);
+  archetypes.json `weather.lightning`.
+  - **A strike is a pure function of seed, clock and the camera's 2 km
+    cell**: 2.5 s slots, each hashed for a strike (rate from storm 0.78,
+    14 a minute at storm 1), its start, place (within 6 km of the cell),
+    kind (40% to the ground) and 1-4 return strokes 40-150 ms apart, each a
+    30 ms decay over a quarter-second continuing current. Peak 5e10 cd,
+    about a real stroke's. The walk report counts strikes and lit frames;
+    `--walk` always starts the clock at 0, so every run sees the SAME
+    minute -- for the default seed, 1 ground strike in its first 15. That
+    looked like a bug in the ground share until a replay of the schedule
+    in Python matched the engine strike for strike (40.2% long run).
+  - **Its light goes into the AMBIENT target** (`flash_light` /
+    `flash_leaf`: inverse square from the channel's middle, or a point in
+    the cloud, times the surface's sky visibility -- a wood's floor
+    flickers, it does not light up like a field), never the direct target,
+    which the composite multiplies by the SUN's and the clouds' shadows.
+  - **The mist carries the flash**: in rain it is most of what is seen,
+    and the clouds behind are lost in it. `cs_fog_inject` adds the flash
+    and takes the frame whole while it is lit (1:12 history smeared a
+    stroke to nothing); the decay after is an afterglow. The clouds glow
+    round it too (diffused over ~1.5 km in the march).
+  - **The bolt**: midpoint displacement from the cloud base to the ground
+    (8 levels, sideways more than up), 3-7 dimmer branches, made on the CPU
+    once per strike; core >= 1.2 px and a glow 10x, additive, depth tested
+    by hand, drawn after the rain.
+  - **Exposure holds through a flash** (`expo_flags` 2), or the frame after
+    a stroke came out dark. At night the held exposure is a moonlit one and
+    the flash is fifteen stops over it -- a white screen -- so the flash's
+    own frames may stop down until it is 2.5 stops over middle grey; the
+    stored state stays the held one.
+  - **Storms are dark now** (`storm_dim`): a closed deck of tall cloud lets
+    down a fifth of the sky's light -- every sky term in `fill_light`, the
+    ground's bounce, the haze's in-scatter in the composite, the clouds'
+    own ambient, the rain's drops. Before it a storm was a grey day at
+    EV 14.4 and a flash added 2 luma; now EV 11.9, and a strike 2.5 km off
+    takes the sky from luma 93 to 133. A grey stratus overcast keeps its
+    light (storm 0.7: 0.98; 0.8: 0.4; 0.9: 0.2).
+  - **The cloud-shadow map's edge**: past it, `cloud_shadow_at` returned
+    full sun, and distant mist sliding out of the 12 km map lit a band down
+    the frame under a closed deck. It takes the edge texel now.
+  - Cost walking at 1440p through a storm with a flash lit a quarter of the
+    time: 9.78 / 9.77 ms against 9.74 / 9.72 without -- 0.05 ms.
+  - Not done: thunder (the report gives its delay; there is no audio); the
+    flash casts no shadows of its own; the sea's glint does not see it; no
+    sheet lightning across the cloud tops seen from above.
+- **Not done (later phases)**: rain on the camera lens;
   underwater the rain still draws; no rain in the RT or GI passes (nothing needs it);
   1/16-pixel-a-frame cloud rendering (Decima's cost path); the base can
   look like a flat ceiling from the ground -- tuning.

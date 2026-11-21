@@ -106,6 +106,7 @@ static const float3 kSky = float3(0.40f, 0.50f, 0.66f);
 #include "engine/render/shaders/leaf.hlsli"
 #include "engine/render/shaders/scene_out.hlsli"
 #include "engine/render/shaders/local_lights.hlsli"
+#include "engine/render/shaders/flash.hlsli"
 
 float3 qrot(float4 q, float3 v) {
     const float3 t = 2.0f * cross(q.xyz, v);
@@ -239,7 +240,8 @@ SceneOut shade(float3 albedo_srgb, float3 n, float ao, float3 world, bool foliag
         // against the sky, which is what the first close-up showed.
         dir = leaf_sun_light(albedo, n, v, 0.6f, 0.7f, sh) * (0.85f * (0.45f + 0.55f * ao));
         amb = albedo / kPi * gi_diffuse(world, n, v) * (0.45f + 0.55f * ao) +
-              local_lights_leaf(albedo, n, v, 0.6f, 0.7f, world, clip) * (0.85f * (0.45f + 0.55f * ao));
+              local_lights_leaf(albedo, n, v, 0.6f, 0.7f, world, clip) * (0.85f * (0.45f + 0.55f * ao)) +
+              flash_leaf(albedo, n, v, world, 0.6f, 0.7f) * (0.45f + 0.55f * ao);
         wet_leaf_sheen(dir, amb, n, v, world, sh, wet * (0.45f + 0.55f * ao));
     } else {
         albedo *= lerp(1.0f, 0.55f, wet);
@@ -248,7 +250,7 @@ SceneOut shade(float3 albedo_srgb, float3 n, float ao, float3 world, bool foliag
         // the ground's fill every trunk's shadow side read as black.
         const Surface s = make_surface(albedo, lerp(0.85f, 0.4f, wet), n, v);
         dir = sun_light(s, sh) * (0.9f * (0.35f + 0.65f * ao));
-        amb = ambient_light(s, world) * ao + local_lights(s, world, clip) * (0.35f + 0.65f * ao);
+        amb = ambient_light(s, world) * ao + (local_lights(s, world, clip) + flash_light(s, world)) * (0.35f + 0.65f * ao);
     }
     return scene_out(dir, amb, world, cam_pos, far_plane, foliage ? 0.0f : 1.0f, foliage ? 0.6f : 1.0f);
 }

@@ -25,6 +25,7 @@
 #include "engine/render/ocean_detail.h"
 #include "engine/render/clouds.h"
 #include "engine/render/rain.h"
+#include "engine/render/lightning.h"
 #include "engine/render/rt_scene.h"
 #include "engine/render/canopy.h"
 #include "engine/render/ddgi.h"
@@ -191,6 +192,21 @@ public:
     void  wetness(float& wet, float& puddle) const;
     // How wet the crowns are: drips under the trees, after the rain too.
     float drips() const;
+    // Lightning (ADR-005 C5): the strike this frame, if any. --lightning
+    // <dist> <bearing_deg> forces one for a still.
+    const Strike& strike() const { return strike_; }
+    // How much of the sky's light a storm deck lets down (ADR-005 C5): 1
+    // under anything but a heavy deck of tall cloud, 0.2 under a closed
+    // cumulonimbus. Every sky term, the haze and the clouds' own ambient.
+    float storm_dim() const;
+    // Strikes seen since start (distinct), ground strikes among them, and
+    // frames drawn with a flash lit -- the schedule's instrument.
+    unsigned strikes_seen() const { return strikes_seen_; }
+    double weather_time() const { return weather_t_; }
+    unsigned ground_strikes_seen() const { return ground_strikes_seen_; }
+    unsigned long long flash_frames() const { return flash_frames_; }
+    Lightning& lightning() { return lightning_; }
+    void set_lightning(bool on) { lightning_on_ = on; }
     void  set_wave_detail(bool on) { detail_on_ = on; }
     bool  wave_detail() const { return detail_on_; }
     const OceanDetail& ocean() const { return ocean_; }
@@ -598,6 +614,14 @@ private:
     Clouds clouds_;
     bool clouds_on_ = true;
     Rain rain_;
+    Lightning lightning_;
+    Strike strike_;
+    bool flash_suppress_ = false;   // a still's warm-up frames, before a forced strike
+    bool lightning_on_ = true;      // --no-lightning
+    uint32_t last_strike_id_ = 0xFFFFFFFFu;
+    unsigned strikes_seen_ = 0, ground_strikes_seen_ = 0;
+    unsigned long long flash_frames_ = 0;
+    void record_lightning();
     bool rain_on_ = true;
     float rain_override_ = -1.0f;
     float wet_override_ = -1.0f;

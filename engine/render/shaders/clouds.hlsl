@@ -36,6 +36,7 @@ cbuffer CloudConstants : register(b0) {
     float  map_extent;  float history_valid; float precip;  float shear;          // m; 0/1; 0..1; m of downwind lean at the top
     uint   prev_index;  float haze_km;      float detail_amount; float pad0;
     float4 shadow_map;  // the cloud-shadow map: centre x, z in the cloud-base plane; half extent m; texels
+    float4 flash;       // ADR-005 C5: a lightning flash's point and luminous intensity (cd, 0 none)
 };
 
 Texture3D<float4> g_base     : register(t0);
@@ -374,7 +375,18 @@ void cs_march(uint3 id : SV_DispatchThreadID) {
                 // light is darker than its edges, seen away from the light.
                 const float powder = lerp(1.0f, 1.0f - exp(-dens * sigma * 120.0f), 0.5f - 0.5f * cphase);
                 const float3 ambient = lerp(ground * 0.6f, sky_mean * 1.4f, hf);
-                const float3 S = key_at(alt) * (ms * powder) + ambient;
+                float3 S = key_at(alt) * (ms * powder) + ambient;
+                // Lightning inside the cloud (ADR-005 C5): the flash's light
+                // DIFFUSES through the droplets rather than travelling
+                // straight, so a cloud glows round it for a kilometre or two
+                // rather than casting it in a beam. Inverse square from the
+                // flash softened over its first 200 m, and lost over 1.5 km,
+                // scattered isotropically (1 / 4 pi).
+                if (flash.w > 0.0f) {
+                    const float3 fd = p - flash.xyz;
+                    const float r2 = dot(fd, fd);
+                    S += float3(0.85f, 0.9f, 1.0f) * (flash.w / (r2 + 4e4f) * exp(-sqrt(r2) / 1500.0f) * 0.0796f);
+                }
                 const float st_ = dens * sigma;
                 const float e = exp(-st_ * dt);
                 L += T * S * (1.0f - e);

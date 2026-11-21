@@ -142,6 +142,16 @@ void cs_fog_inject(uint3 id : SV_DispatchThreadID) {
             L += E * (hg_phase(dot(d, l), phase_g) * local_shadow(Lt, p, l, l));
         }
     }
+    // A lightning flash (ADR-005 C5, flash.hlsli's l_flash): in rain the mist
+    // is most of what is seen, and a flash lights all of it -- the sky
+    // flickers white -- where the clouds behind are lost in it.
+    float flash_lit = 0.0f;
+    if (l_flash.w > 0.0f) {
+        const float3 fd = l_flash.xyz - p;
+        const float r2 = max(dot(fd, fd), 1e4f);
+        L += l_flash_col.rgb * (l_flash.w / r2) * hg_phase(dot(d, fd * rsqrt(r2)), phase_g);
+        flash_lit = 1.0f;
+    }
     float4 cur = float4(L * sigma_s, sigma_t);
 
     if (history_valid != 0u) {
@@ -154,7 +164,10 @@ void cs_fog_inject(uint3 id : SV_DispatchThreadID) {
             const float ps = log(max(c.w, 1e-3f) / near_z) / log_ratio * float(kFZ);
             if (all(puv >= 0.0f) && all(puv <= 1.0f) && ps >= 0.0f && ps <= float(kFZ)) {
                 const float4 h = g_history.SampleLevel(g_lin, float3(puv, ps / float(kFZ)), 0);
-                cur = lerp(h, cur, 0.08f);
+                // A flash lasts a few frames: take this frame whole while it
+                // is lit, or 1:12 smears a 30 ms stroke to nothing; the
+                // history's decay after it is a short afterglow.
+                cur = lerp(h, cur, flash_lit > 0.5f ? 1.0f : 0.08f);
             }
         }
     }

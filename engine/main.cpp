@@ -970,10 +970,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     if (cmdline && std::string(cmdline).find("--rt-no-sway") != std::string::npos) g_renderer.set_rt_sway(false);
     if (cmdline && std::string(cmdline).find("--no-clouds") != std::string::npos) g_renderer.set_clouds(false);
     if (cmdline && std::string(cmdline).find("--no-rain") != std::string::npos) g_renderer.set_rain_on(false);
+    if (cmdline && std::string(cmdline).find("--no-lightning") != std::string::npos) g_renderer.set_lightning(false);
     if (cmdline) {
         const std::string c3 = cmdline;
         const size_t rn = c3.find("--rain ");
         if (rn != std::string::npos) g_renderer.set_rain(float(std::atof(c3.c_str() + rn + 7)));
+        // --lightning <dist m> <bearing deg>: a ground strike for a still, the
+        // bearing from the camera's forward, positive to the right.
+        const size_t lt = c3.find("--lightning ");
+        if (lt != std::string::npos) {
+            float d = 2000.0f, b = 0.0f;
+            int in_cloud = 0;
+            std::sscanf(c3.c_str() + lt + 12, "%f %f %d", &d, &b, &in_cloud);
+            g_renderer.lightning().force(d, b * 0.017453293f, in_cloud != 0);
+        }
         const size_t wt = c3.find("--wet ");
         if (wt != std::string::npos) g_renderer.set_wet(float(std::atof(c3.c_str() + wt + 6)));
     }
@@ -1433,6 +1443,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                  w.wind_dir[0], w.wind_dir[1], w.gust, w.sea_wind, w.swell_hs, w.swell_dir[0],
                                  w.swell_dir[1], 4.0 * std::sqrt(m0), g_camera.x, g_camera.y, g_camera.z, depth,
                                  depth > 0.0f ? ww_significant_height_lod(sea, depth, 0.0f) : 0.0f);
+                    {
+                        const engine::Strike& st = g_renderer.strike();
+                        if (st.active)
+                            std::fprintf(f, "  lightning: %s strike %.0f m away at (%.0f, %.0f), %.0f ms in, %.3g cd now, "
+                                            "channel %.2f; thunder %.1f s after the flash\n",
+                                         st.ground ? "ground" : "in-cloud", st.distance, st.ground_pt[0], st.ground_pt[2],
+                                         st.age * 1000.0f, st.candela, st.channel, st.distance / 343.0f);
+                        else
+                            std::fprintf(f, "  lightning: none this frame\n");
+                    }
                     float wet_now = 0.0f, puddle_now = 0.0f;
                     g_renderer.wetness(wet_now, puddle_now);
                     std::fprintf(f, "  rain: %.2f (%s), cloud cover %.2f; ground wetness %.2f, puddles %.2f\n",
@@ -3913,6 +3933,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                              sm[size_t(sm.size() * 0.99)]);
             }
             write_rock_report(f, g_feet[0], g_feet[2], true);
+            std::fprintf(f, "lightning: %u strikes (%u to the ground), %llu frames lit, seed %u, clock %.1f s at the end\n",
+                         g_renderer.strikes_seen(), g_renderer.ground_strikes_seen(), g_renderer.flash_frames(),
+                         g_renderer.lightning().seed(), double(g_renderer.weather_time()));
             std::fprintf(f, "frames %llu, travelled %.0f m\n", frames, travelled);
             std::fprintf(f, "canopy map: %s, %llu builds, %u trees in the last\n",
                          g_renderer.canopy() ? "on" : "off", g_renderer.canopy_builds(), g_renderer.canopy_trees());

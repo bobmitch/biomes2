@@ -49,6 +49,7 @@ public:
         float wind_dir[2];
         float drift[2];             // the ground wind's drift; aloft is drift_factor x it
         bool  history_valid;
+        float flash[4];             // ADR-005 C5: a lightning flash's point and intensity (cd, 0 none)
     };
 
     bool load(const char* archetypes_path, std::string& error);

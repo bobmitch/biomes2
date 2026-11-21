@@ -10,6 +10,7 @@
 #include "engine/render/shaders/shadow.hlsli"
 #include "engine/render/shaders/wet.hlsli"
 #include "engine/render/shaders/scene_out.hlsli"
+#include "engine/render/shaders/flash.hlsli"
 #include "engine/render/shaders/local_lights.hlsli"
 
 struct Vertex {
@@ -524,6 +525,9 @@ SceneOut ps_main(VSOut i) {
         amb = lerp(amb, lamb, cw);
         pmask *= 1.0f - cw;
     }
+    // Lightning (ADR-005 C5): the ground, or the canopy shell as leaves.
+    if (l_flash.w > 0.0f)
+        amb += lerp(flash_light(s, i.world), flash_leaf(leaf_alb, leaf_n, v, i.world, 0.6f, 0.7f), cw);
     SceneOut o = scene_out(dir, amb, i.world, cam_pos, far_plane);
     o.puddle = pmask;
     return o;

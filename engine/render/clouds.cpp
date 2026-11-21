@@ -25,8 +25,9 @@ struct CloudConstants {
     float map_extent;     float history_valid; float precip;       float shear;
     unsigned prev_index;  float haze_km;       float detail_amount; float pad0;
     float shadow_map[4];
+    float flash[4];
 };
-static_assert(sizeof(CloudConstants) == 304, "CloudConstants must match clouds.hlsl");
+static_assert(sizeof(CloudConstants) == 320, "CloudConstants must match clouds.hlsl");
 
 const char* kCloudShader = "engine/render/shaders/clouds.hlsl";
 const UINT kWeatherSize = 512;
@@ -306,6 +307,7 @@ void Clouds::record(ID3D12GraphicsCommandList* cmd, UINT frame, const Frame& f) 
     c.prev_index = prev_;
     c.haze_km = settings_.haze_km;
     c.detail_amount = settings_.detail_amount;
+    for (int k = 0; k < 4; ++k) c.flash[k] = f.flash[k];
     c.pad0 = std::getenv("BIOMES_CLOUDS_DBG") ? float(std::atoi(std::getenv("BIOMES_CLOUDS_DBG"))) : 0.0f;
     // The shadow map follows the camera's point in the cloud-base plane, in
     // whole texels so the shadows do not crawl as it moves.

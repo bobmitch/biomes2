@@ -67,6 +67,10 @@ cbuffer ShadowConstants : register(b2) {
     // The wet world (ADR-005 C4, wet.hlsli): wetness 0..1, puddles 0..1, the
     // rain now 0..1, the ripples' clock (s, wrapped at 1000).
     float4 l_wet;
+    // A lightning flash (ADR-005 C5, flash.hlsli): where its light comes
+    // from and its luminous intensity now (cd, 0 none); its colour.
+    float4 l_flash;
+    float4 l_flash_col;
 };
 
 Texture2DArray<float>  g_shadow     : register(t8);

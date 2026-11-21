@@ -107,8 +107,10 @@ struct ShadowConstants {
     float swash_b[4];      // ... 4..7's
     float swash[4];        // sea level, run-up, the frame clock, on
     float wet[4];          // ADR-005 C4: wetness, puddles, rain, the ripples' clock (wet.hlsli)
+    float flash[4];        // ADR-005 C5: a lightning flash's point and intensity, cd (flash.hlsli)
+    float flash_col[4];
 };
-static_assert(sizeof(ShadowConstants) == 800, "ShadowConstants must match shadow.hlsli");
+static_assert(sizeof(ShadowConstants) == 832, "ShadowConstants must match shadow.hlsli");
 
 // Matches cbuffer ClusterConstants in lights.hlsl.
 struct ClusterConstants {
@@ -214,8 +216,9 @@ struct PostConstants {
     float fog_near;        float fog_log_ratio; float rt_shadows; float rt_sky;
     float cloud_shadow[4]; // ADR-005 C2: the cloud-shadow map's centre x, z, half extent, base altitude
     float wet[4];          // ADR-005 C4: rain, the ripples' clock, radians a pixel, puddles on
+    float storm[4];        // ADR-005 C5: x the storm deck's dimming of the sky's light (storm_dim)
 };
-static_assert(sizeof(PostConstants) == 448, "PostConstants must match post.hlsl");
+static_assert(sizeof(PostConstants) == 464, "PostConstants must match post.hlsl");
 
 // Matches cbuffer FogConstants in fog.hlsl.
 struct FogConstants {
@@ -1218,6 +1221,12 @@ void Renderer::record_shadows(const ViewConstants& view) {
     wetness(sc.wet[0], sc.wet[1]);
     sc.wet[2] = rain_intensity();
     sc.wet[3] = float(std::fmod(double(view.time), 1000.0));
+    // Lightning (C5).
+    if (strike_.active) {
+        for (int k = 0; k < 3; ++k) sc.flash[k] = strike_.flash_pt[k];
+        sc.flash[3] = strike_.candela;
+    }
+    sc.flash_col[0] = 0.85f; sc.flash_col[1] = 0.9f; sc.flash_col[2] = 1.0f;
     fill_light(sc.light);
     // BIOMES_GI_DBG splits DDGI's cost for A/B: 1 samples stale probes and
     // skips the update, 2 updates them and never samples.
@@ -1938,6 +1947,9 @@ bool Renderer::create_fog(std::string& error) {
     // the heightfield GI's height (the last of its scene SRVs) are past it.
     if (!rain_.init(device_.Get(), kSceneFormat, CanopyMap::kSrvSlot - 3, HeightGi::kSrvScene + 4 - 3, error))
         return false;
+    if (!lightning_.load("worldgen/data/archetypes.json", error)) return false;
+    lightning_.set_seed(world_.field_id());
+    if (!lightning_.init(device_.Get(), kSceneFormat, error)) return false;
     weather_.set_seed(world_.field_id());
     update_weather(0.0);
 
@@ -2766,7 +2778,26 @@ void Renderer::fill_light(float out[7][4]) const {
             const float y = 0.2126f * out[i][0] + 0.7152f * out[i][1] + 0.0722f * out[i][2];
             for (int k = 0; k < 3; ++k) out[i][k] = out[i][k] + (y - out[i][k]) * g;
         }
+        // ...but a heavy deck of tall cloud is DARK (ADR-005 C5): what reaches
+        // the ground under a cumulonimbus is a fraction of a clear sky's. The
+        // ground's bounce too: under the deck it is lit by that sky alone.
+        const float dim = storm_dim();
+        for (int i = 2; i < 7; ++i)
+            for (int k = 0; k < 3; ++k) out[i][k] *= dim;
     }
+}
+
+float Renderer::storm_dim() const {
+    if (!clouds_on_ || !clouds_.ready() || mode_ == Mode::Wireframe) return 1.0f;
+    auto smooth = [](float a, float b, float x) {
+        float t = (x - a) / (b - a);
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        return t * t * (3.0f - 2.0f * t);
+    };
+    // A thick deck (coverage past 0.75) of tall cloud (type past 0.5): storm
+    // 0.7 is 0.98, 0.8 is 0.4, 0.9 is 0.2. A grey stratus overcast keeps its
+    // light, as it should.
+    return 1.0f - 0.8f * smooth(0.75f, 1.0f, clouds_.coverage()) * smooth(0.5f, 1.0f, clouds_.cloud_type());
 }
 
 bool Renderer::create_atmosphere(std::string& error) {
@@ -3647,7 +3678,7 @@ void Renderer::record_rain() {
     const float* s = sky_frame_.sky_mean;
     const float lum = 0.2126f * s[0] + 0.7152f * s[1] + 0.0722f * s[2];
     const float cov = clouds_on_ && clouds_.ready() ? clouds_.coverage() : 0.0f;
-    const float L = lum * (2.0f - 0.4f * cov);
+    const float L = lum * (2.0f - 0.4f * cov) * storm_dim();
     f.light[0] = f.light[1] = f.light[2] = L;
     f.near_plane = kNearPlane;
     f.far_plane = kFarPlane;
@@ -3669,6 +3700,29 @@ void Renderer::record_rain() {
     rain_.record(cmd_.Get(), UINT(frame_), f, rtv, table);
 }
 
+// The lightning bolt (ADR-005 C5), additively onto the scene after the rain.
+void Renderer::record_lightning() {
+    lightning_.bolt(strike_, clouds_.settings().base_alt);
+    Lightning::Frame f = {};
+    std::memcpy(f.view_proj, view_proj_, sizeof f.view_proj);
+    for (int k = 0; k < 3; ++k) f.cam_pos[k] = cur_cam_[k];
+    f.near_plane = kNearPlane;
+    f.far_plane = kFarPlane;
+    f.pixel_angle = 2.0f * cur_tan_ / float(height_ ? height_ : 1);
+    f.channel = strike_.channel;
+    f.width = width_;
+    f.height = height_;
+    const UINT rinc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = post_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += SIZE_T(2) * rinc;
+    const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_GPU_DESCRIPTOR_HANDLE table = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+    table.ptr += UINT64(3) * inc;   // the scene depth
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
+    cmd_->SetDescriptorHeaps(1, heaps);
+    lightning_.record(cmd_.Get(), UINT(frame_), f, rtv, table);
+}
+
 // The clouds' frame (ADR-005): the camera, unjittered, this frame's and
 // last; the key light; the sky; the weather.
 void Renderer::record_clouds() {
@@ -3683,8 +3737,8 @@ void Renderer::record_clouds() {
         clouds_cam_[k] = cur_cam_[k];
         f.key_dir[k] = sky_frame_.key_dir[k];
         f.key_lux_top[k] = sky_frame_.key_is_moon ? sky_frame_.moon_lux_top[k] : sky_frame_.sun_lux_top[k];
-        f.sky_mean[k] = sky_frame_.sky_mean[k];
-        f.ground[k] = sky_frame_.ground[k];
+        f.sky_mean[k] = sky_frame_.sky_mean[k] * storm_dim();
+        f.ground[k] = sky_frame_.ground[k] * storm_dim();
     }
     f.time = cur_time_;
     f.cam_alt_km = sky_frame_.cam_alt_km;
@@ -3695,6 +3749,10 @@ void Renderer::record_clouds() {
     f.drift[1] = weather_now_.drift[1];
     // A camera that jumped (Tab, a teleport, the first frame) starts over.
     f.history_valid = jump < 400.0f;
+    if (strike_.active) {
+        for (int k = 0; k < 3; ++k) f.flash[k] = strike_.flash_pt[k];
+        f.flash[3] = strike_.candela;
+    }
     ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
     cmd_->SetDescriptorHeaps(1, heaps);
     clouds_.record(cmd_.Get(), UINT(frame_), f);
@@ -3767,6 +3825,7 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
         pc.wet[2] = 2.0f * cur_tan_ / float(height_ ? height_ : 1);
         pc.wet[3] = puddle_now > 0.0f ? 1.0f : 0.0f;
     }
+    pc.storm[0] = storm_dim();
     pc.fog_near = kFogNear;
     pc.fog_log_ratio = std::log(kFogFar / kFogNear);
     pc.rt_shadows = (rt_shadows_ && rt_ok_ && !wire) ? 1.0f : 0.0f;
@@ -3807,7 +3866,7 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     pc.tonemap = wire ? 0u : tonemap_;
     pc.meter_lo = 0.10f;
     pc.meter_hi = 0.90f;
-    pc.expo_flags = exposure_snap_ ? 1u : 0u;
+    pc.expo_flags = (exposure_snap_ ? 1u : 0u) | (strike_.active ? 2u : 0u);
     pc.agx_saturation = agx_saturation_;
     pc.agx_power = agx_power_;
     std::memcpy(post_cb_cpu_[frame_], &pc, sizeof pc);
@@ -3898,10 +3957,12 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     cmd_->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
     // The sea and the rain draw onto the scene as a render target.
     const bool rain = rain_.ready() && (rain_intensity() > 0.001f || drips() > 0.001f);
+    const bool bolt = lightning_.ready() && strike_.active && strike_.ground && strike_.channel > 0.001f && !wire;
     if (water_pending_) record_water();
-    else if (rain) tr(scene_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    else if (rain || bolt) tr(scene_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET);
     if (rain) record_rain();
-    if (water_pending_ || rain) {
+    if (bolt) record_lightning();
+    if (water_pending_ || rain || bolt) {
         // Back to the post chain's bindings, which TAA and the meter use.
         cmd_->SetDescriptorHeaps(1, heaps);
         cmd_->SetComputeRootSignature(post_root_.Get());
@@ -3981,6 +4042,9 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
 
 void Renderer::update_weather(double t) {
     weather_now_ = weather_.at(t);
+    // A frame after the weather has moved on: no strike until record_scene
+    // asks for this frame's.
+    strike_ = Strike();
     sea_ = weather_.sea(weather_now_);
     // The swash (water_wave.h): how far up the beach the uprush runs. Stockdon
     // et al.'s fit for gentle (dissipative) beaches, 0.043 sqrt(H L) over the
@@ -4011,6 +4075,22 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     for (int k = 0; k < 3; ++k) tree_settings_.sun_dir[k] = sky_frame_.key_dir[k];
     // This frame's wind and sea, from the frame's own clock.
     update_weather(view.time);
+    // Lightning (ADR-005 C5): this frame's strike, from the clock and the
+    // storm. Needs the clouds -- it is their light.
+    if (lightning_on_ && clouds_on_ && clouds_.ready() && mode_ != Mode::Wireframe && !flash_suppress_) {
+        lightning_.set_view_basis(view.cam_fwd, view.cam_right);
+        strike_ = lightning_.at(view.time, view.cam_pos, clouds_.settings().base_alt,
+                                [this](double t) { return weather_.storm_at(t); },
+                                [this](float x, float z) { return world_.height(x, z); });
+        if (strike_.active) {
+            ++flash_frames_;
+            if (strike_.id != last_strike_id_) {
+                last_strike_id_ = strike_.id;
+                ++strikes_seen_;
+                if (strike_.ground) ++ground_strikes_seen_;
+            }
+        }
+    }
     // The ripples follow the same wind and clock.
     {
         const float dt = ocean_t_ < 0.0f ? 0.0f : view.time - ocean_t_;
@@ -4849,7 +4929,11 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
             cmd_->ResourceBarrier(1, &wb);
             D3D12_CPU_DESCRIPTOR_HANDLE wrtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
             wrtv.ptr += static_cast<SIZE_T>(frame_) * rtv_stride_;
+            // A forced strike (--lightning) waits for the last four frames, so
+            // the meter has settled on the storm first and holds through it.
+            flash_suppress_ = lightning_.forced() && warm < 12;
             record_scene(view, wrtv);
+            flash_suppress_ = false;
             wb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
             wb.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
             cmd_->ResourceBarrier(1, &wb);

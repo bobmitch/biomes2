@@ -20,6 +20,7 @@
 #include "engine/render/shaders/leaf.hlsli"
 #include "engine/render/shaders/scene_out.hlsli"
 #include "engine/render/shaders/local_lights.hlsli"
+#include "engine/render/shaders/flash.hlsli"
 #include "engine/render/shaders/wind.hlsli"
 
 cbuffer FoliageFrame : register(b0) {
@@ -485,7 +486,8 @@ SceneOut shade_foliage(float4 clip, float3 albedo_srgb, float3 n, float ao, floa
     const float sh = shadow_factor(world, float3(0.0f, 1.0f, 0.0f));
     float3 dir = leaf_sun_light(albedo, n, toward_eye, 0.5f, 0.7f, sh) * (1.09f * ao);
     float3 amb = albedo / kPi * gi_diffuse(world, n, toward_eye) * ao +
-                 local_lights_leaf(albedo, n, toward_eye, 0.5f, 0.7f, world, clip) * ao;
+                 local_lights_leaf(albedo, n, toward_eye, 0.5f, 0.7f, world, clip) * ao +
+                 flash_leaf(albedo, n, toward_eye, world, 0.5f, 0.7f) * ao;
     wet_leaf_sheen(dir, amb, n, toward_eye, world, sh, wet * ao);
     return scene_out(dir, amb, world, cam_pos, far_plane, contact, ssao);
 }
