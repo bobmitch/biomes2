@@ -223,6 +223,8 @@ if(BIOMES2_ENGINE)
     engine/rocks/rock_mesh.cpp
     engine/rocks/rock_field.cpp
     engine/rocks/rock_renderer.cpp
+    engine/character/character_model.cpp
+    engine/character/character_renderer.cpp
     engine/ui/ui.cpp
     engine/ui/ui_render_d3d12.cpp
     engine/ui/script_api.cpp

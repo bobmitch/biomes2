@@ -46,3 +46,5 @@ build/edits.bin
 # CC0 scans: fetched and packed by tools/textures/fetch_scans.py, never committed
 assets/textures/download/
 assets/textures/packed/
+# Characters: packed from assets/models/ by tools/models/pack_character.py
+assets/models/packed/

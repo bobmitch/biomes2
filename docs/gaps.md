@@ -117,6 +117,22 @@ Last gathered: 2026-11-21, after the exploration fog.
 - `--adaptive-budget`'s CPU cost that grows with chunks a frame was never
   found. [Gotchas: the per-frame mesh budget]
 
+## The player character
+
+- **No starts, stops or turns**: locomotion is one blend by speed, so a
+  stop is the stride fading into idle and turning on the spot is the body
+  rotating over still feet. `Jump_Start` is unused (physics leaves the
+  ground at once). [The player character]
+- **The axe swing is the library's `Sword_Attack`**, one-handed, on the
+  upper body; nothing holds an axe. [The player character]
+- **No foot IK**: the lowest heel or ball is planted on the capsule's
+  ground, so on a slope the uphill foot sinks and the downhill one floats. [The player character]
+- **TAA has no motion vectors**: a character the camera follows moves
+  against the reprojection. Judged only in stills so far. [The player
+  character]
+- The free kit has no clothing beyond the base body. [The player
+  character]
+
 ## UI and scripting
 
 - **Interaction is checked only through `--shot --ui`**: every screen and

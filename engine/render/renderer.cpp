@@ -81,7 +81,10 @@ static_assert(sizeof(WaterConstants) == 672, "WaterConstants must match water.hl
 // other.
 // [81..82] the ripples' tiles (OceanDetail); [83..106] the clouds (Clouds).
 // [109] the puddle mask (ADR-005 C4: the scene's third target, read by the composite).
-const UINT kWaterSceneSrv = 79, kWaterDepthSrv = 80, kPuddleSrv = Clouds::kHeapEnd, kHeapSlots = kPuddleSrv + 1;
+// [110..111] the player character's textures (CharacterRenderer, t49..t50).
+const UINT kWaterSceneSrv = 79, kWaterDepthSrv = 80, kPuddleSrv = Clouds::kHeapEnd,
+           kHeapSlots = CharacterRenderer::kSrvB + 1;
+static_assert(CharacterRenderer::kSrvA == kPuddleSrv + 1, "the character's textures follow the puddle mask");
 
 // Matches cbuffer ShadowConstants in shadow.hlsli: 368 bytes, in a 512-byte buffer.
 struct ShadowConstants {
@@ -789,7 +792,12 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         params[3].Descriptor.ShaderRegister = 2;
         // The shadow table: the sun's map at heap [0], and since ADR-004 L3
         // the local lights' buffers and atlas at [24..28] (t20..t24).
-        D3D12_DESCRIPTOR_RANGE sr[9] = {};
+        D3D12_DESCRIPTOR_RANGE sr[10] = {};
+        // The player character's two texture arrays at [110..111] (t49..t50).
+        sr[9].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[9].NumDescriptors = 2;
+        sr[9].BaseShaderRegister = 49;
+        sr[9].OffsetInDescriptorsFromTableStart = CharacterRenderer::kSrvA;
         // The forest map at [70..71] (t47..t48): the canopy shell.
         sr[8].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr[8].NumDescriptors = 2;
@@ -836,7 +844,7 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         sr[6].OffsetInDescriptorsFromTableStart = 65;
         params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[4].DescriptorTable.NumDescriptorRanges = 9;
+        params[4].DescriptorTable.NumDescriptorRanges = 10;
         params[4].DescriptorTable.pDescriptorRanges = sr;
         // Each vertex's surface material (ADR-004 L1), parallel to t0.
         params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -1304,6 +1312,7 @@ void Renderer::record_shadows(const ViewConstants& view) {
         cmd_->ExecuteIndirect(cmd_sig_.Get(), kSlots, mesher_.draw_args(), 0, nullptr, 0);
         // Rocks: the same root and constants, their own casters.
         if (rocks_on_ && rocks_.ready() && mode_ != Mode::Wireframe) rocks_.record_shadow(cmd_.Get(), UINT(frame_));
+        if (mode_ != Mode::Wireframe) character_.record_shadow(cmd_.Get(), UINT(frame_));
         {
             static const char* kLabel[4] = {"shadow c0 terrain + rocks", "shadow c1 terrain + rocks",
                                             "shadow c2 terrain + rocks", "shadow c3 terrain + rocks"};
@@ -1988,7 +1997,9 @@ void Renderer::record_lights(const ViewConstants& view) {
         // redrawn every frame for a light that moves anyway.
         const float t = view.time;
         for (int k = 0; k < 3; ++k)
-            a.l.pos[k] = cam[k] + view.cam_right[k] * 0.35f - view.cam_up[k] * 0.30f + view.cam_fwd[k] * 0.45f;
+            a.l.pos[k] = torch_anchored_ ? torch_anchor_[k]
+                                         : cam[k] + view.cam_right[k] * 0.35f - view.cam_up[k] * 0.30f +
+                                               view.cam_fwd[k] * 0.45f;
         a.l.pos[0] += 0.012f * std::sin(t * 9.1f);
         a.l.pos[1] += 0.015f * std::sin(t * 11.3f + 1.0f);
         a.l.pos[2] += 0.012f * std::sin(t * 7.7f + 2.0f);
@@ -2715,6 +2726,10 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     t0 = startup_now_ms();
     if (!create_fog(error)) return false;
     startup_log().push_back(std::make_pair(std::string("phase: mist map + volumes"), startup_now_ms() - t0));
+    t0 = startup_now_ms();
+    if (!character_.init(device_.Get(), queue_.Get(), mesh_root_.Get(), srv_heap_.Get(), character_pack_, error))
+        return false;
+    startup_log().push_back(std::make_pair("phase: character -- " + character_.note(), startup_now_ms() - t0));
 
     ready_ = true;
     return true;
@@ -3638,6 +3653,8 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         build_view_proj(view, rvp);
         rocks_.prepare(UINT(frame_), rock_field_.rocks(), view.cam_pos, rvp);
     }
+    // The character's pose for this frame, before the cascades draw it.
+    character_.prepare(UINT(frame_));
     // Local lights (ADR-004 L3): their list, their clusters and their shadow
     // faces, before anything is shaded with them.
     record_lights(view);
@@ -3790,6 +3807,8 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         // Rocks right after the ground, on its root signature and constants.
         if (rocks_on_ && rocks_.ready() && !wire) rocks_.record(cmd_.Get(), UINT(frame_));
         prof_.mark(cmd_.Get(), "rocks");
+        // The player's character, on the same root.
+        if (!wire) character_.record(cmd_.Get(), UINT(frame_));
     }
 
     // Trees after the ground, before the sea. Not in wireframe: the wire view

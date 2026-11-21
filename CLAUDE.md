@@ -16,6 +16,8 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `engine/foliage/` | Ground cover -- grass, flowers, bushes -- generated on the GPU each frame (`foliage.hlsl`). |
 | `engine/ui/` | The UI layer: RmlUi's D3D12 renderer, input routing, and the `engine` Lua module (tunables). |
 | `game/` | What the UI and scripts ARE: `scripts/*.lua` (entry `main.lua`) and `ui/*.rml`, `*.rcss`. |
+| `engine/character/` | The player's character: the packed model, the procedural animator, the skinned draw. |
+| `tools/models/` | `pack_character.py`: the rigged glTF characters and the animation library in `assets/models/` (not in git) to `assets/models/packed/` (`*.chr`, `ual.anim`). |
 | `engine/rocks/` | Layer 9's rocks: procedural meshes, the CPU tile streamer, instanced drawing on the terrain's root signature, static colliders. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32). Debug tool, Windows only. |
@@ -50,6 +52,14 @@ and bark fall back to their procedural detail.
 python -I tools/textures/fetch_scans.py
 ```
 
+The player's character is packed the same way, from the CC0 kit in
+`assets/models/` (not in git either); without a pack the engine walks with
+no body drawn, and `build/startup.txt` says what to run.
+
+```bash
+python -I tools/models/pack_character.py
+```
+
 ```bash
 build\engine.exe
 ```
@@ -74,13 +84,15 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
 `--band-report`, `--sea-report`, `--swim`, `--blend-report`, `--tab-test`,
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
-references), `--shot ... --gpu-profile [frames]` (per-pass GPU times,
+references), `--pose-sheet` (the character in sixteen fixed poses from fixed
+cameras -- idle, walk, jog, sprint, jump, swim, torch, the axe -- `build/pose_*.bmp` and `pose_sheet.txt`), `--shot ... --gpu-profile [frames]` (per-pass GPU times,
 pipeline statistics and the trees' overdraw, `<shot>.gpu.txt`; see Trees),
 `--leak-test`
 (ADR-004 L6: a sealed chamber, unlit and torch-lit, the heightfield GI against
 the bare fallback), `--lights-report` (ADR-004 L3: local lights at night, six
 configurations timed) and `--fell` (with `--fell-save` / `--fell-verify`).
-Every mode takes `--time <hours>` (ADR-004 L2: 14 by default, which is the
+Every mode takes `--character male|female` (which pack; male by default) and
+`--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), the weather's `--sea-state <0..1>`, `--wind <m/s>`,
 `--wind-dir <deg>` and `--swell <m>` (automatic weather otherwise), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
 `--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`, `--no-rocks`,
@@ -109,7 +121,8 @@ no meter), `--tonemap 0|1|2` (raw pre-L1 path / AgX / fitted ACES),
 tuning.select('Fog')`, `engine.set('time', 19)`) and draw the UI into the
 still -- without it a shot holds no UI. `--sea-shot` only PLACES the camera: pair it with `--shot`,
 or it falls through to the window loop with no window and never exits. `--walk` takes `--uncapped` to time frames at ground
-level, where the grass is. It is a GUI subsystem binary, so a shell does not wait
+level, where the grass is, and `--cam-dist <m>` (the third-person camera's
+distance, 0 for first person). It is a GUI subsystem binary, so a shell does not wait
 on it: run it with `Start-Process -Wait` or the file you read will be the
 last run's.
 
@@ -941,6 +954,77 @@ level's top.
   `--no-hfgi`, `--no-foliage` and `--no-ao` left it; `--no-contact` removed
   it. Fixed in the post chain's `contact_shadow` (see the frame section).
   Turn things off one at a time before believing which pass a pattern is.
+
+### The player character
+
+Walk mode (Tab) is third person: Quaternius's **Universal Base Character**
+(CC0, `assets/models/Universal Base Characters[Standard]`), male by default,
+`--character female`. Chosen over the low-poly girl beside it, which has 36
+clips but no licence file, for its UE5-mannequin skeleton (65 joints): the
+skeleton most animation sets target. The kit ships no animation; its clips
+are Quaternius's **Universal Animation Library** (CC0, `assets/models/
+Universal Animation Library[Standard]`, 43 clips on the same joint names).
+
+- **The pack** (`tools/models/pack_character.py` -> `CHR1`): body and a
+  hairstyle merged on one skeleton, 1K albedo and (normal, roughness)
+  arrays. The kit's hairstyles were bound on the FEMALE skeleton -- 35 cm
+  out at the male's head -- so hair vertices are rebound per joint into the
+  body's rest pose. Hair textures are a grey mask meant for the kit's own
+  shader: tinted in linear light to an authored colour. Normals from the
+  kit's OpenGL folder, stored with +y DOWN the texture.
+- **The clips** (`ual.anim`, the same packer): the IN-PLACE glb, since
+  physics moves the body, resampled to 30 fps; each clip's speed measured
+  from the root-motion glb (walk 0.97 m/s, jog 5.36, sprint 8.25, swim
+  2.18), and for gaits the frame where the left foot leads (`phase0`), so
+  walk, jog and sprint blend IN STEP on one phase.
+- **Retargeting at load** (`AnimLibrary::load`): the library's rest pose is
+  not the characters' -- up to 17 degrees at the neck (20 on the female),
+  limbs up to 8 cm different -- so copying local rotations would bend every
+  joint by its rest difference. Each joint's GLOBAL rotation relative to the
+  library's rest is put on the character's rest (C = G Lrest^-1 Crest), then
+  turned back into locals; bone lengths stay the character's, and the
+  pelvis's translation is scaled by hip height (1.035 male, 1.016 female).
+- **The animator** (`character_model.{h,cpp}`) picks and blends from what
+  physics did -- speed measured from the feet physics moved, on the ground
+  or not, in the water or not. Locomotion is idle, then the pair of walk /
+  jog / sprint either side of the speed, the phase advanced by DISTANCE over
+  the blended stride so feet do not skate; `Jump_Loop` in the air;
+  `Jump_Land` after a fall of more than 0.35 s, faded out by speed;
+  `Swim_Idle_Loop` to `Swim_Fwd_Loop` by speed. Masked layers over that:
+  `Idle_Torch_Loop` on the right arm while a torch is carried, and
+  `Sword_Attack` on the upper body (spine up) for a swing of the axe, the
+  legs carrying on. The lowest heel or ball is planted on the capsule's
+  ground (`foot_drop`), no IK -- capped at 2 cm down with clips: uncapped it
+  pulled a run's flight phase 18 cm down and glued a foot to the ground. In
+  the water the head joint rides 1.3 m over the capsule's feet (buoyancy
+  holds them ~1.3 m under): the swim clips lay the body level at pelvis
+  height, which stood on the feet put the swimmer a metre under.
+  On foot: a jog (5 m/s) by default, Shift sprints (8), Caps Lock walks
+  (1.4) -- near each clip's own speed. A diagonal is no faster.
+- **Without the clips** the animator falls back to a procedural gait: every
+  delta a rotation about a MODEL-SPACE axis at the rest pose (`apply`), legs
+  on gait-lab curves (Winter's walking, Novacheck's running).
+- **The draw** (`character_renderer.{h,cpp}`, `character.hlsl`): GPU
+  skinning, four joints a vertex, bone matrices model -> world in a root
+  SRV (t0), textures at heap [110..111] (t49..t50, a tenth range of the
+  terrain's table). On the TERRAIN's root signature after the rocks, and in
+  every cascade. Not in the local lights' faces (the carried torch is in its
+  hand) nor the heightfield GI's top-down map. Double sided, cull none, a
+  back face's normal flipped. Cost: within noise (`--walk 15 --uncapped` at
+  1440p 5.94 ms against 6.08 in first person).
+- **The camera** (`main.cpp`, `place_walk_camera`): orbits a pivot 1.55 m
+  over the feet at the mouse's yaw and pitch; the wheel sets the distance
+  (1.2-18 m, 15% a notch, 4.5 by default) and zooms through to the old
+  first-person eye with the body hidden. A physics ray (terrain, trunks,
+  rocks) and the heightfield pull it in at once and ease it back out.
+  Movement is relative to the camera; the character turns to where it is
+  going at 12 rad/s, and to the camera's heading when it swings the axe.
+  The axe swings from the head, and the carried torch sits over the right
+  fist (`Renderer::set_torch_anchor`).
+- `--swim` also writes `build/swim_char.bmp`, the same moment in third
+  person (its main still stays first person: it judges the waterline).
+- **Not done**: see gaps.md -- foot IK, motion vectors for TAA, starts,
+  stops and turns.
 
 ### Ground cover
 

@@ -32,6 +32,7 @@
 #include "engine/render/forest_map.h"
 #include "engine/rocks/rock_field.h"
 #include "engine/rocks/rock_renderer.h"
+#include "engine/character/character_renderer.h"
 
 #include <functional>
 #include <unordered_map>
@@ -290,6 +291,10 @@ public:
     RockField&             rock_field() { return rock_field_; }
     RockRenderer&          rocks() { return rocks_; }
     void set_rocks(bool on) { rocks_on_ = on; }
+    // The player's character (engine/character/): the pack is chosen before
+    // init (--character), and the caller poses it every frame.
+    void set_character_pack(const std::string& path) { character_pack_ = path; }
+    CharacterRenderer&     character() { return character_; }
     // The canopy shell past the trees' draw distance (forest_map.h; --no-forest-shell).
     void set_forest_shell(bool on) { forest_on_ = on; }
     const TreeRenderer&    trees() const { return trees_; }
@@ -356,6 +361,12 @@ public:
     // default, off for A/B.
     void set_carried_torch(bool on) { torch_on_ = on; }
     bool carried_torch() const { return torch_on_; }
+    // Where the carried torch is held: a world point (the character's hand
+    // in third person), or nullptr for beside the eye as before.
+    void set_torch_anchor(const float* p) {
+        torch_anchored_ = p != nullptr;
+        if (p) for (int k = 0; k < 3; ++k) torch_anchor_[k] = p[k];
+    }
     uint32_t add_light(const LocalLight& l) {
         lights_.push_back(l);
         lights_.back().id = next_light_id_++;
@@ -705,6 +716,8 @@ private:
     std::vector<LocalLight> lights_;
     uint32_t next_light_id_ = 1;
     bool     torch_on_ = false, light_shadows_on_ = true;
+    bool     torch_anchored_ = false;
+    float    torch_anchor_[3] = {0, 0, 0};
     ShadowSlot shadow_slots_[kMaxShadowLights];
     LightFaceGpu faces_cpu_[kMaxShadowLights * 6] = {};
     float    cluster_consts_[3][4] = {};
@@ -758,6 +771,8 @@ private:
     RockField        rock_field_;
     RockRenderer     rocks_;
     bool             rocks_on_ = true;
+    CharacterRenderer character_;
+    std::string      character_pack_ = "assets/models/packed/male.chr";
     TreeRenderer     trees_;
     GpuProfiler      prof_;
     TreeDrawSettings tree_settings_;

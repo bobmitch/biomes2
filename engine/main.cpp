@@ -9,9 +9,12 @@
 // and their paths are relative, the same convention validate.exe uses for
 // archetypes.json and the golden hashes.
 //
-//   WASD / QE   fly, shift to sprint
-//   mouse       look (click to capture, Esc to release)
-//   Tab         walk (a capsule under physics) / fly
+//   WASD / QE   move; fly, shift to go faster. Walking: a jog, Shift
+//               sprints, Caps Lock (toggled) walks
+//   mouse       look (click to capture, Esc to release); walking, it
+//               orbits the third-person camera round the character
+//   wheel       walking: camera distance, in to first person; flying: speed
+//   Tab         walk (the character, a capsule under physics) / fly
 //   Space       jump; in the sea, swim up -- and out over a ledge
 //   Ctrl        in the sea, dive
 //   [ ]         sea state, calm to storm
@@ -79,6 +82,149 @@ size_t g_mesh_max_verts = 0, g_mesh_max_idx = 0;
 const float kCapsuleRadius = 0.35f;
 const float kCapsuleHalf = 0.80f;
 const float kEyeAboveFeet = 1.60f;
+
+// --- The player in walk mode: a character and a third-person camera -------
+//
+// The camera orbits a point over the feet at the camera's own yaw and pitch
+// (the mouse), g_cam_dist behind it; the wheel sets the distance, and in
+// close enough it becomes the old first-person eye with the character
+// hidden. Movement is relative to the camera; the character turns to face
+// where it is going. A ray through physics (terrain, trunks, rocks) and the
+// terrain height pull the camera in so it never sits inside a hill.
+engine::CharacterAnimator g_anim;
+engine::AnimLibrary g_anim_lib;   // the Universal Animation Library, retargeted
+// On foot: a jog by default, Shift sprints, Caps Lock (toggled) walks --
+// each near the speed its clip covers (5.4, 8.3 and 1.0 m/s), so the
+// stride a clip shows is the stride physics moves.
+const float kJogSpeed = 5.0f, kSprintSpeed = 8.0f, kWalkSpeed = 1.4f;
+float g_cam_dist = 4.5f;        // wanted, metres; 0 is first person
+float g_cam_dist_now = 4.5f;    // after collision, eased back out
+float g_char_yaw = 0.0f;        // the character's facing, Camera's convention
+float g_char_speed = 0.0f;      // horizontal, m/s, from what physics did
+float g_prev_feet[3] = {0.0f, 0.0f, 0.0f};
+bool  g_have_prev_feet = false;
+std::vector<float> g_bones;
+const float kCamDistMin = 1.2f, kCamDistMax = 18.0f;
+const float kFirstPersonBelow = 0.9f;   // zooming in past this goes to the eye
+const float kCamPivot = 1.55f;          // over the feet: the shoulders
+
+bool first_person() { return g_cam_dist < kFirstPersonBelow; }
+
+// The wheel: in walk mode the camera's distance, 15% a notch, through first
+// person at the near end; in flight, the flying speed.
+void zoom(float notches) {
+    if (!g_walk) {
+        g_camera.speed = (std::max)(2.0f, (std::min)(g_camera.speed * std::pow(1.25f, notches), 2000.0f));
+        return;
+    }
+    if (first_person()) {
+        if (notches < 0.0f) g_cam_dist = g_cam_dist_now = kCamDistMin;
+        return;
+    }
+    g_cam_dist *= std::pow(0.85f, notches);
+    if (g_cam_dist < kCamDistMin) g_cam_dist = 0.0f;
+    if (g_cam_dist > kCamDistMax) g_cam_dist = kCamDistMax;
+}
+
+// After physics has moved the capsule: the character's speed, facing and
+// pose. (vx, vz) is the velocity asked for, which decides the facing.
+void update_character(float dt, float t, float vx, float vz) {
+    if (!g_anim.ready()) return;
+    float speed = 0.0f;
+    if (g_have_prev_feet && dt > 1e-5f) {
+        const float dx = g_feet[0] - g_prev_feet[0], dz = g_feet[2] - g_prev_feet[2];
+        speed = std::sqrt(dx * dx + dz * dz) / dt;
+        if (speed > 30.0f) speed = 0.0f;   // a teleport, not a stride
+    }
+    const float vy = (g_have_prev_feet && dt > 1e-5f) ? (g_feet[1] - g_prev_feet[1]) / dt : 0.0f;
+    for (int k = 0; k < 3; ++k) g_prev_feet[k] = g_feet[k];
+    g_have_prev_feet = true;
+    g_char_speed += (speed - g_char_speed) * (1.0f - std::exp(-12.0f * dt));
+    if (first_person()) {
+        g_char_yaw = g_camera.yaw;
+    } else if (vx * vx + vz * vz > 0.01f) {
+        // Turn towards the way we are going, the short way round, quickly.
+        const float want = std::atan2(vx, vz);
+        float d = want - g_char_yaw;
+        d -= 6.2831853f * std::floor((d + 3.14159265f) / 6.2831853f);
+        const float step = 12.0f * dt;
+        g_char_yaw += d > step ? step : (d < -step ? -step : d);
+    }
+    engine::LocomotionInput in;
+    in.dt = dt;
+    in.speed = g_char_speed;
+    in.grounded = g_physics.character_supported();
+    in.swimming = g_physics.medium() == engine::Medium::Swimming;
+    in.vertical = vy;
+    in.time = t;
+    in.torch = g_renderer.carried_torch();
+    g_anim.update(in);
+}
+
+// Hand the renderer this frame's pose (or nothing), and the torch's hand.
+void publish_character() {
+    const bool show = g_walk && g_anim.ready() && !first_person();
+    if (show) g_anim.skin(g_feet, g_char_yaw, g_bones);
+    g_renderer.character().set_pose(g_bones, show);
+    static int hand = -2;
+    if (hand == -2) hand = g_anim.ready() ? g_renderer.character().model().find("hand_r") : -1;
+    float p[3];
+    if (show && g_anim.joint_world(hand, g_feet, g_char_yaw, p)) {
+        // A little ahead of and above the fist, where a flame would be.
+        p[0] += 0.12f * std::sin(g_char_yaw);
+        p[1] += 0.25f;
+        p[2] += 0.12f * std::cos(g_char_yaw);
+        g_renderer.set_torch_anchor(p);
+    } else {
+        g_renderer.set_torch_anchor(nullptr);
+    }
+}
+
+// The walk-mode camera, after the mouse has turned it: the eye in first
+// person, else behind the pivot, pulled in by anything in between.
+void place_walk_camera(float dt) {
+    if (first_person()) {
+        g_camera.x = g_feet[0];
+        g_camera.y = g_feet[1] + kEyeAboveFeet;
+        g_camera.z = g_feet[2];
+        g_cam_dist_now = 0.0f;
+        return;
+    }
+    float fwd[3], right[3], up[3];
+    g_camera.basis(fwd, right, up);
+    const float pivot[3] = {g_feet[0], g_feet[1] + kCamPivot, g_feet[2]};
+    const float back[3] = {-fwd[0], -fwd[1], -fwd[2]};
+    const float margin = 0.3f;
+    float allowed = g_cam_dist;
+    int prop = 0;
+    const float hit = g_physics.probe_ray(pivot, back, g_cam_dist + margin, prop);
+    if (hit >= 0.0f) allowed = (std::max)(0.0f, hit - margin);
+    // The heightfield too: physics holds only what has streamed near the
+    // player, and the ray can slip between two chunks' shapes.
+    const engine::WorldGpu& wg = g_renderer.world();
+    for (int i = 0; i < 12 && allowed > 0.2f; ++i) {
+        const float x = pivot[0] + back[0] * allowed, z = pivot[2] + back[2] * allowed;
+        if (pivot[1] + back[1] * allowed >= wg.height(x, z) + 0.35f) break;
+        allowed *= 0.85f;
+    }
+    // In at once, out gently: a trunk passing between must not make the
+    // camera pump.
+    if (allowed < g_cam_dist_now || dt <= 0.0f) g_cam_dist_now = allowed;
+    else g_cam_dist_now += (allowed - g_cam_dist_now) * (1.0f - std::exp(-5.0f * dt));
+    g_camera.x = pivot[0] + back[0] * g_cam_dist_now;
+    g_camera.y = pivot[1] + back[1] * g_cam_dist_now;
+    g_camera.z = pivot[2] + back[2] * g_cam_dist_now;
+}
+
+// Where a swing of the axe comes from: the eye in first person, the head
+// otherwise -- the camera is metres behind, out of reach of any trunk.
+void chop_origin(float eye[3]) {
+    if (g_walk && !first_person()) {
+        eye[0] = g_feet[0]; eye[1] = g_feet[1] + kEyeAboveFeet; eye[2] = g_feet[2];
+    } else {
+        eye[0] = g_camera.x; eye[1] = g_camera.y; eye[2] = g_camera.z;
+    }
+}
 
 // Layer 9 in a report: what is resident and drawn, the largest outcrop, and
 // the nearest outcrop and boulder over 2 m to (x, z), for a --cam. With
@@ -251,6 +397,11 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 else g_renderer.resize(LOWORD(lp), HIWORD(lp));
             }
             return 0;
+        case WM_MOUSEWHEEL:
+            // Walking: the camera's distance from the character. Flying:
+            // the speed.
+            zoom(float(GET_WHEEL_DELTA_WPARAM(wp)) / float(WHEEL_DELTA));
+            return 0;
         case WM_LBUTTONDOWN:
             // The first click captures the mouse; once captured, a click is
             // a swing of the axe.
@@ -329,6 +480,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     // Drop in where the camera is, so the first frames are a
                     // short fall rather than a long one.
                     g_physics.place_character(g_camera.x, g_camera.y, g_camera.z);
+                    g_char_yaw = g_camera.yaw;
+                    g_have_prev_feet = false;
                 }
                 return 0;
             }
@@ -1146,7 +1299,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                           overhang_seconds > 0.0 ||
                           dig_seconds > 0.0 || mode_dig_save || mode_dig_verify ||
                           mode_dig_stress || sea_shot ||
-                          std::string(cmdline ? cmdline : "").find("--tab-test") != std::string::npos;
+                          std::string(cmdline ? cmdline : "").find("--tab-test") != std::string::npos ||
+                          std::string(cmdline ? cmdline : "").find("--pose-sheet") != std::string::npos;
 
     std::string error;
     if (!g_physics.init(error)) {
@@ -1159,8 +1313,33 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         }
         return 1;
     }
+    {
+        // --character male|female: which packed character (tools/models).
+        const std::string cl = cmdline ? cmdline : "";
+        const size_t ch = cl.find("--character ");
+        if (ch != std::string::npos) {
+            std::string name = cl.substr(ch + 12);
+            name = name.substr(0, name.find(' '));
+            for (char c : name)
+                if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) name.clear();
+            if (!name.empty()) g_renderer.set_character_pack("assets/models/packed/" + name + ".chr");
+        }
+    }
     const double init_t0 = engine::startup_now_ms();
     const bool init_ok = g_renderer.init(hwnd, error, debug_layer);
+    if (init_ok && g_renderer.character().ready()) {
+        // The clips, retargeted onto this character; without them the
+        // procedural gait.
+        std::string aerr;
+        const double ta = engine::startup_now_ms();
+        const bool clips = g_anim_lib.load("assets/models/packed/ual.anim", g_renderer.character().model(), aerr);
+        if (FILE* sf = std::fopen("build/startup.txt", "a")) {
+            std::fprintf(sf, "%9.0f ms  animation clips -- %s\n", engine::startup_now_ms() - ta,
+                         clips ? g_anim_lib.note.c_str() : aerr.c_str());
+            std::fclose(sf);
+        }
+        g_anim.bind(&g_renderer.character().model(), clips ? &g_anim_lib : nullptr);
+    }
     {
         // Where startup went. The 15-20 s before the first frame was always
         // described as "shader compilation plus the world build" and never
@@ -3780,6 +3959,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             const float px = g_feet[0], pz = g_feet[2];
             g_physics.update(float(dt), sy * spd, cy * spd, false);
             g_physics.character_position(g_feet);
+            // The character swims too (it is drawn only in the second still).
+            update_character(float(dt), float(total), sy * spd, cy * spd);
 
             g_camera.x = g_feet[0];
             g_camera.y = g_feet[1] + kEyeAboveFeet;
@@ -3869,6 +4050,21 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 shot_eye_local = double(g_camera.y) - (double(sea) +
                     surf_at(g_camera.x, g_camera.z, float(total)));
                 shot_eye_sea = double(g_camera.y) - double(sea);
+                // And the same moment in third person: the swimmer, through
+                // the window's camera, 4.5 m back and a little above.
+                {
+                    const engine::Camera keep = g_camera;
+                    g_walk = true;
+                    g_cam_dist = g_cam_dist_now = 4.5f;
+                    g_camera.pitch = -0.3f;
+                    place_walk_camera(0.0f);
+                    publish_character();
+                    engine::ViewConstants tv = {};
+                    fill_view(g_camera, g_res_w, g_res_h, float(total), tv);
+                    g_renderer.capture(tv, "build/swim_char.bmp", err);
+                    g_renderer.character().set_pose(g_bones, false);
+                    g_camera = keep;
+                }
                 shot_cam = g_camera;
                 shot_time = float(total);
             }
@@ -3941,6 +4137,96 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (std::string(cmdline ? cmdline : "").find("--pose-sheet") != std::string::npos) {
+        // --pose-sheet: the character in fixed poses from fixed cameras, to
+        // judge the procedural animation without playing. Stands it at spawn,
+        // lets the world and the capsule settle, then for each pose drives
+        // the animator to it and writes build/pose_<name>.bmp, and a line
+        // per pose to build/pose_sheet.txt.
+        g_walk = true;
+        g_cam_dist = g_cam_dist_now = 4.5f;
+        const float sx = 0.0f, sz = 0.0f;
+        g_physics.place_character(sx, Spawn::above(sx, sz), sz);
+        g_physics.character_position(g_feet);
+        for (int i = 0; i < 240; ++i) {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+            step_window_physics(1.0f / 60.0f, float(i) / 60.0f, 0.0f, 0.0f, false, 0.0f);
+            g_camera.x = g_feet[0] - 4.0f; g_camera.y = g_feet[1] + 1.6f; g_camera.z = g_feet[2];
+            engine::ViewConstants v = {};
+            fill_view(g_camera, g_res_w, g_res_h, float(i) / 60.0f, v);
+            g_renderer.render(v);
+        }
+        // speed: m/s; air / swim: the medium; action: seconds into the axe's
+        // swing, -1 none.
+        struct Pose { const char* name; float speed; bool air, swim, torch; float action; float phase;
+                      float cam_yaw; float cam_pitch; float dist; float pivot; };
+        // Camera yaw: the character faces +z (yaw 0); -pi/2 looks along -x,
+        // which is from the character's left side; pi looks back at its front.
+        const float side = -1.5707963f, front = 3.1415927f, behind = 0.35f;
+        const Pose poses[] = {
+            {"idle_front", 0.0f, false, false, false, -1.0f, 0.0f, front, -0.05f, 3.2f, 1.0f},
+            {"idle_side", 0.0f, false, false, false, -1.0f, 0.0f, side, -0.05f, 3.2f, 1.0f},
+            {"walk_0", 1.4f, false, false, false, -1.0f, 0.0f, side, -0.05f, 3.2f, 1.0f},
+            {"walk_50", 1.4f, false, false, false, -1.0f, 0.5f, side, -0.05f, 3.2f, 1.0f},
+            {"jog_0", 5.0f, false, false, false, -1.0f, 0.0f, side, -0.05f, 3.4f, 1.0f},
+            {"jog_25", 5.0f, false, false, false, -1.0f, 0.25f, side, -0.05f, 3.4f, 1.0f},
+            {"sprint_0", 8.0f, false, false, false, -1.0f, 0.0f, side, -0.05f, 3.4f, 1.0f},
+            {"sprint_25", 8.0f, false, false, false, -1.0f, 0.25f, side, -0.05f, 3.4f, 1.0f},
+            {"jog_front", 5.0f, false, false, false, -1.0f, 0.1f, front, -0.05f, 3.4f, 1.0f},
+            {"jump", 0.0f, true, false, false, -1.0f, 0.0f, side, -0.05f, 3.4f, 1.0f},
+            {"swim_idle", 0.0f, false, true, false, -1.0f, 0.0f, side, -0.05f, 3.4f, 1.0f},
+            {"swim_fwd", 2.0f, false, true, false, -1.0f, 0.3f, side, 0.1f, 3.4f, 1.0f},
+            {"torch_idle", 0.0f, false, false, true, -1.0f, 0.0f, front, -0.05f, 3.2f, 1.0f},
+            {"torch_jog", 5.0f, false, false, true, -1.0f, 0.3f, side, -0.05f, 3.4f, 1.0f},
+            {"chop", 0.0f, false, false, false, 0.55f, 0.0f, front, -0.05f, 3.2f, 1.0f},
+            {"third_person", 5.0f, false, false, false, -1.0f, 0.6f, behind, -0.2f, 4.5f, kCamPivot},
+        };
+        FILE* rf = std::fopen("build/pose_sheet.txt", "w");
+        if (rf) std::fprintf(rf, "%s\n%s\nfeet at (%.2f, %.2f, %.2f)\n", g_renderer.character().note().c_str(),
+                             g_anim.clips() ? g_anim_lib.note.c_str() : "no clips: the procedural gait",
+                             g_feet[0], g_feet[1], g_feet[2]);
+        for (const Pose& p : poses) {
+            engine::LocomotionInput in;
+            in.dt = 0.05f;
+            in.speed = p.speed;
+            in.grounded = !p.air && !p.swim;
+            in.swimming = p.swim;
+            in.torch = p.torch;
+            for (int i = 0; i < 60; ++i) {
+                in.time = float(i) * in.dt;
+                g_anim.set_phase(p.phase);
+                g_anim.update(in);
+            }
+            g_anim.set_phase(p.phase);
+            g_anim.set_action_time(p.action);
+            in.dt = 0.0f;
+            g_anim.update(in);
+            g_char_yaw = 0.0f;
+            publish_character();
+            engine::Camera c = g_camera;
+            c.yaw = p.cam_yaw;
+            c.pitch = p.cam_pitch;
+            float f[3], r[3], u[3];
+            c.basis(f, r, u);
+            c.x = g_feet[0] - f[0] * p.dist;
+            c.y = g_feet[1] + p.pivot - f[1] * p.dist;
+            c.z = g_feet[2] - f[2] * p.dist;
+            engine::ViewConstants v = {};
+            fill_view(c, g_res_w, g_res_h, 0.0f, v);
+            std::string err;
+            const std::string path = std::string("build/pose_") + p.name + ".bmp";
+            g_renderer.capture(v, path.c_str(), err);
+            if (rf) std::fprintf(rf, "%-13s speed %.1f %s phase %.2f: run %.2f air %.2f drop %.3f m%s%s\n", p.name,
+                                 p.speed, p.swim ? "swim  " : (p.air ? "air   " : "ground"), g_anim.phase(), g_anim.run_blend(),
+                                 g_anim.air_blend(), g_anim.foot_drop(), err.empty() ? "" : " -- ", err.c_str());
+        }
+        if (rf) std::fclose(rf);
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return 0;
+    }
+
     if (walk_seconds > 0.0) {
         // --uncapped measures frame cost at ground level, where the grass is:
         // a flight passes too high for blades to be emitted at all.
@@ -3950,7 +4236,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         g_walk = true;
         g_physics.place_character(0.0f, Spawn::above(0.0f, 0.0f), 0.0f);
         g_physics.character_position(g_feet);
-        g_camera.pitch = -0.12f;
+        g_camera.pitch = -0.2f;
+        // --cam-dist <m>: the third-person camera's distance; 0 is the old
+        // first-person eye, with no character drawn.
+        {
+            const std::string wcl = cmdline ? cmdline : "";
+            const size_t cd = wcl.find("--cam-dist");
+            if (cd != std::string::npos) g_cam_dist = float(std::atof(wcl.c_str() + cd + 10));
+            g_cam_dist_now = g_cam_dist;
+        }
+        g_char_yaw = 0.0f;
+        g_have_prev_feet = false;
 
         LARGE_INTEGER wfreq, wstart, wprev;
         QueryPerformanceFrequency(&wfreq);
@@ -3993,10 +4289,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_physics.character_position(g_feet);
             travelled += std::sqrt((g_feet[0] - px) * (g_feet[0] - px) +
                                    (g_feet[2] - pz) * (g_feet[2] - pz));
-
-            g_camera.x = g_feet[0];
-            g_camera.y = g_feet[1] + kEyeAboveFeet;
-            g_camera.z = g_feet[2];
+            // The player as the window has it: the character posed from what
+            // physics did, the third-person camera behind it.
+            update_character(float(dt), float(total), sy * sp, cy * sp);
+            place_walk_camera(float(dt));
+            publish_character();
 
             RECT cr;
             GetClientRect(hwnd, &cr);
@@ -4085,6 +4382,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                          g_renderer.strikes_seen(), g_renderer.ground_strikes_seen(), g_renderer.flash_frames(),
                          g_renderer.lightning().seed(), double(g_renderer.weather_time()));
             std::fprintf(f, "frames %llu, travelled %.0f m\n", frames, travelled);
+            std::fprintf(f, "character: %s; camera %.1f m behind (wanted %.1f)%s; speed %.2f m/s, gait phase %.2f, "
+                            "run %.2f, planted-foot drop %.3f m\n",
+                         (g_renderer.character().note() + "; " +
+                          (g_anim.clips() ? g_anim_lib.note : std::string("procedural gait"))).c_str(),
+                         g_cam_dist_now, g_cam_dist,
+                         first_person() ? ", first person" : "", g_char_speed, g_anim.phase(), g_anim.run_blend(),
+                         g_anim.foot_drop());
             std::fprintf(f, "canopy map: %s, %llu builds, %u trees in the last\n",
                          g_renderer.canopy() ? "on" : "off", g_renderer.canopy_builds(), g_renderer.canopy_trees());
             // Jolt cannot tell "in the air" from "that chunk has not arrived":
@@ -4123,24 +4427,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fclose(f);
         }
 
-        // Where the walk ended up. The capsule itself is no longer in the
-        // picture: it was drawn by the raymarch's capsule SDF, and M1 retired
-        // the raymarch along with the trivial field it was the last caller of.
-        // What the shot still shows is the ground the walk finished on.
+        // Where the walk ended up, through the third-person camera as it was
+        // on the last frame: the character mid-stride, and the ground.
         {
-            engine::Camera c = g_camera;
-            const float sy = std::sin(g_camera.yaw), cy = std::cos(g_camera.yaw);
-            c.x = g_feet[0] - sy * 7.0f;
-            c.z = g_feet[2] - cy * 7.0f;
-            // Lifted clear of whatever is at the camera's own position: seven
-            // metres behind the character is often inside a hillside, and the
-            // first attempt at this shot was a screen of solid rock.
-            const float behind = g_renderer.world().height(c.x, c.z);
-            c.y = g_feet[1] + 3.2f;
-            if (c.y < behind + 2.5f) c.y = behind + 2.5f;
-            c.pitch = -0.33f;
             engine::ViewConstants v = {};
-            fill_view(c, g_res_w, g_res_h, 0.0f, v);
+            fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
             g_renderer.set_mode(engine::Mode::Mesh);
             std::string err;
             g_renderer.capture(v, "build/b4_walk.bmp", err);
@@ -4444,7 +4735,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             // (+cos, -sin) -- screen LEFT -- so A and D were swapped in walk
             // mode while fly mode, which uses basis(), had them right.
             const float sy = std::sin(g_camera.yaw), cy = std::cos(g_camera.yaw);
-            const float sp = 6.0f;
+            // A jog; Shift sprints, Caps Lock (toggled) walks. A diagonal is
+            // no faster than straight ahead.
+            float sp = kJogSpeed;
+            if (GetKeyState(VK_CAPITAL) & 1) sp = kWalkSpeed;
+            if (GetAsyncKeyState(VK_SHIFT) & 0x8000) sp = kSprintSpeed;
+            const float ml = std::sqrt(mx * mx + mz * mz);
+            if (ml > 1.0f) { mx /= ml; mz /= ml; }
             const float vx = (sy * mz - cy * mx) * sp;
             const float vz = (cy * mz + sy * mx) * sp;
             const bool jump = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
@@ -4452,9 +4749,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             // the water is the key you would already be pressing.
             const float swim = (GetAsyncKeyState(VK_CONTROL) & 0x8000) ? -1.0f : 0.0f;
             step_window_physics(float(dt), t, vx, vz, jump, swim);
-            g_camera.x = g_feet[0];
-            g_camera.y = g_feet[1] + kEyeAboveFeet;
-            g_camera.z = g_feet[2];
+            update_character(float(dt), t, vx, vz);
         } else {
             step_window_physics(float(dt), t, 0.0f, 0.0f, false, 0.0f);
         }
@@ -4479,6 +4774,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             }
             if (!g_walk) g_camera.update(static_cast<float>(dt));
         }
+        // The camera follows the character after the mouse has turned it, so
+        // the orbit never lags the look by a frame.
+        if (g_walk && !g_paused) place_walk_camera(float(dt));
+        publish_character();
 
         // Trees: colliders round the player, logs posed by physics; then any
         // swing, save or load the window asked for this frame.
@@ -4487,7 +4786,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_want_chop = false;
             float fwd[3], right[3], up[3];
             g_camera.basis(fwd, right, up);
-            const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
+            float eye[3];
+            chop_origin(eye);
+            // The swing: the character turns to where the camera looks and
+            // its upper body plays the axe over whatever the legs are doing.
+            if (g_walk) {
+                g_char_yaw = g_camera.yaw;
+                g_anim.trigger_action();
+            }
             uint32_t id = 0;
             int hits = 0, need = 0;
             const int r = g_felling.chop(eye, fwd, t, &id, &hits, &need);
