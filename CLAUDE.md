@@ -74,7 +74,9 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
 `--band-report`, `--sea-report`, `--swim`, `--blend-report`, `--tab-test`,
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
-references), `--leak-test`
+references), `--shot ... --gpu-profile [frames]` (per-pass GPU times,
+pipeline statistics and the trees' overdraw, `<shot>.gpu.txt`; see Trees),
+`--leak-test`
 (ADR-004 L6: a sealed chamber, unlit and torch-lit, the heightfield GI against
 the bare fallback), `--lights-report` (ADR-004 L3: local lights at night, six
 configurations timed) and `--fell` (with `--fell-save` / `--fell-verify`).
@@ -694,6 +696,64 @@ crowns' upper third of a woodland still: 10.7% before, 10.6% after. Lit pass
 only -- the shadow casters keep `leaf_coverage`. Walking cost within noise. The level cross-fades and far
 fade still dither on the screen (walking per frame), and the grass's clump
 cards fade against the blades the same way.
+
+**What a wood costs at 4K, and the depth prepass.** `--shot ...
+--gpu-profile [frames]` is the instrument (`gpu_profile.h`): `<shot>.gpu.txt`
+gives the frame's GPU time as it runs (first to last timestamp), then every
+pass timed alone behind a NULL UAV barrier (so the passes serialise), the
+pipeline statistics of each draw (PS invocations are the overdraw actually
+PAID, after early depth), and one frame through counting variants of the tree
+pixel shaders (`ps_mesh_od`, `ps_impostor_od`: per pixel, fragments
+rasterised and fragments surviving the dither and leaf tests, leaf and
+impostor shares) with a heat map, `<shot>.overdraw.bmp`. The test view is the
+densest stand of seed 0 (`validate --tree-sites 0`: (-704, -448)),
+`--cam -704 33.1 -448 0 0 --res 3840 2160` -- the eye height from `--pick`,
+because `--ground` put it inside an overhang and the first profile measured
+trees hidden behind rock (0 PS invocations, which is how it showed).
+`tools/profile/prof_ab.ps1 <label> "<flags>" [res] [cam|none]` runs one variant.
+- **Where it went, before**: 24.1 ms a frame, 6.8 without trees. The camera's
+  LOD 0 draw alone 8.6 ms at **13.1 PS invocations per screen pixel**: 42
+  fragments rasterised per pixel, max 261, and 14.9 surviving the leaf test
+  per covered pixel, every one fully shaded (PCSS, GI, local lights) and
+  then painted over. Tree shadow casters 3.9 ms (cascade 0's LOD 0 2.0, its
+  LOD 1 1.2). Terrain 3.5 ms, mostly ground later hidden by trunks. Not the
+  cause: distance (`--tree-distance 200` 24.0), impostors (alone 7.9),
+  foliage (`--no-foliage` 24.0), the level (LOD 0 only 18.4, LOD 1 only
+  17.3, `--tree-lod0 0` 20.3 -- LOD 1's cards are fewer but larger, the
+  same layers per pixel). `--no-shadows` 16.4.
+- **The depth prepass** (`record_prepass`, before the terrain;
+  `--no-tree-prepass` and the Trees tunable for A/B): the mesh levels drawn
+  depth-only with the dither, cut and leaf tests (`ps_mesh_depth`), then
+  colour over that depth with EQUAL, no depth write and
+  `[earlydepthstencil]` (`ps_mesh_eq`, no tests: depth already said). Both
+  run the SAME vertex shader so the depths match bit for bit; a uniform
+  `depth_only` flag skips the vertex GI in the prepass. Impostors stay one
+  ordinary pass. Colour LOD 0 went to 0.76 invocations a pixel, and terrain
+  drawn after the prepass 3.5 -> 1.7 ms. 22.4 -> 16.3 ms.
+- **Level-major draw slots**: every model's LOD 0, then every model's LOD 1
+  (`tree_cull.hlsl`'s `mesh0/mesh1`). Interleaved per model, a far LOD 1
+  drew before the near LOD 0 in front of it; 24.1 -> 22.4 without the
+  prepass.
+- **The leaf test was the cost, not the raster**: with a trivial test the
+  prepass's LOD 0 is 1.4 ms against 4.65. Three fixes, in `card_coverage`
+  and `leaf.hlsli`: the clusters blend in from a tenth of the way (k was
+  never 0 -- ~0.02 at 10 m at 4K -- so every near leaf paid for both
+  patterns): 4.65 -> 4.12. Fragments where the card's round rim is under
+  0.5 return before the leaves -- 36% of a card, EXACT, since every pattern
+  is scaled by the rim: 4.12 -> 3.10 (it barely helps the shadow casters,
+  whose 40-texel cards put corner and middle in one wave). One hash per
+  leaf cell, three 10-bit draws, where it was three hashes of three integer
+  multiplies each: 3.10 -> 2.51, and cascade 0's casters 1.95 -> 1.33. The
+  leaves land elsewhere; shape, size and density are the same (mean luma of
+  the 4K still 101.55 both).
+- **Cascade 0's LOD 1 casters take the card path** (`ps_mesh_shadow`, packed
+  bit 29): a tree past 45 m is in cascade 0's box but its shadow mostly
+  lands past the 28 m slice. 1.16 -> 0.33 ms.
+- **After**: 12.3 ms at 4K (prepass off, the rest kept: 18.9); 1440p 7.9
+  (11.6 without the prepass); spawn at 1440p 6.9 against 9.1 -- the prepass
+  wins in thin woods too. Remaining at 4K: post chain 3.3, prepass 3.0,
+  tree shadow casters 2.3 (cascade 0's LOD 0 1.3), terrain 1.7, tree colour
+  1.3. Cracks 0, as before.
 
 **Felling** (`TreeFelling`): trunks within 40 m of the player are static
 capsules; a click swings from the eye; 2 + one per 6 cm of diameter fells it.

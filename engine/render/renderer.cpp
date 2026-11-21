@@ -1304,6 +1304,11 @@ void Renderer::record_shadows(const ViewConstants& view) {
         cmd_->ExecuteIndirect(cmd_sig_.Get(), kSlots, mesher_.draw_args(), 0, nullptr, 0);
         // Rocks: the same root and constants, their own casters.
         if (rocks_on_ && rocks_.ready() && mode_ != Mode::Wireframe) rocks_.record_shadow(cmd_.Get(), UINT(frame_));
+        {
+            static const char* kLabel[4] = {"shadow c0 terrain + rocks", "shadow c1 terrain + rocks",
+                                            "shadow c2 terrain + rocks", "shadow c3 terrain + rocks"};
+            prof_.mark(cmd_.Get(), kLabel[c < 4 ? c : 0]);
+        }
 
         // Trees, culled against this cascade but levelled by the camera's
         // distance, so a shadow always matches the tree that casts it.
@@ -2687,6 +2692,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
             startup_log().push_back(std::make_pair(std::string(line), forest_.bake_ms()));
         }
         if (!trees_.init(device_.Get(), queue_.Get(), looks, srv_heap_.Get(), 1, error)) return false;
+        if (prof_.init(device_.Get(), queue_.Get())) trees_.set_profiler(&prof_);
         // The canopy map (ADR-004 L6) from the same models' crowns.
         if (!canopy_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         // The heightfield GI (L6): the diffuse GI.
@@ -3555,6 +3561,8 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
         cmd_->ResolveQueryData(post_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, q0, 5, post_query_rb_.Get(), UINT64(q0) * 8);
         post_query_pending_[frame_] = true;
     }
+    prof_.mark(cmd_.Get(), "post chain (sea, clouds, rain, composite, TAA, tonemap)");
+    prof_.end_frame(cmd_.Get());
     ++post_frame_;
 }
 
@@ -3588,6 +3596,7 @@ void Renderer::update_weather(double t) {
 }
 
 void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HANDLE rtv) {
+    prof_.begin_frame(cmd_.Get(), UINT(frame_));
     // This frame's sun, moon and sky (ADR-004 L2), before anything uses them.
     update_sky(view.cam_pos[1]);
     for (int k = 0; k < 3; ++k) tree_settings_.sun_dir[k] = sky_frame_.key_dir[k];
@@ -3621,6 +3630,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         canopy_.record(cmd_.Get(), UINT(frame_), view.cam_pos, trees_.instance_list(), tree_list_version_, canopy_origin_);
         canopy_built_ = true;
     }
+    prof_.mark(cmd_.Get(), "ocean detail + canopy map");
     // The rocks' lists for this frame: the sun's list is drawn by the light
     // faces, the heightfield's top-down pass and the cascades, all below.
     if (rocks_on_ && rocks_.ready() && mode_ != Mode::Wireframe) {
@@ -3631,6 +3641,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     // Local lights (ADR-004 L3): their list, their clusters and their shadow
     // faces, before anything is shaded with them.
     record_lights(view);
+    prof_.mark(cmd_.Get(), "local lights");
     // The sun's view first: the shadow map has to be finished before anything
     // that samples it is drawn.
     // The far terrain shadow: when due, the terrain from above, depth only,
@@ -3645,7 +3656,9 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         float vp[16];
         if (hfgi_.begin(view.cam_pos, sky_frame_.hours, post_frame_, vp)) record_hfgi(vp);
     }
+    prof_.mark(cmd_.Get(), "far shadow + heightfield GI");
     record_shadows(view);
+    prof_.mark(cmd_.Get(), "shadows (rest)");
     // The heightfield's sky share at the eye, for the haze and the mist.
     if (hfgi_on_ && mode_ != Mode::Wireframe)
         hfgi_.record_camera(cmd_.Get(), UINT(frame_), shadow_cb_[frame_]->GetGPUVirtualAddress());
@@ -3725,6 +3738,26 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         cmd_->ClearRenderTargetView(hdr[1], sky, 0, nullptr);
         cmd_->ClearRenderTargetView(hdr[2], zero4, 0, nullptr);
     }
+    prof_.mark(cmd_.Get(), "scene clears");
+
+    // The trees' depth prepass, BEFORE the terrain: in a wood most of the
+    // ground behind the trunks and crowns is then rejected by early depth
+    // instead of shaded and painted over (tree_renderer.h).
+    TreeFrameInputs ti = {};
+    const bool trees_drawn = trees_on_ && trees_.ready() && mode_ != Mode::Wireframe;
+    if (trees_drawn) {
+        std::memcpy(ti.view_proj, mc.view_proj, sizeof ti.view_proj);
+        for (int k = 0; k < 3; ++k) {
+            ti.cam_pos[k] = view.cam_pos[k];
+            ti.cam_fwd[k] = view.cam_fwd[k];
+            ti.cam_right[k] = view.cam_right[k];
+            ti.cam_up[k] = view.cam_up[k];
+        }
+        ti.time = view.time;
+        ti.far_plane = kFarPlane;
+        ti.shadow_cb = shadow_cb_[frame_]->GetGPUVirtualAddress();
+        trees_.record_prepass(cmd_.Get(), frame_, ti, tree_settings_);
+    }
 
     {
         const bool wire = (mode_ == Mode::Wireframe);
@@ -3750,27 +3783,18 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         // One command per slot. A retired or never-used slot has all-zero
         // arguments and the command processor skips it, which is cheaper than
         // compacting the array every time a chunk moves.
+        prof_.stat_begin(cmd_.Get(), "terrain");
         cmd_->ExecuteIndirect(cmd_sig_.Get(), kSlots, mesher_.draw_args(), 0, nullptr, 0);
+        prof_.stat_end(cmd_.Get());
+        prof_.mark(cmd_.Get(), "terrain");
         // Rocks right after the ground, on its root signature and constants.
         if (rocks_on_ && rocks_.ready() && !wire) rocks_.record(cmd_.Get(), UINT(frame_));
+        prof_.mark(cmd_.Get(), "rocks");
     }
 
     // Trees after the ground, before the sea. Not in wireframe: the wire view
     // is for reading the terrain mesh, and a forest over it hides the mesh.
-    if (trees_on_ && trees_.ready() && mode_ != Mode::Wireframe) {
-        TreeFrameInputs ti = {};
-        std::memcpy(ti.view_proj, mc.view_proj, sizeof ti.view_proj);
-        for (int k = 0; k < 3; ++k) {
-            ti.cam_pos[k] = view.cam_pos[k];
-            ti.cam_fwd[k] = view.cam_fwd[k];
-            ti.cam_right[k] = view.cam_right[k];
-            ti.cam_up[k] = view.cam_up[k];
-        }
-        ti.time = view.time;
-        ti.far_plane = kFarPlane;
-        ti.shadow_cb = shadow_cb_[frame_]->GetGPUVirtualAddress();
-        trees_.record(cmd_.Get(), frame_, ti, tree_settings_);
-    }
+    if (trees_drawn) trees_.record(cmd_.Get(), frame_, ti, tree_settings_);
 
     // Ground cover after the trees, before the sea.
     if (foliage_on_ && foliage_.ready() && mode_ != Mode::Wireframe) {
@@ -3787,7 +3811,10 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         fi.shadow_table = srv_heap_->GetGPUDescriptorHandleForHeapStart();
         ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
         cmd_->SetDescriptorHeaps(1, heaps);
+        prof_.stat_begin(cmd_.Get(), "foliage");
         foliage_.record(cmd_.Get(), frame_, fi, foliage_settings_);
+        prof_.stat_end(cmd_.Get());
+        prof_.mark(cmd_.Get(), "foliage");
     }
 
     // The sea's constants. It DRAWS in record_post, after the composite, onto

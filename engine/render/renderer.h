@@ -293,8 +293,26 @@ public:
     // The canopy shell past the trees' draw distance (forest_map.h; --no-forest-shell).
     void set_forest_shell(bool on) { forest_on_ = on; }
     const TreeRenderer&    trees() const { return trees_; }
+    // The overdraw instrument (tree_renderer.h), for the report modes.
+    bool tree_overdraw_begin(std::string& error) {
+        wait_for_gpu();
+        return trees_.overdraw_begin(queue_.Get(), width_, height_, error);
+    }
+    bool tree_overdraw_read(std::vector<uint32_t>& out, std::string& error) {
+        wait_for_gpu();
+        const bool ok = trees_.overdraw_read(queue_.Get(), out, error);
+        trees_.overdraw_end();
+        return ok;
+    }
+    // Per-pass GPU timing and pipeline statistics (gpu_profile.h), for
+    // --gpu-profile. Off by default; while on, every pass is serialised.
+    GpuProfiler& profiler() { return prof_; }
+    void set_profiling(bool on) { prof_.set_enabled(on); }
     TreeDrawSettings&      tree_settings() { return tree_settings_; }
     void set_trees(bool on) { trees_on_ = on; }
+    // The trees' depth prepass (tree_renderer.h); on by default, --no-tree-prepass for A/B.
+    void set_tree_prepass(bool on) { trees_.set_prepass(on); }
+    bool tree_prepass() const { return trees_.prepass(); }
     // Ground cover: grass, flowers, bushes. --no-foliage and G for A/B.
     void set_foliage(bool on) { foliage_on_ = on; }
     bool foliage_on() const { return foliage_on_; }
@@ -741,6 +759,7 @@ private:
     RockRenderer     rocks_;
     bool             rocks_on_ = true;
     TreeRenderer     trees_;
+    GpuProfiler      prof_;
     TreeDrawSettings tree_settings_;
     FoliageRenderer  foliage_;
     FoliageSettings  foliage_settings_;

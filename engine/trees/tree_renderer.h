@@ -17,6 +17,7 @@
 
 #include "engine/trees/tree_field.h"
 #include "engine/trees/tree_mesh.h"
+#include "engine/render/gpu_profile.h"
 
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -80,8 +81,19 @@ public:
 
     // Culls and draws. Render target, depth, viewport and scissor must
     // already be bound; leaves the graphics root signature changed.
+    // After record_prepass in the same frame, draws colour over the
+    // prepass's depth (EQUAL) from the lists it culled.
     void record(ID3D12GraphicsCommandList* cmd, UINT frame, const TreeFrameInputs& in,
                 const TreeDrawSettings& s);
+    // The depth prepass: culls, then draws the mesh levels depth only with
+    // the coverage test (dither, cut, leaves), so record() shades each
+    // visible tree pixel once instead of once per surviving card. Called
+    // before the terrain, whose hidden pixels it also saves. A no-op when
+    // the prepass is off or the overdraw counter is running.
+    void record_prepass(ID3D12GraphicsCommandList* cmd, UINT frame, const TreeFrameInputs& in,
+                        const TreeDrawSettings& s);
+    void set_prepass(bool on) { prepass_on_ = on; }
+    bool prepass() const { return prepass_on_; }
     // Cull against one cascade and draw depth only. The depth target and
     // viewport must already be bound.
     void record_shadow(ID3D12GraphicsCommandList* cmd, UINT frame, UINT cascade,
@@ -93,6 +105,25 @@ public:
     static const UINT kMaxLightFaces = 12;
     void record_light_shadow(ID3D12GraphicsCommandList* cmd, UINT frame, UINT face,
                              const TreeShadowInputs& in, const TreeDrawSettings& s);
+
+    // Per-pass GPU timing (gpu_profile.h). While it is enabled the mesh
+    // levels draw as separate ExecuteIndirect runs -- every model's LOD 0,
+    // then every model's LOD 1 -- so each level gets its own timestamp and
+    // pipeline statistics; the impostors are one draw as always.
+    void set_profiler(GpuProfiler* p) { prof_ = p; }
+
+    // The overdraw instrument (`--gpu-profile`): while on, the CAMERA's pass
+    // draws with pixel shaders that count, per pixel, every fragment the tree
+    // pass rasterised and every one that survived its coverage and dither
+    // tests (and of those, which were leaf cards and which impostors). Two
+    // uints a pixel: invoked | survived << 16, leaf | impostor << 16. A UAV
+    // write forces late depth, so "invoked" is every rasterised fragment, not
+    // what early depth would have let through -- the pipeline statistics'
+    // PS invocations are that. Report modes only: the clear and the readback
+    // wait on the GPU.
+    bool overdraw_begin(ID3D12CommandQueue* queue, UINT width, UINT height, std::string& error);
+    bool overdraw_read(ID3D12CommandQueue* queue, std::vector<uint32_t>& out, std::string& error);
+    void overdraw_end();
 
     // What the models are, for physics and felling.
     const TreeModel& model(uint32_t species, uint32_t variant) const {
@@ -134,7 +165,24 @@ private:
     ComPtr<ID3D12PipelineState> mesh_pso_, imp_pso_, bake_pso_;
     ComPtr<ID3D12PipelineState> mesh_shadow_pso_, imp_shadow_pso_;
     void cull_and_draw(ID3D12GraphicsCommandList* cmd, UINT frame, UINT cb_index,
-                       const void* frame_constants, bool shadow, D3D12_GPU_VIRTUAL_ADDRESS shadow_cb);
+                       const void* frame_constants, bool shadow, D3D12_GPU_VIRTUAL_ADDRESS shadow_cb,
+                       const char* label);
+    void upload_instances(UINT f);
+    void write_cb(UINT f, UINT cb_index, const void* frame_constants);
+    D3D12_GPU_VIRTUAL_ADDRESS cb_address(UINT f, UINT cb_index) const;
+    void cull(ID3D12GraphicsCommandList* cmd, UINT f, D3D12_GPU_VIRTUAL_ADDRESS cb);
+    void bind_draw(ID3D12GraphicsCommandList* cmd, UINT f, D3D12_GPU_VIRTUAL_ADDRESS cb,
+                   D3D12_GPU_VIRTUAL_ADDRESS shadow_cb);
+    void draw_meshes(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, const char* label);
+    void draw_impostors(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, const char* label);
+    void release(ID3D12GraphicsCommandList* cmd);
+    ComPtr<ID3D12PipelineState> mesh_depth_pso_, mesh_eq_pso_;
+    bool prepass_on_ = true, prepassed_ = false;
+    GpuProfiler* prof_ = nullptr;
+    ComPtr<ID3D12PipelineState> mesh_od_pso_, imp_od_pso_;
+    ComPtr<ID3D12Resource> od_buf_, od_zero_, od_rb_;
+    UINT od_w_ = 0, od_h_ = 0;
+    bool od_on_ = false;
     ComPtr<ID3D12PipelineState> clear_pso_, cull_pso_, args_pso_;
     ComPtr<ID3D12CommandSignature> cmd_sig_;
 

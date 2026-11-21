@@ -27,7 +27,8 @@ const UINT kCapLod1 = 4096;
 const UINT kCapImp = 98304;
 const UINT kMaxInstances = 131072;        // 20 bits of index in a visible entry
 
-// Matches cbuffer TreeFrame in trees.hlsl and tree_cull.hlsl: 352 bytes.
+// Matches cbuffer TreeFrame in trees.hlsl (368 bytes) and tree_cull.hlsl,
+// which declares the first 352 and reads nothing after them.
 struct TreeFrame {
     float view_proj[16];
     float cam_pos[3];   float time;
@@ -48,14 +49,19 @@ struct TreeFrame {
     float bake_right[3]; float bake_centre_y;
     float bake_up[3];    float shadow_pass;
     float wind_v[4];
-    float wind_drift[2]; float wind_pad[2];
+    float wind_drift[2];
+    UINT  od_size[2];   // the overdraw counter's width and height; 0 off
+    float depth_only;   // 1: the depth prepass's constants
+    float tf_pad[3];
 };
-static_assert(sizeof(TreeFrame) == 352, "TreeFrame must match the HLSL cbuffer");
+static_assert(sizeof(TreeFrame) == 368, "TreeFrame must match the HLSL cbuffer");
 const UINT kCbStride = 512;
 // Per frame in flight: the camera's constants, then one per shadow cascade.
-// The main pass, four sun cascades, and up to twelve local-light faces.
+// The main pass, four sun cascades, up to twelve local-light faces, and the
+// depth prepass (the camera's, flagged depth-only).
 const UINT kSunCascades = 4;
-const UINT kCbPerFrame = 1 + kSunCascades + TreeRenderer::kMaxLightFaces;
+const UINT kCbPerFrame = 1 + kSunCascades + TreeRenderer::kMaxLightFaces + 1;
+const UINT kPrepassCb = kCbPerFrame - 1;
 
 struct ModelInfoGpu {
     float radius, top, bound, slice;
@@ -182,7 +188,7 @@ bool TreeRenderer::run_and_wait(ID3D12CommandQueue* queue, std::string& error) {
 }
 
 bool TreeRenderer::create_pipelines(std::string& error) {
-    // --- draw root signature: 1 + 2 * 6 + 1 = 14 DWORDs of the 64 ---
+    // --- draw root signature: 1 + 2 * 7 + 1 = 16 DWORDs of the 64 ---
     {
         D3D12_DESCRIPTOR_RANGE range = {};
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -229,7 +235,7 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         srange[7].NumDescriptors = 2;
         srange[7].BaseShaderRegister = 44;
         srange[7].OffsetInDescriptorsFromTableStart = 67;
-        D3D12_ROOT_PARAMETER p[10] = {};
+        D3D12_ROOT_PARAMETER p[11] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         p[0].Constants.ShaderRegister = 1;
         p[0].Constants.Num32BitValues = 1;
@@ -247,7 +253,10 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         p[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[9].DescriptorTable.NumDescriptorRanges = 8;
         p[9].DescriptorTable.pDescriptorRanges = srange;
-        for (int k = 0; k < 10; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        // u0: the overdraw counter (overdraw_begin); bound only while it runs.
+        p[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        p[10].Descriptor.ShaderRegister = 0;
+        for (int k = 0; k < 11; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_STATIC_SAMPLER_DESC ssa[2] = {};
         D3D12_STATIC_SAMPLER_DESC& ss = ssa[0];
@@ -291,7 +300,7 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         an.ShaderRegister = 5;
         an.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         const D3D12_STATIC_SAMPLER_DESC samplers[5] = {ssa[0], ssa[1], lin, pt, an};
-        rsd.NumParameters = 10;
+        rsd.NumParameters = 11;
         rsd.pParameters = p;
         rsd.NumStaticSamplers = 5;
         rsd.pStaticSamplers = samplers;
@@ -363,7 +372,9 @@ bool TreeRenderer::create_pipelines(std::string& error) {
     // (scene_out.hlsli); the bake draws into its own 8-bit atlas pair.
     auto make_pso = [&](const char* vs_e, const char* ps_e, UINT rts,
                         ComPtr<ID3D12PipelineState>& out, bool shadow = false,
-                        DXGI_FORMAT fmt = DXGI_FORMAT_R16G16B16A16_FLOAT) -> bool {
+                        DXGI_FORMAT fmt = DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        D3D12_COMPARISON_FUNC zfunc = D3D12_COMPARISON_FUNC_LESS, bool zwrite = true,
+                        bool colour = true) -> bool {
         ComPtr<ID3DBlob> vs, ps;
         if (!compile_shader(kTreeShader, vs_e, "vs_5_1", vs, error)) return false;
         if (!compile_shader(kTreeShader, ps_e, "ps_5_1", ps, error)) return false;
@@ -379,10 +390,10 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         pd.RasterizerState.DepthClipEnable = TRUE;
         for (UINT i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
-            pd.BlendState.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            pd.BlendState.RenderTarget[i].RenderTargetWriteMask = colour ? D3D12_COLOR_WRITE_ENABLE_ALL : 0;
         pd.DepthStencilState.DepthEnable = TRUE;
-        pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-        pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+        pd.DepthStencilState.DepthWriteMask = zwrite ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+        pd.DepthStencilState.DepthFunc = zfunc;
         pd.SampleMask = UINT_MAX;
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pd.NumRenderTargets = rts;
@@ -403,6 +414,15 @@ bool TreeRenderer::create_pipelines(std::string& error) {
     if (!make_pso("vs_bake", "ps_bake", 2, bake_pso_, false, DXGI_FORMAT_R8G8B8A8_UNORM)) return false;
     if (!make_pso("vs_mesh_shadow", "ps_mesh_shadow", 0, mesh_shadow_pso_, true)) return false;
     if (!make_pso("vs_impostor_shadow", "ps_impostor_shadow", 0, imp_shadow_pso_, true)) return false;
+    // The overdraw instrument's variants: the same shaders, counting.
+    if (!make_pso("vs_mesh", "ps_mesh_od", 3, mesh_od_pso_)) return false;
+    if (!make_pso("vs_impostor", "ps_impostor_od", 3, imp_od_pso_)) return false;
+    // The depth prepass (coverage only; the scene's three targets stay bound,
+    // written by nothing) and the colour pass over it: EQUAL, no depth write.
+    if (!make_pso("vs_mesh", "ps_mesh_depth", 3, mesh_depth_pso_, false, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                  D3D12_COMPARISON_FUNC_LESS, true, false)) return false;
+    if (!make_pso("vs_mesh", "ps_mesh_eq", 3, mesh_eq_pso_, false, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                  D3D12_COMPARISON_FUNC_EQUAL, false, true)) return false;
     return true;
 }
 
@@ -513,13 +533,17 @@ bool TreeRenderer::init(ID3D12Device* device, ID3D12CommandQueue* queue,
         for (int k = 0; k < 3; ++k) lk[s].bark_tint[k] = looks_[s].bark_tint[k];
     }
 
-    // Draw slots: per model LOD 0 and LOD 1, then the impostor draw.
+    // Draw slots: every model's LOD 0, then every model's LOD 1, then the
+    // impostor draw. Level-major, so one ExecuteIndirect draws the near level
+    // whole before the far one starts: nearer first is what early depth
+    // rejection wants, and per-model interleaving (the old order) drew a far
+    // LOD 1 before the near LOD 0 in front of it.
     const UINT nm = static_cast<UINT>(models_.size());
     draw_count_ = nm * 2 + 1;
     std::vector<UINT> slots(size_t(draw_count_) * 2);
     UINT off = 0;
     for (UINT d = 0; d < draw_count_; ++d) {
-        const UINT cap = d == nm * 2 ? kCapImp : ((d & 1) == 0 ? kCapLod0 : kCapLod1);
+        const UINT cap = d == nm * 2 ? kCapImp : (d < nm ? kCapLod0 : kCapLod1);
         slots[d * 2] = off;
         slots[d * 2 + 1] = cap;
         off += cap;
@@ -873,10 +897,9 @@ void fill_common(TreeFrame& tf, UINT count, UINT models, UINT quad_first, UINT q
 }
 }  // namespace
 
-void TreeRenderer::record(ID3D12GraphicsCommandList* cmd, UINT frame, const TreeFrameInputs& in,
-                          const TreeDrawSettings& s) {
-    if (!ready_) return;
-    TreeFrame tf = {};
+namespace {
+void camera_frame(TreeFrame& tf, const TreeFrameInputs& in, const TreeDrawSettings& s, UINT count, UINT models,
+                  UINT quad_first, UINT quad_base) {
     std::memcpy(tf.view_proj, in.view_proj, sizeof tf.view_proj);
     for (int k = 0; k < 3; ++k) {
         tf.cam_pos[k] = in.cam_pos[k];
@@ -887,10 +910,54 @@ void TreeRenderer::record(ID3D12GraphicsCommandList* cmd, UINT frame, const Tree
     tf.time = in.time;
     tf.far_plane = in.far_plane;
     frustum_planes(in.view_proj, tf.frustum);
-    fill_common(tf, static_cast<UINT>(cpu_instances_.size()), static_cast<UINT>(models_.size()),
-                quad_first_, quad_base_, s);
+    fill_common(tf, count, models, quad_first, quad_base, s);
     tf.shadow_pass = 0.0f;
-    cull_and_draw(cmd, frame, 0, &tf, false, in.shadow_cb);
+}
+}  // namespace
+
+void TreeRenderer::record_prepass(ID3D12GraphicsCommandList* cmd, UINT frame, const TreeFrameInputs& in,
+                                  const TreeDrawSettings& s) {
+    prepassed_ = false;
+    // The counting shaders measure the un-prepassed draw: they need every
+    // fragment, and EQUAL would hide all but the nearest.
+    if (!ready_ || !prepass_on_ || od_on_) return;
+    TreeFrame tf = {};
+    camera_frame(tf, in, s, static_cast<UINT>(cpu_instances_.size()), static_cast<UINT>(models_.size()),
+                 quad_first_, quad_base_);
+    const UINT f = frame & 1u;
+    upload_instances(f);
+    write_cb(f, 0, &tf);
+    TreeFrame dp = tf;
+    dp.depth_only = 1.0f;
+    write_cb(f, kPrepassCb, &dp);
+    const bool prof = prof_ && prof_->detailed();
+    cull(cmd, f, cb_address(f, 0));
+    if (prof) prof_->mark(cmd, "trees cull");
+    bind_draw(cmd, f, cb_address(f, kPrepassCb), in.shadow_cb);
+    draw_meshes(cmd, mesh_depth_pso_.Get(), prof ? "trees prepass" : nullptr);
+    // The lists stay in their draw states for record(), which draws colour
+    // from them and releases them.
+    prepassed_ = true;
+}
+
+void TreeRenderer::record(ID3D12GraphicsCommandList* cmd, UINT frame, const TreeFrameInputs& in,
+                          const TreeDrawSettings& s) {
+    if (!ready_) return;
+    if (prepassed_) {
+        prepassed_ = false;
+        const UINT f = frame & 1u;
+        const bool prof = prof_ && prof_->detailed();
+        bind_draw(cmd, f, cb_address(f, 0), in.shadow_cb);
+        draw_meshes(cmd, mesh_eq_pso_.Get(), prof ? "trees" : nullptr);
+        draw_impostors(cmd, imp_pso_.Get(), prof ? "trees" : nullptr);
+        release(cmd);
+        return;
+    }
+    TreeFrame tf = {};
+    camera_frame(tf, in, s, static_cast<UINT>(cpu_instances_.size()), static_cast<UINT>(models_.size()),
+                 quad_first_, quad_base_);
+    if (od_on_) { tf.od_size[0] = od_w_; tf.od_size[1] = od_h_; }
+    cull_and_draw(cmd, frame, 0, &tf, false, in.shadow_cb, "trees");
 }
 
 void TreeRenderer::record_shadow(ID3D12GraphicsCommandList* cmd, UINT frame, UINT cascade,
@@ -918,7 +985,9 @@ void TreeRenderer::record_shadow(ID3D12GraphicsCommandList* cmd, UINT frame, UIN
     if (cascade == 0u) {
         if (const char* e = std::getenv("BIOMES_TREE_SHADOW_PATH")) tf.shadow_pass = 1.0f + float(std::atoi(e));
     }
-    cull_and_draw(cmd, frame, 1 + cascade, &tf, true, 0);
+    static const char* kLabel[kSunCascades] = {"shadow c0 trees", "shadow c1 trees", "shadow c2 trees",
+                                               "shadow c3 trees"};
+    cull_and_draw(cmd, frame, 1 + cascade, &tf, true, 0, kLabel[cascade < kSunCascades ? cascade : 0]);
 }
 
 void TreeRenderer::record_light_shadow(ID3D12GraphicsCommandList* cmd, UINT frame, UINT face,
@@ -937,13 +1006,10 @@ void TreeRenderer::record_light_shadow(ID3D12GraphicsCommandList* cmd, UINT fram
     fill_common(tf, static_cast<UINT>(cpu_instances_.size()), static_cast<UINT>(models_.size()),
                 quad_first_, quad_base_, s);
     tf.shadow_pass = 1.0f;   // the first cascade's floor: full detail, real leaves
-    cull_and_draw(cmd, frame, 1 + kSunCascades + face, &tf, true, 0);
+    cull_and_draw(cmd, frame, 1 + kSunCascades + face, &tf, true, 0, "light face trees");
 }
 
-void TreeRenderer::cull_and_draw(ID3D12GraphicsCommandList* cmd, UINT frame, UINT cb_index,
-                                 const void* frame_constants, bool shadow,
-                                 D3D12_GPU_VIRTUAL_ADDRESS shadow_cb) {
-    const UINT f = frame & 1u;
+void TreeRenderer::upload_instances(UINT f) {
     // Instances go up once per frame in flight, whichever pass runs first --
     // the shadow cascades do, now.
     if (inst_version_[f] != cpu_version_) {
@@ -951,16 +1017,22 @@ void TreeRenderer::cull_and_draw(ID3D12GraphicsCommandList* cmd, UINT frame, UIN
             std::memcpy(inst_cpu_[f], cpu_instances_.data(), cpu_instances_.size() * sizeof(TreeGpuInstance));
         inst_version_[f] = cpu_version_;
     }
-    const UINT count = static_cast<UINT>(cpu_instances_.size());
+}
+
+void TreeRenderer::write_cb(UINT f, UINT cb_index, const void* frame_constants) {
     std::memcpy(static_cast<unsigned char*>(frame_cb_cpu_[f]) + size_t(cb_index) * kCbStride,
                 frame_constants, sizeof(TreeFrame));
-    const D3D12_GPU_VIRTUAL_ADDRESS cb = frame_cb_[f]->GetGPUVirtualAddress() + UINT64(cb_index) * kCbStride;
-    const D3D12_GPU_VIRTUAL_ADDRESS inst = inst_up_[f]->GetGPUVirtualAddress();
+}
 
-    // --- cull ---
+D3D12_GPU_VIRTUAL_ADDRESS TreeRenderer::cb_address(UINT f, UINT cb_index) const {
+    return frame_cb_[f]->GetGPUVirtualAddress() + UINT64(cb_index) * kCbStride;
+}
+
+void TreeRenderer::cull(ID3D12GraphicsCommandList* cmd, UINT f, D3D12_GPU_VIRTUAL_ADDRESS cb) {
+    const UINT count = static_cast<UINT>(cpu_instances_.size());
     cmd->SetComputeRootSignature(cull_root_.Get());
     cmd->SetComputeRootConstantBufferView(0, cb);
-    cmd->SetComputeRootShaderResourceView(1, inst);
+    cmd->SetComputeRootShaderResourceView(1, inst_up_[f]->GetGPUVirtualAddress());
     cmd->SetComputeRootShaderResourceView(2, model_buf_->GetGPUVirtualAddress());
     cmd->SetComputeRootShaderResourceView(3, slot_buf_->GetGPUVirtualAddress());
     cmd->SetComputeRootUnorderedAccessView(4, counters_->GetGPUVirtualAddress());
@@ -980,14 +1052,16 @@ void TreeRenderer::cull_and_draw(ID3D12GraphicsCommandList* cmd, UINT frame, UIN
     barrier(cmd, args_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     barrier(cmd, visible_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+}
 
-    // --- draw ---
+void TreeRenderer::bind_draw(ID3D12GraphicsCommandList* cmd, UINT f, D3D12_GPU_VIRTUAL_ADDRESS cb,
+                             D3D12_GPU_VIRTUAL_ADDRESS shadow_cb) {
     cmd->SetGraphicsRootSignature(draw_root_.Get());
     ID3D12DescriptorHeap* heaps[] = {srv_heap_};
     cmd->SetDescriptorHeaps(1, heaps);
     cmd->SetGraphicsRootConstantBufferView(1, cb);
     cmd->SetGraphicsRootShaderResourceView(2, vb_->GetGPUVirtualAddress());
-    cmd->SetGraphicsRootShaderResourceView(3, inst);
+    cmd->SetGraphicsRootShaderResourceView(3, inst_up_[f]->GetGPUVirtualAddress());
     cmd->SetGraphicsRootShaderResourceView(4, visible_->GetGPUVirtualAddress());
     cmd->SetGraphicsRootShaderResourceView(5, model_buf_->GetGPUVirtualAddress());
     cmd->SetGraphicsRootShaderResourceView(6, look_buf_->GetGPUVirtualAddress());
@@ -1006,15 +1080,63 @@ void TreeRenderer::cull_and_draw(ID3D12GraphicsCommandList* cmd, UINT frame, UIN
     ibv.SizeInBytes = static_cast<UINT>(total_indices_ * 4);
     ibv.Format = DXGI_FORMAT_R32_UINT;
     cmd->IASetIndexBuffer(&ibv);
-    const UINT nm = static_cast<UINT>(models_.size());
-    cmd->SetPipelineState(shadow ? mesh_shadow_pso_.Get() : mesh_pso_.Get());
-    cmd->ExecuteIndirect(cmd_sig_.Get(), nm * 2, args_.Get(), 0, nullptr, 0);
-    cmd->SetPipelineState(shadow ? imp_shadow_pso_.Get() : imp_pso_.Get());
-    cmd->ExecuteIndirect(cmd_sig_.Get(), 1, args_.Get(), UINT64(nm) * 2 * 24, nullptr, 0);
+}
 
+// Every model's LOD 0, then every model's LOD 1 (the slots are level-major).
+// With a label the profiler times and counts each level on its own.
+void TreeRenderer::draw_meshes(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, const char* label) {
+    const UINT nm = static_cast<UINT>(models_.size());
+    cmd->SetPipelineState(pso);
+    if (!label || !prof_) {
+        cmd->ExecuteIndirect(cmd_sig_.Get(), nm * 2, args_.Get(), 0, nullptr, 0);
+        return;
+    }
+    for (UINT lvl = 0; lvl < 2; ++lvl) {
+        const std::string name = std::string(label) + (lvl == 0 ? " lod0" : " lod1");
+        prof_->stat_begin(cmd, name.c_str());
+        cmd->ExecuteIndirect(cmd_sig_.Get(), nm, args_.Get(), UINT64(lvl) * nm * 24, nullptr, 0);
+        prof_->stat_end(cmd);
+        prof_->mark(cmd, name.c_str());
+    }
+}
+
+void TreeRenderer::draw_impostors(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, const char* label) {
+    const UINT nm = static_cast<UINT>(models_.size());
+    cmd->SetPipelineState(pso);
+    const std::string name = std::string(label ? label : "") + " impostors";
+    if (label && prof_) prof_->stat_begin(cmd, name.c_str());
+    cmd->ExecuteIndirect(cmd_sig_.Get(), 1, args_.Get(), UINT64(nm) * 2 * 24, nullptr, 0);
+    if (label && prof_) {
+        prof_->stat_end(cmd);
+        prof_->mark(cmd, name.c_str());
+    }
+}
+
+void TreeRenderer::release(ID3D12GraphicsCommandList* cmd) {
     barrier(cmd, args_.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     barrier(cmd, visible_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+void TreeRenderer::cull_and_draw(ID3D12GraphicsCommandList* cmd, UINT frame, UINT cb_index,
+                                 const void* frame_constants, bool shadow,
+                                 D3D12_GPU_VIRTUAL_ADDRESS shadow_cb, const char* label) {
+    const bool prof = prof_ && prof_->detailed();
+    const std::string lab = label ? label : "trees";
+    const UINT f = frame & 1u;
+    upload_instances(f);
+    write_cb(f, cb_index, frame_constants);
+    const D3D12_GPU_VIRTUAL_ADDRESS cb = cb_address(f, cb_index);
+    cull(cmd, f, cb);
+    if (prof) prof_->mark(cmd, (lab + " cull").c_str());
+    bind_draw(cmd, f, cb, shadow_cb);
+    const bool od = od_on_ && !shadow && od_buf_;
+    if (od) cmd->SetGraphicsRootUnorderedAccessView(10, od_buf_->GetGPUVirtualAddress());
+    draw_meshes(cmd, shadow ? mesh_shadow_pso_.Get() : (od ? mesh_od_pso_.Get() : mesh_pso_.Get()),
+                prof ? lab.c_str() : nullptr);
+    draw_impostors(cmd, shadow ? imp_shadow_pso_.Get() : (od ? imp_od_pso_.Get() : imp_pso_.Get()),
+                   prof ? lab.c_str() : nullptr);
+    release(cmd);
 }
 
 bool TreeRenderer::read_counts(ID3D12CommandQueue* queue, std::vector<uint32_t>& per_draw,
@@ -1038,6 +1160,50 @@ bool TreeRenderer::read_counts(ID3D12CommandQueue* queue, std::vector<uint32_t>&
     rb->Unmap(0, nullptr);
     return true;
 }
+
+bool TreeRenderer::overdraw_begin(ID3D12CommandQueue* queue, UINT width, UINT height, std::string& error) {
+    if (!ready_) return false;
+    const UINT64 bytes = UINT64(width) * height * 8;
+    if (!od_buf_ || od_w_ != width || od_h_ != height) {
+        od_buf_.Reset(); od_zero_.Reset(); od_rb_.Reset();
+        if (!make_buffer(device_, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                         D3D12_RESOURCE_STATE_COPY_DEST, od_buf_, error, "overdraw counter")) return false;
+        if (!make_buffer(device_, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                         D3D12_RESOURCE_STATE_GENERIC_READ, od_zero_, error, "overdraw zero")) return false;
+        void* p = nullptr;
+        od_zero_->Map(0, nullptr, &p);
+        std::memset(p, 0, size_t(bytes));
+        od_zero_->Unmap(0, nullptr);
+        if (!make_buffer(device_, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+                         D3D12_RESOURCE_STATE_COPY_DEST, od_rb_, error, "overdraw readback")) return false;
+        od_w_ = width;
+        od_h_ = height;
+    } else {
+        barrier(init_cmd_.Get(), od_buf_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+    init_cmd_->CopyBufferRegion(od_buf_.Get(), 0, od_zero_.Get(), 0, bytes);
+    barrier(init_cmd_.Get(), od_buf_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (!run_and_wait(queue, error)) return false;
+    od_on_ = true;
+    return true;
+}
+
+bool TreeRenderer::overdraw_read(ID3D12CommandQueue* queue, std::vector<uint32_t>& out, std::string& error) {
+    if (!od_buf_) return false;
+    const UINT64 bytes = UINT64(od_w_) * od_h_ * 8;
+    barrier(init_cmd_.Get(), od_buf_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    init_cmd_->CopyBufferRegion(od_rb_.Get(), 0, od_buf_.Get(), 0, bytes);
+    barrier(init_cmd_.Get(), od_buf_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (!run_and_wait(queue, error)) return false;
+    uint32_t* p = nullptr;
+    od_rb_->Map(0, nullptr, reinterpret_cast<void**>(&p));
+    out.assign(p, p + size_t(od_w_) * od_h_ * 2);
+    D3D12_RANGE w = {0, 0};
+    od_rb_->Unmap(0, &w);
+    return true;
+}
+
+void TreeRenderer::overdraw_end() { od_on_ = false; }
 
 void TreeRenderer::shutdown() {
     for (int f = 0; f < 2; ++f) {

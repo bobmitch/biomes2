@@ -70,6 +70,33 @@ Last gathered: 2026-11-21, after the exploration fog.
 - **Bushes are still leaf cards at arm's length**: better arranged, but a
   real mesh (as the trees have) would be the next step; the sparse kind
   can read as a lone sprig. [Ground cover]
+- **A dense wood still costs ~5.5 ms of a 4K frame** after the depth
+  prepass (12.3 ms against 6.8 without trees; 24.1 before). Good enough for
+  now. If it has to come down again, the candidates, measured with
+  `--gpu-profile` at seed 0's densest stand (`tools/profile/prof_ab.ps1`),
+  roughly in order of payoff for risk -- none built:
+  1. **Cascade 0's LOD 0 casters past its 28 m slice on the card path**,
+     as its LOD 1 casters already are. Most of cascade 0's 1.3 ms. Their
+     shadows reach the near ground only when looking into a low sun, where
+     the dapple would turn into the dithered average: judge that view.
+  2. **A baked leaf-coverage texture** instead of the procedural leaf cells:
+     the test is still ~60% of the prepass (2.5 ms) and of cascade 0's
+     casters. A few variants of the smooth coverage field, bilinear and cut
+     at 0.5 like a distance field; check near cards at 4K stay sharp and
+     the impostor bake still matches.
+  3. **Fewer, denser leaf cards per crown**: 15 surviving layers per covered
+     pixel where ~5 at 55% already block 98% of the sky. Cuts the prepass,
+     the casters and the vertex work together, but it is a tree-mesh change
+     (`tree_mesh.cpp`): judge the crowns' look and the canopy map's shade.
+  4. **Front-to-back instance order within a level** (sort the visible list
+     or the tiles by distance): more of the prepass rejected by early depth.
+     Cheap to try; a single crown's own layers are most of the overdraw, so
+     expect a modest gain.
+  5. **The grass and bushes through the same prepass** if foliage ever
+     grows: today 0.27 ms, not worth it.
+  6. **The post chain**, 3.3 ms at 4K, was not looked at here: AO, TAA,
+     the composite and the sea scale with pixels.
+  [Trees: What a wood costs at 4K]
 - **Root flares assume flat ground**: on a steep slope the downhill side
   can float. [Trees]
 - The level cross-fades and the far fade still dither on the screen, and

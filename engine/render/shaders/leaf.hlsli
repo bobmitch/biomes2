@@ -19,11 +19,15 @@ float hash11(float x) {
     return float((h ^ (h >> 13)) & 0xFFFFu) / 65535.0f;
 }
 
-float hash2(float2 c) {
+uint hash2u(float2 c) {
     const uint2 q = uint2(int2(floor(c)) + int2(0x4000, 0x4000));
     uint h = q.x * 0x8da6b343u ^ q.y * 0xd8163841u;
     h = (h ^ (h >> 13)) * 0xcb1ab31fu;
-    return float((h ^ (h >> 16)) & 0xFFFFu) / 65535.0f;
+    return h ^ (h >> 16);
+}
+
+float hash2(float2 c) {
+    return float(hash2u(c) & 0xFFFFu) / 65535.0f;
 }
 
 float vnoise(float2 p) {
@@ -48,9 +52,14 @@ float leaf_layer(float2 uv, float cells, float seed, float narrow) {
     const float2 g = uv * cells;
     const float2 c = floor(g);
     const float2 f = g - c - 0.5f;
-    const float h0 = hash2(c + seed * 97.0f);
-    const float h1 = hash2(c.yx + seed * 53.0f + 17.0f);
-    const float h2 = hash2(c + seed * 31.0f + 41.0f);
+    // One hash, three 10-bit draws. It was three hashes, each three integer
+    // multiplies at a quarter of the float rate, and this function runs for
+    // every leaf fragment in the depth prepass and the first shadow cascade:
+    // tens of millions a frame in a wood at 4K.
+    const uint hh = hash2u(c + seed * 97.0f);
+    const float h0 = float(hh & 0x3FFu) * (1.0f / 1023.0f);
+    const float h1 = float((hh >> 10) & 0x3FFu) * (1.0f / 1023.0f);
+    const float h2 = float((hh >> 20) & 0x3FFu) * (1.0f / 1023.0f);
     if (h2 < 0.06f) return 0.0f;   // a few gaps, so a card is not a lattice
     const float ang = h0 * 6.2831853f;
     const float2 d = f - (float2(h1, h2) - 0.5f) * 0.18f;

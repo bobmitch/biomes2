@@ -667,6 +667,10 @@ void register_tunables() {
     // Lights.
     toggle("torch", "Lights", "Carry a torch", [&] { return R.carried_torch(); },
            [&](bool b) { R.set_carried_torch(b); });
+
+    // Trees: the depth prepass, live, for A/B (--no-tree-prepass).
+    toggle("tree_prepass", "Trees", "Depth prepass", [&] { return R.tree_prepass(); },
+           [&](bool b) { R.set_tree_prepass(b); });
 }
 
 // Brings the UI up over the window loop. Failure leaves the engine as it was
@@ -1249,6 +1253,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const size_t tg = c2.find("--tree-debug");
         if (tg != std::string::npos) g_renderer.tree_settings().debug = float(std::atof(c2.c_str() + tg + 12));
         if (c2.find("--no-trees") != std::string::npos) g_renderer.set_trees(false);
+        if (c2.find("--no-tree-prepass") != std::string::npos) g_renderer.set_tree_prepass(false);
         if (c2.find("--no-shadows") != std::string::npos) g_renderer.set_shadows(false);
         if (c2.find("--no-foliage") != std::string::npos) g_renderer.set_foliage(false);
         if (c2.find("--no-taa") != std::string::npos) g_renderer.set_taa(false);
@@ -1447,6 +1452,178 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 }
                 g_renderer.set_capture_raw(false);
                 if (sl) std::fclose(sl);
+            }
+        }
+        {
+            // --gpu-profile [frames]: where a still's GPU time goes, pass by
+            // pass, and how much the tree pass overdraws. Writes
+            // <shot>.gpu.txt and <shot>.overdraw.bmp. The camera stays still
+            // and the clock runs, as in --shake.
+            const std::string cl = cmdline ? cmdline : "";
+            const size_t gp = cl.find("--gpu-profile");
+            if (ok && gp != std::string::npos) {
+                int n = 120;
+                {
+                    const size_t q = cl.find_first_not_of(" \t", gp + 13);
+                    if (q != std::string::npos && cl[q] != '-') n = std::atoi(cl.c_str() + q);
+                    if (n < 8) n = 120;
+                }
+                engine::GpuProfiler& prof = g_renderer.profiler();
+                float t = 0.0f;
+                auto run = [&](int frames) {
+                    for (int i = 0; i < frames; ++i) {
+                        t += 1.0f / 60.0f;
+                        fill_view(g_camera, g_res_w, g_res_h, t, v);
+                        g_renderer.step_offscreen(v);
+                    }
+                };
+                run(30);   // settle the streamers, the history, the exposure
+                // The frame as it runs: first and last marks only.
+                g_renderer.set_profiling(true);
+                prof.set_detail(false);
+                prof.reset(2);
+                run(n);
+                g_renderer.flush();
+                prof.harvest_all();
+                const unsigned whole_frames = prof.frames();
+                const double whole_ms = whole_frames ? prof.total_ms() / whole_frames : 0.0;
+                // Pass by pass, serialised.
+                prof.set_detail(true);
+                prof.reset(2);
+                run(n);
+                g_renderer.flush();
+                prof.harvest_all();
+                g_renderer.set_profiling(false);
+                const unsigned pf = prof.frames() ? prof.frames() : 1u;
+                const double W = g_res_w, H = g_res_h;
+                const std::string gpath = shot_path + ".gpu.txt";
+                FILE* gf = std::fopen(gpath.c_str(), "w");
+                if (gf) {
+                    std::fprintf(gf, "gpu profile: %.0f x %.0f, camera (%.1f, %.1f, %.1f) yaw %.2f pitch %.2f, %d frames each\n",
+                                 W, H, g_camera.x, g_camera.y, g_camera.z, g_camera.yaw, g_camera.pitch, n);
+                    std::fprintf(gf, "frame, as it runs (first to last mark, passes overlapping): %.3f ms over %u frames\n",
+                                 whole_ms, whole_frames);
+                    std::fprintf(gf, "frame, every pass serialised by a barrier:                  %.3f ms over %u frames\n\n",
+                                 prof.total_ms() / pf, prof.frames());
+                    std::fprintf(gf, "%-58s %9s %9s %7s\n", "pass (named by the mark that ends it)", "ms/frame", "max ms", "frames");
+                    double sum = 0.0;
+                    const std::vector<std::pair<std::string, engine::GpuProfiler::Segment> > segs = prof.ordered_segments();
+                    for (size_t i = 0; i < segs.size(); ++i) {
+                        const double ms = segs[i].second.ms / pf;
+                        sum += ms;
+                        std::fprintf(gf, "%-58s %9.3f %9.3f %7u\n", segs[i].first.c_str(), ms, segs[i].second.ms_max,
+                                     segs[i].second.frames);
+                    }
+                    // Groups, for the headline.
+                    double g_trees = 0.0, g_shadow_trees = 0.0, g_shadow_terrain = 0.0, g_foliage = 0.0, g_terrain = 0.0;
+                    for (size_t i = 0; i < segs.size(); ++i) {
+                        const std::string& nm = segs[i].first;
+                        const double ms = segs[i].second.ms / pf;
+                        if (nm.compare(0, 6, "trees ") == 0) g_trees += ms;
+                        if (nm.compare(0, 8, "shadow c") == 0 && nm.find("trees") != std::string::npos) g_shadow_trees += ms;
+                        if (nm.compare(0, 8, "shadow c") == 0 && nm.find("terrain") != std::string::npos) g_shadow_terrain += ms;
+                        if (nm == "foliage") g_foliage += ms;
+                        if (nm == "terrain") g_terrain += ms;
+                    }
+                    std::fprintf(gf, "\nsum of passes %.3f ms. Groups: trees (camera) %.3f ms; tree shadow casters %.3f ms; "
+                                     "terrain + rocks shadow casters %.3f ms; foliage %.3f ms; terrain %.3f ms\n",
+                                 sum, g_trees, g_shadow_trees, g_shadow_terrain, g_foliage, g_terrain);
+                    std::fprintf(gf, "\npipeline statistics, per frame it ran (PS invocations: the overdraw PAID, after early depth)\n");
+                    std::fprintf(gf, "%-28s %12s %12s %12s %14s %10s %7s\n", "draws", "VS inv", "prims in", "prims raster",
+                                 "PS invocations", "per pixel", "frames");
+                    const std::vector<std::pair<std::string, engine::GpuProfiler::Stat> > sts = prof.ordered_stats();
+                    for (size_t i = 0; i < sts.size(); ++i) {
+                        const engine::GpuProfiler::Stat& st2 = sts[i].second;
+                        const double f = st2.frames ? double(st2.frames) : 1.0;
+                        std::fprintf(gf, "%-28s %12.0f %12.0f %12.0f %14.0f %10.3f %7u\n", sts[i].first.c_str(), st2.vs / f,
+                                     st2.ia_prims / f, st2.c_prims / f, st2.ps / f, st2.ps / f / (W * H), st2.frames);
+                    }
+                }
+                // One frame through the counting shaders.
+                std::vector<uint32_t> od;
+                std::string oerr;
+                if (g_renderer.tree_overdraw_begin(oerr)) {
+                    run(1);
+                    g_renderer.tree_overdraw_read(od, oerr);
+                }
+                const size_t px = size_t(W) * size_t(H);
+                if (gf && od.size() == px * 2) {
+                    double inv = 0, surv = 0, leaf = 0, imp = 0;
+                    size_t touched = 0, covered = 0;
+                    unsigned max_inv = 0, max_surv = 0;
+                    size_t hist[7] = {0, 0, 0, 0, 0, 0, 0};   // survived: 1, 2, 3-4, 5-8, 9-16, 17-32, 33+
+                    std::vector<unsigned char> bgr(px * 3, 0);
+                    for (size_t i = 0; i < px; ++i) {
+                        const unsigned a = od[i * 2] & 0xFFFFu, b = od[i * 2] >> 16;
+                        const unsigned c = od[i * 2 + 1] & 0xFFFFu, d = od[i * 2 + 1] >> 16;
+                        inv += a; surv += b; leaf += c; imp += d;
+                        if (a) ++touched;
+                        if (b) ++covered;
+                        max_inv = (std::max)(max_inv, a);
+                        max_surv = (std::max)(max_surv, b);
+                        if (b) {
+                            const int k = b <= 1 ? 0 : b <= 2 ? 1 : b <= 4 ? 2 : b <= 8 ? 3 : b <= 16 ? 4 : b <= 32 ? 5 : 6;
+                            ++hist[k];
+                        }
+                        // Heat: the rasterised layers, black 0, blue 1, green 4,
+                        // yellow 8, red 16, white 32+.
+                        const float l = a == 0 ? 0.0f : std::log2(float(a)) / 5.0f;
+                        float r = 0, g = 0, bl = 0;
+                        if (a) {
+                            if (l < 0.4f) { bl = 1.0f - l / 0.4f; g = l / 0.4f; }
+                            else if (l < 0.6f) { g = 1.0f; r = (l - 0.4f) / 0.2f; }
+                            else if (l < 0.8f) { r = 1.0f; g = 1.0f - (l - 0.6f) / 0.2f; }
+                            else { r = 1.0f; g = bl = (std::min)(1.0f, (l - 0.8f) / 0.2f); }
+                            r = 0.15f + 0.85f * r; g = 0.15f + 0.85f * g; bl = 0.15f + 0.85f * bl;
+                        }
+                        const size_t x = i % size_t(W), y = i / size_t(W);
+                        const size_t o = ((size_t(H) - 1 - y) * size_t(W) + x) * 3;   // BMP rows run bottom-up
+                        bgr[o + 0] = (unsigned char)(bl * 255.0f);
+                        bgr[o + 1] = (unsigned char)(g * 255.0f);
+                        bgr[o + 2] = (unsigned char)(r * 255.0f);
+                    }
+                    const double cov = covered ? double(covered) : 1.0;
+                    std::fprintf(gf, "\ntree overdraw, camera pass, one frame (counting shaders: late depth, so every "
+                                     "rasterised fragment runs)\n");
+                    std::fprintf(gf, "  fragments rasterised %.0f (%.2f per screen pixel, %.2f per touched pixel, max %u); "
+                                     "touched %.1f%% of the screen\n",
+                                 inv, inv / double(px), touched ? inv / double(touched) : 0.0, max_inv,
+                                 100.0 * double(touched) / double(px));
+                    std::fprintf(gf, "  survived coverage + dither %.0f (%.1f%% of rasterised): leaf cards %.0f, impostors %.0f, "
+                                     "bark %.0f\n", surv, inv > 0 ? 100.0 * surv / inv : 0.0, leaf, imp, surv - leaf - imp);
+                    std::fprintf(gf, "  covered pixels %.1f%% of the screen; survivors per covered pixel %.2f (max %u) -- "
+                                     "a depth prepass would shade ~1\n",
+                                 100.0 * double(covered) / double(px), surv / cov, max_surv);
+                    std::fprintf(gf, "  survivors per covered pixel: 1: %.1f%%, 2: %.1f%%, 3-4: %.1f%%, 5-8: %.1f%%, 9-16: %.1f%%, "
+                                     "17-32: %.1f%%, 33+: %.1f%%\n",
+                                 100.0 * hist[0] / cov, 100.0 * hist[1] / cov, 100.0 * hist[2] / cov, 100.0 * hist[3] / cov,
+                                 100.0 * hist[4] / cov, 100.0 * hist[5] / cov, 100.0 * hist[6] / cov);
+                    const std::string hp = shot_path + ".overdraw.bmp";
+                    FILE* bf = std::fopen(hp.c_str(), "wb");
+                    if (bf) {
+                        const int w = int(W), h = int(H);
+                        const int row = (w * 3 + 3) & ~3;
+                        const unsigned size = 54u + unsigned(row) * unsigned(h);
+                        unsigned char hd[54] = {'B', 'M'};
+                        auto put32 = [&](int at, unsigned val) {
+                            for (int k = 0; k < 4; ++k) hd[at + k] = (unsigned char)(val >> (8 * k));
+                        };
+                        put32(2, size); put32(10, 54); put32(14, 40); put32(18, unsigned(w)); put32(22, unsigned(h));
+                        hd[26] = 1; hd[28] = 24;
+                        std::fwrite(hd, 1, 54, bf);
+                        const unsigned char pad[3] = {0, 0, 0};
+                        for (int y = 0; y < h; ++y) {
+                            std::fwrite(&bgr[size_t(y) * size_t(w) * 3], 1, size_t(w) * 3, bf);
+                            std::fwrite(pad, 1, size_t(row - w * 3), bf);
+                        }
+                        std::fclose(bf);
+                        std::fprintf(gf, "  heat map of rasterised layers: %s (black 0, blue 1, green 4, yellow 8, red 16, "
+                                         "white 32+)\n", hp.c_str());
+                    }
+                } else if (gf) {
+                    std::fprintf(gf, "\ntree overdraw: not measured (%s)\n", oerr.empty() ? "no trees" : oerr.c_str());
+                }
+                if (gf) std::fclose(gf);
             }
         }
         const engine::FrameStats st = g_renderer.stats();

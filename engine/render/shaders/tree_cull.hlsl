@@ -76,7 +76,7 @@ void append(uint d, uint entry) {
     // --tree-debug 2/3/4: only LOD 0 / LOD 1 / impostors, for isolating a
     // level's artefacts.
     if (debug > 1.5f) {
-        const uint lvl = d >= model_count * 2u ? 2u : (d & 1u);
+        const uint lvl = d >= model_count * 2u ? 2u : (d >= model_count ? 1u : 0u);
         if (lvl != uint(debug - 2.0f + 0.5f)) return;
     }
     uint at;
@@ -122,7 +122,9 @@ void cs_cull(uint3 id : SV_DispatchThreadID) {
         if (dot(frustum[k].xyz, c) + frustum[k].w < -r) return;
     }
 
-    const uint mesh0 = t.model * 2u, mesh1 = t.model * 2u + 1u;
+    // Level-major slots (tree_renderer.cpp): every model's LOD 0, then
+    // every model's LOD 1, then the impostors.
+    const uint mesh0 = t.model, mesh1 = model_count + t.model;
     const uint imp = model_count * 2u;
 
     // Logs and stumps are few and near; always the full mesh.
@@ -175,9 +177,10 @@ void cs_args(uint3 id : SV_DispatchThreadID) {
     const uint n = min(g_counters[d], s.y);
     uint first = 0u, count = 0u, base = 0u;
     if (d < model_count * 2u) {
-        const ModelInfo m = g_models[d >> 1];
-        if ((d & 1u) == 0u) { first = m.first0; count = m.count0; base = m.base0; }
-        else                { first = m.first1; count = m.count1; base = m.base1; }
+        const bool lod1 = d >= model_count;
+        const ModelInfo m = g_models[lod1 ? d - model_count : d];
+        if (!lod1) { first = m.first0; count = m.count0; base = m.base0; }
+        else       { first = m.first1; count = m.count1; base = m.base1; }
     } else {
         first = quad_first; count = 6u; base = quad_base;
     }
