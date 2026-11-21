@@ -389,11 +389,25 @@ SceneOut ps_mesh(MeshOut i, bool front : SV_IsFrontFace) {
     } else if (i.kind < 2.5f) {
         foliage = true;
         const float blur = length(fwidth(i.uv));
-        const float a = leaf_coverage(i.uv, i.kind, i.seed, blur, i.narrow);
-        // Coverage tested against the dither once the card is small enough
-        // to shimmer, against 0.5 while it is sharp.
-        const float thr = lerp(0.5f, dither(i.clip.xy), saturate(blur * 6.0f));
-        if (a < thr) discard;
+        // Sharp leaves while the card can show them; solid clusters as it
+        // shrinks past that (leaf.hlsli leaf_cluster), on the switch the old
+        // dither used. A fixed 0.5 test throughout: no screen-door, nothing
+        // for TAA to lose in motion.
+        const float k = saturate(blur * 6.0f);
+        float a;
+        if (i.narrow > 0.5f) {
+            // A willow's strands keep their own fine leaves at every
+            // distance, cut at 0.5: the pattern is fixed to the card, so it
+            // moves with the strand and TAA averages the leaves into a soft
+            // curtain. Solid clusters -- blobs, then strips -- read as fat
+            // tongues and then as blocks.
+            const float rim = 1.0f - saturate((length(i.uv - 0.5f) - 0.40f) / 0.1f);
+            a = rim * leaf_coverage_sharp(i.uv, i.kind, i.seed, blur, i.narrow);
+        } else {
+            a = k < 1.0f ? leaf_coverage(i.uv, i.kind, i.seed, blur, i.narrow) : 0.0f;
+            if (k > 0.0f) a = lerp(a, leaf_cluster(i.uv, i.kind, i.seed, i.narrow), k);
+        }
+        if (a < 0.5f) discard;
         const float var = 0.82f + 0.36f * frac(i.seed * 7.31f) ;
         albedo = i.leaf * var * (0.9f + 0.2f * i.tint);
         // Sunlit cards a touch yellower, shaded ones bluer: the cheapest

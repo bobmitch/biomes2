@@ -603,6 +603,33 @@ Trees use the terrain's sun, sky term and fog. The draw-distance slider is
 `-`/`=` (100-2000 m, default 500); terrain is unaffected. Cost, uncapped:
 ~0.4 ms a frame at spawn, ~0.6 ms over the densest forest.
 
+**Distant leaf cards are solid clusters, not a halftone.** Once a card is
+too small for its leaves (`blur * 6`, ~30 m on), its coverage used to be
+the pattern's average tested against the screen-fixed dither: the dots
+stayed still while the leaves slid under them, so TAA dropped its history in
+motion and mid-distance crowns went see-through and blurred; and every card
+tested against the SAME screen pattern, so overlapping cards kept the same
+pixels and a crown never got denser than one card. `leaf_cluster`
+(`leaf.hlsli`) takes over on that switch: per-card value-noise blobs at a
+fixed 0.5 cut, set so a card keeps leaf_coverage's own 55%.
+**Willows are the exception, and were a regression twice.** Blobs on a
+tall strand card read as fat painted tongues; streaks within it as
+hatching; one solid strip per card as blocks. A willow's `narrow` cards keep
+their own sharp leaves at every distance, cut at 0.5 -- fixed to the card,
+so TAA averages them into a soft curtain. And the willow's LOD 1 was a
+DIFFERENT TREE: 4-5 branches a limb and one strand 1.7x as wide where LOD 0
+had 7-8 and three, so it drew a different number of randoms and every
+branch after the first moved. Now both levels have the same branches and
+the same three strands, each from a generator of its own (`srng`, one
+draw from the tree's), so the far level's fewer, longer cards hang where
+the near level's do. Cost: +0.25 ms walking in a willow wood; the RT
+cutouts 1.87 -> 2.07 M triangles, 292 -> 323 MB. Sky through the
+crowns' upper third of a woodland still: 10.7% before, 10.6% after. Lit pass
+only -- the shadow casters and `leaf_cutout.cpp`'s port keep
+`leaf_coverage`. Walking cost within noise. The level cross-fades and far
+fade still dither on the screen (walking per frame), and the grass's clump
+cards fade against the blades the same way.
+
 **Felling** (`TreeFelling`): trunks within 40 m of the player are static
 capsules; a click swings from the eye; 2 + one per 6 cm of diameter fells it.
 The tree's id is marked felled, a stump (static) and a log (Jolt rigid body:

@@ -305,8 +305,10 @@ void build_broadleaf(Builder& b, TreeMesh& m, const TreeLook& L, float H, int lo
         const float rb = (std::min)(sr * 0.38f, 0.02f * Ln + 0.03f);
         std::vector<Node> limb = branch_nodes(sp, d, Ln, rb, rb * 0.15f, 0.25f, 5, 0.25f, 0.6f, &cr, rng);
         if (lod == 0 || rb > 0.07f) b.tube(limb, lod == 0 ? 7 : 5);
-        // Second-order branches along the limb.
-        const int subs = (lod == 0 ? 7 : 4) + int(rng.uni() * 2.0f);
+        // Second-order branches along the limb. A willow keeps the near
+        // level's count at both levels: its strands hang from them, and with
+        // fewer the far level was a different, sparser tree.
+        const int subs = (lod == 0 || weeping ? 7 : 4) + int(rng.uni() * 2.0f);
         for (int j = 0; j < subs; ++j) {
             const float t = 0.3f + 0.65f * (float(j) + rng.uni() * 0.5f) / float(subs);
             const size_t ni = std::min(limb.size() - 2, size_t(t * (limb.size() - 1)));
@@ -321,19 +323,28 @@ void build_broadleaf(Builder& b, TreeMesh& m, const TreeLook& L, float H, int lo
             if (lod == 0) b.tube(sub, 5);
             if (weeping) {
                 // Strands hanging from the branch end: the willow's curtain.
+                // The SAME three strands at both levels, from a generator of
+                // their own (one draw from the tree's), so the far level's
+                // fewer, longer cards hang where the near level's do and do
+                // not shift every branch after them. Before, the far level had
+                // one strand a branch, 1.7x as wide, from a different stream
+                // of draws: a different tree, which the solid far leaves made
+                // plain as it switched.
+                Rng srng(rng.next());
                 const V3 tip = sub.back().p;
-                const int strands = lod == 0 ? 3 : 1;
-                for (int s = 0; s < strands; ++s) {
-                    const V3 top = tip + V3(rng.range(-1, 1), 0, rng.range(-1, 1)) * leaf * 0.6f;
-                    const float drop = std::min(top.y - 0.8f, H * rng.range(0.25f, 0.5f));
+                const float leaf0 = L.leaf_size;   // the near level's leaf, for the strand's width
+                for (int s = 0; s < 3; ++s) {
+                    const V3 top = tip + V3(srng.range(-1, 1), 0, srng.range(-1, 1)) * leaf0 * 0.6f;
+                    const float drop = std::min(top.y - 0.8f, H * srng.range(0.25f, 0.5f));
                     const int cards = std::max(2, int(drop / (leaf * 1.2f)));
                     const V3 out = norm(V3(top.x, 0, top.z) + V3(0.001f, 0, 0));
+                    const float turn = srng.range(-0.6f, 0.6f);
                     for (int c = 0; c < cards; ++c) {
-                        const V3 ctr = top - V3(0, (float(c) + 0.5f) * drop / cards, 0) + out * (0.15f * c);
+                        const V3 ctr = top - V3(0, (float(c) + 0.5f) * drop / cards, 0) + out * (0.15f * float(c) * leaf / leaf0);
                         const V3 hv(0, drop / cards * 0.6f, 0);
-                        const V3 hu = rotate(out, V3(0, 1, 0), rng.range(-0.6f, 0.6f)) * (leaf * (lod == 0 ? 0.35f : 0.6f));
+                        const V3 hu = rotate(out, V3(0, 1, 0), turn) * (leaf0 * 0.35f);
                         const float depth = clamp01(cr.depth(ctr));
-                        b.card(ctr, hu, hv, norm(out + V3(0, 0.3f, 0)), kKindLeaf, rng.uni(),
+                        b.card(ctr, hu, hv, norm(out + V3(0, 0.3f, 0)), kKindLeaf, srng.uni(),
                                0.7f + 0.3f * float(c) / cards, 0.35f + 0.6f * depth);
                     }
                 }

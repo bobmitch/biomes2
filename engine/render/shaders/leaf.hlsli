@@ -76,6 +76,43 @@ float leaf_coverage(float2 uv, float kind, float seed, float blur, float narrow)
     return rim * lerp(leaf_coverage_sharp(uv, kind, seed, blur, narrow), avg, saturate(blur * 5.0f - 0.25f));
 }
 
+// A card's leaves as SOLID CLUSTERS, for once the card is too small for its
+// leaves (the lit pass only; trees.hlsl ps_mesh). A few blobs per card from
+// value noise seeded by the card, cut at a fixed level -- no dither: the
+// screen-fixed dither held the pixels still while the leaves slid under them,
+// so TAA threw its history away in motion and distant crowns went to a
+// see-through halftone; and every card tested against the SAME screen
+// pattern, so overlapping cards kept the same pixels and a crown of a hundred
+// cards stayed at one card's 55%. Cut so the share inside the rim is about
+// leaf_coverage's own average, 0.55 -- the same fill, placed per card, so
+// cards stack as leaves do. Returns a field whose 0.5 level is the edge, so it
+// blends with the sharp coverage under the same 0.5 test.
+// Not in leaf_cutout.cpp's port: the RT shadow's cutouts and the shadow
+// casters keep leaf_coverage.
+//
+// `narrow` cards (a willow's hanging strands: u across, v down the strand)
+// get STRANDS instead of blobs -- thin streaks running the card's length,
+// across its full width. Round blobs on a tall strand card read as fat
+// painted tongues, a different tree from the near one's fine curtain.
+float leaf_cluster(float2 uv, float kind, float seed, float narrow) {
+    const float2 o = float2(seed * 13.7f, seed * 29.3f);
+    if (narrow > 0.5f) {
+        // The card IS a strand (three thin ones a branch at both levels,
+        // tree_mesh.cpp): a leafy strip down its middle, broken along its
+        // length, tapering at the ends. Streaks within a card -- seven of
+        // them -- read as hatching, not hanging leaves.
+        const float w = 0.26f + 0.08f * vnoise(float2(uv.y * 5.0f, 0.5f) + o);
+        const float band = 1.0f - saturate((abs(uv.x - 0.5f) - w) / 0.06f);
+        const float ends = saturate(uv.y * 6.0f) * saturate((1.0f - uv.y) * 4.0f);
+        const float gaps = vnoise(float2(0.5f, uv.y * 4.5f) + o.yx);
+        return band * ends * saturate(0.5f + (gaps - 0.35f) * 8.0f);
+    }
+    const float rim = 1.0f - saturate((length(uv - 0.5f) - 0.40f) / 0.1f);
+    const float n = 0.65f * vnoise(uv * 3.2f + o) + 0.35f * vnoise(uv * 6.5f + o.yx + 7.0f);
+    const float cut = kind < 1.5f ? 0.485f : 0.5f;
+    return rim * saturate(0.5f + (n - cut) * 8.0f);
+}
+
 float leaf_coverage_sharp(float2 uv, float kind, float seed, float blur, float narrow) {
     if (kind < 1.5f) {
         // Two layers half a cell apart: leaves overlap irregularly, which a
