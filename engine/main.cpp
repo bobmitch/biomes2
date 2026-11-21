@@ -26,6 +26,8 @@
 //   L           sun shadows on / off
 //   G           ground cover (grass, flowers, bushes) on / off
 //   Y O J       TAA, ambient occlusion, contact shadows on / off
+//   Esc         pause menu (resume, options, controls, quit) -- game/scripts
+//   F1 or `     the tuning panel: time, weather, fog, exposure, live
 // ---------------------------------------------------------------------------
 #include "engine/render/renderer.h"
 #include "engine/render/water_wave.h"
@@ -35,12 +37,14 @@
 #include "engine/camera.h"
 #include "engine/physics/physics_world.h"
 #include "engine/trees/felling.h"
+#include "engine/ui/ui.h"
 
 #include <windows.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -209,6 +213,16 @@ void step_window_physics(float dt, float t, float vx, float vz, bool jump, float
     g_physics.character_position(g_feet);
 }
 bool g_captured = false;
+// The UI layer (engine/ui, game/): absent in every headless mode. Paused
+// stops the game clock, physics and the camera; the frame still draws, so the
+// tuning panel's changes show behind the menu.
+engine::ui::Ui   g_ui;
+engine::ui::Host g_host;
+bool g_paused = false;
+// The display as the options screen sees it. Borderless renders at
+// g_display.width x height and DXGI stretches it to the monitor; windowed
+// renders at the client size.
+engine::ui::DisplayState g_display;
 // The window's client size, and so every mode's render size: --res W H
 // (1280 x 720 by default), so a cost can be measured at the resolution it
 // will be played at.
@@ -229,9 +243,13 @@ void set_capture(HWND hwnd, bool on) {
 }
 
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_ui.ready() && g_ui.on_message(hwnd, msg, wp, lp, g_captured)) return 0;
     switch (msg) {
         case WM_SIZE:
-            if (wp != SIZE_MINIMIZED) g_renderer.resize(LOWORD(lp), HIWORD(lp));
+            if (wp != SIZE_MINIMIZED) {
+                if (g_display.borderless) g_renderer.resize(UINT(g_display.width), UINT(g_display.height));
+                else g_renderer.resize(LOWORD(lp), HIWORD(lp));
+            }
             return 0;
         case WM_LBUTTONDOWN:
             // The first click captures the mouse; once captured, a click is
@@ -431,6 +449,249 @@ void fill_view(const engine::Camera& cam, float w, float h, float t,
     v.cap_pos[2] = g_feet[2];
     v.cap_r = g_walk ? kCapsuleRadius : 0.0f;
     v.cap_half = kCapsuleHalf;
+}
+
+// --- The script host: what game/scripts may read and set ---------------------
+//
+// Every knob is a Tunable (engine/ui/script_api.h): a name, a range, a getter
+// and a setter. The "Graphics" group is the options screen and is saved to
+// build/settings.lua by the script; every other group is the tuning panel,
+// for auditioning values live, and is NOT saved -- the authored values stay
+// in archetypes.json, where the panel's findings belong once settled.
+
+std::vector<std::pair<int, int> > display_modes(HWND hwnd) {
+    MONITORINFOEXA mi = {};
+    mi.cbSize = sizeof mi;
+    GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    std::vector<std::pair<int, int> > out;
+    DEVMODEA dm = {};
+    dm.dmSize = sizeof dm;
+    for (DWORD i = 0; EnumDisplaySettingsA(mi.szDevice, i, &dm); ++i)
+        if (dm.dmPelsWidth >= 800 && dm.dmPelsHeight >= 600)
+            out.push_back(std::make_pair(int(dm.dmPelsWidth), int(dm.dmPelsHeight)));
+    std::sort(out.begin(), out.end(), [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+        return a.first != b.first ? a.first > b.first : a.second > b.second;
+    });
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+engine::ui::DisplayState current_display(HWND hwnd) {
+    engine::ui::DisplayState d = g_display;
+    d.vsync = g_renderer.vsync();
+    if (!d.borderless) {
+        RECT cr;
+        GetClientRect(hwnd, &cr);
+        d.width = int(cr.right - cr.left);
+        d.height = int(cr.bottom - cr.top);
+    }
+    return d;
+}
+
+// Windowed: a framed window with that client size, centred on its monitor.
+// Borderless: a popup over the whole monitor, the swapchain at the asked
+// size and stretched by DXGI -- so a lower resolution costs what it should
+// while the window stays full screen. No exclusive mode: flip-model
+// borderless presents as fast, and alt-tab never loses the device.
+void apply_display(HWND hwnd, engine::ui::DisplayState d) {
+    g_renderer.set_vsync(d.vsync);
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof mi;
+    GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    d.width = (std::max)(640, (std::min)(d.width, 7680));
+    d.height = (std::max)(360, (std::min)(d.height, 4320));
+    g_display = d;
+    if (d.borderless) {
+        const RECT& m = mi.rcMonitor;
+        SetWindowLongPtrA(hwnd, GWL_STYLE, LONG_PTR(WS_POPUP | WS_VISIBLE));
+        SetWindowPos(hwnd, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        g_renderer.resize(UINT(d.width), UINT(d.height));
+    } else {
+        const DWORD style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+        SetWindowLongPtrA(hwnd, GWL_STYLE, LONG_PTR(style));
+        RECT rc = {0, 0, LONG(d.width), LONG(d.height)};
+        AdjustWindowRect(&rc, style, FALSE);
+        const RECT& wa = mi.rcWork;
+        const int ww = rc.right - rc.left, wh = rc.bottom - rc.top;
+        const int x = wa.left + (std::max)(0, int(wa.right - wa.left - ww) / 2);
+        const int y = wa.top + (std::max)(0, int(wa.bottom - wa.top - wh) / 2);
+        SetWindowPos(hwnd, nullptr, x, y, ww, wh, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER);
+        RECT cr;
+        GetClientRect(hwnd, &cr);
+        g_renderer.resize(UINT(cr.right - cr.left), UINT(cr.bottom - cr.top));
+    }
+}
+
+void register_tunables() {
+    using engine::ui::Tunable;
+    using engine::ui::TunableKind;
+    std::vector<Tunable>& T = g_host.tunables;
+    auto range = [&](const std::string& id, const char* group, const std::string& label, float mn, float mx,
+                     float step, const char* unit, std::function<float()> get, std::function<void(float)> set) {
+        Tunable t;
+        t.id = id; t.group = group; t.label = label;
+        t.kind = TunableKind::Range;
+        t.min = mn; t.max = mx; t.step = step; t.unit = unit;
+        t.get = std::move(get); t.set = std::move(set);
+        T.push_back(t);
+    };
+    auto toggle = [&](const char* id, const char* group, const char* label,
+                      std::function<bool()> get, std::function<void(bool)> set) {
+        Tunable t;
+        t.id = id; t.group = group; t.label = label;
+        t.kind = TunableKind::Toggle;
+        t.min = 0.0f; t.max = 1.0f; t.step = 1.0f;
+        t.get = [get]() { return get() ? 1.0f : 0.0f; };
+        t.set = [set](float v) { set(v > 0.5f); };
+        T.push_back(t);
+    };
+    auto choice = [&](const char* id, const char* group, const char* label, std::vector<std::string> names,
+                      std::function<float()> get, std::function<void(float)> set) {
+        Tunable t;
+        t.id = id; t.group = group; t.label = label;
+        t.kind = TunableKind::Choice;
+        t.min = 0.0f; t.max = float(names.size() - 1); t.step = 1.0f;
+        t.choices = std::move(names);
+        t.get = std::move(get); t.set = std::move(set);
+        T.push_back(t);
+    };
+    // Static, so the getters and setters below name it rather than capture a
+    // reference to a local that dies with this function.
+    static engine::Renderer& R = g_renderer;
+
+    // Graphics: the options screen, saved.
+    const char* G = "Graphics";
+    toggle("shadows", G, "Sun shadows", [&] { return R.shadows(); }, [&](bool b) { R.set_shadows(b); });
+    toggle("light_shadows", G, "Torch and fire shadows", [&] { return R.light_shadows(); },
+           [&](bool b) { R.set_light_shadows(b); });
+    toggle("ao", G, "Ambient occlusion", [&] { return R.ao(); }, [&](bool b) { R.set_ao(b); });
+    toggle("contact", G, "Contact shadows", [&] { return R.contact(); }, [&](bool b) { R.set_contact(b); });
+    toggle("taa", G, "Temporal anti-aliasing", [&] { return R.taa(); }, [&](bool b) { R.set_taa(b); });
+    toggle("pom", G, "Parallax occlusion", [&] { return R.pom(); }, [&](bool b) { R.set_pom(b); });
+    toggle("hfgi", G, "Terrain bounce light", [&] { return R.hfgi(); }, [&](bool b) { R.set_hfgi(b); });
+    toggle("canopy", G, "Canopy shade", [&] { return R.canopy(); }, [&](bool b) { R.set_canopy(b); });
+    toggle("foliage", G, "Grass and flowers", [&] { return R.foliage_on(); }, [&](bool b) { R.set_foliage(b); });
+    toggle("trees", G, "Trees", [&] { return R.trees_on(); }, [&](bool b) { R.set_trees(b); });
+    range("tree_distance", G, "Tree draw distance", 100.0f, 2000.0f, 50.0f, "m",
+          [&] { return R.tree_settings().max_dist; }, [&](float v) { R.tree_settings().max_dist = v; });
+    choice("texture", G, "Surface texture", {"Flat", "Scans", "Grid", "Scans + grid"},
+           [&] { return R.texture_mode(); }, [&](float v) { R.set_texture_mode(std::floor(v + 0.5f)); });
+
+    // Time.
+    range("time", "Time", "Time of day", 0.0f, 24.0f, 0.05f, "h",
+          [&] { return R.time_of_day(); }, [&](float v) { R.set_time_of_day(v); });
+    toggle("time_lapse", "Time", "Run the clock (1 h / 10 s)", [] { return g_time_lapse; },
+           [](bool b) { g_time_lapse = b; });
+
+    // Weather. Setting the storm or the wind fixes the dial; "automatic"
+    // hands it back to the seed's weather.
+    const char* W = "Weather";
+    toggle("weather_auto", W, "Automatic weather", [&] { return R.weather().automatic(); },
+           [&](bool b) { if (b) R.weather().set_auto(); else R.set_sea_state(R.sea_state()); });
+    range("storm", W, "Storm", 0.0f, 1.0f, 0.01f, "", [&] { return R.sea_state(); },
+          [&](float v) { R.set_sea_state(v); });
+    range("wind", W, "Wind speed", 0.0f, 30.0f, 0.5f, "m/s", [&] { return R.weather_state().wind_speed; },
+          [&](float v) { R.weather().set_wind(v); });
+    range("wind_dir", W, "Wind heading", 0.0f, 359.0f, 1.0f, "deg",
+          [&] {
+              const engine::WeatherState& w = R.weather_state();
+              float h = std::atan2(w.wind_dir[1], w.wind_dir[0]) * 57.29578f;
+              return h < 0.0f ? h + 360.0f : h;
+          },
+          [&](float v) { R.weather().set_heading(v * 0.01745329f); });
+    range("swell", W, "Swell height", 0.0f, 4.0f, 0.05f, "m", [&] { return R.weather_state().swell_hs; },
+          [&](float v) { R.weather().set_swell(v); });
+    toggle("rain_auto", W, "Rain follows the storm", [&] { return R.rain_override() < 0.0f; },
+           [&](bool b) { R.set_rain(b ? -1.0f : R.rain_intensity()); });
+    range("rain", W, "Rain", 0.0f, 1.0f, 0.01f, "", [&] { return R.rain_intensity(); },
+          [&](float v) { R.set_rain(v); });
+    toggle("wet_auto", W, "Wetness follows the rain", [&] { return R.wet_override() < 0.0f; },
+           [&](bool b) {
+               float wet = 0.0f, puddle = 0.0f;
+               R.wetness(wet, puddle);
+               R.set_wet(b ? -1.0f : wet);
+           });
+    range("wet", W, "Wetness", 0.0f, 1.0f, 0.01f, "",
+          [&] {
+              float wet = 0.0f, puddle = 0.0f;
+              R.wetness(wet, puddle);
+              return wet;
+          },
+          [&](float v) { R.set_wet(v); });
+    toggle("clouds", W, "Clouds", [&] { return R.clouds(); }, [&](bool b) { R.set_clouds(b); });
+    toggle("rain_drawn", W, "Rain drawn", [&] { return R.rain_on(); }, [&](bool b) { R.set_rain_on(b); });
+    toggle("lightning", W, "Lightning", [&] { return R.lightning_on(); }, [&](bool b) { R.set_lightning(b); });
+
+    // Fog. The height layers as their sea-level VISIBILITY (the 2% contrast
+    // distance, 3.912 / sigma) and their thickness (the e-folding height);
+    // the shader still takes sigma.
+    const char* F = "Fog";
+    toggle("mist", F, "Mist (near, patchy)", [&] { return R.fog(); }, [&](bool b) { R.set_fog(b); });
+    range("mist_density", F, "Mist density", 0.0f, 5.0f, 0.05f, "x", [&] { return R.fog_density(); },
+          [&](float v) { R.set_fog_density(v); });
+    range("mist_top", F, "Mist thins above", 0.0f, 400.0f, 5.0f, "m",
+          [&] { return R.fog_settings().mist_top[0]; }, [&](float v) { R.fog_settings().mist_top[0] = v; });
+    toggle("height_fog", F, "Height fog (exploration)", [&] { return R.height_fog(); },
+           [&](bool b) { R.set_height_fog(b); });
+    range("height_fog_scale", F, "Height fog density", 0.0f, 5.0f, 0.05f, "x",
+          [&] { return R.height_fog_scale(); }, [&](float v) { R.set_height_fog_scale(v); });
+    auto layer = [&](const char* id, const char* label, float* lp, float vmin, float vmax, float vstep,
+                     float hmax, float hstep) {
+        range(std::string(id) + "_vis", F, std::string(label) + ": visibility at sea level", vmin, vmax, vstep,
+              "m", [lp] { return lp[0] > 0.0f ? 3.912f / lp[0] : 1e6f; },
+              [lp](float v) { lp[0] = 3.912f / (v > 1.0f ? v : 1.0f); });
+        range(std::string(id) + "_height", F, std::string(label) + ": thickness", 5.0f, hmax, hstep, "m",
+              [lp] { return lp[1]; }, [lp](float v) { lp[1] = v; });
+    };
+    engine::FogSettings& fs = R.fog_settings();
+    layer("ground", "Ground layer", fs.ground, 100.0f, 20000.0f, 50.0f, 500.0f, 5.0f);
+    layer("valley", "Valley layer (dawn peak)", fs.valley, 50.0f, 5000.0f, 10.0f, 300.0f, 5.0f);
+    layer("deep", "Deep layer", fs.deep, 2000.0f, 200000.0f, 500.0f, 5000.0f, 50.0f);
+    range("valley_noon", F, "Valley layer left at noon", 0.0f, 1.0f, 0.01f, "",
+          [&] { return R.fog_settings().valley_noon; }, [&](float v) { R.fog_settings().valley_noon = v; });
+    range("valley_wind", F, "Wind that clears the valleys", 1.0f, 20.0f, 0.5f, "m/s",
+          [&] { return R.fog_settings().valley_wind; }, [&](float v) { R.fog_settings().valley_wind = v; });
+
+    // Exposure.
+    const char* E = "Exposure";
+    range("ev_comp", E, "Exposure compensation", -4.0f, 4.0f, 0.25f, "EV", [&] { return R.ev_comp(); },
+          [&](float v) { R.set_ev_comp(v); });
+    choice("tonemap", E, "Tonemap", {"Raw", "AgX", "ACES"}, [&] { return float(R.tonemap()); },
+           [&](float v) { R.set_tonemap(unsigned(v + 0.5f)); });
+    range("agx_saturation", E, "AgX saturation", 0.5f, 2.0f, 0.05f, "", [&] { return R.agx_saturation(); },
+          [&](float v) { R.set_agx_saturation(v); });
+    range("agx_power", E, "AgX power (contrast)", 0.5f, 2.5f, 0.05f, "", [&] { return R.agx_power(); },
+          [&](float v) { R.set_agx_power(v); });
+
+    // Lights.
+    toggle("torch", "Lights", "Carry a torch", [&] { return R.carried_torch(); },
+           [&](bool b) { R.set_carried_torch(b); });
+}
+
+// Brings the UI up over the window loop. Failure leaves the engine as it was
+// before the UI existed (Esc releases the mouse, then quits); the reason is
+// in build/ui_log.txt.
+void setup_ui(HWND hwnd) {
+    register_tunables();
+    g_host.quit = [] { PostQuitMessage(0); };
+    g_host.set_paused = [](bool p) { g_paused = p; };
+    g_host.paused = [] { return g_paused; };
+    g_host.capture_mouse = [hwnd](bool on) { set_capture(hwnd, on); };
+    g_host.display = [hwnd] { return current_display(hwnd); };
+    g_host.display_modes = [hwnd] { return display_modes(hwnd); };
+    g_host.apply_display = [hwnd](const engine::ui::DisplayState& d) { apply_display(hwnd, d); };
+    std::string err;
+    if (!g_ui.init(hwnd, g_renderer.device(), g_renderer.width(), g_renderer.height(), &g_host, err)) {
+        if (FILE* ef = std::fopen("build/engine_error.txt", "w")) {
+            std::fprintf(ef, "ui init failed (running without it):\n%s\n", err.c_str());
+            std::fclose(ef);
+        }
+        return;
+    }
+    g_renderer.set_overlay([](ID3D12GraphicsCommandList* cmd, D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT w, UINT h) {
+        g_ui.draw(cmd, rtv, w, h);
+    });
 }
 
 }  // namespace
@@ -853,6 +1114,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                               rc.right - rc.left, rc.bottom - rc.top,
                               nullptr, nullptr, inst, nullptr);
     if (!hwnd) return 1;
+    g_display.width = int(g_res_w);
+    g_display.height = int(g_res_h);
+    g_display.borderless = res_given;
+    g_display.forced = res_given;
 
     // Every batch mode, not just --shot. The narrow version of this check
     // covered --shot only and --dig-save hung on a message box the very next
@@ -1118,6 +1383,32 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         engine::ViewConstants v = {};
         fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
 
+        // --ui "<lua>": bring the UI up, run the code against it (say,
+        // menu.open()) and draw it into the still -- the one way to check a
+        // document without a person at the window. Without it a shot holds
+        // no UI at all.
+        {
+            const std::string cl = cmdline ? cmdline : "";
+            const size_t ui = cl.find("--ui ");
+            if (ui != std::string::npos) {
+                std::string code;
+                size_t p = cl.find_first_not_of(" 	", ui + 5);
+                if (p != std::string::npos && cl[p] == '"') {
+                    const size_t e = cl.find('"', p + 1);
+                    code = cl.substr(p + 1, e == std::string::npos ? std::string::npos : e - p - 1);
+                } else if (p != std::string::npos) {
+                    code = cl.substr(p, cl.find_first_of(" 	", p) - p);
+                }
+                g_display.forced = true;   // the still's size is the command line's
+                setup_ui(hwnd);
+                if (g_ui.ready()) {
+                    g_ui.run(code);
+                    for (int k = 0; k < 4; ++k) g_ui.update(0.25f);   // past the panel's refresh
+                    g_renderer.set_capture_overlay(true);
+                }
+            }
+        }
+
         bool ok = g_renderer.capture(v, shot_path.c_str(), error);
         {
             // --shake <frames>: a still camera through a session's worth of
@@ -1353,6 +1644,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (pf) std::fclose(pf);
         }
 
+        if (g_ui.ready()) {
+            g_renderer.flush();
+            g_renderer.set_overlay(nullptr);
+            g_ui.shutdown();
+        }
         g_renderer.shutdown();
         g_physics.shutdown();
 
@@ -3923,6 +4219,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     int    fps_frames = 0;
     float  t = 0.0f;
 
+    setup_ui(hwnd);
+
     MSG msg = {};
     while (msg.message != WM_QUIT) {
         if (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -3938,6 +4236,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         double dt = elapsed - last;
         last = elapsed;
         if (dt > 0.1) dt = 0.1;   // a breakpoint must not teleport the camera
+        // The UI runs on the wall clock; the game's clock stops while paused.
+        const double wall_dt = dt;
+        if (g_paused) dt = 0.0;
         t += static_cast<float>(dt);
 
         RECT cr;
@@ -3946,7 +4247,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const float h = static_cast<float>(cr.bottom - cr.top);
         if (w < 1.0f || h < 1.0f) continue;
 
-        if (g_walk) {
+        if (g_paused) {
+            // Still hand physics what streamed in: the events are this
+            // frame's only (see step_window_physics).
+            sync_physics_terrain();
+        } else if (g_walk) {
             // The capsule moves; the camera rides it at eye height. Streaming
             // follows the camera, so this is also what keeps chunks loading
             // around the character rather than around a detached viewpoint.
@@ -4028,6 +4333,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_want_save = g_want_load = false;
         }
 
+        g_ui.update(float(wall_dt));
+
         engine::ViewConstants view = {};
         fill_view(g_camera, w, h, t, view);
         g_renderer.render(view);
@@ -4039,9 +4346,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         }
 
         if (g_time_lapse) g_renderer.set_time_of_day(g_renderer.time_of_day() + float(dt) * 0.1f);
-        const double frame_ms = dt * 1000.0;
+        const double frame_ms = wall_dt * 1000.0;
         if (frame_ms > worst_frame_ms) worst_frame_ms = frame_ms;
-        fps_accum += dt;
+        fps_accum += wall_dt;
         ++fps_frames;
         if (fps_accum >= 0.5) {
             const engine::FrameStats st = g_renderer.stats();
@@ -4075,7 +4382,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         }
     }
 
+    g_renderer.flush();
+    g_renderer.set_overlay(nullptr);
+    g_ui.shutdown();
     g_renderer.shutdown();
-        g_physics.shutdown();
+    g_physics.shutdown();
     return 0;
 }

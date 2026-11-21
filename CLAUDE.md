@@ -14,6 +14,8 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `worldgen/golden/` | Pinned seed hashes. Changes must be deliberate. |
 | `engine/trees/` | Tree meshes (procedural, made here), the CPU tile streamer over layer 8, GPU culling and impostors, felling. |
 | `engine/foliage/` | Ground cover -- grass, flowers, bushes -- generated on the GPU each frame (`foliage.hlsl`). |
+| `engine/ui/` | The UI layer: RmlUi's D3D12 renderer, input routing, and the `engine` Lua module (tunables). |
+| `game/` | What the UI and scripts ARE: `scripts/*.lua` (entry `main.lua`) and `ui/*.rml`, `*.rcss`. |
 | `engine/rocks/` | Layer 9's rocks: procedural meshes, the CPU tile streamer, instanced drawing on the terrain's root signature, static colliders. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32). Debug tool, Windows only. |
@@ -100,7 +102,10 @@ the streaming A/B switches `--no-lod-align`,
 `--no-contact`, `--no-post` and `--post-debug 1|2|4|5` (AO alone, contact
 shadows alone, how each puddle pixel found its reflection, the clouds' shadow on the key light), and exposure's `--ev-comp <stops>`, `--ev100 <v>` (fixed,
 no meter), `--tonemap 0|1|2` (raw pre-L1 path / AgX / fitted ACES),
-`--agx-sat` and `--agx-power`. `--sea-shot` only PLACES the camera: pair it with `--shot`,
+`--agx-sat` and `--agx-power`. `--shot` also takes `--ui "<lua>"`: bring up the UI, run the code
+(`menu.open()`, `menu.show_screen('options')`, `tuning.toggle();
+tuning.select('Fog')`, `engine.set('time', 19)`) and draw the UI into the
+still -- without it a shot holds no UI. `--sea-shot` only PLACES the camera: pair it with `--shot`,
 or it falls through to the window loop with no window and never exits. `--walk` takes `--uncapped` to time frames at ground
 level, where the grass is. It is a GUI subsystem binary, so a shell does not wait
 on it: run it with `Start-Process -Wait` or the file you read will be the
@@ -494,6 +499,42 @@ last run's.
   read as the failed variant's. Delete the report before the run and check
   `build/engine_error.txt` after; numbers identical to the digit to an earlier
   run are the tell.
+
+### UI and scripting: Lua and RmlUi
+
+Esc opens the pause menu (resume, options, controls, tuning panel, quit) and
+stops the game clock, physics and the camera; the frame keeps drawing. F1 or
+` toggles the tuning panel over the running game. Submodules: `third_party/
+lua` (5.4, compiled as C++ so errors unwind), `RmlUi` (6.3, static, with its
+Lua plugin), `freetype` -- all built inside the engine block only; worldgen
+and validate do not see them.
+
+- **C++ routes, Lua decides.** `engine/ui/ui.cpp` feeds Win32 input to RmlUi
+  and calls `game.on_key` (Esc, F1, `) and `game.on_update`; what any key or
+  button DOES is in `game/scripts`. While paused the UI takes every key and
+  click; otherwise it takes the mouse only while uncaptured, and a click on
+  no element falls through to the game (and captures).
+- **Tunables are the API.** `main.cpp`'s `register_tunables` lists named
+  numbers with a range, getter and setter; `engine.tunables()` hands them to
+  Lua, which builds the options screen (group "Graphics", saved to
+  `build/settings.lua`) and the tuning panel (every other group, live, NOT
+  saved) from the list. A new knob is one line there and appears in the UI
+  with no script change. The fog layers are shown as sea-level visibility
+  (3.912 / sigma) and thickness.
+- **Display**: windowed (client size) or borderless (a popup over the
+  monitor, the swapchain at the chosen size and stretched by DXGI; WM_SIZE
+  keeps the chosen size). `--res` on the command line beats saved settings.
+- **The renderer** (`ui_render_d3d12.cpp`) is one pipeline, drawn last onto
+  the back buffer through its own descriptor heap via `Renderer::set_overlay`;
+  `capture()` skips it unless `--ui`. No clip masks: never centre with
+  `transform` -- an overflow box inside a transformed element then does not
+  clip (the options list spilled over its Back button until the menu was
+  centred with flexbox).
+- Script errors and RmlUi warnings go to `build/ui_log.txt` (no console). A
+  UI that fails to start leaves the engine as before (Esc releases the mouse,
+  then quits) and says why in `build/engine_error.txt`.
+- Fonts are RmlUi's sample Lato and Roboto Mono (OFL), read from the
+  submodule; the family is `LatoLatin`, not `Lato`.
 
 ### Surface texture
 

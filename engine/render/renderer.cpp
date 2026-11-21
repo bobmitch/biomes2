@@ -4201,6 +4201,7 @@ void Renderer::render(const ViewConstants& view) {
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     rtv.ptr += static_cast<SIZE_T>(frame_) * rtv_stride_;
     record_frame(view, rtv);
+    if (overlay_) overlay_(cmd_.Get(), rtv, width_, height_);
 
     D3D12_RESOURCE_BARRIER to_present = to_rt;
     to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -4417,6 +4418,7 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     rtv.ptr += static_cast<SIZE_T>(frame_) * rtv_stride_;
     record_scene(view, rtv);
+    if (capture_overlay_ && overlay_) overlay_(cmd_.Get(), rtv, width_, height_);
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;

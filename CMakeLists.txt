@@ -103,13 +103,22 @@ endif()
 # determinism gate, and refusing to configure one was the bug.
 set(BIOMES2_ENGINE OFF)
 if(WIN32 AND EXISTS ${PROJECT_SOURCE_DIR}/engine/main.cpp)
-  if(EXISTS ${PROJECT_SOURCE_DIR}/third_party/JoltPhysics/Build/CMakeLists.txt)
+  # Every submodule the engine links. Missing any one skips the engine, for
+  # the reason above: the gate must never depend on them.
+  set(_missing "")
+  foreach(_sub JoltPhysics/Build lua RmlUi freetype)
+    if(NOT EXISTS ${PROJECT_SOURCE_DIR}/third_party/${_sub}/CMakeLists.txt AND
+       NOT EXISTS ${PROJECT_SOURCE_DIR}/third_party/${_sub}/lua.h)
+      list(APPEND _missing ${_sub})
+    endif()
+  endforeach()
+  if(_missing STREQUAL "")
     set(BIOMES2_ENGINE ON)
   else()
     message(STATUS
-      "engine/: SKIPPED -- the Jolt submodule is not checked out. "
+      "engine/: SKIPPED -- submodules not checked out: ${_missing}. "
       "Run  git submodule update --init --recursive  to build it. "
-      "worldgen and validate, which are the determinism gate, do not need it.")
+      "worldgen and validate, which are the determinism gate, do not need them.")
   endif()
 endif()
 
@@ -142,6 +151,50 @@ if(BIOMES2_ENGINE)
   set_property(TARGET Jolt PROPERTY MSVC_RUNTIME_LIBRARY
                "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
+  # --- The UI and scripting layer: Lua 5.4 driving RmlUi (engine/ui/) ---
+  #
+  # All three are built from submodules, statically, and only here: nothing
+  # in worldgen/ or validate links them, so the gate's build is unchanged.
+  # FreeType is C, the one C dependency, so C is enabled for the engine only.
+  enable_language(C)
+
+  # FreeType: RmlUi's font engine. Every optional codec off -- the UI loads
+  # plain TrueType and nothing else, and each of these would be one more
+  # thing to find on a build machine.
+  set(FT_DISABLE_ZLIB ON CACHE BOOL "" FORCE)
+  set(FT_DISABLE_BZIP2 ON CACHE BOOL "" FORCE)
+  set(FT_DISABLE_PNG ON CACHE BOOL "" FORCE)
+  set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
+  set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
+  add_subdirectory(third_party/freetype EXCLUDE_FROM_ALL)
+  add_library(Freetype::Freetype ALIAS freetype)
+
+  # Lua, compiled as C++ so a script error unwinds with an exception rather
+  # than a longjmp straight over the destructors of the C++ that called it.
+  # lua.c and onelua.c are the standalone interpreter, ltests.c the test
+  # harness: not the library.
+  file(GLOB _lua_src ${PROJECT_SOURCE_DIR}/third_party/lua/l*.c)
+  list(FILTER _lua_src EXCLUDE REGEX "/(lua|ltests|onelua)\\.c$")
+  set_source_files_properties(${_lua_src} PROPERTIES LANGUAGE CXX)
+  add_library(biomes2_lua STATIC ${_lua_src})
+  target_include_directories(biomes2_lua PUBLIC ${PROJECT_SOURCE_DIR}/third_party/lua)
+  if(MSVC)
+    target_compile_options(biomes2_lua PRIVATE /W0 /TP /D_CRT_SECURE_NO_WARNINGS)
+  endif()
+  # RmlUi aliases Lua::Lua, and an alias cannot be aliased: an imported
+  # interface target over the real library.
+  add_library(Lua::Lua INTERFACE IMPORTED GLOBAL)
+  set_target_properties(Lua::Lua PROPERTIES
+    INTERFACE_LINK_LIBRARIES biomes2_lua
+    INTERFACE_INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/third_party/lua)
+
+  set(RMLUI_LUA_BINDINGS ON CACHE BOOL "" FORCE)
+  set(RMLUI_LUA_BINDINGS_LIBRARY "lua_as_cxx" CACHE STRING "" FORCE)
+  set(RMLUI_SAMPLES OFF CACHE BOOL "" FORCE)
+  add_subdirectory(third_party/RmlUi EXCLUDE_FROM_ALL)
+
   add_executable(engine WIN32
     engine/main.cpp
     engine/render/renderer.cpp
@@ -169,8 +222,14 @@ if(BIOMES2_ENGINE)
     engine/render/forest_map.cpp
     engine/rocks/rock_mesh.cpp
     engine/rocks/rock_field.cpp
-    engine/rocks/rock_renderer.cpp)
-  target_include_directories(engine PRIVATE ${PROJECT_SOURCE_DIR})
+    engine/rocks/rock_renderer.cpp
+    engine/ui/ui.cpp
+    engine/ui/ui_render_d3d12.cpp
+    engine/ui/script_api.cpp
+    third_party/RmlUi/Backends/RmlUi_Platform_Win32.cpp)
+  target_include_directories(engine PRIVATE ${PROJECT_SOURCE_DIR}
+                             ${PROJECT_SOURCE_DIR}/third_party/RmlUi/Backends)
+  target_link_libraries(engine PRIVATE RmlUi::RmlUi imm32)
   # M1: the engine links the generator now. Track B was built against the
   # trivial field precisely so a pipeline bug could never be confused with a
   # worldgen bug; that separation ends here, which is what the milestone is.

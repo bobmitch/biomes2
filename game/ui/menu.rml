@@ -1,0 +1,84 @@
+<rml>
+<!--
+  The pause menu. Three screens in one document -- main, options, controls --
+  of which game/scripts/menu.lua shows one at a time. Markup only: every
+  behaviour is in the scripts, and the options and controls lists are built
+  there from the engine's tunables and the key table.
+-->
+<head>
+	<title>Paused</title>
+	<link type="text/rcss" href="common.rcss"/>
+	<style>
+		/* Centred by flexbox, not transform: under a transform RmlUi clips with
+		   clip masks, which the renderer does not draw, so scrolling content
+		   would spill out of its box. */
+		body {
+			width: 100%;
+			height: 100%;
+			display: flex;
+			justify-content: center;
+			align-items: center;
+			background-color: #05080ca8;
+		}
+		#panel {
+			width: 380dp;
+			padding: 28dp 32dp;
+			background-color: #121822e8;
+			border: 1dp #ffffff22;
+			border-radius: 6dp;
+		}
+		#panel.wide { width: 560dp; }
+		.scroll {
+			max-height: 62vh;
+			overflow-y: auto;
+			padding-right: 6dp;
+		}
+		.keys td { padding: 4dp 0; font-size: 16dp; }
+		.keys td.key {
+			width: 150dp;
+			font-family: "Roboto Mono";
+			font-size: 15dp;
+			color: #ffffff;
+		}
+		.keys td.what { color: #c4ccd8; }
+		.buttons { margin-top: 16dp; }
+	</style>
+</head>
+<body>
+	<div id="panel">
+		<div id="screen-main">
+			<h1>PAUSED</h1>
+			<button id="btn-resume" onclick="menu.resume()">Resume</button>
+			<button onclick="menu.show_screen('options')">Options</button>
+			<button onclick="menu.show_screen('controls')">Controls</button>
+			<button onclick="menu.toggle_tuning()">Tuning panel</button>
+			<button onclick="engine.quit()">Quit</button>
+		</div>
+
+		<div id="screen-options" class="hidden">
+			<h1>OPTIONS</h1>
+			<div class="scroll">
+				<h2>DISPLAY</h2>
+				<div id="opt-display"></div>
+				<div>
+					<button class="small" onclick="menu.apply_display()">Apply display</button>
+					<span id="opt-display-now" class="hint"></span>
+				</div>
+				<h2>GRAPHICS</h2>
+				<div id="opt-graphics"></div>
+			</div>
+			<div class="buttons">
+				<button onclick="menu.show_screen('main')">Back</button>
+			</div>
+		</div>
+
+		<div id="screen-controls" class="hidden">
+			<h1>CONTROLS</h1>
+			<div class="scroll"><table class="keys" id="keys"></table></div>
+			<div class="buttons">
+				<button onclick="menu.show_screen('main')">Back</button>
+			</div>
+		</div>
+	</div>
+</body>
+</rml>

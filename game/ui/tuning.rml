@@ -1,0 +1,43 @@
+<rml>
+<!--
+  The tuning panel: every engine tunable outside "Graphics", one group at a
+  time, live. Built by game/scripts/tuning.lua from engine.tunables(), so a
+  new knob registered in C++ shows up here with no change to this file.
+  The body is only as big as the panel: a click anywhere else is the game's.
+-->
+<head>
+	<title>Tuning</title>
+	<link type="text/rcss" href="common.rcss"/>
+	<style>
+		body {
+			position: absolute;
+			right: 16dp;
+			top: 16dp;
+			width: 400dp;
+			max-height: 92%;
+			padding: 14dp 16dp;
+			background-color: #10151ddc;
+			border: 1dp #ffffff22;
+			border-radius: 6dp;
+			font-size: 15dp;
+		}
+		#title {
+			font-size: 18dp;
+			font-weight: bold;
+			margin-bottom: 8dp;
+		}
+		#title span { font-size: 13dp; font-weight: normal; color: #8f9aaa; }
+		#groups { margin-bottom: 4dp; }
+		#body {
+			max-height: 80vh;
+			overflow-y: auto;
+			padding-right: 6dp;
+		}
+	</style>
+</head>
+<body>
+	<div id="title">Tuning <span>F1 to hide -- values are live, not saved</span></div>
+	<div id="groups"></div>
+	<div id="body"></div>
+</body>
+</rml>

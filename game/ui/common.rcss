@@ -1,0 +1,195 @@
+/*
+ * The game's UI style. RmlUi has no default stylesheet, so the first block is
+ * the HTML defaults it needs; the rest is the look. Sizes are dp, authored
+ * for 1080 lines (engine/ui/ui.cpp scales them to the window).
+ *
+ * The renderer (engine/ui/ui_render_d3d12.cpp) draws boxes, borders, rounded
+ * corners and text. It does NOT do filters, masks, box-shadow or gradients:
+ * they draw nothing, so they are not used here. Nor is `transform`: under
+ * one RmlUi clips with clip masks instead of scissor, so an overflow box
+ * inside a transformed element does not clip (its content spills out).
+ */
+
+div, p, h1, h2, h3, form, section { display: block; }
+strong { font-weight: bold; }
+em { font-style: italic; }
+table { box-sizing: border-box; display: table; }
+tr { box-sizing: border-box; display: table-row; }
+td { box-sizing: border-box; display: table-cell; }
+
+body {
+	font-family: LatoLatin;
+	font-weight: normal;
+	font-style: normal;
+	font-size: 17dp;
+	color: #e8ecf2;
+}
+
+.hidden { display: none; }
+
+/* ---- Buttons ---- */
+
+button {
+	display: block;
+	font-size: 22dp;
+	padding: 10dp 18dp;
+	margin: 6dp 0;
+	text-align: center;
+	color: #e8ecf2;
+	background-color: #ffffff12;
+	border: 1dp #ffffff26;
+	border-radius: 4dp;
+	tab-index: auto;
+	nav: auto;
+	transition: background-color 0.12s linear-in-out;
+}
+button:hover, button:focus-visible {
+	background-color: #ffffff2e;
+	border-color: #ffffff60;
+}
+button:active { background-color: #ffffff45; }
+button.small {
+	display: inline-block;
+	font-size: 16dp;
+	padding: 5dp 12dp;
+	margin: 0 4dp 0 0;
+}
+button.tab {
+	display: inline-block;
+	font-size: 15dp;
+	padding: 5dp 10dp;
+	margin: 0 3dp 4dp 0;
+	background-color: #ffffff0c;
+}
+button.tab.selected {
+	background-color: #ffffff38;
+	border-color: #ffffff80;
+}
+
+/* ---- Form controls ---- */
+
+input.range {
+	display: inline-block;
+	width: 100%;
+	height: 18dp;
+	vertical-align: middle;
+	nav: horizontal;
+}
+input.range slidertrack {
+	height: 4dp;
+	margin-top: 7dp;
+	background-color: #ffffff2a;
+	border-radius: 2dp;
+}
+input.range sliderbar {
+	width: 12dp;
+	height: 18dp;
+	background-color: #cfd7e3;
+	border-radius: 3dp;
+}
+input.range sliderbar:hover, input.range:focus-visible sliderbar { background-color: #ffffff; }
+input.range sliderbar:active { background-color: #9fc3ff; }
+input.range sliderarrowdec, input.range sliderarrowinc { width: 0; height: 0; }
+
+input.checkbox {
+	display: inline-block;
+	width: 18dp;
+	height: 18dp;
+	vertical-align: middle;
+	background-color: #ffffff14;
+	border: 1dp #ffffff50;
+	border-radius: 3dp;
+	nav: auto;
+}
+input.checkbox:hover, input.checkbox:focus-visible { border-color: #ffffffb0; }
+input.checkbox:checked {
+	background-color: #7fb0ff;
+	border-color: #b8d2ff;
+}
+
+select {
+	display: inline-block;
+	width: 100%;
+	height: 26dp;
+	text-align: left;
+	vertical-align: middle;
+	nav: auto;
+}
+select selectvalue {
+	height: 26dp;
+	padding: 3dp 8dp;
+	background-color: #ffffff14;
+	border: 1dp #ffffff40;
+	border-radius: 3dp;
+}
+select:hover selectvalue, select:focus-visible selectvalue { border-color: #ffffffa0; }
+select selectarrow {
+	width: 18dp;
+	height: 26dp;
+}
+select selectbox {
+	margin-top: 2dp;
+	padding: 2dp;
+	background-color: #1d232ef8;
+	border: 1dp #ffffff40;
+	border-radius: 3dp;
+}
+select selectbox option { padding: 4dp 8dp; }
+select selectbox option:hover { background-color: #ffffff2a; }
+select selectbox option:checked { font-weight: bold; }
+
+/* ---- Scrollbars ---- */
+
+scrollbarvertical { width: 8dp; margin-left: 4dp; }
+scrollbarvertical slidertrack { background-color: #ffffff10; border-radius: 4dp; }
+scrollbarvertical sliderbar {
+	width: 8dp;
+	min-height: 30dp;
+	background-color: #ffffff50;
+	border-radius: 4dp;
+}
+scrollbarvertical sliderbar:hover { background-color: #ffffff80; }
+scrollbarvertical sliderarrowdec, scrollbarvertical sliderarrowinc { width: 0; height: 0; }
+
+/* ---- Rows: a label, a control, a value ---- */
+
+.row {
+	display: block;
+	padding: 5dp 0;
+	clear: both;
+}
+.row .label {
+	display: block;
+	font-size: 15dp;
+	color: #b9c2cf;
+	margin-bottom: 2dp;
+}
+.row .value {
+	font-family: "Roboto Mono";
+	font-size: 14dp;
+	color: #ffffff;
+	float: right;
+}
+.row.toggle .label { display: inline-block; margin: 0 0 0 8dp; }
+
+h1 {
+	font-size: 40dp;
+	font-weight: bold;
+	letter-spacing: 2dp;
+	margin-bottom: 20dp;
+	text-align: center;
+}
+h2 {
+	font-size: 15dp;
+	font-weight: bold;
+	letter-spacing: 1dp;
+	color: #8fa0b8;
+	margin: 18dp 0 4dp 0;
+	padding-bottom: 3dp;
+	border-bottom: 1dp #ffffff20;
+}
+.hint {
+	font-size: 14dp;
+	color: #8f9aaa;
+	margin-top: 6dp;
+}

@@ -33,6 +33,7 @@
 #include "engine/rocks/rock_field.h"
 #include "engine/rocks/rock_renderer.h"
 
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -134,6 +135,8 @@ public:
     // captures (no warm-up, no history reset) of consecutive frames.
     void step_offscreen(const ViewConstants& view);
     void set_capture_raw(bool on) { capture_raw_ = on; }
+    // --shot --ui: draw the overlay into the still as well.
+    void set_capture_overlay(bool on) { capture_overlay_ = on; }
     void resize(UINT width, UINT height);
     void shutdown();
 
@@ -144,6 +147,18 @@ public:
     // Off for benchmarking: with vsync on, every measurement reads 60 and
     // says nothing about how much headroom there is.
     void set_vsync(bool on) { vsync_ = on; }
+    bool vsync() const { return vsync_; }
+    UINT width() const { return width_; }
+    UINT height() const { return height_; }
+
+    // Drawn over the finished frame, straight onto the back buffer, in
+    // render() only -- capture() never calls it, so a --shot holds no UI.
+    // The callee may bind its own descriptor heap: nothing after it in the
+    // command list needs the renderer's.
+    using Overlay = std::function<void(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE, UINT, UINT)>;
+    void set_overlay(Overlay o) { overlay_ = std::move(o); }
+    // Waits until the GPU has finished everything submitted so far.
+    void flush() { wait_for_gpu(); }
     bool tearing_available() const { return tearing_ok_; }
     // What the slot pool is actually holding, after a capture: per-chunk
     // vertex and index counts against the caps, and memory against the GPU.
@@ -178,12 +193,14 @@ public:
     // Rain (ADR-005 C3): from the clouds' precipitation, or fixed with
     // --rain <0..1> (negative: automatic). Shift+F3 / --no-rain.
     void  set_rain(float k) { rain_override_ = k; }
+    float rain_override() const { return rain_override_; }
     void  set_rain_on(bool on) { rain_on_ = on; }
     bool  rain_on() const { return rain_on_; }
     float rain_intensity() const;
     // The wet world (ADR-005 C4): the surfaces' wetness and the puddles, from
     // the weather's rain history; fixed with --wet <0..1> (both at once).
     void  set_wet(float k) { wet_override_ = k; }
+    float wet_override() const { return wet_override_; }
     void  wetness(float& wet, float& puddle) const;
     // How wet the crowns are: drips under the trees, after the rain too.
     float drips() const;
@@ -198,6 +215,8 @@ public:
     // far the low land can be seen. --no-height-fog, --height-fog <k> scales it.
     void set_height_fog(bool on) { hfog_on_ = on; }
     void set_height_fog_scale(float k) { hfog_scale_ = k; }
+    bool  height_fog() const { return hfog_on_; }
+    float height_fog_scale() const { return hfog_scale_; }
     // Its extinction at an altitude now (1/m), for the shot report.
     float height_fog_sigma(float y) const {
         if (!hfog_on_ || !fog_on_ || !fog_map_.built()) return 0.0f;
@@ -214,6 +233,7 @@ public:
     unsigned long long flash_frames() const { return flash_frames_; }
     Lightning& lightning() { return lightning_; }
     void set_lightning(bool on) { lightning_on_ = on; }
+    bool lightning_on() const { return lightning_on_; }
     void  set_wave_detail(bool on) { detail_on_ = on; }
     bool  wave_detail() const { return detail_on_; }
     const OceanDetail& ocean() const { return ocean_; }
@@ -305,6 +325,8 @@ public:
     unsigned tonemap() const { return tonemap_; }
     void set_agx_saturation(float s) { agx_saturation_ = s; }
     void set_agx_power(float p) { agx_power_ = p; }
+    float agx_saturation() const { return agx_saturation_; }
+    float agx_power() const { return agx_power_; }
     // Time of day (ADR-004 L2), hours 0..24. The sun, the moon, the sky and
     // every light the scene uses follow it.
     void  set_time_of_day(float hours);
@@ -340,7 +362,12 @@ public:
     void set_fog(bool on) { fog_on_ = on; fog_hist_valid_ = false; }
     bool fog() const { return fog_on_; }
     void set_fog_density(float k) { fog_density_ = k; }
+    float fog_density() const { return fog_density_; }
     const FogMap& fog_map() const { return fog_map_; }
+    // The fog's authored settings, live: the layers and the mist's top are
+    // read every frame, so a tuning panel can move them without a rebake.
+    // The per-biome density map is baked once and does NOT follow.
+    FogSettings& fog_settings() { return fog_map_.settings(); }
     // GPU time of the post chain's parts, ms, smoothed over frames: the
     // atmosphere's tables, the mist's inject and integrate, the whole chain.
     // Frame-time A/B cannot resolve passes this small on a noisy machine.
@@ -622,6 +649,7 @@ private:
     bool create_fog_pipelines(std::string& error);
     void record_fog();
     bool capture_raw_ = false;
+    bool capture_overlay_ = false;
     CanopyMap canopy_;
     bool canopy_on_ = true, canopy_built_ = false;
     unsigned long long tree_list_version_ = 0;   // bumped whenever tree_all_ is rebuilt
@@ -787,6 +815,7 @@ private:
 
     bool ready_ = false;
     bool vsync_ = true;
+    Overlay overlay_;
     bool tearing_ok_ = false;
     unsigned long long adapter_vram_ = 0;   // dedicated video memory, bytes
 };

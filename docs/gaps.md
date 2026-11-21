@@ -89,3 +89,21 @@ Last gathered: 2026-11-21, after the exploration fog.
   fault, but their cause is not settled. [The engine's own checks]
 - `--adaptive-budget`'s CPU cost that grows with chunks a frame was never
   found. [Gotchas: the per-frame mesh budget]
+
+## UI and scripting
+
+- **Interaction is checked only through `--shot --ui`**: every screen and
+  tab renders, and `engine.set` from Lua reaches the renderer, but the
+  mouse and keyboard paths (clicks, slider drags, Esc, F1, recapture on a
+  click past the panel) and switching to borderless and back had not been
+  exercised by hand when the layer landed. [UI and scripting]
+- The UI renderer draws no clip masks, layers, filters or shaders:
+  `transform`, `filter`, `mask-image`, `box-shadow` and gradients either do
+  nothing or, for `transform`, stop overflow boxes clipping. No image
+  loading (`LoadTexture` returns nothing), so no `<img>` or image
+  decorators. Selects have no arrow glyph. [UI and scripting]
+- The tuning panel is not saved; there is no "write these to
+  archetypes.json". Fog layer edits move the layers live but not the
+  per-biome mist map, which is baked once. [UI and scripting]
+- Keys are fixed: the controls screen is a table in `menu.lua`, not a
+  binding table. The engine's own hotkeys stay in `wnd_proc`. [UI and scripting]

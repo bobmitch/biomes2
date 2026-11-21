@@ -52,6 +52,7 @@ public:
     const std::vector<float>& texels() const { return texels_; }
     float extent() const { return extent_; }   // the map spans [-extent/2, extent/2] in x and z
     const FogSettings& settings() const { return settings_; }
+    FogSettings& settings() { return settings_; }
     // How much thicker than its base the mist is at this hour.
     float time_factor(float hours) const;
     // The valley fog's strength 0..1 at this hour and wind: full a little
