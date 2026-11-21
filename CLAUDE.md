@@ -603,6 +603,29 @@ Trees use the terrain's sun, sky term and fog. The draw-distance slider is
 `-`/`=` (100-2000 m, default 500); terrain is unaffected. Cost, uncapped:
 ~0.4 ms a frame at spawn, ~0.6 ms over the densest forest.
 
+**Trunks stand on roots** (`root_flare` in `tree_mesh.cpp`): a lobed tube
+round the base, from 0.6 m under the ground to 3.5 x the trunk's radius +
+0.25 m up, widening concave to (1 + 0.85 x `shape.roots`) at the ground in
+4-6 buttress ridges of random strength, normals from the lobes' own slope;
+the strongest send a root out along and into the ground. Its randomness is
+a COPY of the tree's generator, so every tree keeps its branches.
+**The flare was BLACK, and its winding was why.** The bark shader flips
+the normal of a back face (`ps_mesh`, for double-sided cards), and the
+flare's rings run counter-clockwise where `tube()`'s run clockwise:
+wound like `tube()`, every face of it was a back face, its normal pointed
+into the trunk, and it shaded black -- a dark skirt with teeth where it
+poked through. The first "fix" chased the teeth (an inset too shallow for
+the trunk's facets: the middle of a flat face is cos(pi / sides) of the
+radius out, 5% in at ten sides, 13% at six), was judged on a still where
+the black base passed for shade, and missed it. Both are fixed; the inset
+is now the facet depth + 3%, and each ring follows the trunk's axis.
+Hand-built geometry on this shader: wind it as `tube()` does, and check a
+SUNLIT close-up.
+archetypes.json `shape.roots`: beech 1.5, oak 1.3, willow 1.1, maple and
+spruce 1.0, fir, alder and snag 0.9, pine 0.8, birch 0.5, scrub 0.
+Presentation only (validate's golden hashes unchanged); walking cost within
+noise. The flare is bark, in the RT scene and the casters like the trunk.
+
 **Distant leaf cards are solid clusters, not a halftone.** Once a card is
 too small for its leaves (`blur * 6`, ~30 m on), its coverage used to be
 the pattern's average tested against the screen-fixed dither: the dots
@@ -835,7 +858,7 @@ cached cells in the frustum into: blades (5 segments to 22 m, 2 beyond),
 full density inside 10 m and thinning as (10/d)^2 to 60 m with each blade
 widening by the square root so cover holds, the last blade of a cell
 shrinking rather than popping; crossed clump cards 48-150 m, dither-faded
-against the blades; leaf-card bushes; flowers on a few blade tips. A 6-8 m
+against the blades; bushes (below); flowers on a few blade tips. A 6-8 m
 tuft noise varies height and density inside a patch. Same sun, shadows and
 fog as everything else. `G` toggles it. Cost: +0.3 ms a frame walking
 through a meadow (`--walk 15 --uncapped`, with and without `--no-foliage`);
@@ -857,6 +880,17 @@ Cost walking at 2560 x 1440: all ground cover ~1.0 ms (5.19 with
 tufts of 2 with the width +0.18. Tinting the terrain under grass toward
 the sward (a 256 m grass map from the cells, read by the terrain shader)
 was built and judged not to look right; left for a later quality pass.
+
+**Bushes have stems now** (`vs_bush`, 24 quads: six stems, eighteen leaf
+cards). They were fourteen cards round the inside of a ball -- a few
+textures with nothing solid in them -- and evenly 0.4-1.4 m in radius, so
+waist-high balls every few metres. Now up to six tapered stem ribbons from
+the base, facing the eye, with the leaf cards on their upper halves, in four
+kinds from the bush's hash (round, upright vase, low spreading, sparse
+twiggy), a tint per bush (most green, some yellower, bluer, a few red), one
+in seven needle-leaved, and radii 0.25-1.4 m skewed small (u^2). Leaves cut
+as the trees' are: sharp, then solid clusters (`leaf_cluster`), no dither.
+The index layout is 264 entries (`foliage_renderer.cpp` checks it).
 
 Not handled: grass does not know about dig edits, and floats over a dug hole.
 

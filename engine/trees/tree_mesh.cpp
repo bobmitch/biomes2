@@ -154,6 +154,9 @@ public:
         m_.idx.push_back(base); m_.idx.push_back(base + 2); m_.idx.push_back(base + 3);
     }
 
+    // For shapes built by hand (root_flare).
+    TreeMesh& mesh() { return m_; }
+
 private:
     TreeMesh& m_;
 };
@@ -177,6 +180,135 @@ struct Crown {
 };
 
 // The trunk, with the cut ring at kCutHeight and the caps there.
+// The root flare: where a trunk meets the ground it widens and splits into
+// buttresses -- the roots' tops -- and a few of them run out and down into
+// the soil. Without it every trunk stood on the ground like a post.
+//
+// A tube of its own round the trunk's base, with more sides than the trunk
+// so its lobes resolve: from 0.6 m under the ground to `hf` up, its radius
+// the trunk's times (1 + F(y) x lobe(angle)), F rising concave to `Fmax` at
+// the ground, lobe 4-6 ridges of random strength. It is never narrower than
+// the trunk it wraps until its top, where it slips just inside, so the two
+// never fight. Normals from the lobed section's own slope, so the ridges
+// shade. The strongest lobes send a root out along the ground and under it.
+// Its randomness comes from a COPY of the tree's generator: every tree keeps
+// its branches and only gains a base.
+void root_flare(Builder& b, const TreeLook& L, float H, float R0, float top, float top_r_frac, int trunk_sides,
+                const std::vector<Node>& trunk, const Rng& tree_rng) {
+    if (L.roots <= 0.0f) return;
+    Rng rng(tree_rng.s ^ 0x5EED0F1Au);
+    // Where the flare meets the trunk it must stay INSIDE it, and the trunk
+    // is a polygon: the middle of each flat face is cos(pi / sides) of the
+    // radius out -- 5% in at ten sides, 13% at six. A 3% inset let the
+    // rounder flare poke out through every face in a row of dark teeth.
+    const float inset = 1.0f - std::cos(kPi / float(trunk_sides)) + 0.03f;
+    // And the trunk wanders sideways as it rises; the flare follows its axis.
+    auto axis_at = [&](float y) {
+        for (size_t i = 1; i < trunk.size(); ++i) {
+            if (y <= trunk[i].p.y || i + 1 == trunk.size()) {
+                const Node& a = trunk[i - 1];
+                const Node& c = trunk[i];
+                const float t = clamp01((y - a.p.y) / std::max(c.p.y - a.p.y, 1e-3f));
+                return V3(a.p.x + (c.p.x - a.p.x) * t, 0.0f, a.p.z + (c.p.z - a.p.z) * t);
+            }
+        }
+        return V3(0, 0, 0);
+    };
+    auto rmain = [&](float y) {
+        const float r = R0 * (1.0f - (1.0f - top_r_frac) * clamp01(y / top));
+        const float fl = clamp01(1.0f - y / (0.08f * H + 0.3f));
+        return r * (1.0f + 0.35f * fl * fl);
+    };
+    const float hf = 3.5f * R0 + 0.25f;
+    const float Fmax = 0.85f * L.roots;
+    const int lobes = 4 + int(rng.uni() * 3.0f);
+    const float phase = rng.uni() * 2.0f * kPi;
+    float amp[6];
+    for (int k = 0; k < 6; ++k) amp[k] = 0.35f + 0.65f * rng.uni();
+    auto F = [&](float y) {
+        const float u = clamp01(1.0f - y / hf);
+        return Fmax * u * u * std::sqrt(u);
+    };
+    auto lobe = [&](float a) {
+        const float x = (a - phase) * float(lobes) / (2.0f * kPi);
+        const int k = (int(std::floor(x + 0.5f)) % lobes + lobes) % lobes;
+        const float l = 0.5f + 0.5f * std::cos(2.0f * kPi * x);
+        return 0.15f + 0.85f * l * l * l * amp[k];
+    };
+    auto R = [&](float y, float a) {
+        const float f = F(y);
+        return rmain(std::max(y, 0.0f)) * (1.0f + f * lobe(a) - inset * (1.0f - f / Fmax));
+    };
+    const int sides = trunk_sides >= 8 ? 24 : 14;
+    const float ys[] = {-0.6f, -0.15f, 0.0f, 0.08f, 0.2f, 0.35f, 0.55f, 0.75f, 1.0f, 1.3f, 1.7f, 2.2f};
+    std::vector<float> rings;
+    for (float y : ys) if (y < hf) rings.push_back(y);
+    rings.push_back(hf);
+    const uint32_t base = static_cast<uint32_t>(b.mesh().v.size());
+    const float da = 0.01f;
+    for (size_t i = 0; i < rings.size(); ++i) {
+        const float y = rings[i];
+        for (int s = 0; s <= sides; ++s) {
+            const float a = 2.0f * kPi * float(s) / float(sides);
+            const float r = R(y, a);
+            const float drda = (R(y, a + da) - R(y, a - da)) / (2.0f * da);
+            const float dy = 0.05f;
+            const float drdy = (R(y + dy, a) - R(y - dy, a)) / (2.0f * dy);
+            const V3 radial(std::cos(a), 0.0f, std::sin(a));
+            const V3 tang(-std::sin(a), 0.0f, std::cos(a));
+            const V3 nrm = norm(radial - tang * (drda / std::max(r, 1e-3f)) + V3(0, -drdy, 0));
+            TreeVertex v = {};
+            const V3 ax = axis_at(y);
+            v.pos[0] = ax.x + radial.x * r; v.pos[1] = y; v.pos[2] = ax.z + radial.z * r;
+            v.nrm[0] = nrm.x; v.nrm[1] = nrm.y; v.nrm[2] = nrm.z;
+            v.uv[0] = float(s) / float(sides) * 2.0f * kPi * std::max(rmain(0.0f), 0.05f);
+            v.uv[1] = y + 0.6f;
+            v.sway = 0.0f;
+            // The trunk's own occlusion where they meet (0.85), a little
+            // darker only in the crotches at the ground: at 0.55 the flare
+            // read as a dark skirt wherever it showed.
+            v.ao = 0.72f + 0.13f * clamp01(y / (0.5f * hf));
+            v.kind = float(kKindBark);
+            v.seed = 0.0f;
+            b.mesh().v.push_back(v);
+        }
+    }
+    for (size_t i = 0; i + 1 < rings.size(); ++i) {
+        for (int s = 0; s < sides; ++s) {
+            const uint32_t a0 = base + uint32_t(i * (sides + 1) + s), a1 = a0 + 1;
+            const uint32_t b0 = a0 + uint32_t(sides + 1), b1 = b0 + 1;
+            // Wound as tube() winds its own rings. This ring runs the other
+            // way round (counter-clockwise from above, tube()'s clockwise),
+            // and the bark shader flips the normal of a back face (cards are
+            // double-sided): wound like tube(), every face of the flare was a
+            // back face and shaded black.
+            const uint32_t t[6] = {a0, a1, b0, a1, b1, b0};
+            b.mesh().idx.insert(b.mesh().idx.end(), t, t + 6);
+        }
+    }
+    // Roots: out along the strongest lobes, dipping into the ground.
+    for (int k = 0; k < lobes; ++k) {
+        if (amp[k] < 0.55f) continue;
+        const float a = phase + 2.0f * kPi * float(k) / float(lobes) + rng.range(-0.15f, 0.15f);
+        const V3 d(std::cos(a), 0.0f, std::sin(a));
+        const float r0 = R0 * (0.3f + 0.25f * amp[k]) * L.roots;
+        const float reach = R0 * (2.5f + 2.5f * rng.uni()) * (0.6f + 0.4f * L.roots);
+        std::vector<Node> rn;
+        const float start = rmain(0.0f) * (1.0f + 0.5f * Fmax * amp[k]);
+        const int nn = 4;
+        for (int j = 0; j < nn; ++j) {
+            const float t = float(j) / float(nn - 1);
+            Node q;
+            q.p = d * (start * 0.85f + reach * t) + V3(rng.range(-0.08f, 0.08f) * reach * t, 0.12f - 0.45f * t * t, 0.0f);
+            q.r = r0 * (1.0f - 0.75f * t);
+            q.sway = 0.0f;
+            q.ao = 0.72f;
+            rn.push_back(q);
+        }
+        b.tube(rn, trunk_sides >= 8 ? 6 : 4);
+    }
+}
+
 void build_trunk(Builder& b, TreeMesh& m, const TreeLook& L, float H, float top_frac,
                  float top_r_frac, int sides, Rng& rng, std::vector<V3>& axis,
                  std::vector<float>& radius) {
@@ -207,6 +339,7 @@ void build_trunk(Builder& b, TreeMesh& m, const TreeLook& L, float H, float top_
         n.push_back(k);
     }
     b.tube(n, sides);
+    root_flare(b, L, H, R0, top, top_r_frac, sides, n, rng);
     const float rc = rad_at(kCutHeight);
     b.cap(V3(0, kCutHeight, 0), rc * 0.995f, sides, true);
     b.cap(V3(0, kCutHeight, 0), rc * 0.995f, sides, false);
@@ -511,6 +644,7 @@ bool load_tree_looks(const worldgen::ArchetypeTable& table, const char* json_pat
                 l.leaf_density = float(s.number("leaf_density"));
                 if (s.has("bark_scan")) l.bark_scan = s.string("bark_scan");
                 if (s.has("bend")) l.bend = float(s.number("bend"));
+                if (s.has("roots")) l.roots = float(s.number("roots"));
             }
             const worldgen::TreeSpecies& ts = table.trees.species[i];
             l.nominal_height = 0.5f * (ts.height_min + ts.height_max);

@@ -371,12 +371,12 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         const uint32_t t[6] = {b, b + 1, b + 2, b, b + 2, b + 3};
         idx.insert(idx.end(), t, t + 6);
     }
-    for (uint32_t c = 0; c < 14; ++c) {   // 84, at 120
+    for (uint32_t c = 0; c < 24; ++c) {   // 144, at 120: six stems and eighteen leaf cards
         const uint32_t b = c * 4;
         const uint32_t t[6] = {b, b + 1, b + 2, b, b + 2, b + 3};
         idx.insert(idx.end(), t, t + 6);
     }
-    if (idx.size() != 204) { error = "foliage index layout disagrees with foliage.hlsl"; return false; }
+    if (idx.size() != 264) { error = "foliage index layout disagrees with foliage.hlsl"; return false; }
     if (!make_buffer(device_, idx.size() * 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
                      D3D12_RESOURCE_STATE_GENERIC_READ, ib_, error, "foliage indices")) return false;
     {
