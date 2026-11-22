@@ -215,8 +215,10 @@ bool HeightGi::begin(const float cam[3], float hours, unsigned long long frame, 
     const float dx = cam[0] - centre_[0], dy = cam[1] - centre_[1], dz = cam[2] - centre_[2];
     // 8 m of the camera's travel, a minute of the clock, or a second.
     const bool due = !built_ || dx * dx + dz * dz > 64.0f || std::fabs(dy) > 8.0f ||
-                     std::fabs(hours - hours_) > 1.0f / 60.0f || frame - last_frame_ >= 60;
+                     std::fabs(hours - hours_) > 1.0f / 60.0f || frame - last_frame_ >= 60 || bounce_reset_ > 0;
     if (!due) return false;
+    drop_bounce_ = bounce_reset_ == 4;
+    if (bounce_reset_ > 0) --bounce_reset_;
     for (int k = 0; k < 3; ++k) centre_[k] = cam[k];
     hours_ = hours;
     last_frame_ = frame;
@@ -244,7 +246,7 @@ void HeightGi::record(ID3D12GraphicsCommandList* cmd, UINT frame, D3D12_GPU_VIRT
     hc.origin_xz[1] = origin_[1];
     hc.y_top = y_top_;
     hc.y_range = y_range_;
-    hc.first = built_ ? 0u : 1u;
+    hc.first = built_ ? (drop_bounce_ ? 2u : 0u) : 1u;   // 2: the last rebuild's sky, none of its bounce
     std::memcpy(cb_cpu_[f], &hc, sizeof hc);
     auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
         D3D12_RESOURCE_BARRIER rb = {};

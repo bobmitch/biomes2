@@ -1797,7 +1797,10 @@ void Renderer::record_fog() {
     fc.jitter = halton(int(post_frame_ % 16) + 1, 2);
     fc.near_z = kFogNear;
     fc.log_ratio = std::log(kFogFar / kFogNear);
-    fc.history_valid = fog_hist_valid_ ? 1u : 0u;
+    // A jump of the light (a time skip) starts the mist's history over, as
+    // the near field's (record_scene): its 1:12 blend held a day's
+    // in-scatter in a tunnel for a second after the jump.
+    fc.history_valid = (fog_hist_valid_ && !NearField::is_reset(light_change_)) ? 1u : 0u;
     fc.time_factor = fog_map_.time_factor(time_hours_);
     const FogSettings& fs = fog_map_.settings();
     fc.map_extent = fog_map_.extent();
@@ -2149,6 +2152,25 @@ void Renderer::record_lights(const ViewConstants& view) {
     // (most important first, as `act` is sorted), then the stalest -- a
     // static light's faces are redrawn every few seconds so a dug hole or a
     // felled tree reaches its shadow -- within twelve faces.
+    // The near field's fast lights: a shadowed light that moved, or took its
+    // slot, within the last 60 frames -- the carried torch always (its flame
+    // wanders), a campfire just dropped. Their probes ride the camera box's
+    // timer with a short memory, so the bounce keeps up (near_field.h).
+    {
+        std::vector<float> fast;
+        for (size_t i = 0; i < act.size(); ++i) {
+            if (slot_of[i] < 0) continue;
+            ShadowSlot& sl = shadow_slots_[slot_of[i]];
+            const float dx = act[i].l.pos[0] - sl.pos[0], dy = act[i].l.pos[1] - sl.pos[1], dz = act[i].l.pos[2] - sl.pos[2];
+            if (!sl.ready || dx * dx + dy * dy + dz * dz > 1e-4f) sl.fast_until = post_frame_ + 60;
+            if (sl.fast_until <= post_frame_) continue;
+            fast.push_back(act[i].l.pos[0]);
+            fast.push_back(act[i].l.pos[1]);
+            fast.push_back(act[i].l.pos[2]);
+            fast.push_back(act[i].l.range);
+        }
+        near_.set_fast_lights(fast);
+    }
     std::vector<size_t> redraw;
     {
         UINT budget = kMaxFacesPerFrame;
@@ -3781,6 +3803,32 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     prof_.begin_frame(cmd_.Get(), UINT(frame_));
     // This frame's sun, moon and sky (ADR-004 L2), before anything uses them.
     update_sky(view.cam_pos[1]);
+    // How much the sun and sky changed since last frame, for the GI's
+    // histories (NearField::set_light_change): a time skip, the clock run
+    // fast, the key light passing from sun to moon. Lightning is not in it.
+    {
+        const SkyFrame& sf = sky_frame_;
+        const float key = 0.2126f * sf.key_lux[0] + 0.7152f * sf.key_lux[1] + 0.0722f * sf.key_lux[2];
+        const float sky = 0.2126f * sf.sky_mean[0] + 0.7152f * sf.sky_mean[1] + 0.0722f * sf.sky_mean[2];
+        float c = 0.0f;
+        if (have_prev_light_) {
+            const float dot = sf.key_dir[0] * prev_key_dir_[0] + sf.key_dir[1] * prev_key_dir_[1] +
+                              sf.key_dir[2] * prev_key_dir_[2];
+            c = std::fabs(std::log((key + 0.01f) / (prev_key_ + 0.01f))) +
+                std::fabs(std::log((sky + 1e-4f) / (prev_sky_ + 1e-4f))) +
+                std::acos((std::max)(-1.0f, (std::min)(1.0f, dot))) / 0.05f;
+        }
+        // BIOMES_NF_NORELIGHT: A/B, as before it (no reset on a jump).
+        static const bool no_relight = std::getenv("BIOMES_NF_NORELIGHT") != nullptr;
+        if (no_relight) c = 0.0f;
+        have_prev_light_ = true;
+        prev_key_ = key;
+        prev_sky_ = sky;
+        for (int k = 0; k < 3; ++k) prev_key_dir_[k] = sf.key_dir[k];
+        light_change_ = c;
+        near_.set_light_change(c);
+        if (NearField::is_reset(c) && !exposure_snap_) hfgi_.reset_bounce();
+    }
     for (int k = 0; k < 3; ++k) tree_settings_.sun_dir[k] = sky_frame_.key_dir[k];
     // This frame's wind and sea, from the frame's own clock.
     update_weather(view.time);
@@ -3877,7 +3925,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         };
         tr(shadow_map_.Get(), ps, ps | nps);
         tr(light_atlas_.Get(), ps, ps | nps);
-        near_.record(cmd_.Get(), UINT(frame_), world_, shadow_cb_[frame_]->GetGPUVirtualAddress(), cloud);
+        near_.record(cmd_.Get(), UINT(frame_), world_, shadow_cb_[frame_]->GetGPUVirtualAddress(), cloud, &prof_);
         tr(shadow_map_.Get(), ps | nps, ps);
         tr(light_atlas_.Get(), ps | nps, ps);
     }

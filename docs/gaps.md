@@ -30,12 +30,14 @@ Last gathered: 2026-11-21, after the exploration fog.
   0.8 s / 0.3 s. The light presence measures at the ground under the eye
   with physics rays; a fire round a corner lighting a wall you see does
   not count (no clear line to it). [Dark vision]
-- **After walking into a tunnel its unlit depths still darken for 10-20
-  s** (the meter's 10th percentile, 0.2 -> 0.02 nits) as the near field's
-  bounce settles. The exposure no longer follows them (it keys on the lit
-  part when a light is present; unlit, the floor holds it). Not run down:
-  neither shorter memories nor clearing stale probes removed it.
-  [Near field; Dark vision]
+- **After walking into a tunnel its unlit depths still darken for ~5 s**
+  (the meter's 10th percentile 0.08 -> 0.007 nits, 20 m in at 11:00).
+  NOT the probes' history any more: with every covered probe traced every
+  other frame it is unchanged, and so with the heightfield GI rebuilt
+  every frame, and with the mist and height fog off. Its curve follows the
+  eye's own adaptation (adapted EV100 2.2 -> 1.5 over the same seconds,
+  the same shape) -- something exposure-dependent in what the meter reads
+  is the next suspect. [Near field; Dark vision]
 - **The dark floor's colour fade is by each pixel's own luminance**, not
   by the eye's adaptation: a dim wall beside a bright one greys even while
   the eye is light-adapted. A real eye's rods take over only once it is
@@ -50,21 +52,37 @@ Last gathered: 2026-11-21, after the exploration fog.
   (every lit pixel walks its cluster, each light with its shadow cube).
   Grass is the bigger share for its overdraw. [Local lights]
 
-## The next lighting pass (planned)
-- **Two probe levels in the near field, radiance-cascades style** (Split
-  Radiance Cascades, Freeman, Sannikov and Pitt-Francis, the PDF in
-  docs/): the 2 m probes keep short rays (a few metres) and a second level
-  (4-8 m spacing, ~256 directions) takes 6-48 m, merged as RC merges
-  intervals. It replaces the sun-at-hits fade (`kNfSunNear/Far`), which
-  drops real light from far sunlit patches to kill their noise. The paper
-  as written needs hardware ray tracing and ~10 ms; only its core idea
-  fits here. [Near field]
-- **Local lights back in the probes, properly**: their bounce is an
-  instant per-light fill today (20%, shadowed by the light's own map). In
-  the probes it lagged through their history and pulsed when a ray struck
-  rock beside a flame; a near level with short rays and a clamp on the
-  inverse square near the light are the candidates. Emitters (below) want
-  the same path. [Near field; Local lights]
+## The near field's two levels (built; what is left)
+- **Far sunlit walls still arrive second-hand.** The coarse level's direct
+  sun at a hit fades from 6 to 24 m of ray (`kNfCoarseSunFar`): unfaded,
+  its 4 rays a bin found a sunlit patch 20-40 m down a tunnel by chance,
+  and the unlit tunnel's 90th percentile wandered 4x over seconds (its
+  standard deviation 70% of its mean). That light now comes through the
+  fine probes beside the patch, one bounce later. Sampling sunlit surfaces
+  as lights (next-event estimation) is what would bring it back.
+  [Near field]
+- **Some fine rays find no coarse probe** and march to 48 m themselves,
+  with the old fade (one side of a 4 m tunnel whose blocks put their probe
+  near the other wall; `BIOMES_NF_DBG=1` paints them green). [Near field]
+- **The merge's parallax is a visibility test**, not the cascades'
+  bilinear fix: a coarse probe that sees the ray's 6 m point (and, where
+  its own 6 m point is air, that too) lends its bin. A probe on the
+  surface seen through a tunnel's mouth can still lend its view along a
+  ray the tunnel would have closed. [Near field]
+- **Coarse hits see no local lights**: a fire 10 m down a tunnel reaches
+  walls past 6 m from a probe only second-hand, through the fine probes by
+  them. [Near field; Local lights]
+- **Fast lights are held fast for 60 frames**, not seconds: 0.4 s at 144
+  fps; at most 8 a frame. [Near field]
+- **The live list has no priority**: past 8,192 covered probes (a big cave
+  system, when caves come back) it is walked in longer turns, near and far
+  alike, and every probe's history covers its turn. The camera's
+  surroundings first would be the next step. [Near field]
+- **A probe dug fresh keeps its old light until its turn** (a frame or
+  two at stride 2), then starts over. [Near field]
+- **A light jump is judged from the sun and the sky only**: a storm
+  rolling in, or the clouds' shadow arriving, is followed at the probes'
+  memory (0.35 s fine, 1 s coarse), not at once. [Near field]
 
 ## Shadows and light
 
@@ -76,7 +94,8 @@ Last gathered: 2026-11-21, after the exploration fog.
   shadows**; the casters were matched to the real leaves, not re-checked
   since RT left. [Shadows; Hardware ray tracing: REMOVED]
 - **The heightfield GI**: crowns do not bounce green, local lights are not
-  in the bounce, nothing past 256 m, and a big cavern sees only its
+  in its bounce (in the open their fill stands in; under cover the near
+  field carries them), nothing past 256 m, and a big cavern sees only its
   nearest opening's light. [Heightfield GI]
 - The canopy map is static in the wind; leaf flutter is raster only.
   [Weather]
@@ -125,7 +144,9 @@ Last gathered: 2026-11-21, after the exploration fog.
   takes that path near the camera (the volume always holds the eye).
   [Near field]
 - **A light past the 24 shadowed ones lights through rock**, its fill
-  with it. [Local lights]
+  with it. The near field's probes leave it out (they would carry it
+  through rock), so under cover such a light has no bounce at all.
+  [Local lights; Near field]
 - **The near field reaches 64 m round the camera and 32 m up and down**:
   past it, the heightfield's old covered branch answers (a search for a
   way out, else black). A mine deeper than 32 m below the eye is fine (the

@@ -3,12 +3,14 @@
 #endif
 #include "engine/render/near_field.h"
 #include "engine/render/shader_compile.h"
+#include "engine/render/gpu_profile.h"
 #include "engine/field/world_gpu.h"
 #include "engine/svdag/brick_store.h"
 
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -19,12 +21,17 @@ namespace {
 struct NfConstants {
     int32_t origin[4];
     uint32_t edits, probes;
-    float keep_box, keep_rr;   // the blend over history: the camera's box (and a still), the round robin
+    float keep_box, keep_rr;   // a frame's blend at the fine memory: a still's base, a probe traced from the CPU's list
     float rot[3][4];   // rows of this update's random rotation of the ray set
     float cloud[4];    // the clouds' shadow map
-    uint32_t lights, pad2, pad3, pad4;
+    uint32_t lights, coarse;   // local lights a near hit is lit by; entries in the coarse list
+    float keep_coarse, keep_light;   // the coarse level's blend; probes a moving light reaches
+    uint32_t seed, dbg, pad_lap, settle; // the rays' jitter; BIOMES_NF_DBG; -; a still's updates so far (~0: play)
+    float live[4];                   // the live pass's blends: fine, by a fast light, coarse; -
+    uint32_t live2[4];               // fast lights, plans so far, fine and coarse strides
+    float fast[8][4];                // fast lights: x, y, z, reach^2
 };
-static_assert(sizeof(NfConstants) == 112, "NfConstants must match near_field.hlsl");
+static_assert(sizeof(NfConstants) == 288, "NfConstants must match near_field.hlsl");
 
 // A uniformly random rotation (Shoemake's quaternion from three uniforms),
 // as matrix rows. Presentation; sin and cos are fine here.
@@ -81,6 +88,7 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
     held_.assign(size_t(kBlocks) * 3, INT_MIN);
     dirty_.assign(kBlocks, 0);
     probe_dirty_.assign(kProbes, 0);
+    stamp_.assign(kProbes, 0u);
 
     D3D12_HEAP_PROPERTIES dh = {};
     dh.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -140,12 +148,37 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
         error = "near field probes";
         return false;
     }
+    if (!buffer(coarse_, UINT64(kCoarseFloat4s) * 16, D3D12_HEAP_TYPE_DEFAULT, true,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) {
+        error = "near field coarse probes";
+        return false;
+    }
+    if (!buffer(aux_, UINT64(kAuxUints) * 4, D3D12_HEAP_TYPE_DEFAULT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||
+        !buffer(args_, 256, D3D12_HEAP_TYPE_DEFAULT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||
+        !buffer(live_rb_[0], 256, D3D12_HEAP_TYPE_READBACK, false, D3D12_RESOURCE_STATE_COPY_DEST) ||
+        !buffer(live_rb_[1], 256, D3D12_HEAP_TYPE_READBACK, false, D3D12_RESOURCE_STATE_COPY_DEST)) {
+        error = "near field live lists";
+        return false;
+    }
+    {
+        D3D12_INDIRECT_ARGUMENT_DESC ad = {};
+        ad.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+        D3D12_COMMAND_SIGNATURE_DESC sd = {};
+        sd.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+        sd.NumArgumentDescs = 1;
+        sd.pArgumentDescs = &ad;
+        if (FAILED(device->CreateCommandSignature(&sd, nullptr, IID_PPV_ARGS(&dispatch_sig_)))) {
+            error = "near field dispatch signature";
+            return false;
+        }
+    }
     for (int f = 0; f < 2; ++f) {
         const D3D12_HEAP_TYPE up = D3D12_HEAP_TYPE_UPLOAD;
         const D3D12_RESOURCE_STATES gr = D3D12_RESOURCE_STATE_GENERIC_READ;
-        if (!buffer(cb_[f], 256, up, false, gr) || !buffer(blocks_up_[f], UINT64(kBlocks) * 16, up, false, gr) ||
+        if (!buffer(cb_[f], 512, up, false, gr) || !buffer(blocks_up_[f], UINT64(kBlocks) * 16, up, false, gr) ||
             !buffer(edits_up_[f], UINT64(kMaxEdits) * 16, up, false, gr) ||
-            !buffer(probes_up_[f], UINT64(kProbes) * 4, up, false, gr)) {
+            !buffer(probes_up_[f], UINT64(kProbes) * 4, up, false, gr) ||
+            !buffer(coarse_up_[f], UINT64(kCoarse) * 4, up, false, gr)) {
             error = "near field uploads";
             return false;
         }
@@ -153,6 +186,7 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
         blocks_up_[f]->Map(0, nullptr, &blocks_cpu_[f]);
         edits_up_[f]->Map(0, nullptr, &edits_cpu_[f]);
         probes_up_[f]->Map(0, nullptr, &probes_cpu_[f]);
+        coarse_up_[f]->Map(0, nullptr, &coarse_cpu_[f]);
     }
 
     const UINT inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -229,7 +263,7 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
         r[2].OffsetInDescriptorsFromTableStart = kSrvProbes;
         r[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r[3].NumDescriptors = 5; r[3].BaseShaderRegister = 38;
         r[3].OffsetInDescriptorsFromTableStart = 48;   // the heightfield GI (height_gi.h kSrvScene)
-        D3D12_ROOT_PARAMETER p[19] = {};
+        D3D12_ROOT_PARAMETER p[23] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 1;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[2].Descriptor.ShaderRegister = 2;
@@ -247,7 +281,13 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
         p[18].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         p[18].Constants.ShaderRegister = 3;
         p[18].Constants.Num32BitValues = 1;
-        for (int k = 0; k < 19; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        // The coarse level (u8) and its list (t5).
+        p[19].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; p[19].Descriptor.ShaderRegister = 8;
+        p[20].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[20].Descriptor.ShaderRegister = 5;
+        // The live lists (u9) and the live passes' dispatch arguments (u10).
+        p[21].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; p[21].Descriptor.ShaderRegister = 9;
+        p[22].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; p[22].Descriptor.ShaderRegister = 10;
+        for (int k = 0; k < 23; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_STATIC_SAMPLER_DESC ss[3] = {};
         for (int k = 0; k < 2; ++k) {
             ss[k].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -267,7 +307,7 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
         ss[2].ShaderRegister = 1;
         ss[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 19;
+        rsd.NumParameters = 23;
         rsd.pParameters = p;
         rsd.NumStaticSamplers = 3;
         rsd.pStaticSamplers = ss;
@@ -281,9 +321,13 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
             return false;
         }
     }
-    const char* entries[6] = {"cs_nf_fill", "cs_nf_edits", "cs_nf_occ", "cs_nf_mip", "cs_nf_probe", "cs_nf_top"};
-    ComPtr<ID3D12PipelineState>* outs[6] = {&fill_pso_, &edits_pso_, &occ_pso_, &mip_pso_, &probe_pso_, &top_pso_};
-    for (int k = 0; k < 6; ++k) {
+    const char* entries[13] = {"cs_nf_fill", "cs_nf_edits", "cs_nf_occ", "cs_nf_mip", "cs_nf_probe", "cs_nf_top",
+                               "cs_nf_coarse", "cs_nf_probe_live", "cs_nf_coarse_live", "cs_nf_classify",
+                               "cs_nf_live", "cs_nf_live_args", "cs_nf_clear"};
+    ComPtr<ID3D12PipelineState>* outs[13] = {&fill_pso_, &edits_pso_, &occ_pso_, &mip_pso_, &probe_pso_, &top_pso_,
+                                             &coarse_pso_, &probe_live_pso_, &coarse_live_pso_, &classify_pso_,
+                                             &live_pso_, &live_args_pso_, &clear_pso_};
+    for (int k = 0; k < 13; ++k) {
         ComPtr<ID3DBlob> cs;
         if (!compile_shader("engine/render/shaders/near_field.hlsl", entries[k], "cs_5_1", cs, error)) return false;
         D3D12_COMPUTE_PIPELINE_STATE_DESC cd = {};
@@ -418,67 +462,73 @@ void NearField::plan(const float cam[3], const BrickStore* edits, bool settle, f
     ++plans_;
     if (!blocks_.empty()) { ++fill_frames_; blocks_filled_ += blocks_.size() / 4; }
 
-    // Probes: the dirty ones first, then a round robin over all of them so
-    // the light follows the hour and the heightfield's rebuilds.
+    // The light jumped: start over -- every probe this frame, cleared first,
+    // iterated as a still is.
+    reset_ = !settle && is_reset(relight_c_);
+    if (reset_) {
+        settle = true;
+        settle_frames_ = 0;
+        ++resets_;
+    }
+
+    // Probes: the dirty ones first (fresh), then a round robin over all of
+    // them -- which in play only places and copies: a probe that traces is
+    // the live pass's, every frame (near_field.hlsl cs_nf_live). The round
+    // robin finds probes newly under cover (dug ones come dirty) and keeps
+    // the copies of the heightfield current. A still lists every probe.
     const size_t pbudget = settle ? size_t(kProbes) : size_t(kProbesPerFrame);
     size_t take = (std::min)(dirty_probes_.size(), pbudget);
     // The top bit: start the probe over rather than blend into its history,
-    // which predates the edit or the block that scrolled in. The next bit:
-    // traced every frame, so it keeps more history (near_field.hlsl).
+    // which predates the edit or the block that scrolled in.
+    const uint32_t stamp = uint32_t(plans_) + 1u;   // this plan's mark: a probe listed once
     for (size_t i = 0; i < take; ++i) {
         probe_list_.push_back(dirty_probes_[i] | 0x80000000u);
         probe_dirty_[dirty_probes_[i]] = 0;
+        stamp_[dirty_probes_[i]] = stamp;
     }
     dirty_probes_.erase(dirty_probes_.begin(), dirty_probes_.begin() + std::ptrdiff_t(take));
-    const float rate = sched_.box_rate > 0.1f ? sched_.box_rate : 0.1f;
+    // A still blends as play does at 60 Hz (the shader takes the plain mean
+    // of its updates until that is the smaller); play, a frame's dt.
+    const float step = settle ? 1.0f / 60.0f : dt_smooth_;
+    keep_box_ = std::exp(-step / (std::max)(sched_.near_memory, 0.01f));
+    keep_light_ = std::exp(-step / (std::max)(sched_.light_memory, 0.01f));
+    keep_rr_ = keep_box_;
+    keep_live_ = keep_box_;
+    keep_live_light_ = keep_light_;
+    keep_live_coarse_ = std::exp(-step / (std::max)(sched_.coarse_memory, 0.01f));
     if (settle) {
-        // A still: every probe every frame, blended as the camera's box is
-        // at its rate -- the look a player standing there sees.
         probe_list_.clear();
-        for (uint32_t i = 0; i < uint32_t(kProbes); ++i) probe_list_.push_back(i | 0x40000000u);
+        for (uint32_t i = 0; i < uint32_t(kProbes); ++i) probe_list_.push_back(i);
         std::fill(probe_dirty_.begin(), probe_dirty_.end(), uint8_t(0));
         dirty_probes_.clear();
-        keep_box_ = std::exp(-1.0f / (rate * (std::max)(sched_.near_memory, 0.01f)));
-        keep_rr_ = keep_box_;
     } else {
-        // The box round the camera, on a timer: what is near enough to see
-        // closely, where a carried torch's bounce must keep up with it. Its
-        // slices are a fixed parity of the WORLD probe grid, so a moving
-        // camera does not reshuffle them; each frame traces the slices its
-        // time has paid for. Below the rate (a slow frame), every slice, and
-        // the blend follows the frame's real interval.
-        box_credit_ += dt * rate * float(kBoxSlices);
-        int slices = int(box_credit_);
-        if (slices > kBoxSlices) slices = kBoxSlices;
-        box_credit_ -= float(slices);
-        if (box_credit_ > float(kBoxSlices)) box_credit_ = float(kBoxSlices);
-        const int cp[3] = {int(std::floor((cam[0] - 1.0f) * 0.5f)), int(std::floor((cam[1] - 1.0f) * 0.5f)),
-                           int(std::floor((cam[2] - 1.0f) * 0.5f))};
-        const int h = kCameraBox / 2;
-        for (int s = 0; s < slices; ++s) {
-            const uint32_t sl = (box_slice_ + uint32_t(s)) % uint32_t(kBoxSlices);
-            const int sx = int(sl & 1u), sy = int((sl >> 1) & 1u), sz = int((sl >> 2) & 1u);
-            for (int z = cp[2] - h; z < cp[2] + h; ++z) {
-                if ((z & 1) != sz) continue;
-                for (int y = cp[1] - h; y < cp[1] + h; ++y) {
-                    if ((y & 1) != sy) continue;
-                    for (int x = cp[0] - h; x < cp[0] + h; ++x)
-                        if ((x & 1) == sx) probe_list_.push_back(probe_storage(x, y, z) | 0x40000000u);
-                }
-            }
-        }
-        box_slice_ = (box_slice_ + uint32_t(slices)) % uint32_t(kBoxSlices);
-        const float box_interval = (std::max)(1.0f / rate, dt_smooth_);
-        keep_box_ = std::exp(-box_interval / (std::max)(sched_.near_memory, 0.01f));
-        // The round robin: a lap is kProbes / kProbesPerFrame frames.
-        const float lap = float(kProbes) / float(kProbesPerFrame) * dt_smooth_;
-        keep_rr_ = std::exp(-lap / (std::max)(sched_.far_memory, 0.01f));
-        const size_t rr_end = probe_list_.size() + pbudget;
-        while (probe_list_.size() < rr_end) {
-            probe_list_.push_back(cursor_);
+        for (size_t n = 0; n < pbudget; ++n) {
+            if (stamp_[cursor_] != stamp) probe_list_.push_back(cursor_);   // not if listed already
             cursor_ = (cursor_ + 1) % uint32_t(kProbes);
         }
     }
+    // The coarse level: a round robin too (every probe in a still), which in
+    // play places the unplaced and refreshes the open; the covered ones are
+    // the live pass's.
+    coarse_list_.clear();
+    keep_coarse_ = keep_live_coarse_;
+    if (settle) {
+        for (uint32_t i = 0; i < uint32_t(kCoarse); ++i) coarse_list_.push_back(i);
+        // A still is ~17 frames, and a second's memory at 60 Hz (0.983 a
+        // frame) kept three quarters of the FIRST frames -- traced while the
+        // fine probes its hits bounce off were still empty -- and the
+        // stairwell's side tunnel came out 10x too dark. The shader takes the
+        // plain mean of the still's updates so far (NfConstants settle).
+        ++settle_frames_;
+    } else {
+        settle_frames_ = 0;
+        for (int i = 0; i < kCoarsePerFrame; ++i) {
+            coarse_list_.push_back(coarse_cursor_);
+            coarse_cursor_ = (coarse_cursor_ + 1) % uint32_t(kCoarse);
+        }
+    }
+    settling_ = settle;
+    coarse_traced_ += coarse_list_.size();
 
     probes_traced_ += probe_list_.size();
     // Ready once the whole volume has been filled and every probe traced
@@ -489,22 +539,70 @@ void NearField::plan(const float cam[3], const BrickStore* edits, bool settle, f
 }
 
 void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGpu& world,
-                       D3D12_GPU_VIRTUAL_ADDRESS shadow_cb, const float cloud[4]) {
-    if (!root_ || (blocks_.empty() && probe_list_.empty())) return;
+                       D3D12_GPU_VIRTUAL_ADDRESS shadow_cb, const float cloud[4], GpuProfiler* prof) {
+    auto mark = [&](const char* name) { if (prof) prof->mark(cmd, name); };
+    if (!root_ || (blocks_.empty() && probe_list_.empty() && coarse_list_.empty())) return;
     const UINT f = frame & 1u;
+    // The live lists' lengths this slot copied two frames ago (its fence has
+    // been waited for before the frame's allocator came back).
+    if (live_rb_pending_[f]) {
+        void* p = nullptr;
+        D3D12_RANGE rr = {0, 16};
+        if (SUCCEEDED(live_rb_[f]->Map(0, &rr, &p))) {
+            const uint32_t* u = static_cast<const uint32_t*>(p);
+            live_fine_ = u[0] + u[2];
+            live_coarse_ = u[1] + u[3];
+            D3D12_RANGE nr = {0, 0};
+            live_rb_[f]->Unmap(0, &nr);
+        }
+        live_rb_pending_[f] = false;
+    }
     NfConstants c = {};
     for (int k = 0; k < 3; ++k) c.origin[k] = origin_[k];
     c.edits = uint32_t(edit_list_.size() / 4);
     c.probes = uint32_t(probe_list_.size());
     c.keep_box = keep_box_;
     c.keep_rr = keep_rr_;
-    random_rotation(rng_, c.rot);
+    random_rotation(rng_, c.rot);   // unused by the shader now; advances rng_, the jitters' seed
     for (int k = 0; k < 4; ++k) c.cloud[k] = cloud ? cloud[k] : 0.0f;
-    c.lights = 0u;   // hits are no longer lit by local lights (near_field.hlsl nf_hit)
+    // A/B: BIOMES_NF_NOLIGHTS (no local light at a hit), BIOMES_NF_NOCOARSE
+    // (no coarse level: every fine ray marches to 48 m, as before it).
+    // BIOMES_NF_DBG: 1 a fine ray that took the coarse level returns red,
+    // one that found none green; 2 per ray (coarse probes placed, with the
+    // bin open, visible) as rgb; 3 never merge (the coarse pass still runs:
+    // what the merge costs). View with --texture 0 --tonemap 0 --ev100 1.
+    static const bool no_lights = std::getenv("BIOMES_NF_NOLIGHTS") != nullptr;
+    static const bool no_coarse = std::getenv("BIOMES_NF_NOCOARSE") != nullptr;
+    if (no_coarse) coarse_list_.clear();
+    c.lights = no_lights ? 0u : uint32_t(kHitLights);
+    c.coarse = uint32_t(coarse_list_.size());
+    c.keep_coarse = keep_coarse_;
+    c.keep_light = keep_light_;
+    c.seed = rng_;
+    c.settle = settling_ ? (settle_frames_ - 1u) * uint32_t(kSettleIters) : 0xFFFFFFFFu;
+    c.live[0] = keep_live_;
+    c.live[1] = keep_live_light_;
+    c.live[2] = keep_live_coarse_;
+    c.live[3] = 0.0f;
+    {
+        const size_t nfast = (std::min)(fast_.size() / 4, size_t(8));
+        c.live2[0] = uint32_t(nfast);
+        for (size_t i = 0; i < nfast; ++i) {
+            const float reach = (std::min)(fast_[i * 4 + 3], sched_.light_reach);
+            for (int k = 0; k < 3; ++k) c.fast[i][k] = fast_[i * 4 + k];
+            c.fast[i][3] = reach * reach;
+        }
+    }
+    c.live2[1] = uint32_t(plans_);
+    c.live2[2] = uint32_t((std::max)(sched_.live_stride, 1));
+    c.live2[3] = uint32_t((std::max)(sched_.coarse_stride, 1));
+    static const char* dbg_env = std::getenv("BIOMES_NF_DBG");
+    c.dbg = dbg_env ? uint32_t(std::atoi(dbg_env)) : 0u;
     std::memcpy(cb_cpu_[f], &c, sizeof c);
     if (!blocks_.empty()) std::memcpy(blocks_cpu_[f], blocks_.data(), blocks_.size() * 4);
     if (!edit_list_.empty()) std::memcpy(edits_cpu_[f], edit_list_.data(), edit_list_.size() * 4);
     if (!probe_list_.empty()) std::memcpy(probes_cpu_[f], probe_list_.data(), probe_list_.size() * 4);
+    if (!coarse_list_.empty()) std::memcpy(coarse_cpu_[f], coarse_list_.data(), coarse_list_.size() * 4);
 
     ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
     cmd->SetDescriptorHeaps(1, heaps);
@@ -522,6 +620,10 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
     cmd->SetComputeRootShaderResourceView(16, probes_up_[f]->GetGPUVirtualAddress());
     cmd->SetComputeRootUnorderedAccessView(17, probes_->GetGPUVirtualAddress());
     cmd->SetComputeRoot32BitConstant(18, 0u, 0);
+    cmd->SetComputeRootUnorderedAccessView(19, coarse_->GetGPUVirtualAddress());
+    cmd->SetComputeRootShaderResourceView(20, coarse_up_[f]->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(21, aux_->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(22, args_->GetGPUVirtualAddress());
 
     if (!blocks_.empty()) {
         if (occ_is_srv_) { transition(cmd, occ_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); occ_is_srv_ = false; }
@@ -548,12 +650,71 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
     }
     if (!occ_is_srv_) { transition(cmd, occ_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead); occ_is_srv_ = true; }
     if (!top_is_srv_) { transition(cmd, top_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead); top_is_srv_ = true; }
-    if (!probe_list_.empty()) {
-        if (probes_is_srv_) { transition(cmd, probes_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); probes_is_srv_ = false; }
-        cmd->SetPipelineState(probe_pso_.Get());
-        // A group a probe (a thread a ray), in rows of 256 groups: a still's
-        // list is longer than one dimension's 65,535.
-        cmd->Dispatch(256u, UINT((probe_list_.size() + 255) / 256), 1);
+    if (probes_is_srv_) { transition(cmd, probes_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); probes_is_srv_ = false; }
+    mark("near field: fill, occupancy");
+    if (reset_) {
+        cmd->SetPipelineState(clear_pso_.Get());
+        cmd->Dispatch(UINT((kProbes * kProbeFloat4s + 255) / 256), 1, 1);
+        uav_barrier(cmd, probes_.Get());
+    }
+    // A still iterates both levels (kSettleIters); the root constant b3 is
+    // the iteration (the mips left it at their last level).
+    const int iters = settling_ ? kSettleIters : 1;
+    for (int it = 0; it < iters; ++it) {
+        cmd->SetComputeRoot32BitConstant(18, UINT(it), 0);
+        if (!coarse_list_.empty()) {
+            // The coarse level first: the fine rays read it. Its hits read
+            // the fine probes (last frame's) for their bounce.
+            if (probes_is_srv_) { transition(cmd, probes_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); probes_is_srv_ = false; }
+            cmd->SetPipelineState(coarse_pso_.Get());
+            cmd->Dispatch(UINT(coarse_list_.size()), 1, 1);
+            uav_barrier(cmd, coarse_.Get());
+        }
+        mark("near field: coarse, listed");
+        if (!probe_list_.empty() && settling_) {
+            if (probes_is_srv_) { transition(cmd, probes_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); probes_is_srv_ = false; }
+            cmd->SetPipelineState(probe_pso_.Get());
+            // A group a probe (a thread a ray), in rows of 256 groups: a
+            // still's list is longer than one dimension's 65,535.
+            cmd->Dispatch(256u, UINT((probe_list_.size() + 255) / 256), 1);
+            uav_barrier(cmd, probes_.Get());
+        }
+        if (settling_) continue;
+        // Play: the CPU's list is placed and copied a thread a probe; then
+        // every probe that traces (fine and coarse) is listed and traced in
+        // its turn, by an indirect dispatch.
+        if (!probe_list_.empty()) {
+            cmd->SetPipelineState(classify_pso_.Get());
+            cmd->Dispatch(UINT((probe_list_.size() + 63) / 64), 1, 1);
+            uav_barrier(cmd, aux_.Get());
+        }
+        mark("near field: classify");
+        cmd->SetPipelineState(live_pso_.Get());
+        cmd->Dispatch(UINT((kProbes + kCoarse + 255) / 256), 1, 1);
+        uav_barrier(cmd, aux_.Get());
+        cmd->SetPipelineState(live_args_pso_.Get());
+        cmd->Dispatch(1, 1, 1);
+        transition(cmd, args_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        mark("near field: live lists");
+        // The coarse and fine live passes run side by side, no barrier
+        // between: the coarse one is a handful of groups whose 48 m rays are
+        // all latency (0.04 ms alone), and the fine rays' merge takes a bin
+        // from this frame or the last -- a benign race, the two a frame apart.
+        cmd->SetPipelineState(coarse_live_pso_.Get());
+        cmd->ExecuteIndirect(dispatch_sig_.Get(), 1, args_.Get(), 12, nullptr, 0);
+        cmd->SetPipelineState(probe_live_pso_.Get());
+        cmd->ExecuteIndirect(dispatch_sig_.Get(), 1, args_.Get(), 0, nullptr, 0);
+        uav_barrier(cmd, probes_.Get());
+        uav_barrier(cmd, coarse_.Get());
+        transition(cmd, args_.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        // The counts, for the stats, now and then (both slots: the other
+        // was zeroed for next frame).
+        if ((plans_ & 31u) == 0u) {
+            transition(cmd, aux_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            cmd->CopyBufferRegion(live_rb_[f].Get(), 0, aux_.Get(), UINT64(2 * kProbes + kCoarse) * 4, 16);
+            transition(cmd, aux_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            live_rb_pending_[f] = true;
+        }
     }
     if (!probes_is_srv_) { transition(cmd, probes_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead); probes_is_srv_ = true; }
 }

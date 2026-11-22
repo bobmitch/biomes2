@@ -141,6 +141,24 @@ float nf_openness(float3 p, out float k) {
     return saturate(2.0f * v.x / (kHfY00 * 4.0f * 3.14159265f));
 }
 
+// How far the near field's probes answer at a surface point: 1 under real
+// cover, 0 in the open, the same rule hfgi_sample blends them by (less the
+// volume's margin, which only matters at its edge). Where it is 1 the
+// probes carry a local light's bounce, and the light's own fill
+// (local_lights.hlsli) steps aside.
+float nf_cover(float3 world) {
+    if (l_hf.w < 0.5f || l_nf.w < 0.5f) return 0.0f;
+    float dnf;
+    if (!nf_depth(world, dnf)) return 0.0f;
+    float k = smoothstep(-0.5f, -1.5f, dnf);
+    const float2 uv = float2((world.x - l_hf.x) / kHfExtent, 1.0f - (world.z - l_hf.y) / kHfExtent);
+    if (all(uv > 0.0f) && all(uv < 1.0f)) {
+        const float h = g_hf_height.SampleLevel(g_gi_linear, uv, 0.0f).x;
+        if (h > kHfNone * 0.5f && world.y - h < -1.5f) k = 1.0f;
+    }
+    return k;
+}
+
 // `vis_e`: the sky's share as an irradiance factor -- pi for a point that
 // sees a whole open hemisphere about n, as kSkyMean * vis_e is the sky's
 // irradiance. `bounce`: the terrain's bounce irradiance, lux. `cover` how

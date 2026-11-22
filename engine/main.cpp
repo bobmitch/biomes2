@@ -951,12 +951,12 @@ void register_tunables() {
     {
         const char* NF = "Near field";
         static engine::NearField::Schedule& S = R.near_field_schedule();
-        range("nf_box_rate", NF, "Probes round the camera, traced", 2.0f, 60.0f, 1.0f, "Hz",
-              [] { return S.box_rate; }, [](float v) { S.box_rate = v; });
-        range("nf_near_memory", NF, "Their memory", 0.05f, 3.0f, 0.05f, "s",
+        range("nf_near_memory", NF, "Probes' memory", 0.05f, 3.0f, 0.05f, "s",
               [] { return S.near_memory; }, [](float v) { S.near_memory = v; });
-        range("nf_far_memory", NF, "The rest's memory", 0.5f, 10.0f, 0.1f, "s",
-              [] { return S.far_memory; }, [](float v) { S.far_memory = v; });
+        range("nf_coarse_memory", NF, "Coarse level's memory", 0.1f, 5.0f, 0.1f, "s",
+              [] { return S.coarse_memory; }, [](float v) { S.coarse_memory = v; });
+        range("nf_light_memory", NF, "By a moving light", 0.02f, 1.0f, 0.02f, "s",
+              [] { return S.light_memory; }, [](float v) { S.light_memory = v; });
     }
     const char* E = "Exposure";
     range("ev_comp", E, "Exposure compensation", -4.0f, 4.0f, 0.25f, "EV", [&] { return R.ev_comp(); },
@@ -1760,12 +1760,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 g_renderer.add_light(l);
             }
         }
-        // --nf-schedule <Hz> <near s> <far s>: the probes' timer and memories.
+        // --nf-schedule <fine s> <coarse s> <light s>: the probes' memories.
         {
             const size_t ns = c2.find("--nf-schedule ");
             engine::NearField::Schedule& s = g_renderer.near_field_schedule();
             if (ns != std::string::npos)
-                std::sscanf(c2.c_str() + ns + 14, "%f %f %f", &s.box_rate, &s.near_memory, &s.far_memory);
+                std::sscanf(c2.c_str() + ns + 14, "%f %f %f", &s.near_memory, &s.coarse_memory, &s.light_memory);
         }
         // Dark vision for A/B: --ev-floor <open> <under> (EV100), the display
         // floor off, the player's brightness.
@@ -2140,6 +2140,56 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_renderer.set_post_dt_override(-1.0f);
         }
 
+        // --clock-jump <hours> [seconds] [ramp]: how fast the light under the
+        // ground follows the clock. After the still, 2 s at its hour, then the
+        // clock jumps to <hours> -- or with [ramp] seconds, runs there
+        // evenly over them, as H does -- and holds for [seconds] (10) after
+        // it. Every frame a
+        // simulated 1/30 s, the camera still. build/time_jump.txt: time, hour,
+        // the meter's target and adapted EV100, its 10th and 90th percentiles
+        // in nits (exposure-independent), every frame.
+        {
+            const std::string cl = cmdline ? cmdline : "";
+            const size_t tj = cl.find("--clock-jump ");
+            if (ok && tj != std::string::npos) {
+                float to = 23.0f, secs = 10.0f, ramp = 0.0f;
+                std::sscanf(cl.c_str() + tj + 13, "%f %f %f", &to, &secs, &ramp);
+                if (secs <= 0.0f || secs > 300.0f) secs = 10.0f;
+                const float step = 1.0f / 30.0f;
+                g_renderer.set_post_dt_override(step);
+                FILE* jf = std::fopen("build/time_jump.txt", "w");
+                if (jf) std::fprintf(jf, "t_s  hour  target_EV100  adapted_EV100  p10_nits  p90_nits\n");
+                float t = 0.0f;
+                auto run = [&](float seconds) {
+                    const int n = int(seconds / step + 0.5f);
+                    for (int i = 0; i < n; ++i) {
+                        t += step;
+                        fill_view(g_camera, g_res_w, g_res_h, t, v);
+                        g_renderer.step_offscreen(v);
+                        const float* ex = g_renderer.live_exposure();
+                        if (jf)
+                            std::fprintf(jf, "%6.3f  %5.2f  %6.2f  %6.2f  %9.5f %9.5f\n", t, g_renderer.time_of_day(),
+                                         ex[3] + 3.0f, ex[2], ex[4], ex[5]);
+                    }
+                };
+                run(2.0f);
+                if (ramp > 0.0f) {
+                    // Forward through midnight if need be, as the clock runs.
+                    const float from = g_renderer.time_of_day();
+                    const float span = std::fmod(to - from + 24.0f, 24.0f);
+                    const int n = int(ramp / step + 0.5f);
+                    for (int i = 0; i < n; ++i) {
+                        g_renderer.set_time_of_day(from + span * float(i + 1) / float(n));
+                        run(step);
+                    }
+                }
+                g_renderer.set_time_of_day(to);
+                run(secs);
+                if (jf) std::fclose(jf);
+                g_renderer.set_post_dt_override(-1.0f);
+            }
+        }
+
         // --write-snapshot: the still's scene as an F8 snapshot (the window's
         // key, headless), its folder named in build/last_snapshot.txt.
         if (ok && std::string(cmdline).find("--write-snapshot") != std::string::npos) {
@@ -2248,8 +2298,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                  wall_ms);
                     std::fprintf(gf, "frame, every pass serialised by a barrier:                  %.3f ms over %u frames\n\n",
                                  prof.total_ms() / pf, prof.frames());
-                    std::fprintf(gf, "near field: %.0f probes traced a frame%s\n\n", nf_probes_frame,
-                                 std::getenv("BIOMES_NF_PLAY") ? " (BIOMES_NF_PLAY: play's schedule)" : "");
+                    std::fprintf(gf, "near field: %.0f probes listed by the CPU a frame%s; live, traced every frame: %u fine, %u coarse\n\n",
+                                 nf_probes_frame, std::getenv("BIOMES_NF_PLAY") ? " (BIOMES_NF_PLAY: play's schedule)" : "",
+                                 g_renderer.near_field().live_fine(), g_renderer.near_field().live_coarse());
                     std::fprintf(gf, "%-58s %9s %9s %7s\n", "pass (named by the mark that ends it)", "ms/frame", "max ms", "frames");
                     double sum = 0.0;
                     const std::vector<std::pair<std::string, engine::GpuProfiler::Segment> > segs = prof.ordered_segments();

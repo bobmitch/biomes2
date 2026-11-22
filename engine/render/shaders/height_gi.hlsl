@@ -98,14 +98,17 @@ void cs_hf_light(uint3 id : SV_DispatchThreadID) {
         E += kSunLux * (nl * vis);
     }
     // The sky and the bounce the last rebuild found here.
-    if (first != 0u) {
+    if (first == 1u) {
         const float up = 0.5f + 0.5f * n.y;
         E += kPi * (kSkyMean * up + kGroundRadiance * (1.0f - up));
     } else {
         const float sv = canopy_visibility_raw(P + float3(0.0f, 0.5f, 0.0f));
         E += kSkyMean * (hf_irradiance(g_hf_vis.Load(int3(t, 0)), n) * sv);
-        E += float3(hf_irradiance(g_hf_r.Load(int3(t, 0)), n), hf_irradiance(g_hf_g.Load(int3(t, 0)), n),
-                    hf_irradiance(g_hf_b.Load(int3(t, 0)), n));
+        // 2: the light jumped (HeightGi::reset_bounce), and the last
+        // rebuild's bounce was the old light's.
+        if (first == 0u)
+            E += float3(hf_irradiance(g_hf_r.Load(int3(t, 0)), n), hf_irradiance(g_hf_g.Load(int3(t, 0)), n),
+                        hf_irradiance(g_hf_b.Load(int3(t, 0)), n));
     }
     // The curvature for the ground's macro variation (mesh.hlsl): the
     // height over the mean of four points 6 m round, + a crest, - a hollow.

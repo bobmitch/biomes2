@@ -94,6 +94,8 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--shot`, `--flight <s>`, `--walk <s>`, `--overhang`, `--dig`, `--dig-save`,
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
 `--band-report`, `--sea-report`, `--swim`, `--blend-report`, `--tab-test`,
+`--clock-jump` (with `--shot`: the light under the ground after the clock
+jumps or runs, `build/time_jump.txt`; see The near field),
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
 references), `--pose-sheet` (the character in sixteen fixed poses from fixed
 cameras -- idle, walk, jog, sprint, jump, swim, torch, the axe -- `build/pose_*.bmp` and `pose_sheet.txt`), `--shot ... --gpu-profile [frames]` (per-pass GPU times,
@@ -1795,9 +1797,14 @@ BRDF as the sun (`direct_light`, `leaf_light` in `lighting.hlsli`).
   `local_lights.hlsli`): 20% of what it puts at a distance of at least
   1.5 m, wrapped round the normal, diffuse only, its visibility one tap of
   the light's own shadow from a point moved up to 1.5 m towards it -- it
-  wraps round a pillar, never through thicker rock. It replaced the
-  probes' torch bounce (near field). A light past the 24th shadowed one
-  lights through everything, fill included. `--lights-report` at 1280 x
+  wraps round a pillar, never through thicker rock. **Under cover it steps
+  aside** (`kFillUnderCover` 0, by `nf_cover`, the near field's own blend
+  rule): the near field's probes carry the bounce there. A/B, a torch-lit
+  tunnel at 23:00: the fill alone (before) EV100 -0.94, the probes alone
+  -0.90, both -0.65 (counted twice). In the open the probes only copy the
+  heightfield, which no local light reaches, so the fill stays -- and on
+  leaves and grass. A light past the 24th shadowed one lights through
+  everything, fill included; the probes leave it out. `--lights-report` at 1280 x
   720, 23:00: torch held 4.27 -> 4.30 ms with the fill; 64 campfires, 24
   shadowed, 6.78 -> 7.74 (the fill's four-tap shadow cost 1.2 ms, one tap
   0.96); no lights 4.07 either way.
@@ -2040,19 +2047,22 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   its blocks and dirties every probe within 12 m. Occupancy (a 1 m ramp of
   the density, R32 so typed UAV loads are guaranteed) with mips to 16 m,
   and a per-column map of the REAL top surface at 1 m (`cs_nf_top`).
-- **Probes**: 64 x 32 x 64 at 2 m, 64 rays each (a Fibonacci set turned by
-  a random rotation each update), marched through the occupancy at 1 m;
-  the coarse mips only SKIP empty 4 m cells. A ray that rises above the
+- **Probes**: 64 x 32 x 64 at 2 m, 64 rays each -- one per bin of an 8 x 8
+  EQUAL-AREA octahedral map (Clarberg 2008), jittered inside it by a hash
+  of the probe and the update -- marched through the occupancy at 1 m to
+  6 m, where the coarse level takes over (below); the coarse mips only
+  SKIP empty 4 m cells. A ray that rises above the
   heightfield's top surface, or leaves the volume, carries back the
   heightfield's sky visibility and bounce in its direction. L1 SH in the
   heightfield's own convention, blended over updates (DDGI's way) by
-  exp(-interval / memory): 0.35 s for the camera's box, 3.3 s for the round
-  robin; an edit's probes start over. 4096 probes a frame, dirty first
-  then round robin, plus the 8 x 8 x 8 round the camera (a carried torch's
-  bounce keeps up) ON A TIMER: 60 Hz in 8 interleaved slices, as many a
-  frame as its time has paid for, so neither the look nor the cost a
-  second changes with the frame rate (`NearField::Schedule`, the tuning
-  panel's Near field group, `--nf-schedule <Hz> <near s> <far s>`).
+  exp(-interval / memory): 0.35 s (`NearField::Schedule`, the tuning
+  panel's Near field group, `--nf-schedule <fine s> <coarse s> <light s>`);
+  an edit's probes start over. **Every probe under cover is traced every
+  other frame (the LIVE LIST, below)**; the CPU's round robin, 2048 a
+  frame, only places probes and copies the heightfield into the open ones.
+  (Until the live list: 4096 a frame round robin with 1.5 s of memory, and
+  the 8 x 8 x 8 round the camera on a 60 Hz timer. The history notes below
+  are from then.)
   - **32 rays at 0.85 everywhere made the walls DANCE** where the sky came
     in through a small opening -- the bottom of a stairwell 10 m down: a
     few of the 32 rays found it, a different few each frame. Settled at a
@@ -2079,12 +2089,21 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   is a metre-resolution guess at the mesh -- times the clouds' shadow) and
   the probes round the hit (read from the buffer being written, with the
   reader's rock-in-between test): every further bounce, a frame at a time.
-  Times a fixed wall albedo (0.26, 0.23, 0.20) over pi. **The probes carry
-  the sky and the sun only.** Local lights were in the hits too, and came
-  OUT: their bounce faded in through the probes' history, and a ray that
-  struck rock beside a flame (the inverse square at a few tens of cm) lit
-  its probe tenfold for a frame. A light's bounce is its own instant fill
-  now (Local lights). Putting it back properly is the next pass (gaps.md).
+  Times a fixed wall albedo (0.26, 0.23, 0.20) over pi. **A fine hit (under
+  6 m) is lit by the local lights too** -- the frame's first 32 with a
+  shadow, each through one tap of its own map, the distance held to 0.5 m
+  (`kNfLightNear`). They came out once: their bounce faded in through the
+  probes' history, and a ray that struck rock beside a flame (the inverse
+  square at a few tens of cm) lit its probe tenfold for a frame. Back in,
+  with the clamp, the short rays, and the FAST LIGHTS: a shadowed light
+  that moved or took its shadow slot within 60 frames (the carried torch
+  always) gives its probes within 10 m a 0.1 s memory
+  (`Schedule::light_memory`, `light_reach`; the live pass tests each probe
+  against up to 8 fast lights), so the bounce follows the torch with no
+  fade-in. The torch walk
+  with the bounce in the probes and no coarse level: the meter's 90th
+  percentile 0.234-0.399 nits, sd 0.023 -- what the fill gave. A light
+  past the 24 shadowed ones is left out (it would bounce through rock).
 - **Three things made a lit tunnel pulse and creep** (the torch walk of
   `--adapt-test --torch`, its meter's 90th percentile per frame):
   - **One rotation of the ray set for every probe.** Down a straight
@@ -2094,12 +2113,10 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
     Each probe now turns the set by its own hash (`nf_probe_turn`).
   - **The sun at a FAR hit.** Turned per probe, the same rare rays still
     lit single probes tenfold (the meter wandered 0.25-1.25 nits; 0.22-0.29
-    with the near field off). The sun at a hit now fades out over 4-12 m
-    of ray (`kNfSunNear/Far`): near the patch many rays find it smoothly,
-    further off its light arrives second-hand through those probes. A
-    radiance clamp at the sky's mean did nothing more and cut real bounce;
-    it went. A second, coarser probe level would do this properly (the
-    next pass, gaps.md).
+    with the near field off). The sun at a hit faded out over 4-12 m of
+    ray (`kNfSunNear/Far`); that fade now applies only to a fine ray that
+    finds no coarse level to take. A radiance clamp at the sky's mean did
+    nothing more and cut real bounce; it went.
   - **Stale probes in the toroidal store**: a block that scrolls in
     clears its probes in the fill pass, so no neighbour reads a probe from
     the far side through `nf_hit_irradiance`. The round robin's memory
@@ -2165,9 +2182,116 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
     More than 4 m under its map it is now enclosed.
   The reader's probe visibility marches the occupancy every half metre
   (`nf_clear`) instead of two samples, which could straddle a 1 m roof.
+- **Two levels** (Split Radiance Cascades' idea, `docs/2607.20384v2.pdf`:
+  a coarser level with more directions over the longer interval, merged
+  into the finer; not its hash map, screen-space split or hardware rays).
+  The COARSE level (`cs_nf_coarse`) is one probe per 8 m block (2048),
+  placed on the block's 1 m lattice point that is air, under cover by the
+  fine probes' own rule, with least rock beside it, then nearest the
+  centre (open air takes the heightfield's answer in every bin; all rock,
+  none) -- kept until the block is filled again. 256 rays, four per
+  octahedral bin (the cascades' branching), each in its quarter of the bin
+  jittered by an R2 sequence over the probe's updates, marched from the
+  probe and counted from 6 m to 48 m; a bin keeps (a R, a G, a B, a vis)
+  and a, the share of its rays that got 6 m clear, blended with a 1 s
+  memory (`Schedule::coarse_memory`); the covered ones are on the live
+  list, every frame, the R2 sequence stepping once an update. A fine ray that
+  gets 6 m clear takes ITS bin (`nf_merge`) from the eight coarse probes
+  round its probe -- trilinearly, by a, and only those the fine probe sees
+  (`nf_coarse_seen`, once a probe by eight threads; per ray from its 6 m
+  point it was the fine pass's longest chain) and, where their own 6 m
+  point is air, whose point the ray's sees -- and stops; with none, it
+  marches on as before. Measured:
+  - **Rays pinned to bins, not a rotated Fibonacci set.** With the set
+    turned per update, WHICH coarse bin a ray landed in was a lottery: a
+    sunlit mouth 25 m off caught by one ray or three, and the meter
+    wandered 4x over seconds. **Equal-area bins:** the plain octahedral
+    map's strata run from 0.32 to 1.65 of the mean solid angle, and a
+    sunlit patch in a heavy one jumped the stairwell's mouth on 202 pixels
+    where equal-area gives 19. **Fresh random jitter for the fine rays,
+    not R2**: the round robin returns to a probe every ~32 frames, a stride
+    that walks the sequence slowly across a bin -- updates in a row all
+    miss a sunlit patch, then all catch it: 8,467 pixels.
+  - **The coarse level's direct sun still fades, 6 to 24 m**
+    (`kNfCoarseSunFar`). Unfaded, its 4 rays a bin found a sunlit patch
+    20-40 m down the test tunnel by chance; unlit and 20 m in, the 90th
+    percentile wandered 4x over seconds (sd 70% of the mean). Faded, the
+    patch's light comes through the fine probes beside it. Not clouds:
+    `--no-clouds` gave the identical run. A longer coarse memory (3 s)
+    only stretched the settle after walking in (gaps.md).
+  - **A still iterates both levels four times a frame** (`kSettleIters`)
+    and the coarse level takes the plain mean of a still's updates: the
+    levels bounce off each other, and a still's ~17 frames at a second's
+    memory left the stairwell's side tunnel 10x too dark against play.
+  - Torch walk (`--adapt-test --torch`, 20 m in): 0 frames where the 90th
+    percentile doubles; it holds 0.234-0.318 nits (mean 0.265, sd 0.014;
+    before: 0.217-0.431, sd 0.022). Unlit: EV100 holds the 1.5 floor, p90
+    0.031 nits. Stairwell (`BIOMES_NF_PLAY=60`, `--shake 300 --ev100 3.5`,
+    pixels a frame changing over 20 levels): [11, 19, 6, 1, 5, 0, 4] against
+    [131, 20070, 907, 20, 95, 9, 38] -- the 20k was a round-robin probe at
+    the sunlit mouth taking a 30% step. `--leak-test` sealed 0.001 nits.
+  - `BIOMES_NF_NOCOARSE`, `BIOMES_NF_NOLIGHTS` A/B the two halves;
+    `BIOMES_NF_DBG=1` paints a fine ray that took the coarse level red and
+    one that found none green, `=2` counts (placed, bin open, visible),
+    `=3` never merges (the merge's cost); view with `--texture 0 --tonemap
+    0 --ev100 1`.
 - **Cost** at 1440p, walking: +0.17 ms before the hits were lit, +0.22 /
   +0.25 with them (8.27 / 8.40 against 8.05 / 8.15); the probe pass is
-  ~0.05 ms in a tunnel since it went to a thread a ray (above). It was +0.8 ms twice over before two finds: the
+  ~0.05 ms in a tunnel since it went to a thread a ray (above). **With two
+  levels** (the torch tunnel, `BIOMES_NF_PLAY=60 --gpu-profile`): 0.115-
+  0.121 ms at 1440p and 4K alike (both levels off 0.074-0.076; coarse pass
+  without merging 0.107 -- the coarse pass ~0.03, latency-bound by its
+  48 m rays, the merge's visibility ~0.015, the lights at hits ~0.005).
+  Walking at 1440p 8.34 ms against 8.35; `--lights-report` +0.06-0.09 ms
+  on every row (the coarse pass, lights or none).
+- **The live list, and the clock jumping.** Fast-forwarding the clock left
+  tunnels lit by daylight for ~10 s after the jump: a 3,000x fall through
+  the round robin's 1.5 s memory, the box's 0.35 s, the coarse level's 1 s,
+  each bouncing off the others. `--shot ... --clock-jump <hours> [s]
+  [ramp s]` is the instrument (`build/time_jump.txt`: the meter's 10th
+  and 90th percentiles in nits, every simulated 1/30 s, after 2 s at the
+  still's hour; with a ramp the clock runs there evenly, as H does).
+  - **Only probes under cover trace**: 1,128 fine and 21 coarse of 131k
+    in the test tunnel. Every probe every frame was 0.45 ms. So in play the
+    CPU's list is classified a THREAD a probe (`cs_nf_classify`: copy, off,
+    or mark to trace -- fresh if dirty), `cs_nf_live` compacts every probe
+    marked to trace into a list on the GPU (and every covered coarse
+    probe), `cs_nf_live_args` writes an indirect dispatch, and
+    `cs_nf_probe_live` / `cs_nf_coarse_live` trace them -- fine probes half
+    the list a frame (`Schedule::live_stride` 2, ~33 ms; stride 1 is
+    0.138 ms against 0.104), coarse every frame (its pass is latency, a
+    handful of groups of 48 m rays, so it runs beside the fine pass with no
+    barrier between: a fine ray takes a bin from this frame or the last).
+    Past 8,192 fine probes a frame the list is walked in longer turns.
+    The counts live in two slots by the plan's parity, so no reset
+    dispatch; `--gpu-profile` prints the lists' lengths and marks each pass.
+  - **A jump of the light starts over.** `Renderer` measures each frame's
+    change (|ln| of the key light's and the sky's ratios, plus the key's
+    turn over 0.05 rad, `NearField::set_light_change`); past 1 (a time skip
+    over ~10 minutes, the key passing from sun to moon) the near field
+    clears its probes and settles in the frame as a still does (both levels
+    iterated four times: one frame at a still's cost, unmeasured), the heightfield GI rebuilds four
+    frames running with the first dropping the old bounce
+    (`HeightGi::reset_bounce`), and the mist drops its history. Shortening
+    every blend by the change instead (exp(-c / 0.1)) made the meter jump
+    4x frame to frame through a fast sunset; with the live list a fast
+    clock is followed anyway. `BIOMES_NF_NORELIGHT` A/Bs it.
+  - **Measured**: the stairwell 14:00 -> 23:00, the 90th percentile within
+    10% of night in **1 frame** (9.4 s with the live list and no reset,
+    over 12 s before either); the pit 04:00 -> 12:00 in 0.3 s; 17:30 -> 20:00
+    over 25 s (H's rate) no frame doubling, at night before the clock
+    stops. The torch walk holds 0.234-0.294 nits (sd 0.010), unlit 0.029
+    (sd 0.003); the stairwell's flicker [15, 19, 9, 2, 9, 1, 4];
+    `--leak-test` 0.001 nits.
+  - **The R2 sequence must step once an update.** It stepped once a lap of
+    the coarse round robin; traced every frame, a coarse probe re-traced
+    the same 256 directions 16 frames running and blended them as new, and
+    the unlit tunnel's meter came in bursts (sd 0.025 against 0.003).
+  - **Cost** (the torch tunnel, `BIOMES_NF_PLAY=60 --gpu-profile`, the
+    near field's marks summed): 0.104 ms at 1440p, 0.106 at 4K -- below
+    the 0.115-0.121 before the live list: fill 0.001, coarse round robin
+    0.007, classify 0.005, lists 0.004, live 0.087. Walking 8.37 ms; the
+    lights report within noise. It was +0.8 ms twice over before two finds: the
   shallow cover test (above), and **HLSL's `&&` does not short-circuit**:
   `knf > 0 && nf_sample(...)` ran the eight probes on every terrain pixel
   and threw the result away. Call anything costly inside an `if`.

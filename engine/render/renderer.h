@@ -829,6 +829,7 @@ private:
         float    pos[3] = {0, 0, 0};
         unsigned long long drawn = 0;     // post_frame_ when its faces were drawn
         int      faces = 6;
+        unsigned long long fast_until = 0;   // the near field traces its probes on the timer until then
     };
     std::vector<LocalLight> lights_;
     uint32_t next_light_id_ = 1;
@@ -874,6 +875,10 @@ private:
     UINT  hist_cur_ = 0;
     bool  hist_valid_ = false;
     unsigned long long post_frame_ = 0;
+    // The sun and sky last frame, for the GI's histories (record_scene).
+    bool  have_prev_light_ = false;
+    float prev_key_ = 0.0f, prev_sky_ = 0.0f, prev_key_dir_[3] = {0.0f, 1.0f, 0.0f};
+    float light_change_ = 0.0f;
     bool  taa_on_ = true, ao_on_ = true, contact_on_ = true;
     CrackCount cracks_;
     float post_debug_ = 0.0f;

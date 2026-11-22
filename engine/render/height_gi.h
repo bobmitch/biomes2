@@ -59,12 +59,18 @@ public:
     // first rebuild.
     void constants(bool on, float out[4]) const;
     unsigned long long rebuilds() const { return rebuilds_; }
+    // The light jumped (a time skip): its next rebuilds come every frame and
+    // the first drops the last rebuild's bounce, which was the old light's --
+    // each rebuild adds a bounce, so four give the new light four.
+    void reset_bounce() { bounce_reset_ = 4; }
 
 private:
     template <class T> using ComPtr = Microsoft::WRL::ComPtr<T>;
     bool ready_ = false, built_ = false;
     float origin_[2] = {}, centre_[3] = {}, y_top_ = 0.0f, y_range_ = 0.0f, hours_ = -100.0f;
     unsigned long long last_frame_ = 0, rebuilds_ = 0;
+    int bounce_reset_ = 0;                // rebuilds still due by reset_bounce (4: the first, no old bounce)
+    bool drop_bounce_ = false;
     ComPtr<ID3D12Device> dev_;
     ComPtr<ID3D12DescriptorHeap> heap_, rtv_heap_, dsv_heap_;
     ComPtr<ID3D12Resource> albedo_, depth_, height_, rad_, sh_[4], cb_[2];

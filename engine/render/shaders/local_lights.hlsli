@@ -104,13 +104,21 @@ float local_shadow(LocalLightGpu L, float3 world, float3 n, float3 l) {
 // puts at a distance of at least kFillNear (the fill is room-scale; the
 // inverse square at the flame is not), wrapped round the normal, diffuse
 // only. Rock bounces a quarter to a third of what lands on it in an
-// enclosure; 0.2 is a little under. It came through the near field's
-// probes before, which faded it in over seconds and pulsed (near_field.hlsl).
+// enclosure; 0.2 is a little under. UNDER COVER the near field's probes
+// carry a light's bounce (near_field.hlsl nf_hit, fine hits) and the fill
+// steps aside (kFillUnderCover, by nf_cover): with both, a torch-lit tunnel
+// at 23:00 metered EV100 -0.65 against -0.90 for the probes alone and -0.94
+// for the fill alone before them. In the open the probes only copy the
+// heightfield, which no local light reaches, so the fill stays -- and on
+// leaves and grass.
 // Its visibility is the light's own shadow, tested from a point moved
 // towards the light by up to kFillReach: it wraps round a pillar or a
 // person, never through rock thicker than that. A light with no shadow
 // map lights through everything, fill included.
 static const float kLocalFill = 0.2f;
+// Under cover the near field's probes carry a light's bounce (near_field.hlsl
+// nf_hit), and the fill keeps only this share of itself there.
+static const float kFillUnderCover = 0.0f;
 static const float kFillNear = 1.5f;
 static const float kFillReach = 1.5f;
 float3 local_fill_irradiance(LocalLightGpu L, float3 world, float3 n) {
@@ -139,12 +147,13 @@ float3 local_lights(Surface s, float3 world, float4 clip) {
     const uint c = cluster_of(world, clip);
     const uint n = g_cluster_n[c];
     float3 acc = float3(0.0f, 0.0f, 0.0f);
+    const float fill = lerp(1.0f, kFillUnderCover, nf_cover(world));
     [loop] for (uint i = 0; i < n; ++i) {
         const LocalLightGpu L = g_lights[g_cluster_ix[c * kClusterMaxItems + i]];
         float3 l;
         const float3 E = light_illuminance(L, world, l);
         if (max(E.r, max(E.g, E.b)) <= 0.0f) continue;
-        acc += s.albedo * (1.0f - s.metal) / kPi * local_fill_irradiance(L, world, s.n);
+        if (fill > 0.0f) acc += s.albedo * (1.0f - s.metal) / kPi * (fill * local_fill_irradiance(L, world, s.n));
         if (dot(s.n, l) <= 0.0f) continue;
         acc += direct_light(s, l, E, local_shadow(L, world, s.n, l));
     }
