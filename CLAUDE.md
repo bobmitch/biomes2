@@ -101,7 +101,7 @@ pipeline statistics and the trees' overdraw, `<shot>.gpu.txt`; see Trees),
 `--leak-test`
 (ADR-004 L6: a sealed chamber, unlit and torch-lit, the heightfield GI against
 the bare fallback), `--lights-report` (ADR-004 L3: local lights at night, six
-configurations timed) and `--fell` (with `--fell-save` / `--fell-verify`).
+configurations timed), `--fell` (with `--fell-save` / `--fell-verify`) and `--dig-settle`.
 Every mode takes `--character male|female` (which pack; male by default) and
 `--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), the weather's `--sea-state <0..1>`, `--wind <m/s>`,
@@ -246,6 +246,12 @@ last run's.
   memory. The impostor mip chain averaged each level by reading the one
   above out of the upload buffer it had just written: a 20 s startup for
   work that takes 180 ms in ordinary memory.
+- **HLSL's `&&` and `||` do NOT short-circuit** (before HLSL 2021): both
+  sides run. `cheap_test && costly_call(...)` pays for the call on every
+  pixel and discards it. The near field's reader cost the terrain 0.33 ms
+  at 1440p that way with no pixel using the result; a magenta debug paint
+  showed none taking the path, which is what made it hard to see. Put
+  anything costly inside an `if`.
 - **A dual-compile header's OUT parameters must be spelled per language.**
   `T out[1]` decays to a pointer in C++ and works; in HLSL an array parameter
   is passed BY VALUE and the write never reaches the caller. The wave normal
@@ -1181,7 +1187,85 @@ in seven needle-leaved, and radii 0.25-1.4 m skewed small (u^2). Leaves cut
 as the trees' are: sharp, then solid clusters (`leaf_cluster`), no dither.
 The index layout is 264 entries (`foliage_renderer.cpp` checks it).
 
-Not handled: grass does not know about dig edits, and floats over a dug hole.
+Dug ground grows nothing: see Digging, below.
+
+### Digging (right mouse)
+
+Right click digs where the screen centre (the HUD's crosshair) meets the
+ground, held it digs every 0.2 s; `,` `.` step the radius 0.5 m (ONE edit
+voxel) to 8 m (Shift + `,` `.` is exposure now). `Renderer::dig_aimed`
+marches `edited_density` -- the edit store at each lattice corner, else
+the field at the 0.5 m voxel, trilinear between: what LOD 0 meshes -- so a
+second click digs deeper into the first hole. It centres the sphere on the
+nearest SOLID lattice point half a voxel past the hit, so even the smallest
+dig removes rock. Under 1 ms a dig at any size. `--shot ... --dig-row` digs
+one of each size across the view before the still and writes
+`<shot>.dig.txt` (hit, centre, voxels written, how far the ray now goes).
+Two edit-store fixes came with it: `edit_sphere` measured each voxel from
+its middle while the mesher reads it at the lattice POINT (every edit sat a
+quarter voxel towards +xyz), and it wrote exactly 0 on the rim and
+overwrote earlier edits -- now strictly inside, never past -5 cm of its
+sign, and the deeper of old and new wins.
+
+- **Grass goes where an edit reaches the ground.** The edit store keeps a
+  derived map (`BrickStore::column_top`, rebuilt on load, not saved): per
+  0.5 m column, the highest edited lattice point that reaches it. Each
+  foliage bake gets that for its tile (t3, 32 x 32 floats) and marks each
+  1 m cell's four quarters bare where the top is within 1 m of the
+  generated ground (`Cell.bare`, now 28 bytes). `cs_emit` drops the blades
+  in a bare quarter and any card or bush in a cell with one. A dig
+  re-bakes the resident tiles under it, in their own slots, before the
+  frame's new tiles (`FoliageRenderer::invalidate_box`; a load re-bakes
+  all). A one-voxel pit bares a metre square. A tunnel more than a metre
+  under the grass leaves it.
+- **Trees drop straight down to the new ground** (`Renderer::settle_trees`).
+  A standing tree whose trunk column an edit reaches within 1.5 m of its
+  base is checked once per edit generation (`BrickStore::generation`):
+  `ground_below` marches the edited field down the trunk's axis from half
+  a metre over the generated base. If that ground is more than 10 cm lower,
+  the tree falls from rest under gravity and lands there, upright: not
+  physics. `TreeField::set_base` overrides by id, so `standing()` carries
+  the new base to drawing, shadows, the canopy map and felling. It also
+  persists across tile re-streams. Ground that comes back (a load) lifts it
+  at once. Felling rebuilds a trunk capsule whose tree moved
+  (`collider_y_`), so a sunk tree blocks and chops like any other.
+- **Rocks drop too** (`Renderer::settle_rocks`, `RockField::set_drop`),
+  by the LEAST ground lost under nine points of their footprint: the
+  middle and a ring at a third of their size. Each point compares the
+  generated field with the edited one (`ground_below(..., with_edits)`), so
+  an outcrop undercut on one side stays put, held up by the rest. Both `y`
+  and `ground` move. The rock renderer rebuilds a moved rock's body
+  (`collider_y_`); the draw reads the list every frame anyway.
+- `engine.exe --dig-settle` is the test, `build/dig_settle.txt`. Tree: a
+  3 m sphere under the nearest fellable tree to spawn. It checks the drop
+  (3.87 m in 0.88 s; free fall predicts 0.89), the landing height, a ray
+  at the new base hitting a prop, and felling from the bottom of the hole
+  (`build/dig_tree.bmp`). Boulder: the nearest over 1.5 m, a hole under
+  its whole footprint (3.48 m boulder: 3.35 m down in 0.83 s, free fall
+  0.83). A ray down its axis must hit a prop at its NEW top: it hits 6 cm
+  under, as `--walk`'s undisturbed probe does (`build/dig_rock.bmp`).
+  It also counts frames from the dig until every chunk it threw away is
+  redrawn: 1.
+- **A dig swaps its chunks, it does not cross-fade them.** `invalidate_box`
+  used the LOD change's hold: the old mesh stayed until the remesh, then
+  the two dithered over 16 frames, so every hole arrived ~18 frames
+  (0.3 s) late whatever its size, and faded in. Now an edited key goes on
+  `edit_swap_`, and `plan_work` frees its held mesh and draws the new one
+  the frame it is meshed (`edit_swaps_pending()`).
+- **Skirts over dug ground.** Every chunk-border cell hangs a curtain two
+  voxels into the rock to hide gaps between LOD levels. Under natural
+  ground that is always buried. After repeated small digs the rock can be
+  a lip a voxel thick. Undercut, its normal points down and the curtain
+  climbs out into the air. Thin, it pokes through into the next hole.
+  Those were the spiky fins with stretched streaks (a vertical face shaded
+  with its vertices' "up" normals). `cs_vertices` now drops the skirt of an
+  EDITED border cell unless it goes down and neither its middle nor its
+  end is in dug-out air. `--shot ... --dig-burst <n>` hammers the view's
+  middle with n small digs (0.5-1.5 m, fixed sequence). With
+  `--mesh-debug 1` at spawn (`--cam -96 32.5 -440 0 -0.55`, over two chunk
+  borders) the visible curtain went from 1427 pixels to 0, with 0 cracks.
+  A LOD seam over dug ground can show a sliver now; coarse levels
+  point-sample the edits and disagree with LOD 0 there anyway.
 
 ### The frame: HDR targets and the post chain
 
@@ -1228,7 +1312,7 @@ as a STAND-IN for inter-leaf bounce (`gi_fill`).
 puts the mean of its 10-90% band at middle grey 0.18, adapting like an eye
 (faster into light than out). A still adapts instantly. Every `--shot`
 writes the EV100, the band and the histogram to `<shot>.txt`: spawn EV100
-13.7, the badlands hillside 14.9, a sea view 15.4. `,` `.` step the
+13.7, the badlands hillside 14.9, a sea view 15.4. Shift + `,` `.` step the
 compensation; `U` cycles AgX / ACES / raw.
 
 **AgX, with the reference "punchy" look** (power 1.35, saturation 1.4). Base
@@ -1826,6 +1910,74 @@ off screen as on. `engine/render/height_gi.{h,cpp}`, `shaders/height_gi.hlsl`
   nearest opening's light).
 - Heap [48..52] the scene's SRVs (t38..t42, a sixth range of the lit
   tables), [53..55] the update's inputs, [56..61] its UAVs; the heap is 64.
+
+### The near field: light under the top surface
+
+The heightfield GI is 2.5D: anything more than 1.5 m under its 2 m map was
+"covered", and either borrowed light from a way out found by a search or
+went black -- a hard step in every dug pit and tunnel. `engine/render/
+near_field.{h,cpp}`, `shaders/near_field.hlsl`, the reader in `hfgi.hlsli`
+(`nf_sample`, `nf_depth`, `nf_openness`). On by default; `--no-near-field`
+for A/B, `BIOMES_NF_NOREAD=1` updates it but has no shader read it (cost
+A/B). The goal set for it: deep is DARK unless something down there emits.
+
+- **The volume**: 128 x 64 x 128 voxels of 1 m round the camera, the field
+  (`real_terrain_density` at 1 m) plus the player's edits (their absolute
+  value at the 1 m points, scattered from the CPU). TOROIDAL: world voxel w
+  is stored at w mod N, so following the camera refills the 8 m blocks that
+  scrolled in (48 a frame, dug ones first) and moves nothing. A dig refills
+  its blocks and dirties every probe within 12 m. Occupancy (a 1 m ramp of
+  the density, R32 so typed UAV loads are guaranteed) with mips to 16 m,
+  and a per-column map of the REAL top surface at 1 m (`cs_nf_top`).
+- **Probes**: 64 x 32 x 64 at 2 m, 32 rays each (a Fibonacci set turned by
+  a random rotation each update), marched through the occupancy at 1 m;
+  the coarse mips only SKIP empty 4 m cells. A ray that rises above the
+  heightfield's top surface, or leaves the volume, carries back the
+  heightfield's sky visibility and bounce in its direction; a ray that
+  meets rock carries nothing (yet). L1 SH in the heightfield's own
+  convention, blended 0.85 over updates (DDGI's way); an edit's probes
+  start over. 4096 probes a frame, dirty first then round robin. A probe
+  in rock moves 0.9 m along an axis into air or switches off; one at or
+  over the top surface copies the heightfield.
+- **Cones leaked; rays do not.** The first version traced six 45-degree
+  cones through the occupancy mips. At 8-16 m a cone samples 16 m cells,
+  where a 6 m roof averages to half open: `--leak-test`'s sealed chamber
+  went from 0.001 nits to 18.5. Rays at 1 m put it back to 0.001.
+- **The reader**: `hfgi_sample` blends to the probes where a point is under
+  the REAL top surface (`nf_depth`, from the per-column map) by 0.5-1.5 m,
+  and wherever the heightfield's old covered branch would have run (more
+  than 1.5 m under its map). Eight probes, weighted trilinearly, by facing,
+  and to ZERO where either of two occupancy loads on the way to the probe
+  is rock -- so a tunnel under a metre of roof does not borrow the sunlit
+  probes over it. Deciding cover by the 2 m map instead put ordinary bumpy
+  ground in the probe path: it keeps the HIGHEST point of each texel.
+- **The air**: the mist lit every froxel with the sky's share at the EYE,
+  and the composite lit the haze and the height fog the same way, so a
+  tunnel seen from a sunlit shaft glowed (centre luma 58; 2 without the
+  height fog). Each froxel now records how much ground over it darkens it
+  (`nf_openness`: 1 in the open, the probes' mean sky visibility under the
+  top surface, 1 inside rock, which nobody sees), `cs_fog_integrate`
+  averages that along each view ray, and the composite multiplies its old
+  rule by it. Open air keeps the old rule EXACTLY: lighting it by the
+  heightfield's visibility instead moved 63% of an open meadow's pixels by
+  up to 47 levels, against fog tuned to the old one. With it on, the open
+  spawn view differs from `--no-near-field` on 3 pixels in 921,600.
+- **`--shot ... --dig-tunnel`** digs a shaft 6 m down at the camera and a
+  22 m tunnel along its heading, and stands the camera in the shaft
+  looking down it; `--tunnel-in <m>` stands it that far in, looking back;
+  `--tunnel-up` looks up the shaft. From spawn: `--cam -96 32.5 -440 0
+  -0.55 --dig-tunnel --time 11 --ev100 11`.
+- **Cost** at 1440p, walking: 8.27 / 8.34 ms against 8.13 / 8.14 (+0.17);
+  the update pass 0.11 ms. It was +0.8 ms twice over before two finds: the
+  shallow cover test (above), and **HLSL's `&&` does not short-circuit**:
+  `knf > 0 && nf_sample(...)` ran the eight probes on every terrain pixel
+  and threw the result away. Call anything costly inside an `if`.
+- Heap: [40..42] (t26..t28, the range every lit table kept from DDGI): the
+  probes, the occupancy, the top map; [112..119] the near field's own;
+  [120..122] the mist's openness volumes (t16 in post). The mist root and
+  the heightfield's camera pass declare the range too.
+- **Not done**: see gaps.md -- wall bounce, local lights and emitters into
+  the probes (step 2), and the volume's reach.
 
 ### Screen-space bounce (ADR-004 L6, an experiment, OFF by default)
 

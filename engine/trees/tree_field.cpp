@@ -158,10 +158,23 @@ void TreeField::rebuild() {
     for (auto it = tiles_.begin(); it != tiles_.end(); ++it) {
         const std::vector<worldgen::TreeInstance>& ts = it->second.trees;
         for (size_t i = 0; i < ts.size(); ++i) {
-            if (!felled_.count(ts[i].id)) standing_.push_back(ts[i]);
+            if (felled_.count(ts[i].id)) continue;
+            standing_.push_back(ts[i]);
+            if (!bases_.empty()) {
+                std::unordered_map<uint32_t, float>::const_iterator b = bases_.find(ts[i].id);
+                if (b != bases_.end()) standing_.back().y = b->second;
+            }
         }
     }
+    bases_dirty_ = false;
     ++version_;
+}
+
+void TreeField::commit_bases() {
+    if (!bases_dirty_) return;
+    // A whole rebuild: a few thousand copies, only in frames a tree moved,
+    // and a cleared override then falls back to the tile's own height.
+    rebuild();
 }
 
 }  // namespace engine

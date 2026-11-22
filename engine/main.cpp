@@ -24,6 +24,9 @@
 //   F2          write a capture to build/shot.bmp
 //   click       (once captured) chop the tree in front of you; enough
 //               swings fell it, and the log falls under physics
+//   right click (once captured) dig where the screen centre meets the
+//               ground; held, keep digging
+//   , .         dig radius, 0.5 m (one voxel) to 8 m; Shift: exposure
 //   - =         tree draw distance, 100 to 2000 m in 50 m steps
 //   F6 / F9     save / load: dig edits and felled trees, under build/
 //   L           sun shadows on / off
@@ -64,6 +67,16 @@ bool  g_walk = false;
 bool  g_want_chop = false;
 bool  g_want_save = false, g_want_load = false;
 char  g_tree_msg[96] = "";
+// Digging (right mouse): a sphere carved where the screen centre meets the
+// ground. The smallest removes ONE 0.5 m edit voxel; , and . step the size.
+// Held, it digs again every kDigRepeat seconds.
+const float kDigRadii[] = {0.5f, 0.75f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f};
+const int   kDigSizes = int(sizeof(kDigRadii) / sizeof(kDigRadii[0]));
+const float kDigReach = 80.0f;
+const float kDigRepeat = 0.2f;
+int   g_dig_size = 0;
+bool  g_want_dig = false, g_dig_held = false;
+float g_dig_timer = 0.0f;
 // The capsule's feet, read back from Jolt each frame. Kept here so the camera
 // and the raymarch's capsule agree with what physics actually did, rather than
 // with what was asked for.
@@ -411,6 +424,14 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_captured) g_want_chop = true;
             else set_capture(hwnd, true);
             return 0;
+        case WM_RBUTTONDOWN:
+            // Dig where the screen centre meets the ground; held, keep digging.
+            if (g_captured) { g_want_dig = true; g_dig_held = true; g_dig_timer = 0.0f; }
+            else set_capture(hwnd, true);
+            return 0;
+        case WM_RBUTTONUP:
+            g_dig_held = false;
+            return 0;
         case WM_KEYDOWN:
             if (wp == VK_ESCAPE) {
                 if (g_captured) set_capture(hwnd, false);
@@ -539,7 +560,14 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == 'P') { g_renderer.set_pom(!g_renderer.pom()); return 0; }
             if (wp == 'H') { g_time_lapse = !g_time_lapse; return 0; }
             if (wp == VK_OEM_COMMA || wp == VK_OEM_PERIOD) {
-                g_renderer.set_ev_comp(g_renderer.ev_comp() + (wp == VK_OEM_PERIOD ? 0.5f : -0.5f));
+                // , . the dig's size; with Shift, exposure by half a stop.
+                if (GetKeyState(VK_SHIFT) & 0x8000) {
+                    g_renderer.set_ev_comp(g_renderer.ev_comp() + (wp == VK_OEM_PERIOD ? 0.5f : -0.5f));
+                } else {
+                    g_dig_size += (wp == VK_OEM_PERIOD) ? 1 : -1;
+                    g_dig_size = g_dig_size < 0 ? 0 : (g_dig_size >= kDigSizes ? kDigSizes - 1 : g_dig_size);
+                    std::snprintf(g_tree_msg, sizeof g_tree_msg, "dig radius %.2f m", kDigRadii[g_dig_size]);
+                }
                 return 0;
             }
             if (wp == VK_F6) { g_want_save = true; return 0; }
@@ -835,6 +863,21 @@ void register_tunables() {
           [&](float v) { R.set_agx_saturation(v); });
     range("agx_power", E, "AgX power (contrast)", 0.5f, 2.5f, 0.05f, "", [&] { return R.agx_power(); },
           [&](float v) { R.set_agx_power(v); });
+
+    // Digging (right mouse; , . step it). The HUD reads this too.
+    {
+        std::vector<std::string> names;
+        for (int i = 0; i < kDigSizes; ++i) {
+            char b[32];
+            std::snprintf(b, sizeof b, "%.2f m", kDigRadii[i]);
+            names.push_back(b);
+        }
+        choice("dig_radius", "Dig", "Dig radius", names, [] { return float(g_dig_size); },
+               [](float v) {
+                   const int i = int(v + 0.5f);
+                   g_dig_size = i < 0 ? 0 : (i >= kDigSizes ? kDigSizes - 1 : i);
+               });
+    }
 
     // Lights.
     toggle("torch", "Lights", "Carry a torch", [&] { return R.carried_torch(); },
@@ -1137,7 +1180,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (cl.find("--dig-save") != std::string::npos) mode_dig_save = true;
         else if (cl.find("--dig-verify") != std::string::npos) mode_dig_verify = true;
         else if (cl.find("--dig-stress") != std::string::npos) mode_dig_stress = true;
-        else if (cl.find("--dig") != std::string::npos) dig_seconds = 20.0;
+        else {
+            // --dig alone: --dig-row and --dig-settle contain it too.
+            for (size_t at = cl.find("--dig"); at != std::string::npos; at = cl.find("--dig", at + 5)) {
+                const char nx = at + 5 < cl.size() ? cl[at + 5] : ' ';
+                if (nx == ' ' || nx == '\t' || nx == '"') { dig_seconds = 20.0; break; }
+            }
+        }
         const size_t wk = cl.find("--walk");
         if (wk != std::string::npos) {
             walk_seconds = 8.0;
@@ -1310,9 +1359,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                              hl.find("--normal-check") != std::string::npos ||
                              hl.find("--blend-report") != std::string::npos;
     const bool fell_mode = hl.find("--fell") != std::string::npos;
+    const bool dig_tree_mode = hl.find("--dig-settle") != std::string::npos;
     const bool lights_mode = hl.find("--lights-report") != std::string::npos;
     const bool leak_mode = hl.find("--leak-test") != std::string::npos;
-    const bool headless = report_mode || fell_mode || lights_mode || leak_mode ||
+    const bool headless = report_mode || fell_mode || dig_tree_mode || lights_mode || leak_mode ||
                           !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
@@ -1503,6 +1553,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if ((" " + c2 + " ").find(" --ssgi ") != std::string::npos) g_renderer.set_ssgi(true);
         if (c2.find("--no-ssgi") != std::string::npos) g_renderer.set_ssgi(false);
         if (c2.find("--no-hfgi") != std::string::npos) g_renderer.set_hfgi(false);
+        if (c2.find("--no-near-field") != std::string::npos) g_renderer.set_near_field(false);
         if (c2.find("--no-far-shadow") != std::string::npos) g_renderer.set_far_shadow(false);
         if (c2.find("--no-pom") != std::string::npos) g_renderer.set_pom(false);
         if (c2.find("--no-rocks") != std::string::npos) g_renderer.set_rocks(false);
@@ -1669,6 +1720,122 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                     g_ui.run(code);
                     for (int k = 0; k < 4; ++k) g_ui.update(0.25f);   // past the panel's refresh
                     g_renderer.set_capture_overlay(true);
+                }
+            }
+        }
+
+        // --dig-row: before the still, one aimed dig of every size, left to
+        // right across the view at 60% of its height (smallest on the left),
+        // through the same Renderer::dig_aimed the right mouse uses.
+        // <shot>.dig.txt says where each landed and what it wrote.
+        if (std::string(cmdline ? cmdline : "").find("--dig-row") != std::string::npos) {
+            const std::string dp = shot_path + ".dig.txt";
+            FILE* df = std::fopen(dp.c_str(), "w");
+            float fwd[3], right[3], up[3];
+            g_camera.basis(fwd, right, up);
+            const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
+            if (df) std::fprintf(df, "aimed digs from (%.2f, %.2f, %.2f) yaw %.3f pitch %.3f\n",
+                                 eye[0], eye[1], eye[2], g_camera.yaw, g_camera.pitch);
+            for (int i = 0; i < kDigSizes; ++i) {
+                const float px = g_res_w * (0.08f + 0.84f * float(i) / float(kDigSizes - 1));
+                const float py = g_res_h * 0.6f;
+                const float nx = (px / g_res_w) * 2.0f - 1.0f, ny = 1.0f - (py / g_res_h) * 2.0f;
+                float d[3];
+                for (int k = 0; k < 3; ++k)
+                    d[k] = fwd[k] + right[k] * nx * v.tan_half_fov * v.aspect + up[k] * ny * v.tan_half_fov;
+                const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                for (int k = 0; k < 3; ++k) d[k] /= dl;
+                const engine::Renderer::AimedDig r = g_renderer.dig_aimed(eye, d, kDigReach, kDigRadii[i]);
+                // What the ray sees now: a dig must have moved the surface
+                // back along it, by about the radius.
+                float after[3], dist_after = -1.0f;
+                g_renderer.aim_terrain(eye, d, kDigReach, after, dist_after);
+                if (df) {
+                    if (!r.hit) std::fprintf(df, "r %.2f m: pixel (%.0f, %.0f) no ground within %.0f m\n",
+                                             kDigRadii[i], px, py, kDigReach);
+                    else std::fprintf(df, "r %.2f m: pixel (%.0f, %.0f) hit at %.2f m (%.2f, %.2f, %.2f), "
+                                          "centre (%.2f, %.2f, %.2f), %zu voxels, %.2f ms; "
+                                          "the ray now meets ground at %.2f m (+%.2f)\n",
+                                      kDigRadii[i], px, py, r.dist, r.hit_pos[0], r.hit_pos[1], r.hit_pos[2],
+                                      r.centre[0], r.centre[1], r.centre[2], r.voxels, r.ms,
+                                      dist_after, dist_after - r.dist);
+                }
+            }
+            if (df) std::fclose(df);
+        }
+
+        // --dig-tunnel: a shaft 6 m down at the camera's x, z (2.5 m radius),
+        // then a tunnel 22 m along the camera's heading from its floor (1.4 m
+        // radius), and the camera moved into the shaft, at eye height off its
+        // floor, looking down the tunnel. The scene for light under the
+        // ground: sky down the shaft, dark along the tunnel. With --tunnel-up
+        // it looks up the shaft instead.
+        if (std::string(cmdline ? cmdline : "").find("--dig-tunnel") != std::string::npos) {
+            const float x0 = g_camera.x, z0 = g_camera.z;
+            const float h0 = g_renderer.world().height(x0, z0);
+            const float fx = std::sin(g_camera.yaw), fz = std::cos(g_camera.yaw);
+            for (int k = 0; k <= 4; ++k) g_renderer.dig(x0, h0 - 1.5f * float(k), z0, 2.5f, -4.0f, 1);
+            const float floor_y = h0 - 6.0f;
+            for (int k = 0; k <= 22; ++k)
+                g_renderer.dig(x0 + fx * float(k), floor_y + 0.9f, z0 + fz * float(k), 1.4f, -4.0f, 1);
+            g_camera.x = x0 - fx * 1.0f;
+            g_camera.z = z0 - fz * 1.0f;
+            g_camera.y = floor_y + 1.6f;
+            g_camera.pitch = std::string(cmdline).find("--tunnel-up") != std::string::npos ? 1.2f : -0.05f;
+            // --tunnel-in <m>: stand that far down the tunnel, looking back
+            // at its mouth and the lit shaft.
+            const size_t ti = std::string(cmdline).find("--tunnel-in ");
+            if (ti != std::string::npos) {
+                const float m = float(std::atof(cmdline + ti + 12));
+                g_camera.x = x0 + fx * m;
+                g_camera.z = z0 + fz * m;
+                g_camera.y = floor_y + 1.4f;
+                g_camera.yaw += 3.14159265f;
+                g_camera.pitch = 0.0f;
+            }
+            fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
+            if (FILE* tf = std::fopen((shot_path + ".tunnel.txt").c_str(), "w")) {
+                std::fprintf(tf, "shaft at (%.1f, %.1f, %.1f), 6 m deep; tunnel heading (%.2f, %.2f), 22 m; "
+                                 "camera (%.2f, %.2f, %.2f) yaw %.3f pitch %.3f\n",
+                             x0, h0, z0, fx, fz, g_camera.x, g_camera.y, g_camera.z, g_camera.yaw, g_camera.pitch);
+                std::fclose(tf);
+            }
+        }
+
+        // --dig-burst <n>: a player hammering one spot with small digs --
+        // n aimed digs at radii 0.5, 0.75, 1 and 1.5 m in turn, scattered
+        // over +-90 px round 60% down the middle of the view by a fixed
+        // sequence, so a still of what repeated small edits leave is
+        // repeatable. Pair with --mesh-debug 1 to see the skirt curtain.
+        {
+            const std::string cl = cmdline ? cmdline : "";
+            const size_t at = cl.find("--dig-burst ");
+            if (at != std::string::npos) {
+                const int n = std::atoi(cl.c_str() + at + 12);
+                float fwd[3], right[3], up[3];
+                g_camera.basis(fwd, right, up);
+                const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
+                const float radii[4] = {0.5f, 0.75f, 1.0f, 1.5f};
+                uint32_t h = 0x2545F491u;
+                int hits = 0;
+                for (int i = 0; i < n; ++i) {
+                    h = h * 1664525u + 1013904223u;
+                    const float jx = (float(h >> 8) / 16777216.0f - 0.5f) * 180.0f;
+                    h = h * 1664525u + 1013904223u;
+                    const float jy = (float(h >> 8) / 16777216.0f - 0.5f) * 180.0f;
+                    const float px = 0.5f * g_res_w + jx, py = 0.6f * g_res_h + jy;
+                    const float nx = (px / g_res_w) * 2.0f - 1.0f, ny = 1.0f - (py / g_res_h) * 2.0f;
+                    float d[3];
+                    for (int k = 0; k < 3; ++k)
+                        d[k] = fwd[k] + right[k] * nx * v.tan_half_fov * v.aspect + up[k] * ny * v.tan_half_fov;
+                    const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                    for (int k = 0; k < 3; ++k) d[k] /= dl;
+                    if (g_renderer.dig_aimed(eye, d, kDigReach, radii[i & 3]).dug) ++hits;
+                }
+                if (FILE* bf = std::fopen((shot_path + ".dig.txt").c_str(), "a")) {
+                    std::fprintf(bf, "burst: %d of %d small digs landed, %zu edited voxels in all\n", hits, n,
+                                 g_renderer.edits().edited_voxels());
+                    std::fclose(bf);
                 }
             }
         }
@@ -3545,6 +3712,247 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (dig_tree_mode) {
+        // --dig-settle: a tree, then a boulder, dug out from under. Picks a fellable tree near
+        // spawn, carves a 3 m sphere a metre under its base, then with the
+        // clock running:
+        //   1. watches it drop -- straight down, under gravity, to the new
+        //      ground under its trunk (Renderer::ground_below), upright;
+        //   2. probes its trunk collider half a metre over the NEW base,
+        //      where the old capsule (built at the old base) would be absent;
+        //   3. stands beside it at the bottom of the hole and chops it down.
+        // A still of it in the hole first: build/dig_tree.bmp. Then a boulder
+        // near spawn: a hole under its whole footprint, the drop, and a ray
+        // down its axis that must hit its collider at its NEW top
+        // (build/dig_rock.bmp).
+        const engine::WorldGpu& wg = g_renderer.world();
+        g_renderer.set_vsync(true);
+        g_walk = true;
+        std::remove("build/dig_settle.txt");
+        LARGE_INTEGER tf, tp;
+        QueryPerformanceFrequency(&tf);
+        auto frame = [&](float tt) -> bool {
+            sync_physics_terrain();
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
+            if (w < 1.0f || h < 1.0f) return false;
+            engine::ViewConstants v = {};
+            fill_view(g_camera, w, h, tt, v);
+            g_renderer.render(v);
+            return true;
+        };
+        auto standing_y = [&](uint32_t id, float& y) -> bool {
+            const std::vector<worldgen::TreeInstance>& st = g_renderer.tree_field().standing();
+            for (size_t i = 0; i < st.size(); ++i) if (st[i].id == id) { y = st[i].y; return true; }
+            return false;
+        };
+        g_camera.x = g_spawn.x; g_camera.z = g_spawn.z;
+        g_camera.y = wg.height(g_camera.x, g_camera.z) + 2.0f;
+        for (int i = 0; i < 600 && !g_renderer.tree_field().settled(); ++i) { frame(0.0f); Sleep(5); }
+        for (int i = 0; i < 5; ++i) frame(0.0f);
+
+        FILE* f = std::fopen("build/dig_settle.txt", "w");
+        if (!f) return 1;
+        const std::vector<worldgen::TreeInstance> st = g_renderer.tree_field().standing();
+        const worldgen::TreeInstance* pick = nullptr;
+        float best = 1e30f;
+        for (size_t i = 0; i < st.size(); ++i) {
+            float b[3], ht, tr;
+            int hits;
+            if (!g_felling.tree_info(st[i].id, b, ht, tr, hits) || tr < 0.12f || ht < 8.0f) continue;
+            const float dx = st[i].x - g_spawn.x, dz = st[i].z - g_spawn.z;
+            if (dx * dx + dz * dz < best) { best = dx * dx + dz * dz; pick = &st[i]; }
+        }
+        if (!pick) {
+            std::fprintf(f, "VOID RUN: no fellable tree near spawn (%zu standing)\n", st.size());
+            std::fclose(f);
+            return 1;
+        }
+        const worldgen::TreeInstance tree = *pick;
+        float b0[3], height, trunk_r;
+        int need = 0;
+        g_felling.tree_info(tree.id, b0, height, trunk_r, need);
+        std::fprintf(f, "tree %08x, %.1f m tall, trunk radius %.2f m, base (%.2f, %.2f, %.2f)\n",
+                     tree.id, height, trunk_r, tree.x, tree.y, tree.z);
+
+        const float y0 = tree.y;
+        g_renderer.dig(tree.x, y0 - 1.0f, tree.z, 3.0f, -4.0f, 1);
+        // How long the hole takes to reach the screen: frames until every
+        // chunk the dig threw away has its remesh drawn (Streamer's edit
+        // swap: no cross-fade; it was the remesh plus 16 faded frames).
+        int swap_frames = -1;
+        {
+            const size_t dug = g_renderer.stats().chunks_invalidated;
+            for (int i = 1; i <= 60; ++i) {
+                frame(0.0f);
+                if (g_renderer.streamer().edit_swaps_pending() == 0) { swap_frames = i; break; }
+            }
+            std::fprintf(f, "remesh: %zu chunks thrown away, all redrawn after %d frame(s), "
+                            "swapped without a fade\n", dug, swap_frames);
+        }
+        const float expect = g_renderer.ground_below(tree.x, tree.z, y0);
+        std::fprintf(f, "dug a 3 m sphere 1 m under the base; ground under the trunk now %.2f (%.2f m down)\n",
+                     expect, y0 - expect);
+
+        // 1. The drop, on the real clock.
+        float t = 0.0f, y_prev = y0, y = y0, max_step = 0.0f, landed_at = -1.0f;
+        bool rose = false;
+        QueryPerformanceCounter(&tp);
+        unsigned long long frames = 0;
+        while (t < 4.0f) {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            float dt = float(double(now.QuadPart - tp.QuadPart) / double(tf.QuadPart));
+            tp = now;
+            if (dt > 0.1f) dt = 0.1f;
+            t += dt;
+            g_felling.update(tree.x + 6.0f, tree.z);
+            frame(t);
+            ++frames;
+            if (!standing_y(tree.id, y)) break;
+            if (y > y_prev + 1e-4f) rose = true;
+            if (y_prev - y > max_step) max_step = y_prev - y;
+            if (landed_at < 0.0f && std::fabs(y - expect) < 0.01f) landed_at = t;
+            y_prev = y;
+        }
+        const float fall = y0 - expect;
+        std::fprintf(f, "drop: %.2f m in %.2f s over %llu frames (free fall from rest: %.2f s); "
+                        "now at %.3f, %.3f off the ground; largest step %.2f m; moved up: %s\n",
+                     y0 - y, landed_at, frames, std::sqrt(2.0f * fall / 9.81f), y, y - expect, max_step,
+                     rose ? "YES" : "no");
+
+        // The still, from the rim, looking down at the base.
+        {
+            engine::Camera c = g_camera;
+            c.x = tree.x + 7.0f; c.z = tree.z - 7.0f;
+            c.y = wg.height(c.x, c.z) + 5.0f;
+            const float dx = tree.x - c.x, dz = tree.z - c.z, dy = (y + 1.5f) - c.y;
+            c.yaw = std::atan2(dx, dz);
+            c.pitch = std::atan2(dy, std::sqrt(dx * dx + dz * dz));
+            engine::ViewConstants cv = {};
+            fill_view(c, g_res_w, g_res_h, t, cv);
+            std::string e3;
+            g_renderer.capture(cv, "build/dig_tree.bmp", e3);
+        }
+
+        // 2. The trunk collider at the new base.
+        for (int i = 0; i < 3; ++i) { g_felling.update(tree.x + 1.0f, tree.z); frame(t); }
+        int prop = 0;
+        const float from[3] = {tree.x + 1.5f, y + 0.5f, tree.z};
+        const float dir[3] = {-1.0f, 0.0f, 0.0f};
+        const float hit = g_physics.probe_ray(from, dir, 3.0f, prop);
+        std::fprintf(f, "collider: a ray 0.5 m over the new base hits %s at %.2f m (bark at %.2f)\n",
+                     hit < 0.0f ? "NOTHING" : (prop ? "a prop" : "terrain"), hit, 1.5f - trunk_r);
+
+        // 3. Chop it from the bottom of the hole.
+        const float eye[3] = {tree.x + trunk_r + 1.0f, y + kEyeAboveFeet, tree.z};
+        int swings = 0, r = 0;
+        while (swings < 40 && r != 2) {
+            r = g_felling.chop(eye, dir, t, nullptr, nullptr, nullptr);
+            ++swings;
+            t += 0.2f;
+            frame(t);
+            if (r == 0) break;
+        }
+        float lp[3] = {0, 0, 0}, lr[4];
+        bool active = false;
+        const bool have_log = g_felling.log_pose(tree.id, lp, lr, active);
+        std::fprintf(f, "chop: %s after %d swings (needs %d); log starts at y %.2f (new base %.2f)\n",
+                     r == 2 ? "FELLED" : (r == 0 ? "NOTHING IN REACH" : "still standing"), swings, need,
+                     have_log ? lp[1] : 0.0f, y);
+
+        const bool tree_pass = landed_at >= 0.0f && landed_at < 3.0f && !rose && std::fabs(y - expect) < 0.02f &&
+                               fall > 1.0f && hit >= 0.0f && prop && r == 2;
+        std::fprintf(f, "tree: %s\n\n", tree_pass ? "pass" : "FAIL");
+
+        // A boulder: the nearest to spawn over 1.5 m across, clear of the tree.
+        bool rock_pass = false;
+        {
+            for (int i = 0; i < 600 && !g_renderer.rock_field().settled(); ++i) { frame(t); Sleep(5); }
+            const worldgen::RockInstance* bp = nullptr;
+            float bd = 1e30f;
+            for (const worldgen::RockInstance& rk : g_renderer.rock_field().rocks()) {
+                if (rk.kind != 0 || rk.size < 1.5f) continue;
+                const float tx = rk.x - tree.x, tz = rk.z - tree.z;
+                if (tx * tx + tz * tz < 15.0f * 15.0f) continue;
+                const float dx = rk.x - g_spawn.x, dz = rk.z - g_spawn.z;
+                if (dx * dx + dz * dz < bd) { bd = dx * dx + dz * dz; bp = &rk; }
+            }
+            if (!bp) {
+                std::fprintf(f, "rock: VOID, no boulder over 1.5 m resident near spawn\n");
+            } else {
+                const worldgen::RockInstance rock = *bp;
+                const engine::RockModel& rm = g_renderer.rocks().model(engine::rock_model(rock.kind, rock.variant));
+                std::fprintf(f, "boulder %08x, %.2f m across, origin y %.2f, ground %.2f, %.0f m from spawn\n",
+                             rock.id, rock.size, rock.y, rock.ground, std::sqrt(bd));
+                const float R = 0.6f * rock.size + 1.5f;
+                g_renderer.dig(rock.x, rock.ground - 0.5f, rock.z, R, -4.0f, 1);
+                auto rock_y = [&](float& ry) -> bool {
+                    for (const worldgen::RockInstance& rk : g_renderer.rock_field().rocks())
+                        if (rk.id == rock.id) { ry = rk.y; return true; }
+                    return false;
+                };
+                float ry = rock.y, rprev = rock.y, rlanded = -1.0f, last_move = 0.0f;
+                bool rrose = false;
+                const float t_start = t;
+                QueryPerformanceCounter(&tp);
+                while (t - t_start < 4.0f) {
+                    LARGE_INTEGER now;
+                    QueryPerformanceCounter(&now);
+                    float dt = float(double(now.QuadPart - tp.QuadPart) / double(tf.QuadPart));
+                    tp = now;
+                    if (dt > 0.1f) dt = 0.1f;
+                    t += dt;
+                    g_felling.update(rock.x, rock.z);
+                    frame(t);
+                    if (!rock_y(ry)) break;
+                    if (ry > rprev + 1e-4f) rrose = true;
+                    if (ry < rprev - 1e-4f) last_move = t - t_start;
+                    rprev = ry;
+                }
+                rlanded = last_move;
+                const float rdrop = rock.y - ry;
+                std::fprintf(f, "dug a %.1f m sphere 0.5 m under its middle: dropped %.2f m, still after %.2f s "
+                                "(free fall: %.2f s); moved up: %s\n",
+                             R, rdrop, rlanded, std::sqrt(2.0f * (rdrop > 0.0f ? rdrop : 0.0f) / 9.81f),
+                             rrose ? "YES" : "no");
+                {
+                    engine::Camera c = g_camera;
+                    c.x = rock.x + 3.0f + 0.5f * rock.size; c.z = rock.z - 3.0f - 0.5f * rock.size;
+                    c.y = wg.height(c.x, c.z) + 6.0f + rock.size;
+                    const float dx = rock.x - c.x, dz = rock.z - c.z, dy = ry - c.y;
+                    c.yaw = std::atan2(dx, dz);
+                    c.pitch = std::atan2(dy, std::sqrt(dx * dx + dz * dz));
+                    engine::ViewConstants cv = {};
+                    fill_view(c, g_res_w, g_res_h, t, cv);
+                    std::string e3;
+                    g_renderer.capture(cv, "build/dig_rock.bmp", e3);
+                }
+                for (int i = 0; i < 3; ++i) { g_felling.update(rock.x, rock.z); frame(t); }
+                const float top = ry + rm.height * rock.size;
+                const float rf[3] = {rock.x, top + 30.0f, rock.z};
+                const float down[3] = {0.0f, -1.0f, 0.0f};
+                int rprop = 0;
+                const float rh = g_physics.probe_ray(rf, down, 80.0f, rprop);
+                const float hy = rh < 0.0f ? 0.0f : rf[1] - rh;
+                std::fprintf(f, "collider: a ray down its axis hits %s at y %.2f; its new top %.2f\n",
+                             rh < 0.0f ? "NOTHING" : (rprop ? "a prop" : "terrain"), hy, top);
+                rock_pass = rdrop > 0.5f && !rrose && rlanded < 3.0f && rh >= 0.0f && rprop &&
+                            std::fabs(hy - top) < 0.5f + 0.15f * rock.size;
+                std::fprintf(f, "rock: %s\n", rock_pass ? "pass" : "FAIL");
+            }
+        }
+        const bool pass = tree_pass && rock_pass;
+        std::fprintf(f, "\n%s\n", pass ? "PASS" : "FAIL");
+        std::fclose(f);
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return pass ? 0 : 1;
+    }
+
     if (fell_mode) {
         // --fell: the whole life of one tree, measured. Picks a real tree
         // near spawn, stands the character 1.6 m off its trunk, and:
@@ -4468,6 +4876,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                              sm[size_t(sm.size() * 0.99)]);
             }
             write_rock_report(f, g_feet[0], g_feet[2], true);
+            {
+                const engine::NearField& nf = g_renderer.near_field();
+                std::fprintf(f, "near field: %s; %llu plans, %llu of them filled blocks (%llu blocks), %llu probes traced\n",
+                             g_renderer.near_field_on() ? (nf.ready() ? "on, ready" : "on, NOT ready") : "off",
+                             nf.plans(), nf.fill_frames(), nf.blocks_filled(), nf.probes_traced());
+            }
             std::fprintf(f, "lightning: %u strikes (%u to the ground), %llu frames lit, seed %u, clock %.1f s at the end\n",
                          g_renderer.strikes_seen(), g_renderer.ground_strikes_seen(), g_renderer.flash_frames(),
                          g_renderer.lightning().seed(), double(g_renderer.weather_time()));
@@ -4892,6 +5306,21 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             else if (r == 1) std::snprintf(g_tree_msg, sizeof g_tree_msg, "chop %d/%d", hits, need);
             else std::snprintf(g_tree_msg, sizeof g_tree_msg, "TIMBER (%zu felled)", g_felling.felled());
         }
+        if (g_dig_held && g_captured && !g_paused) {
+            g_dig_timer += float(dt);
+            if (g_dig_timer >= kDigRepeat) { g_dig_timer = 0.0f; g_want_dig = true; }
+        }
+        if (g_want_dig) {
+            g_want_dig = false;
+            float fwd[3], right[3], up[3];
+            g_camera.basis(fwd, right, up);
+            const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
+            const engine::Renderer::AimedDig d =
+                g_renderer.dig_aimed(eye, fwd, kDigReach, kDigRadii[g_dig_size]);
+            if (!d.hit) std::snprintf(g_tree_msg, sizeof g_tree_msg, "dig: no ground within %.0f m", kDigReach);
+            else std::snprintf(g_tree_msg, sizeof g_tree_msg, "dug r %.2f m at %.1f m, %zu voxels, %.1f ms",
+                               kDigRadii[g_dig_size], d.dist, d.voxels, d.ms);
+        }
         if (g_want_save || g_want_load) {
             std::string err;
             bool ok = true, mismatch = false;
@@ -4926,10 +5355,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         ++fps_frames;
         if (fps_accum >= 0.5) {
             const engine::FrameStats st = g_renderer.stats();
-            char title[400];
+            char title[512];
             const float tod = g_renderer.time_of_day();
             std::snprintf(title, sizeof(title),
-                          "biomes2 engine - %02d:%02d%s [PgUp/PgDn H] - wind %.1f m/s, sea Hs %.1f m%s [[ ] \\ ;] - %s [M] %s [T] - trees %.0f m [-=] %s - %.0f fps (worst %.1f ms) - "
+                          "biomes2 engine - %02d:%02d%s [PgUp/PgDn H] - wind %.1f m/s, sea Hs %.1f m%s [[ ] \\ ;] - %s [M] %s [T] - trees %.0f m [-=] - dig r %.2f m [RMB , .] %s - %.0f fps (worst %.1f ms) - "
                           "%zu chunks, %u tris - %u meshed/frame in %.3f ms - "
                           "%zu pending, %zu slots free%s%s",
                           int(tod), int((tod - float(int(tod))) * 60.0f), g_time_lapse ? " running" : "",
@@ -4939,7 +5368,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                           g_renderer.texture_mode() < 0.5f ? "flat"
                           : g_renderer.texture_mode() < 1.5f ? "detail"
                           : g_renderer.texture_mode() < 2.5f ? "grid" : "detail+grid",
-                          g_renderer.tree_settings().max_dist, g_tree_msg,
+                          g_renderer.tree_settings().max_dist, kDigRadii[g_dig_size], g_tree_msg,
                           fps_frames / fps_accum, worst_frame_ms,
                           st.resident, st.indices / 3,
                           st.meshed_this_frame, st.mesh_ms,

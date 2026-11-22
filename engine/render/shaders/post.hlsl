@@ -74,6 +74,7 @@ Texture2D<float4> g_clouds     : register(t12); // clouds.hlsl, quarter resoluti
 Texture2D<float>  g_cloud_dist : register(t13); // ... the cloud's distance, km
 Texture2D<float>  g_cloud_shadow : register(t14); // clouds.hlsl cs_shadow: the key light through the clouds, top-down
 Texture2D<float4> g_puddle  : register(t15); // scene_out.hlsli: standing water's sky reflection (rgb) and weight (a)
+Texture3D<float>  g_fog_open : register(t16); // fog.hlsl: how much ground over the air darkens it, averaged along the ray
 
 RWTexture2D<float>  u_ao    : register(u0);
 RWTexture2D<float4> u_scene : register(u1);
@@ -498,7 +499,17 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     // haze 4 m into a sealed chamber: 0.2 nits, the whole residue.)
     const float dist = length(P - cam_pos);
     const float4 ap = aerial(uv, dist);
-    c = c * ap.a + ap.rgb * (lerp(cam_sky, 1.0f, saturate((dist - 64.0f) / 192.0f)) * storm.x);
+    // With the mist's volume, times how much ground lies over the air along
+    // THIS ray (the near field, nf_openness; 1 in the open, so open air is
+    // lit exactly as before): a tunnel seen from a sunlit shaft holds no
+    // daylit haze.
+    float lit_air = lerp(cam_sky, 1.0f, saturate((dist - 64.0f) / 192.0f));
+    if (fog_on > 0.5f) {
+        const float vz = dot(P - cam_pos, cam_fwd);
+        const float w = log(max(vz, fog_near) / fog_near) / fog_log_ratio * 128.0f;
+        lit_air *= g_fog_open.SampleLevel(g_linear, float3(uv, saturate((w - 0.5f) / 128.0f)), 0);
+    }
+    c = c * ap.a + ap.rgb * (lit_air * storm.x);
     // A cloud nearer than the surface (a mountain behind low cloud) lies over it.
     if (clouds_on > 0.5f) {
         const float cd = g_cloud_dist.SampleLevel(g_linear, uv, 0) * 1000.0f;
@@ -510,7 +521,7 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     // The exploration fog (haze.hlsli): the layered height fog that hides
     // the low land at range and leaves the peaks standing out of it.
     {
-        const float4 hf = height_fog(cam_pos, (P - cam_pos) / max(dist, 1e-3f), dist);
+        const float4 hf = height_fog_lit(cam_pos, (P - cam_pos) / max(dist, 1e-3f), dist, lit_air);
         c = c * hf.a + hf.rgb;
     }
     // Then the mist, which is nearer than the bulk of the air.

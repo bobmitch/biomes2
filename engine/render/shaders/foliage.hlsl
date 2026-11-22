@@ -50,6 +50,7 @@ struct Cell {
     uint  look;    // height lo, height hi (x0.01 m), dry, narrow
     uint  color;   // grass rgb8
     uint  dryc;    // dry rgb8
+    uint  bare;    // 4 bits: which 0.5 m quarter the player's edits reach (x lo/hi, z lo/hi)
 };
 
 struct Blade {
@@ -65,6 +66,9 @@ RWStructuredBuffer<Cell>  g_pool     : register(u0);
 StructuredBuffer<int4>    g_slots    : register(t0);   // tile x, z, valid
 StructuredBuffer<uint>    g_bake     : register(t1);   // slots to bake this frame
 StructuredBuffer<float4>  g_ground   : register(t2);   // 4 per biome
+// Per baked tile, 32 x 32 half-metre columns: the highest lattice point the
+// player's edits wrote there (BrickStore::column_top), or -1e30.
+StructuredBuffer<float>   g_edit_top : register(t3);
 RWStructuredBuffer<Blade> g_hi       : register(u1);
 RWStructuredBuffer<Blade> g_lo       : register(u2);
 RWStructuredBuffer<Blade> g_cards    : register(u3);
@@ -204,6 +208,18 @@ void cs_bake(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
     const float steep = saturate((0.95f - slope) / 0.35f);
     grass *= steep; flowers *= steep; bushes *= steep;
 
+    // Where the player has dug (or filled) up to within a metre of the
+    // ground, nothing grows: per 0.5 m quarter, so a one-voxel pit bares
+    // a metre square and no more. The ground here is the generated one; the
+    // edit reaching it is what says it is gone.
+    uint bare = 0u;
+    [unroll] for (uint q = 0u; q < 4u; ++q) {
+        const uint hx = t.x * 2u + (q & 1u), hz = t.y * 2u + (q >> 1);
+        if (g_edit_top[g.x * 1024u + hz * 32u + hx] >= y - 1.0f) bare |= 1u << q;
+    }
+    if (bare == 15u) grass = flowers = bushes = 0.0f;
+    c.bare = bare;
+
     c.y = y;
     const int gx = clamp(int(hx * 8192.0f), -32767, 32767), gz = clamp(int(hz * 8192.0f), -32767, 32767);
     c.grad = (uint(gx) & 0xFFFFu) | ((uint(gz) & 0xFFFFu) << 16);
@@ -282,6 +298,7 @@ void cs_emit(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
         for (uint k = 0; k < n; ++k) {
             const uint h = fhash(seed, k + 1u);
             const float ox = funit(h), oz = funit(fhash(h, 3u));
+            if ((c.bare >> ((ox >= 0.5f ? 1u : 0u) | (oz >= 0.5f ? 2u : 0u))) & 1u) continue;
             Blade b;
             b.pos = float3(float(cx) + ox, c.y + gx * (ox - 0.5f) + gz * (oz - 0.5f) - 0.06f, float(cz) + oz);
             const float scale = saturate(want - float(k));
@@ -300,7 +317,8 @@ void cs_emit(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
 
     // Clump cards, from card_near out: one per cell at the cell's grass
     // density, sized to the grass.
-    if (d > card_near - 1.0f && d < card_far + 1.0f && funit(fhash(seed, 101u)) < g_eff * 1.15f) {
+    // A clump card or a bush spans the cell: none where any of it is dug.
+    if (c.bare == 0u && d > card_near - 1.0f && d < card_far + 1.0f && funit(fhash(seed, 101u)) < g_eff * 1.15f) {
         Blade b;
         const uint h = fhash(seed, 103u);
         b.pos = float3(float(cx) + 0.5f, c.y - 0.08f, float(cz) + 0.5f);
@@ -313,7 +331,7 @@ void cs_emit(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
     }
 
     // Bushes: more of them under a canopy, which is where undergrowth is.
-    if (d < 130.0f && funit(fhash(seed, 211u)) < bushes * (1.0f + canopy)) {
+    if (c.bare == 0u && d < 130.0f && funit(fhash(seed, 211u)) < bushes * (1.0f + canopy)) {
         Blade b;
         const uint h = fhash(seed, 213u);
         b.pos = float3(float(cx) + 0.3f + 0.4f * funit(h), c.y - 0.1f, float(cz) + 0.3f + 0.4f * funit(fhash(h, 1u)));

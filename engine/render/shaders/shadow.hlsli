@@ -70,7 +70,7 @@ cbuffer ShadowConstants : register(b2) {
     // ground scan hex-tiled (x > 0.5), far detail's strength and its scale
     // over the tile, unused.
     float4 l_look;
-    float4 l_look2;
+    float4 l_nf;        // the near field (near_field.h): the volume's min world voxel xyz; w ready
     float4 l_look3;
 };
 

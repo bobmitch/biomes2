@@ -288,6 +288,7 @@ void RockRenderer::sync_colliders(PhysicsWorld* physics, const std::vector<world
         phys_ = physics;
         phys_mesh_.clear();
         colliders_.clear();
+        collider_y_.clear();
         for (const RockModel& rm : meshes_.models) {
             std::vector<float> v(size_t(rm.vcount[1]) * 3);
             for (uint32_t i = 0; i < rm.vcount[1]; ++i)
@@ -315,16 +316,27 @@ void RockRenderer::sync_colliders(PhysicsWorld* physics, const std::vector<world
         const float reach = kColliderRadius + r.size;
         if (ex * ex + ez * ez > reach * reach) continue;
         auto it = colliders_.find(r.id);
-        if (it != colliders_.end()) { keep[r.id] = it->second; colliders_.erase(it); continue; }
+        if (it != colliders_.end()) {
+            // Kept while the rock stays put; one dropped into a dug hole
+            // gets a new body at its new height.
+            auto yi = collider_y_.find(r.id);
+            if (yi != collider_y_.end() && std::fabs(yi->second - r.y) < 0.01f) {
+                keep[r.id] = it->second;
+                colliders_.erase(it);
+                continue;
+            }
+            physics->remove_body(it->second);
+            colliders_.erase(it);
+        }
         const int pm = phys_mesh_[rock_model(r.kind, r.variant)];
         if (pm < 0) continue;
         float q[4];
         rock_rotation(r, q);
         const float pos[3] = {r.x, r.y, r.z};
         const uint32_t h = physics->add_static_prop(pm, pos, q, r.size);
-        if (h) keep[r.id] = h;
+        if (h) { keep[r.id] = h; collider_y_[r.id] = r.y; }
     }
-    for (auto& kv : colliders_) physics->remove_body(kv.second);
+    for (auto& kv : colliders_) { physics->remove_body(kv.second); collider_y_.erase(kv.first); }
     colliders_.swap(keep);
 }
 

@@ -27,6 +27,7 @@
 #include "engine/render/lightning.h"
 #include "engine/render/canopy.h"
 #include "engine/render/height_gi.h"
+#include "engine/render/near_field.h"
 #include "engine/render/far_shadow.h"
 #include "engine/render/scan_library.h"
 #include "engine/render/forest_map.h"
@@ -421,6 +422,10 @@ public:
     // The heightfield GI (ADR-004 L6, height_gi.h): the diffuse GI
     // (--no-hfgi, Z).
     void set_hfgi(bool on) { hfgi_on_ = on; }
+    // The near field (near_field.h): light under the top surface. --no-near-field for A/B.
+    void set_near_field(bool on) { near_on_ = on; }
+    bool near_field_on() const { return near_on_; }
+    const NearField& near_field() const { return near_; }
     // Parallax occlusion on the scans' height (pom.hlsli; --no-pom, P).
     void set_pom(bool on) { pom_on_ = on; }
     bool pom() const { return pom_on_; }
@@ -488,6 +493,31 @@ public:
     }
     bool dig(float x, float y, float z, float radius, float strength,
              unsigned char material);
+
+    // The terrain as LOD 0 meshes it, on the CPU: the player's value at each
+    // lattice corner where one is stored, else the field at the 0.5 m voxel,
+    // trilinear between. Away from any edit it is the field itself.
+    float edited_density(float x, float y, float z) const;
+    // Where a ray first enters the terrain (edits included), within `reach`
+    // metres. False if it starts inside rock or meets nothing.
+    bool aim_terrain(const float from[3], const float dir[3], float reach,
+                     float hit[3], float& dist) const;
+    // A dig aimed along a ray: carve a sphere of `radius` centred on the
+    // nearest SOLID lattice point half a voxel past where the ray enters the
+    // ground, so even the smallest dig always removes rock. `voxels` is how
+    // many lattice points it wrote.
+    struct AimedDig {
+        bool  hit = false, dug = false;
+        float dist = 0.0f;
+        float hit_pos[3] = {0, 0, 0};
+        float centre[3] = {0, 0, 0};
+        size_t voxels = 0;
+        double ms = 0.0;      // the CPU time the aim and the edit took
+    };
+    AimedDig dig_aimed(const float from[3], const float dir[3], float reach, float radius);
+    // The first ground at or below `from_y` on the vertical through (x, z),
+    // edits included; `from_y` itself if there is none within 200 m.
+    float ground_below(float x, float z, float from_y, bool with_edits = true) const;
 
 
     // Persistence. Saving writes only the voxels the player actually edited;
@@ -566,6 +596,15 @@ private:
     bool create_water_pipeline(std::string& error);
     // Advance the tree field and rebuild the instance list if anything moved.
     void update_trees(const ViewConstants& view, bool settle);
+    // Trees the player dug out from under drop straight down to the new
+    // ground under their trunk -- not physics, they stay upright and
+    // choppable. `settle` lands them at once (a still).
+    void settle_trees(float time, bool settle);
+    // Rocks the same way, from the support under their whole footprint: a
+    // rock drops by the LEAST ground lost under its middle and eight points
+    // round it, so an outcrop undercut on one side stays where it is.
+    void settle_rocks(float dt, bool settle);
+
 
     // --- sun shadows ---
     // 4096: twice the old resolution in each axis. Four cascades: the fourth
@@ -649,6 +688,7 @@ private:
     ComPtr<ID3D12PipelineState> ao_pso_, composite_pso_, taa_pso_, final_pso_, ssgi_pso_;
     ComPtr<ID3D12Resource> ssgi_;              // the screen-space bounce (L6): irradiance, distance
     HeightGi hfgi_;
+    NearField near_;
     FarShadow far_;
     ScanLibrary scans_;
     ForestMap forest_;
@@ -656,6 +696,7 @@ private:
     bool far_on_ = true;
     void record_far(const float vp[16]);
     bool hfgi_on_ = true;
+    bool near_on_ = true;
     bool pom_on_ = true;
     ComPtr<ID3D12PipelineState> mesh_top_pso_;
     void record_hfgi(const float vp[16]);
@@ -701,6 +742,11 @@ private:
     GroundLook ground_look_;
     UINT   fog_cur_ = 0;
     ComPtr<ID3D12Resource> fog_map_tex_, fog_map_up_, fog_inject_[2], fog_integrated_;
+    // Each froxel's share of open air's light (hfgi.hlsli nf_openness), and its
+    // mean along the view ray to each slice: what lights the haze and the
+    // height fog along a pixel's own path, not as the eye is lit.
+    ComPtr<ID3D12Resource> fog_open_, fog_open_avg_;
+    bool fog_open_avg_read_ = false;
     ComPtr<ID3D12Resource> fog_cb_[kFrameCount];
     void* fog_cb_cpu_[kFrameCount] = {};
     ComPtr<ID3D12RootSignature> fog_root_;
@@ -786,6 +832,24 @@ private:
     std::vector<TreeGpuInstance> tree_all_;
     std::unordered_map<uint32_t, float> tree_hits_;
     unsigned long long tree_field_seen_ = 0;
+    struct TreeSink {
+        float orig = 0.0f;     // the generated base
+        float target = 0.0f;   // the ground under the trunk now
+        float y = 0.0f, v = 0.0f;
+        uint64_t gen = 0;      // the edit generation `target` was found for
+    };
+    std::unordered_map<uint32_t, TreeSink> tree_sink_;
+    uint64_t sink_gen_seen_ = ~0ull;
+    unsigned long long sink_field_seen_ = ~0ull;
+    float sink_time_ = -1.0f;
+    struct RockSink {
+        float target = 0.0f;   // metres it must drop
+        float drop = 0.0f, v = 0.0f;
+        uint64_t gen = 0;
+    };
+    std::unordered_map<uint32_t, RockSink> rock_sink_;
+    uint64_t rock_gen_seen_ = ~0ull;
+    unsigned long long rock_field_seen_ = ~0ull;
     bool tree_dirty_ = true;
     bool trees_on_ = true;
     ComPtr<ID3D12CommandSignature> cmd_sig_;

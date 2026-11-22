@@ -151,12 +151,15 @@ float3 hfog_colour(float3 d) {
 // (in-scattered light, transmittance) from the eye `o` along `d` for `t`
 // metres. Near the eye the air is lit as the eye is (hfog_c.w, the GI's
 // share of open sky), so a sealed chamber does not glow with daylit fog.
-float4 height_fog(float3 o, float3 d, float t) {
+float4 height_fog_lit(float3 o, float3 d, float t, float lit) {
     const float tau = hfog_tau(o, d, t);
     if (tau <= 1e-5f) return float4(0.0f, 0.0f, 0.0f, 1.0f);
     const float T = exp(-min(tau, 60.0f));
-    const float lit = lerp(hfog_c.w, 1.0f, saturate((t - 64.0f) / 192.0f));
     return float4(hfog_colour(d) * ((1.0f - T) * lit), T);
+}
+
+float4 height_fog(float3 o, float3 d, float t) {
+    return height_fog_lit(o, d, t, lerp(hfog_c.w, 1.0f, saturate((t - 64.0f) / 192.0f)));
 }
 
 #endif

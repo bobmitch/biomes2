@@ -40,6 +40,13 @@ public:
     bool update(float x, float z, float radius);
 
     const std::vector<worldgen::RockInstance>& rocks() const { return rocks_; }
+
+    // A rock the player dug out from under drops by `drop` metres (y and
+    // ground both), by id, so it stays down when its tile streams in again.
+    // TreeField::set_base's twin; commit_drops applies changes in one pass.
+    void set_drop(uint32_t id, float drop) { drops_[id] = drop; drops_dirty_ = true; }
+    void clear_drop(uint32_t id) { if (drops_.erase(id)) drops_dirty_ = true; }
+    void commit_drops() { if (drops_dirty_) rebuild(); }
     unsigned long long version() const { return version_; }
     bool settled() const { return settled_; }
     size_t tiles_resident() const { return tiles_.size(); }
@@ -65,6 +72,8 @@ private:
     const WorldGpu* world_ = nullptr;
     std::unordered_map<TileKey, Tile, TileKeyHash> tiles_;
     std::vector<worldgen::RockInstance> rocks_;
+    std::unordered_map<uint32_t, float> drops_;
+    bool drops_dirty_ = false;
     unsigned long long version_ = 0;
     bool dirty_ = false;
     bool settled_ = false;

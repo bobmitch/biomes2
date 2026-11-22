@@ -8,6 +8,7 @@
 
 #include <d3dcompiler.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -82,8 +83,12 @@ static_assert(sizeof(WaterConstants) == 672, "WaterConstants must match water.hl
 // [81..82] the ripples' tiles (OceanDetail); [83..106] the clouds (Clouds).
 // [109] the puddle mask (ADR-005 C4: the scene's third target, read by the composite).
 // [110..111] the player character's textures (CharacterRenderer, t49..t50).
+// [112..118] the near field's own (NearField); it also writes [40..41], the
+// range every lit table has declared since DDGI.
 const UINT kWaterSceneSrv = 79, kWaterDepthSrv = 80, kPuddleSrv = Clouds::kHeapEnd,
-           kHeapSlots = CharacterRenderer::kSrvB + 1;
+           kFogOpenUav = NearField::kHeapEnd, kFogOpenAvgUav = kFogOpenUav + 1, kFogOpenAvgSrv = kFogOpenUav + 2,
+           kHeapSlots = kFogOpenUav + 3;
+static_assert(NearField::kFirst == CharacterRenderer::kSrvB + 1, "the near field follows the character's textures");
 static_assert(CharacterRenderer::kSrvA == kPuddleSrv + 1, "the character's textures follow the puddle mask");
 
 // Matches cbuffer ShadowConstants in shadow.hlsli: 368 bytes, in a 512-byte buffer.
@@ -112,7 +117,7 @@ struct ShadowConstants {
     float flash[4];        // ADR-005 C5: a lightning flash's point and intensity, cd (flash.hlsli)
     float flash_col[4];
     float look[4];         // bare ground (GroundLook): variation, detail fade start, end; unused
-    float look2[4];        // unused
+    float near_field[4];   // the near field (near_field.h): the volume's min world voxel xyz; w ready
     float look3[4];        // ... hex-tiling on, far detail strength, far detail scale; unused
 };
 static_assert(sizeof(ShadowConstants) == 816, "ShadowConstants must match shadow.hlsli");
@@ -1251,6 +1256,10 @@ void Renderer::record_shadows(const ViewConstants& view) {
     // without the reprojection's depth check (2).
     static const bool ssgi_dbg = std::getenv("BIOMES_SSGI_DBG") != nullptr;
     hfgi_.constants(hfgi_on_ && mode_ != Mode::Wireframe && !gi_dbg_hf_off(), sc.hf);
+    // Under the top surface; it answers through the heightfield's reader, so it needs it.
+    // BIOMES_NF_NOREAD: the near field updates but no shader reads it (cost A/B).
+    static const bool nf_noread = std::getenv("BIOMES_NF_NOREAD") != nullptr;
+    near_.constants(near_on_ && hfgi_on_ && mode_ != Mode::Wireframe && !gi_dbg_hf_off() && !nf_noread, sc.near_field);
     if (ssgi_dbg && sc.prev_cam[3] > 0.5f) sc.prev_cam[3] = std::atoi(std::getenv("BIOMES_SSGI_DBG")) == 2 ? 3.0f : 2.0f;
     std::memcpy(sc.cluster, cluster_consts_, sizeof sc.cluster);
     sc.cluster[2][3] = 0.0f;   // l_cam_fwd.w: was "RT shadows on" (shadow.hlsli)
@@ -1539,6 +1548,9 @@ bool Renderer::create_fog(std::string& error) {
     if (!tex(fog_inject_[0], true, kFogX, kFogY, kFogZ, f16, true, ua, "mist inject 0")) return false;
     if (!tex(fog_inject_[1], true, kFogX, kFogY, kFogZ, f16, true, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "mist inject 1")) return false;
     if (!tex(fog_integrated_, true, kFogX, kFogY, kFogZ, f16, true, ua, "mist integrated")) return false;
+    if (!tex(fog_open_, true, kFogX, kFogY, kFogZ, DXGI_FORMAT_R16_FLOAT, true, ua, "mist openness")) return false;
+    if (!tex(fog_open_avg_, true, kFogX, kFogY, kFogZ, DXGI_FORMAT_R16_FLOAT, true, ua, "mist openness along")) return false;
+    fog_open_avg_read_ = false;
     fog_cur_ = 0;
     fog_hist_valid_ = false;
 
@@ -1599,6 +1611,11 @@ bool Renderer::create_fog(std::string& error) {
         device_->CreateUnorderedAccessView(fog_inject_[0].Get(), nullptr, &ud, slot(33));
         device_->CreateUnorderedAccessView(fog_inject_[1].Get(), nullptr, &ud, slot(34));
         device_->CreateUnorderedAccessView(fog_integrated_.Get(), nullptr, &ud, slot(35));
+        ud.Format = DXGI_FORMAT_R16_FLOAT;
+        device_->CreateUnorderedAccessView(fog_open_.Get(), nullptr, &ud, slot(kFogOpenUav));
+        device_->CreateUnorderedAccessView(fog_open_avg_.Get(), nullptr, &ud, slot(kFogOpenAvgUav));
+        sd.Format = DXGI_FORMAT_R16_FLOAT;
+        device_->CreateShaderResourceView(fog_open_avg_.Get(), &sd, slot(kFogOpenAvgSrv));
     }
 
     for (UINT f = 0; f < kFrameCount; ++f) {
@@ -1623,7 +1640,7 @@ bool Renderer::create_fog(std::string& error) {
     // and one-descriptor tables for the map, the history, this frame's
     // inject volume read and written, and the integrated volume.
     {
-        D3D12_DESCRIPTOR_RANGE shadow[3] = {};
+        D3D12_DESCRIPTOR_RANGE shadow[5] = {};
         shadow[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         shadow[0].NumDescriptors = 1;
         shadow[0].BaseShaderRegister = 8;
@@ -1636,18 +1653,28 @@ bool Renderer::create_fog(std::string& error) {
         shadow[2].NumDescriptors = 1;
         shadow[2].BaseShaderRegister = 60;
         shadow[2].OffsetInDescriptorsFromTableStart = Clouds::kShadowSrv;
+        // The near field's probes and occupancy (t26..t27) and the heightfield's
+        // maps (t38..t42): each froxel's own share of open air (nf_openness).
+        shadow[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        shadow[3].NumDescriptors = 3;
+        shadow[3].BaseShaderRegister = 26;
+        shadow[3].OffsetInDescriptorsFromTableStart = NearField::kSrvProbes;
+        shadow[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        shadow[4].NumDescriptors = 5;
+        shadow[4].BaseShaderRegister = 38;
+        shadow[4].OffsetInDescriptorsFromTableStart = HeightGi::kSrvScene;
         D3D12_DESCRIPTOR_RANGE one[5] = {};
         const D3D12_DESCRIPTOR_RANGE_TYPE kinds[5] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
                                                       D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
                                                       D3D12_DESCRIPTOR_RANGE_TYPE_UAV};
         const UINT regs[5] = {0, 1, 2, 0, 1};
-        D3D12_ROOT_PARAMETER p[8] = {};
+        D3D12_ROOT_PARAMETER p[10] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[0].Descriptor.ShaderRegister = 0;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[1].Descriptor.ShaderRegister = 2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[2].DescriptorTable.NumDescriptorRanges = 3;
+        p[2].DescriptorTable.NumDescriptorRanges = 5;
         p[2].DescriptorTable.pDescriptorRanges = shadow;
         for (int k = 0; k < 5; ++k) {
             one[k].RangeType = kinds[k];
@@ -1657,8 +1684,18 @@ bool Renderer::create_fog(std::string& error) {
             p[3 + k].DescriptorTable.NumDescriptorRanges = 1;
             p[3 + k].DescriptorTable.pDescriptorRanges = &one[k];
         }
-        for (int k = 0; k < 8; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_STATIC_SAMPLER_DESC ss[2] = {};
+        // u2, u3: each froxel's openness and its mean along the ray.
+        D3D12_DESCRIPTOR_RANGE open_r[2] = {};
+        for (int k = 0; k < 2; ++k) {
+            open_r[k].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            open_r[k].NumDescriptors = 1;
+            open_r[k].BaseShaderRegister = UINT(2 + k);
+            p[8 + k].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            p[8 + k].DescriptorTable.NumDescriptorRanges = 1;
+            p[8 + k].DescriptorTable.pDescriptorRanges = &open_r[k];
+        }
+        for (int k = 0; k < 10; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_STATIC_SAMPLER_DESC ss[3] = {};
         ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         ss[0].AddressU = ss[0].AddressV = ss[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
         ss[0].MaxLOD = D3D12_FLOAT32_MAX;
@@ -1671,10 +1708,13 @@ bool Renderer::create_fog(std::string& error) {
         ss[1].MaxLOD = D3D12_FLOAT32_MAX;
         ss[1].ShaderRegister = 1;
         ss[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        // s3: g_gi_linear (shadow.hlsli), the heightfield's maps.
+        ss[2] = ss[0];
+        ss[2].ShaderRegister = 3;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 8;
+        rsd.NumParameters = 10;
         rsd.pParameters = p;
-        rsd.NumStaticSamplers = 2;
+        rsd.NumStaticSamplers = 3;
         rsd.pStaticSamplers = ss;
         ComPtr<ID3DBlob> sig, err;
         HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
@@ -1802,6 +1842,9 @@ void Renderer::record_fog() {
     cmd_->SetComputeRootDescriptorTable(5, at(30 + cur));       // this frame's, read by the integrate pass
     cmd_->SetComputeRootDescriptorTable(6, at(33 + cur));       // this frame's, written
     cmd_->SetComputeRootDescriptorTable(7, at(35));
+    cmd_->SetComputeRootDescriptorTable(8, at(kFogOpenUav));
+    cmd_->SetComputeRootDescriptorTable(9, at(kFogOpenAvgUav));
+    if (fog_open_avg_read_) { tr(fog_open_avg_.Get(), nps, ua); fog_open_avg_read_ = false; }
     cmd_->SetPipelineState(fog_inject_pso_.Get());
     cmd_->Dispatch((kFogX + 7) / 8, (kFogY + 7) / 8, kFogZ);
     tr(fog_inject_[cur].Get(), ua, nps);
@@ -1810,6 +1853,8 @@ void Renderer::record_fog() {
     cmd_->Dispatch((kFogX + 7) / 8, (kFogY + 7) / 8, 1);
     if (post_queries_) cmd_->EndQuery(post_queries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, UINT(frame_) * 5 + 3);
     tr(fog_integrated_.Get(), ua, nps);
+    tr(fog_open_avg_.Get(), ua, nps);
+    fog_open_avg_read_ = true;
 
     tr(shadow_map_.Get(), ps | nps, ps);
     tr(light_atlas_.Get(), ps | nps, ps);
@@ -2719,6 +2764,8 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         if (!canopy_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         // The heightfield GI (L6): the diffuse GI.
         if (!hfgi_.init(device_.Get(), srv_heap_.Get(), error)) return false;
+        // The near field: the light under it.
+        if (!near_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         // The key light's shadow past the cascades.
         if (!far_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         canopy_.set_models(trees_.models(), trees_.looks());
@@ -2733,6 +2780,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     startup_log().push_back(std::make_pair(std::string("phase: tree models + impostor bake"), startup_now_ms() - t0));
     t0 = startup_now_ms();
     if (!foliage_.init(device_.Get(), &world_, "worldgen/data/archetypes.json", error)) return false;
+    foliage_.set_edits(&edits_);
     startup_log().push_back(std::make_pair(std::string("phase: foliage pipelines"), startup_now_ms() - t0));
     t0 = startup_now_ms();
     if (!create_fog(error)) return false;
@@ -2768,6 +2816,7 @@ void Renderer::update_trees(const ViewConstants& view, bool settle) {
             tree_field_.update(view.cam_pos[0], view.cam_pos[2], radius);
         }
     }
+    settle_trees(view.time, settle);
     if (tree_field_.version() == tree_field_seen_ && !tree_dirty_) return;
     tree_field_seen_ = tree_field_.version();
     tree_dirty_ = false;
@@ -2957,7 +3006,12 @@ bool Renderer::create_post_pipelines(std::string& error) {
         sr.NumDescriptors = 9;
         // t9, the mist's integrated volume, sits at heap [32]: 29 past the
         // table's start at [3].
-        D3D12_DESCRIPTOR_RANGE sr2[6] = {sr, {}, {}, {}, {}, {}};
+        D3D12_DESCRIPTOR_RANGE sr2[7] = {sr, {}, {}, {}, {}, {}, {}};
+        // t16, the mist's openness along each ray (fog.hlsl cs_fog_integrate).
+        sr2[6].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr2[6].NumDescriptors = 1;
+        sr2[6].BaseShaderRegister = 16;
+        sr2[6].OffsetInDescriptorsFromTableStart = kFogOpenAvgSrv - 3;
         // t15, the puddle mask (ADR-005 C4).
         sr2[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr2[5].NumDescriptors = 1;
@@ -2992,7 +3046,7 @@ bool Renderer::create_post_pipelines(std::string& error) {
         D3D12_ROOT_PARAMETER p[6] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[1].DescriptorTable.NumDescriptorRanges = 6;
+        p[1].DescriptorTable.NumDescriptorRanges = 7;
         p[1].DescriptorTable.pDescriptorRanges = sr2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[2].DescriptorTable.NumDescriptorRanges = 1;
@@ -3685,8 +3739,16 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         if (hfgi_.begin(view.cam_pos, sky_frame_.hours, post_frame_, vp)) record_hfgi(vp);
     }
     prof_.mark(cmd_.Get(), "far shadow + heightfield GI");
+    // The near field plans here: its readiness goes into the shadow constants.
+    // A still (exposure_snap_) settles it whole.
+    const bool near_live = near_on_ && hfgi_on_ && hfgi_.ready() && mode_ != Mode::Wireframe;
+    if (near_live) near_.plan(view.cam_pos, &edits_, exposure_snap_);
     record_shadows(view);
     prof_.mark(cmd_.Get(), "shadows (rest)");
+    // The near field (after the shadow constants, which carry the heightfield's
+    // corner, and before anything lit, or the camera's sky share, reads it).
+    if (near_live) near_.record(cmd_.Get(), UINT(frame_), world_, shadow_cb_[frame_]->GetGPUVirtualAddress());
+    prof_.mark(cmd_.Get(), "near field");
     // The heightfield's sky share at the eye, for the haze and the mist.
     if (hfgi_on_ && mode_ != Mode::Wireframe)
         hfgi_.record_camera(cmd_.Get(), UINT(frame_), shadow_cb_[frame_]->GetGPUVirtualAddress());
@@ -5310,6 +5372,8 @@ bool Renderer::load_edits(const char* path, std::string& error, bool& field_mism
     const float lo[3] = {-1.0e9f, -1.0e9f, -1.0e9f};
     const float hi[3] = {1.0e9f, 1.0e9f, 1.0e9f};
     streamer_.invalidate_box(lo, hi);
+    foliage_.invalidate_all();
+    near_.invalidate_all();
     return true;
 }
 
@@ -5318,8 +5382,266 @@ bool Renderer::dig(float x, float y, float z, float radius, float strength,
     float lo[3], hi[3];
     if (!edits_.edit_sphere(x, y, z, radius, strength, material, lo, hi)) return false;
     streamer_.invalidate_box(lo, hi);
+    foliage_.invalidate_box(lo, hi);
+    near_.invalidate_box(lo, hi);
     stats_.chunks_invalidated = streamer_.last_invalidated();
     return true;
+}
+
+namespace {
+// The field at one lattice corner, as the LOD 0 mesher evaluates it there.
+float lattice_density(const BrickStore& e, const WorldGpu& w, int vx, int vy, int vz) {
+    float d = 0.0f;
+    if (e.edited_at(vx, vy, vz, d)) return d;
+    return w.density(float(vx) * kEditVoxel, float(vy) * kEditVoxel, float(vz) * kEditVoxel, kEditVoxel);
+}
+}  // namespace
+
+float Renderer::edited_density(float x, float y, float z) const {
+    const float fx = x / kEditVoxel, fy = y / kEditVoxel, fz = z / kEditVoxel;
+    const int x0 = int(std::floor(fx)), y0 = int(std::floor(fy)), z0 = int(std::floor(fz));
+    // Most of the world has no edit within a voxel: one field call, not eight.
+    bool any = false;
+    float tmp;
+    for (int c = 0; c < 8 && !any; ++c)
+        any = edits_.edited_at(x0 + (c & 1), y0 + ((c >> 1) & 1), z0 + ((c >> 2) & 1), tmp);
+    if (!any) return world_.density(x, y, z, kEditVoxel);
+    const float tx = fx - float(x0), ty = fy - float(y0), tz = fz - float(z0);
+    float acc = 0.0f;
+    for (int c = 0; c < 8; ++c) {
+        const int ox = c & 1, oy = (c >> 1) & 1, oz = (c >> 2) & 1;
+        const float wgt = (ox ? tx : 1.0f - tx) * (oy ? ty : 1.0f - ty) * (oz ? tz : 1.0f - tz);
+        acc += wgt * lattice_density(edits_, world_, x0 + ox, y0 + oy, z0 + oz);
+    }
+    return acc;
+}
+
+bool Renderer::aim_terrain(const float from[3], const float dir[3], float reach,
+                           float hit[3], float& dist) const {
+    auto at = [&](float t) {
+        return edited_density(from[0] + dir[0] * t, from[1] + dir[1] * t, from[2] + dir[2] * t);
+    };
+    float t0 = 0.0f;
+    float d = at(0.0f);
+    if (d > 0.0f) return false;   // the eye is in rock
+    // Density is roughly metres to the surface in air, but layer 6's
+    // overhangs make it no strict bound: half of it, capped at a metre and
+    // never under 10 cm, so a 0.5 m feature is not stepped over.
+    float t1 = -1.0f;
+    for (float t = 0.0f; t < reach;) {
+        const float step = (std::min)(1.0f, (std::max)(0.1f, -0.5f * d));
+        t += step;
+        if (t > reach) t = reach;
+        d = at(t);
+        if (d > 0.0f) { t1 = t; break; }
+        t0 = t;
+        if (t >= reach) break;
+    }
+    if (t1 < 0.0f) return false;
+    for (int it = 0; it < 16; ++it) {
+        const float tm = 0.5f * (t0 + t1);
+        if (at(tm) > 0.0f) t1 = tm; else t0 = tm;
+    }
+    dist = t1;
+    for (int k = 0; k < 3; ++k) hit[k] = from[k] + dir[k] * t1;
+    return true;
+}
+
+float Renderer::ground_below(float x, float z, float from_y, bool with_edits) const {
+    // The edited field, or the generated one alone (what stood there first).
+    auto dens = [&](float y) {
+        return with_edits ? edited_density(x, y, z) : world_.density(x, y, z, kEditVoxel);
+    };
+    // From half a metre over the base: air there unless something overhangs.
+    float ya = from_y + 0.5f;
+    float d = dens(ya);
+    if (d > 0.0f) return from_y;
+    const float floor_y = from_y - 200.0f;
+    for (float y = ya; y > floor_y;) {
+        const float step = (std::min)(1.0f, (std::max)(0.05f, -0.5f * d));
+        y -= step;
+        d = dens(y);
+        if (d > 0.0f) {
+            float yr = y;
+            for (int it = 0; it < 12; ++it) {
+                const float ym = 0.5f * (ya + yr);
+                if (dens(ym) > 0.0f) yr = ym; else ya = ym;
+            }
+            return (std::min)(from_y, 0.5f * (ya + yr));
+        }
+        ya = y;
+    }
+    return from_y;
+}
+
+void Renderer::settle_trees(float time, bool settle) {
+    const float dt = (sink_time_ < 0.0f || settle) ? 0.0f : (std::min)(0.1f, (std::max)(0.0f, time - sink_time_));
+    sink_time_ = time;
+    if (edits_.brick_count() == 0 && tree_sink_.empty() && rock_sink_.empty()) return;
+
+    // Which trees stand on dug ground, and where that ground is now: on an
+    // edit, and when tiles arrive (a tree streamed in over an old hole).
+    // Only a tree whose trunk column an edit reaches within 1.5 m of its
+    // base is marched, and only once per edit generation.
+    const uint64_t gen = edits_.generation();
+    if (gen != sink_gen_seen_ || tree_field_.version() != sink_field_seen_) {
+        sink_gen_seen_ = gen;
+        const std::vector<worldgen::TreeInstance>& st = tree_field_.standing();
+        for (size_t i = 0; i < st.size(); ++i) {
+            const worldgen::TreeInstance& t = st[i];
+            std::unordered_map<uint32_t, TreeSink>::iterator e = tree_sink_.find(t.id);
+            if (e != tree_sink_.end() && e->second.gen == gen) continue;
+            const float orig = e != tree_sink_.end() ? e->second.orig : t.y;
+            float top = -1e30f;
+            const bool touched =
+                edits_.column_top(int(std::floor(t.x / kEditVoxel)), int(std::floor(t.z / kEditVoxel)), top) &&
+                top >= orig - 1.5f;
+            if (!touched && e == tree_sink_.end()) continue;
+            float target = touched ? ground_below(t.x, t.z, orig) : orig;
+            if (target > orig - 0.1f) target = orig;   // the field at 0.5 m against layer 8's: centimetres
+            if (e == tree_sink_.end()) {
+                if (target >= orig) continue;
+                TreeSink k;
+                k.orig = orig; k.y = orig;
+                e = tree_sink_.insert(std::make_pair(t.id, k)).first;
+            }
+            e->second.target = target;
+            e->second.gen = gen;
+            // Ground that came back (a load) lifts the tree at once.
+            if (target > e->second.y) { e->second.y = target; e->second.v = 0.0f; tree_field_.set_base(t.id, target); }
+        }
+    }
+
+    // Fall: from rest, under gravity, straight down.
+    for (std::unordered_map<uint32_t, TreeSink>::iterator it = tree_sink_.begin(); it != tree_sink_.end();) {
+        TreeSink& k = it->second;
+        if (k.y > k.target) {
+            if (settle) k.y = k.target;
+            else {
+                k.v += 9.81f * dt;
+                k.y -= k.v * dt;
+            }
+            if (k.y <= k.target) { k.y = k.target; k.v = 0.0f; }
+            tree_field_.set_base(it->first, k.y);
+        }
+        if (k.target >= k.orig && k.y >= k.orig) {
+            tree_field_.clear_base(it->first);
+            it = tree_sink_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    tree_field_.commit_bases();
+    sink_field_seen_ = tree_field_.version();
+    if (rocks_on_) settle_rocks(dt, settle);
+}
+
+void Renderer::settle_rocks(float dt, bool settle) {
+    if (edits_.brick_count() == 0 && rock_sink_.empty()) return;
+    const uint64_t gen = edits_.generation();
+    if (gen != rock_gen_seen_ || rock_field_.version() != rock_field_seen_) {
+        rock_gen_seen_ = gen;
+        for (const worldgen::RockInstance& r : rock_field_.rocks()) {
+            std::unordered_map<uint32_t, RockSink>::iterator e = rock_sink_.find(r.id);
+            if (e != rock_sink_.end() && e->second.gen == gen) continue;
+            const float drop_now = e != rock_sink_.end() ? e->second.drop : 0.0f;
+            const float g0 = r.ground + drop_now;   // the generated ground at its middle
+            // Its footprint: the middle and eight points on a ring at a third
+            // of its size. Touched if an edit reaches any of them near the ground.
+            const float ring = 0.33f * r.size;
+            float px[9], pz[9];
+            px[0] = r.x; pz[0] = r.z;
+            for (int k = 0; k < 8; ++k) {
+                const float a = 0.785398f * float(k);
+                px[1 + k] = r.x + ring * std::cos(a);
+                pz[1 + k] = r.z + ring * std::sin(a);
+            }
+            bool touched = false;
+            for (int k = 0; k < 9 && !touched; ++k) {
+                float top;
+                touched = edits_.column_top(int(std::floor(px[k] / kEditVoxel)), int(std::floor(pz[k] / kEditVoxel)), top) &&
+                          top >= g0 - 1.5f - r.size;
+            }
+            if (!touched && e == rock_sink_.end()) continue;
+            float target = 0.0f;
+            if (touched) {
+                target = 1e30f;
+                const float from = g0 + r.size + 1.0f;
+                for (int k = 0; k < 9 && target > 0.0f; ++k) {
+                    const float before = ground_below(px[k], pz[k], from, false);
+                    const float after = ground_below(px[k], pz[k], from, true);
+                    target = (std::min)(target, (std::max)(0.0f, before - after));
+                }
+                if (target < 0.1f) target = 0.0f;
+            }
+            if (e == rock_sink_.end()) {
+                if (target <= 0.0f) continue;
+                e = rock_sink_.insert(std::make_pair(r.id, RockSink())).first;
+            }
+            e->second.target = target;
+            e->second.gen = gen;
+            if (target < e->second.drop) {   // ground came back (a load): up at once
+                e->second.drop = target; e->second.v = 0.0f;
+                rock_field_.set_drop(r.id, target);
+            }
+        }
+    }
+    for (std::unordered_map<uint32_t, RockSink>::iterator it = rock_sink_.begin(); it != rock_sink_.end();) {
+        RockSink& k = it->second;
+        if (k.drop < k.target) {
+            if (settle) k.drop = k.target;
+            else { k.v += 9.81f * dt; k.drop += k.v * dt; }
+            if (k.drop >= k.target) { k.drop = k.target; k.v = 0.0f; }
+            rock_field_.set_drop(it->first, k.drop);
+        }
+        if (k.target <= 0.0f && k.drop <= 0.0f) {
+            rock_field_.clear_drop(it->first);
+            it = rock_sink_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    rock_field_.commit_drops();
+    rock_field_seen_ = rock_field_.version();
+}
+
+Renderer::AimedDig Renderer::dig_aimed(const float from[3], const float dir[3], float reach, float radius) {
+    AimedDig r;
+    const auto start = std::chrono::steady_clock::now();
+    if (aim_terrain(from, dir, reach, r.hit_pos, r.dist)) {
+        r.hit = true;
+        // Half a voxel past the surface along the ray, then the nearest of
+        // that cell's eight corners which is rock. Centring on the hit itself
+        // put the smallest dig's one lattice point in the air above about
+        // half the time, and it removed nothing.
+        float p[3];
+        for (int k = 0; k < 3; ++k) p[k] = r.hit_pos[k] + dir[k] * (0.5f * kEditVoxel);
+        const int x0 = int(std::floor(p[0] / kEditVoxel));
+        const int y0 = int(std::floor(p[1] / kEditVoxel));
+        const int z0 = int(std::floor(p[2] / kEditVoxel));
+        float best = 1e30f, any_best = 1e30f;
+        int bx = x0, by = y0, bz = z0, ax = x0, ay = y0, az = z0;
+        for (int c = 0; c < 8; ++c) {
+            const int vx = x0 + (c & 1), vy = y0 + ((c >> 1) & 1), vz = z0 + ((c >> 2) & 1);
+            const float dx = float(vx) * kEditVoxel - p[0], dy = float(vy) * kEditVoxel - p[1],
+                        dz = float(vz) * kEditVoxel - p[2];
+            const float q = dx * dx + dy * dy + dz * dz;
+            if (q < any_best) { any_best = q; ax = vx; ay = vy; az = vz; }
+            if (q < best && lattice_density(edits_, world_, vx, vy, vz) > 0.0f) {
+                best = q; bx = vx; by = vy; bz = vz;
+            }
+        }
+        if (best > 1e29f) { bx = ax; by = ay; bz = az; }
+        r.centre[0] = float(bx) * kEditVoxel;
+        r.centre[1] = float(by) * kEditVoxel;
+        r.centre[2] = float(bz) * kEditVoxel;
+        const size_t before = edits_.edited_voxels();
+        r.dug = dig(r.centre[0], r.centre[1], r.centre[2], radius, -4.0f, 1);
+        // Newly owned points only: a re-dig of the same spot writes none.
+        r.voxels = edits_.edited_voxels() - before;
+    }
+    r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    return r;
 }
 
 void Renderer::slot_report(const char* path) {

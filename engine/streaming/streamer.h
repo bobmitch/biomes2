@@ -165,6 +165,8 @@ public:
     // detail arrives late".
     const std::vector<int>& latency_frames(int lod) const { return latency_[lod]; }
     size_t held_count() const { return held_.size(); }
+    // Chunks an edit threw away whose remesh has not landed yet.
+    size_t edit_swaps_pending() const { return edit_swap_.size(); }
     size_t fading_in_count() const { return fading_in_.size(); }
     unsigned long long forced_retires() const { return forced_retires_; }
     // Frames in which a chunk was queued and no slot was free for it.
@@ -217,6 +219,7 @@ public:
         resident_.clear();
         queue_.clear();
         retire_.clear();
+        edit_swap_.clear();
         empty_resident_ = 0;
     }
 
@@ -338,6 +341,15 @@ public:
         // Retire anything no longer wanted.
         wanted_.clear();
         for (size_t i = 0; i < desired_.size(); ++i) wanted_[desired_[i]] = 1;
+        // An edited chunk the camera has since left takes the ordinary path.
+        for (size_t e = 0; e < edit_swap_.size();) {
+            if (wanted_.find(edit_swap_[e]) == wanted_.end()) {
+                edit_swap_[e] = edit_swap_.back();
+                edit_swap_.pop_back();
+            } else {
+                ++e;
+            }
+        }
         retire_.clear();
         retired_keys_.clear();
         for (std::unordered_map<ChunkKey, UINT, ChunkKeyHash>::iterator it = resident_.begin();
@@ -434,6 +446,11 @@ public:
             // the edit, until the remesh WITH it lands, rather than leaving a
             // hole the size of the chunk for the frames in between.
             if (it->second != kNoSlot) retire_or_hold(it->first, it->second);
+            // But swapped the frame the remesh lands, not cross-faded: the
+            // fade is for a LOD change, where two levels of the same ground
+            // trade places. Here it held every dig back 16 frames past its
+            // remesh (~0.3 s, whatever the hole's size) and dithered the hole in.
+            edit_swap_.push_back(it->first);
             it = resident_.erase(it);
             ++last_invalidated_;
         }
@@ -496,7 +513,26 @@ public:
             const ChunkKey& k = queue_[i].key;
             const UINT slot = free_slots_.back();
             free_slots_.pop_back();
-            if (hold_ && fade_frames_ > 0) {
+            // A chunk an edit threw away: the held old mesh of the SAME key
+            // goes now, and the new one draws the frame it is meshed.
+            bool swap = false;
+            for (size_t e = 0; e < edit_swap_.size(); ++e) {
+                if (!(edit_swap_[e] == k)) continue;
+                edit_swap_[e] = edit_swap_.back();
+                edit_swap_.pop_back();
+                swap = true;
+                break;
+            }
+            if (swap) {
+                for (size_t h = 0; h < held_.size(); ++h) {
+                    if (!(held_[h].key == k)) continue;
+                    free_now(held_[h].slot);
+                    held_[h] = held_.back();
+                    held_.pop_back();
+                    break;
+                }
+                note_visible(k);
+            } else if (hold_ && fade_frames_ > 0) {
                 FadeIn f;
                 f.key = k; f.slot = slot; f.start = -1;
                 fading_in_.push_back(f);
@@ -774,6 +810,7 @@ private:
     }
 
     std::vector<Held>   held_;
+    std::vector<ChunkKey> edit_swap_;   // re-queued by an edit: swap, do not fade
     std::vector<FadeIn> fading_in_;
     int   frame_ = 0;
     // 16 frames, about 0.27 s at 60 Hz: long enough to read as a fade rather

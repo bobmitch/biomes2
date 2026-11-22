@@ -18,6 +18,7 @@ for _, f in ipairs(FONTS) do
 end
 
 local settings = require("settings")
+require("hud")
 require("menu")
 require("tuning")
 
@@ -42,8 +43,11 @@ end
 function game.on_update(dt)
 	tuning.update(dt)
 	menu.update()
+	hud.update(menu.is_open())
 end
 
+-- First, so the menu and the panel draw over it.
+hud.init(ctx)
 if not menu.init(ctx) then error("the pause menu did not load") end
 tuning.init(ctx)
 settings.apply(settings.load())

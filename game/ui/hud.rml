@@ -1,0 +1,51 @@
+<rml>
+<!--
+  The in-game HUD: a crosshair at the screen centre (where a dig lands) and
+  the dig radius. Markup only; game/scripts/hud.lua fills the label and hides
+  it all behind the pause menu. Nothing here takes the mouse
+  (pointer-events: none), so a click still falls through to the game.
+-->
+<head>
+	<title>HUD</title>
+	<link type="text/rcss" href="common.rcss"/>
+	<style>
+		body {
+			width: 100%;
+			height: 100%;
+			pointer-events: none;
+			display: flex;
+			justify-content: center;
+			align-items: center;
+		}
+		#cross {
+			width: 4dp;
+			height: 4dp;
+			background-color: #ffffffd0;
+			border: 1dp #000000a0;
+			border-radius: 3dp;
+			pointer-events: none;
+		}
+		#dig {
+			position: absolute;
+			left: 0;
+			right: 0;
+			bottom: 18dp;
+			text-align: center;
+			font-family: "Roboto Mono";
+			font-size: 15dp;
+			color: #ffffffe0;
+			pointer-events: none;
+		}
+		#dig span {
+			display: inline-block;
+			padding: 3dp 10dp;
+			background-color: #00000080;
+			border-radius: 3dp;
+		}
+	</style>
+</head>
+<body>
+	<div id="cross"></div>
+	<div id="dig"></div>
+</body>
+</rml>

@@ -55,7 +55,18 @@ void TreeFelling::update(float x, float z) {
             const float ex = t.x - x, ez = t.z - z;
             if (ex * ex + ez * ez > r2) continue;
             std::unordered_map<uint32_t, uint32_t>::iterator it = colliders_.find(t.id);
-            if (it != colliders_.end()) { keep[t.id] = it->second; colliders_.erase(it); continue; }
+            if (it != colliders_.end()) {
+                // Kept while the tree stays put; a tree dropping into a dug
+                // hole gets a new capsule at its new base.
+                std::unordered_map<uint32_t, float>::iterator yi = collider_y_.find(t.id);
+                if (yi != collider_y_.end() && std::fabs(yi->second - t.y) < 0.01f) {
+                    keep[t.id] = it->second;
+                    colliders_.erase(it);
+                    continue;
+                }
+                physics_->remove_body(it->second);
+                colliders_.erase(it);
+            }
             const TreeModel& m = tr.model(t.species, t.variant);
             const float s = t.height / tr.look(t.species).nominal_height;
             const float r = m.trunk_radius * s * 0.9f;
@@ -68,10 +79,12 @@ void TreeFelling::update(float x, float z) {
             const float a[3] = {t.x, t.y - 0.5f, t.z};
             const float b[3] = {t.x + top[0], t.y + top[1], t.z + top[2]};
             const uint32_t h = physics_->add_static_capsule(a, b, r);
-            if (h) keep[t.id] = h;
+            if (h) { keep[t.id] = h; collider_y_[t.id] = t.y; }
         }
-        for (std::unordered_map<uint32_t, uint32_t>::iterator it = colliders_.begin(); it != colliders_.end(); ++it)
+        for (std::unordered_map<uint32_t, uint32_t>::iterator it = colliders_.begin(); it != colliders_.end(); ++it) {
             physics_->remove_body(it->second);
+            collider_y_.erase(it->first);
+        }
         colliders_.swap(keep);
     }
 

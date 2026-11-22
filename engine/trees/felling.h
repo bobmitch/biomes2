@@ -73,6 +73,7 @@ private:
     Renderer*     renderer_ = nullptr;
     PhysicsWorld* physics_ = nullptr;
     std::unordered_map<uint32_t, uint32_t> colliders_;   // tree id -> body
+    std::unordered_map<uint32_t, float>    collider_y_;  // the base each was built at
     std::unordered_map<uint32_t, int>      hits_;
     std::unordered_map<uint32_t, Log>      logs_;
     unsigned long long field_version_ = 0;

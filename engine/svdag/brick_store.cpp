@@ -60,12 +60,20 @@ bool BrickStore::edit_sphere(float cx, float cy, float cz, float radius,
     for (int vz = v0z; vz <= v1z; ++vz) {
         for (int vy = v0y; vy <= v1y; ++vy) {
             for (int vx = v0x; vx <= v1x; ++vx) {
-                const float wx = (float(vx) + 0.5f) * kEditVoxel;
-                const float wy = (float(vy) + 0.5f) * kEditVoxel;
-                const float wz = (float(vz) + 0.5f) * kEditVoxel;
+                // Voxel v's value is what the mesher reads at the lattice
+                // POINT v x kEditVoxel (surface_nets.hlsl floors the corner's
+                // position), so that is where its distance is measured. It
+                // was measured from the voxel's middle, which put every edit
+                // a quarter voxel off towards +x +y +z -- nothing at 3.5 m,
+                // the whole hole at 0.5.
+                const float wx = float(vx) * kEditVoxel;
+                const float wy = float(vy) * kEditVoxel;
+                const float wz = float(vz) * kEditVoxel;
                 const float dx = wx - cx, dy = wy - cy, dz = wz - cz;
                 const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
-                if (d > radius) continue;
+                // Strictly inside: a point ON the rim would be written as
+                // exactly zero, which is neither air nor rock.
+                if (d >= radius) continue;
 
                 BrickKey key;
                 key.x = floor_div(vx, kBrickSide);
@@ -87,18 +95,52 @@ bool BrickStore::edit_sphere(float cx, float cy, float cz, float radius,
                 // Absolute, and feathered to the rim so the carve does not end
                 // in a step one voxel wide. The sign is what matters: negative
                 // is air, positive is rock.
+                //
+                // Two guards make overlapping edits add up. The value never
+                // reaches zero at the rim (kept a hair on the edit's side),
+                // so a rim point that was air stays air instead of becoming
+                // a film of "surface". And a point an earlier edit already
+                // owns keeps whichever value goes further the same way:
+                // digging the rim of one hole into the middle of another
+                // must not shallow it.
                 const float t = d / radius;
-                b.density[li] = strength * (1.0f - t * t);
+                float v = strength * (1.0f - t * t);
+                const float kRim = 0.05f;
+                if (strength < 0.0f) v = std::min(v, -kRim);
+                else                 v = std::max(v, kRim);
+                const bool owned = (b.edited[li >> 5] & (1u << (li & 31))) != 0;
+                if (owned) v = strength < 0.0f ? std::min(v, b.density[li]) : std::max(v, b.density[li]);
+                b.density[li] = v;
                 b.material[li] = material;
                 b.edited[li >> 5] |= (1u << (li & 31));
+                mark_column(vx, vy, vz);
                 any = true;
             }
         }
     }
     if (!any) return false;
+    ++generation_;
 
-    out_min[0] = cx - radius; out_min[1] = cy - radius; out_min[2] = cz - radius;
-    out_max[0] = cx + radius; out_max[1] = cy + radius; out_max[2] = cz + radius;
+    // One voxel past the sphere: an edited point on a chunk's border is also
+    // its neighbour's ghost corner, and that neighbour must re-mesh too.
+    const float pad = radius + kEditVoxel;
+    out_min[0] = cx - pad; out_min[1] = cy - pad; out_min[2] = cz - pad;
+    out_max[0] = cx + pad; out_max[1] = cy + pad; out_max[2] = cz + pad;
+    return true;
+}
+
+bool BrickStore::edited_at(int vx, int vy, int vz, float& out_d) const {
+    if (bricks_.empty()) return false;
+    BrickKey key;
+    key.x = floor_div(vx, kBrickSide);
+    key.y = floor_div(vy, kBrickSide);
+    key.z = floor_div(vz, kBrickSide);
+    std::unordered_map<BrickKey, Brick, BrickKeyHash>::const_iterator it = bricks_.find(key);
+    if (it == bricks_.end()) return false;
+    const int li = (floor_mod(vz, kBrickSide) * kBrickSide + floor_mod(vy, kBrickSide)) * kBrickSide +
+                   floor_mod(vx, kBrickSide);
+    if ((it->second.edited[li >> 5] & (1u << (li & 31))) == 0) return false;
+    out_d = it->second.density[li];
     return true;
 }
 
@@ -217,6 +259,8 @@ bool BrickStore::load(const std::string& path, uint32_t expect_field_id,
 
     bricks_.clear();
     dirty_.clear();
+    column_top_.clear();
+    ++generation_;
     for (uint32_t b = 0; b < count; ++b) {
         int32_t kx = 0, ky = 0, kz = 0;
         if (!read_pod(f, kx) || !read_pod(f, ky) || !read_pod(f, kz)) {
@@ -243,6 +287,44 @@ bool BrickStore::load(const std::string& path, uint32_t expect_field_id,
         }
     }
     std::fclose(f);
+    // The column map is derived, never saved: rebuilt from what was read.
+    column_top_.clear();
+    for (std::unordered_map<BrickKey, Brick, BrickKeyHash>::const_iterator it = bricks_.begin();
+         it != bricks_.end(); ++it) {
+        for (int i = 0; i < kBrickVoxels; ++i) {
+            if ((it->second.edited[i >> 5] & (1u << (i & 31))) == 0) continue;
+            const int lx = i % kBrickSide, ly = (i / kBrickSide) % kBrickSide, lz = i / (kBrickSide * kBrickSide);
+            mark_column(it->first.x * kBrickSide + lx, it->first.y * kBrickSide + ly, it->first.z * kBrickSide + lz);
+        }
+    }
+    ++generation_;
+    return true;
+}
+
+namespace {
+inline uint64_t column_key(int sx, int sz) {
+    return (uint64_t(uint32_t(sx)) << 32) | uint64_t(uint32_t(sz));
+}
+}  // namespace
+
+void BrickStore::mark_column(int vx, int vy, int vz) {
+    // Lattice point v reaches the surface over [v - 1, v + 1] voxels each
+    // way (trilinear), which is half-voxel columns v - 1 and v.
+    const float y = float(vy) * kEditVoxel;
+    for (int dz = -1; dz <= 0; ++dz) {
+        for (int dx = -1; dx <= 0; ++dx) {
+            std::unordered_map<uint64_t, float>::iterator it = column_top_.find(column_key(vx + dx, vz + dz));
+            if (it == column_top_.end()) column_top_[column_key(vx + dx, vz + dz)] = y;
+            else if (y > it->second) it->second = y;
+        }
+    }
+}
+
+bool BrickStore::column_top(int sx, int sz, float& out_top) const {
+    if (column_top_.empty()) return false;
+    std::unordered_map<uint64_t, float>::const_iterator it = column_top_.find(column_key(sx, sz));
+    if (it == column_top_.end()) return false;
+    out_top = it->second;
     return true;
 }
 

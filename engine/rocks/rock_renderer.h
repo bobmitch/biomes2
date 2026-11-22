@@ -100,6 +100,7 @@ private:
     std::vector<int> phys_mesh_;
     PhysicsWorld* phys_ = nullptr;
     std::unordered_map<uint32_t, uint32_t> colliders_;
+    std::unordered_map<uint32_t, float>    collider_y_;   // the height each was built at
     float last_x_ = 1e30f, last_z_ = 1e30f;
     unsigned long long seen_version_ = ~0ull;
 };

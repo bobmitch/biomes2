@@ -119,13 +119,17 @@ bool HeightGi::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::strin
     // Root: the update's constants, the frame's shadow constants (the light,
     // the sky, the canopy), the SRVs it reads, the UAVs it writes.
     {
-        D3D12_DESCRIPTOR_RANGE sr[3] = {};
+        D3D12_DESCRIPTOR_RANGE sr[4] = {};
         sr[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; sr[0].NumDescriptors = 3; sr[0].BaseShaderRegister = 0;
         sr[0].OffsetInDescriptorsFromTableStart = kSrvTop;
         sr[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; sr[1].NumDescriptors = 5; sr[1].BaseShaderRegister = 38;
         sr[1].OffsetInDescriptorsFromTableStart = kSrvScene;
         sr[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; sr[2].NumDescriptors = 1; sr[2].BaseShaderRegister = 25;
         sr[2].OffsetInDescriptorsFromTableStart = 38;   // the canopy map
+        // The near field's probes and occupancy (near_field.h): the camera's
+        // sky share comes through hfgi_sample, which reads them under the ground.
+        sr[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; sr[3].NumDescriptors = 3; sr[3].BaseShaderRegister = 26;
+        sr[3].OffsetInDescriptorsFromTableStart = 40;
         D3D12_DESCRIPTOR_RANGE ur = {};
         ur.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; ur.NumDescriptors = 6; ur.BaseShaderRegister = 0;
         ur.OffsetInDescriptorsFromTableStart = kUav;
@@ -133,7 +137,7 @@ bool HeightGi::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::strin
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[2].DescriptorTable.NumDescriptorRanges = 3; p[2].DescriptorTable.pDescriptorRanges = sr;
+        p[2].DescriptorTable.NumDescriptorRanges = 4; p[2].DescriptorTable.pDescriptorRanges = sr;
         p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[3].DescriptorTable.NumDescriptorRanges = 1; p[3].DescriptorTable.pDescriptorRanges = &ur;
         p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; p[4].Descriptor.ShaderRegister = 6;   // the camera's share

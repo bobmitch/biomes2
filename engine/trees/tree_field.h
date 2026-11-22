@@ -70,6 +70,16 @@ public:
     void set_felled(uint32_t id, bool felled);
     bool is_felled(uint32_t id) const { return felled_.count(id) != 0; }
 
+    // A standing tree's base moved off the generated ground: the player dug
+    // it out from under it, and it drops to the new ground (Renderer's
+    // settle_trees). Stored by id, so a tile streamed in again comes back
+    // where its tree came to rest; standing() carries it, so drawing,
+    // shadows and trunk colliders all follow. set_base only records;
+    // commit_bases applies every change since in one pass.
+    void set_base(uint32_t id, float y) { bases_[id] = y; bases_dirty_ = true; }
+    void clear_base(uint32_t id) { if (bases_.erase(id)) bases_dirty_ = true; }
+    void commit_bases();
+
     // Diagnostics.
     size_t tiles_resident() const { return tiles_.size(); }
     size_t tiles_queued() const;
@@ -98,6 +108,8 @@ private:
     const WorldGpu* world_ = nullptr;
     std::unordered_map<TileKey, Tile, TileKeyHash> tiles_;
     std::unordered_set<uint32_t> felled_;
+    std::unordered_map<uint32_t, float> bases_;
+    bool bases_dirty_ = false;
     std::vector<worldgen::TreeInstance> standing_;
     unsigned long long version_ = 0;
     bool dirty_ = false;

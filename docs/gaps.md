@@ -64,9 +64,30 @@ Last gathered: 2026-11-21, after the exploration fog.
 
 ## Ground cover, trees and rocks
 
-- **Grass grows through rock footprints and puddles**, and floats over dug
-  holes: the bake is cached per 16 m tile and sees neither rocks, puddles
-  nor edits. [Rocks; Ground cover; The wet world]
+- **Grass grows through rock footprints and puddles**: the bake is cached
+  per 16 m tile and sees neither rocks nor puddles (it does see dig edits
+  now). [Rocks; Ground cover; The wet world]
+- **Nothing under the ground bounces yet** (the near field, step 1): its
+  probes' rays carry the open air's light in from the mouth and nothing
+  from what they hit. A sunlit pit wall does not light the pit floor, a
+  torch lights only what it sees directly, and glowing things (algae pools,
+  lit particles) have no way in. Step 2 is the rays' hits: the sun through
+  the cascades, local lights through their shadow atlas, an emissive term,
+  and last update's probes (multi-bounce) -- the rt-last DDGI's hit
+  shading, without the hardware rays. [Near field]
+- **The near field reaches 64 m round the camera and 32 m up and down**:
+  past it, the heightfield's old covered branch answers (a search for a
+  way out, else black). A mine deeper than 32 m below the eye is fine (the
+  volume follows the camera); a tunnel seen from far above is not.
+  [Near field]
+- **A filled edit is not in the near field the way a dug one is**: its
+  1 m points take the edit's value only where the 0.5 m lattice point falls
+  on one, so a fill thinner than a metre can be missed. [Near field]
+- **A dug pit's floor reads as turf**: the terrain shader picks the
+  biome's ground scan by slope, so a flat floor two metres down takes the
+  same grass-soil scan as the meadow over it (with no blades). An
+  edit-aware material (bare soil where the edits are) would sell a hole.
+  [Digging]
 - **Bushes are still leaf cards at arm's length**: better arranged, but a
   real mesh (as the trees have) would be the next step; the sparse kind
   can read as a lone sprig. [Ground cover]

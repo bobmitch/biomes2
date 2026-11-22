@@ -217,6 +217,7 @@ if(BIOMES2_ENGINE)
     engine/render/lightning.cpp
     engine/render/canopy.cpp
     engine/render/height_gi.cpp
+    engine/render/near_field.cpp
     engine/render/far_shadow.cpp
     engine/render/scan_library.cpp
     engine/render/forest_map.cpp
