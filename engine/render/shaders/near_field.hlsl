@@ -16,14 +16,21 @@
 //                bounce in its direction. L1 SH, the heightfield's own
 //                convention, blended over updates as DDGI's probes are.
 //
-// What it does NOT do yet: light from the walls themselves (sun on a pit
-// wall, a torch, glowing things). A ray that meets rock carries nothing, so
-// deep is dark -- which is the goal -- and a lit wall bounces nothing
-// either, which is the next step (the rays' hits).
+// A ray that meets rock carries what that wall sends back (nf_hit): the
+// sun on it through the cascades and the clouds, every local light on it
+// through its own shadow, and the probes round it -- every further bounce,
+// a frame at a time -- times the wall's albedo over pi. Deep and unlit is
+// still dark: nothing there to send anything. Glowing things are meant to
+// be local lights (an algae pool is a few dim unshadowed ones), so they
+// reach the walls and the bounce the same way a torch does.
 // ---------------------------------------------------------------------------
 #include "engine/field/real_field.hlsl"
 #include "engine/render/shaders/shadow.hlsli"
+#include "engine/render/shaders/lighting.hlsli"
+#include "engine/render/shaders/local_lights.hlsli"
 #include "engine/render/shaders/near_field_common.hlsli"
+Texture2D<float> g_cloud_shadow : register(t60);   // clouds.hlsl cs_shadow, last frame's
+#include "engine/render/shaders/cloud_shadow.hlsli"
 
 cbuffer NfConstants : register(b0) {
     int4 nf_origin;    // the volume's min world voxel (a multiple of 8); w unused
@@ -31,7 +38,13 @@ cbuffer NfConstants : register(b0) {
     uint nf_probes;    // entries in g_probe_list
     uint nf_pad0, nf_pad1;
     float4 nf_rot0, nf_rot1, nf_rot2;   // this update's random rotation of the ray set (rows)
+    float4 nf_cloud;                    // the clouds' shadow map: centre x, z, half extent (0: none), base
+    uint   nf_lights;                   // local lights to light a hit with (the frame's first, most important)
+    uint   nf_pad2, nf_pad3, nf_pad4;
 };
+// A dug wall's albedo: soil and rock, a little warm. The terrain's own
+// material per biome would be better (gaps.md); this is its mean.
+static const float3 kNfWallAlbedo = float3(0.26f, 0.23f, 0.20f);
 static const int   kNfRays = 32;
 static const float kNfHysteresis = 0.85f;
 cbuffer NfLevel : register(b3) { uint nf_level; };
@@ -122,6 +135,93 @@ bool nf_hf_uv(float2 xz, out float2 uv, out float top) {
     return top > kHfNone * 0.5f;
 }
 
+// The key light's visibility at a hit: one tap of the cascades, as the mist
+// takes it (fog.hlsl key_visibility), and the clouds' shadow over it.
+float nf_key_visibility(float3 p) {
+    float v = 1.0f;
+    if (shadow_res >= 0.0f) {
+        const float d = length(p - shadow_cam);
+        if (d < shadow_split.w) {
+            const uint c = max(d < shadow_split.x ? 0u : (d < shadow_split.y ? 1u : (d < shadow_split.z ? 2u : 3u)),
+                               uint(l_shadow_frame.z + 0.5f));
+            const float4 lp = mul(float4(p, 1.0f), light_vp[c]);
+            const float2 suv = float2(lp.x * 0.5f + 0.5f, 0.5f - lp.y * 0.5f) * shadow_scale[c];
+            v = g_shadow.SampleCmpLevelZero(g_shadow_cmp, float3(suv, float(c)), lp.z - 0.12f / shadow_depth_range[c]);
+        }
+    }
+    return v * cloud_shadow_at(g_cloud_shadow, g_gi_linear, nf_cloud, kSunDir, p);
+}
+
+// What reaches a hit from the probes round it -- the sky through the
+// openings and every bounce so far -- read from the buffer being written
+// (a probe updated earlier this pass is a frame fresher; DDGI reads last
+// frame's). Rock between the hit and a probe drops it, as in the reader.
+float3 nf_hit_irradiance(float3 p, float3 n) {
+    const float3 q = p + n * 0.5f;
+    const float3 f = (q - 1.0f) * 0.5f;
+    const int3 p0 = int3(floor(f));
+    const float3 t = f - float3(p0);
+    const int3 op = nf_origin.xyz / 2;
+    float4 sv = 0.0f, sr = 0.0f, sg = 0.0f, sb = 0.0f;
+    float wsum = 0.0f;
+    [loop] for (int c = 0; c < 8; ++c) {
+        const int3 o = int3(c & 1, (c >> 1) & 1, c >> 2);
+        const int3 pq = p0 + o;
+        if (any(pq < op) || any(pq >= op + kNfProbeDims)) continue;
+        const uint i4 = nf_probe_index(pq) * uint(kNfProbeFloat4s);
+        const float4 meta = u_probes[i4 + 4u];
+        if (meta.x < 0.5f) continue;
+        const float3 pc = float3(pq * 2 + 1) + meta.yzw;
+        const float3 v = pc - q;
+        if (nf_occ_point(q + v * 0.5f) > 0.5f) continue;
+        const float3 tw = lerp(1.0f - t, t, float3(o));
+        const float bf = 0.5f + 0.5f * dot(v * rsqrt(max(dot(v, v), 1e-6f)), n);
+        const float w = tw.x * tw.y * tw.z * (bf * bf + 0.05f);
+        sv += w * u_probes[i4 + 0u];
+        sr += w * u_probes[i4 + 1u];
+        sg += w * u_probes[i4 + 2u];
+        sb += w * u_probes[i4 + 3u];
+        wsum += w;
+    }
+    if (wsum <= 1e-6f) return float3(0.0f, 0.0f, 0.0f);
+    const float inv = 1.0f / wsum;
+    return kSkyMean * hf_irradiance(sv * inv, n) +
+           float3(hf_irradiance(sr * inv, n), hf_irradiance(sg * inv, n), hf_irradiance(sb * inv, n));
+}
+
+float nf_occ_lin(float3 wp) {
+    return g_nf_occ.SampleLevel(g_nf_wrap, (wp + 0.5f) / float3(kNfDims), 0.0f);
+}
+
+// The radiance a wall sends back along -d from hit point p (in air, just
+// short of the rock), its normal from the occupancy's gradient.
+float3 nf_hit(float3 p, float3 d) {
+    const float e = 0.5f;
+    const float3 g = float3(nf_occ_lin(p + float3(e, 0, 0)) - nf_occ_lin(p - float3(e, 0, 0)),
+                            nf_occ_lin(p + float3(0, e, 0)) - nf_occ_lin(p - float3(0, e, 0)),
+                            nf_occ_lin(p + float3(0, 0, e)) - nf_occ_lin(p - float3(0, 0, e)));
+    float3 n = dot(g, g) > 1e-8f ? -normalize(g) : -d;
+    if (dot(n, d) > 0.0f) n = -n;   // it faces the ray that found it
+    float3 E = float3(0.0f, 0.0f, 0.0f);
+    // The sun. The volume's wall is a metre-resolution guess at the real
+    // mesh, so the shadow is taken half a metre out along the normal.
+    const float nl = dot(n, kSunDir);
+    if (nl > 0.0f) E += kSunLux * (nl * nf_key_visibility(p + n * 0.5f));
+    // Local lights: a torch, a fire -- and anything that glows.
+    const uint nlights = min(uint(l_cluster.w), nf_lights);
+    [loop] for (uint i = 0u; i < nlights; ++i) {
+        const LocalLightGpu Lg = g_lights[i];
+        float3 l;
+        const float3 El = light_illuminance(Lg, p, l);
+        const float ndl = dot(n, l);
+        if (ndl <= 0.0f || max(El.r, max(El.g, El.b)) <= 0.0f) continue;
+        E += El * (ndl * local_shadow(Lg, p, n, l));
+    }
+    E += nf_hit_irradiance(p, n);
+    const float3 L = kNfWallAlbedo * (E * (1.0f / kPi));
+    return (any(isnan(L)) || any(isinf(L))) ? float3(0.0f, 0.0f, 0.0f) : L;
+}
+
 // One ray from o along d, marched through the occupancy at its finest
 // level -- a cone's coarse levels average a 6 m roof into a half-open one,
 // and the sealed chamber of --leak-test lit to 18 nits through it. The
@@ -129,11 +229,11 @@ bool nf_hf_uv(float2 xz, out float2 uv, out float top) {
 // strides to its far side. A ray that rises above the heightfield's top
 // surface, or leaves the volume, carries back the heightfield's sky
 // visibility and bounce in its direction (irradiance / pi of its SH); one
-// that meets rock carries nothing yet (the hit is where wall light goes).
+// that meets rock carries what the wall sends back (nf_hit).
 void nf_ray(float3 o, float3 d, out float vis, out float3 rad) {
     vis = 0.0f;
     rad = float3(0.0f, 0.0f, 0.0f);
-    float t = 0.3f;
+    float t = 0.3f, t_air = 0.0f;
     [loop] for (int i = 0; i < 96; ++i) {
         const float3 q = o + d * t;
         float2 uv;
@@ -151,7 +251,18 @@ void nf_ray(float3 o, float3 d, out float vis, out float3 rad) {
             return;
         }
         const float3 uvw = (q + 0.5f) / float3(kNfDims);
-        if (g_nf_occ.SampleLevel(g_nf_wrap, uvw, 0.0f) > 0.5f) return;   // rock
+        if (g_nf_occ.SampleLevel(g_nf_wrap, uvw, 0.0f) > 0.5f) {
+            // Rock: close in on the surface from the last point in air.
+            float ta = t_air, tb = t;
+            [unroll] for (int k = 0; k < 3; ++k) {
+                const float tm = 0.5f * (ta + tb);
+                if (nf_occ_lin(o + d * tm) > 0.5f) tb = tm;
+                else ta = tm;
+            }
+            rad = nf_hit(o + d * ta, d);
+            return;
+        }
+        t_air = t;
         // Empty 4 m cell (mip 2 is its mean; zero is no rock at all): stride.
         const float coarse = g_nf_occ.SampleLevel(g_nf_wrap, uvw, 2.0f);
         t += coarse <= 0.0f ? 2.0f : 0.5f;
@@ -175,9 +286,15 @@ void cs_nf_probe(uint3 id : SV_DispatchThreadID) {
     // surface as a neighbour, which its occupancy test mostly rejects.
     // Tracing these (their sideways rays crawl along the ground at 0.5 m
     // steps) was most of +0.8 ms on an open-ground walk at 1440p.
+    // Traced only under real cover: under the 1 m top surface (a tunnel, a
+    // roof), or more than 1.5 m under the heightfield's 2 m map (a narrow
+    // pit, which the map's texel maximum spans). Open air over a slope also
+    // sits under that maximum; tracing it -- and since the hits are lit,
+    // lighting every hit -- doubled the walking cost.
     float2 uv;
     float top;
-    if (nf_hf_uv(c.xz, uv, top) && c.y > top - 0.5f) {
+    const float ttop = u_top[nf_wrap(int3(int(floor(c.x + 0.5f)), 0, int(floor(c.z + 0.5f))), kNfDims).xz];
+    if (nf_hf_uv(c.xz, uv, top) && c.y > top - 1.5f && c.y > ttop - 0.5f) {
         u_probes[o4 + 0] = g_hf_vis.SampleLevel(g_gi_linear, uv, 0.0f);
         u_probes[o4 + 1] = g_hf_r.SampleLevel(g_gi_linear, uv, 0.0f);
         u_probes[o4 + 2] = g_hf_g.SampleLevel(g_gi_linear, uv, 0.0f);

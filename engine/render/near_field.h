@@ -15,8 +15,9 @@
 // metre by metre from its mouth, and a sealed chamber gets nothing.
 // hfgi.hlsli reads the probes for any point under the top surface.
 //
-// Not yet: light from the walls themselves (a sunlit pit wall, a torch,
-// glowing things) -- the probes' cones carry nothing back from a hit.
+// A ray that meets rock carries back what that wall sends: the sun on it,
+// the local lights on it, and the probes round it (every further bounce).
+// Deep and unlit stays dark: nothing there to send anything.
 // Presentation only; nothing here is upstream of the golden hash.
 // ---------------------------------------------------------------------------
 #include <d3d12.h>
@@ -54,8 +55,15 @@ public:
     static const int kBlocksPerFrame = 48;
     static const int kProbesPerFrame = 4096;
     static const int kMaxEdits = 65536;
+    // Probes round the camera traced every frame, so a carried torch's
+    // bounce follows it: a box this many probes a side (2 m each).
+    static const int kCameraBox = 8;
+    // Local lights a ray's hit is lit by: the frame's first, most important.
+    static const int kHitLights = 32;
 
-    bool init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::string& error);
+    // `cloud_shadow_srv`: the clouds' shadow map's heap slot (Clouds::kShadowSrv),
+    // which a sunlit wall's light passes through.
+    bool init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT cloud_shadow_srv, std::string& error);
     bool ready() const { return ready_; }
 
     // The player's edits changed inside a world box: its blocks are filled
@@ -69,8 +77,11 @@ public:
     void plan(const float cam[3], const BrickStore* edits, bool settle);
     // GPU. Needs the frame's shadow constants (the heightfield's corner)
     // and the heightfield's maps already built this frame.
+    // `cloud` the clouds' shadow parameters (Clouds::shadow_params; zero extent
+    // for none). The sun's shadow map and the light atlas must be readable
+    // by compute.
     void record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGpu& world,
-                D3D12_GPU_VIRTUAL_ADDRESS shadow_cb);
+                D3D12_GPU_VIRTUAL_ADDRESS shadow_cb, const float cloud[4]);
     // ShadowConstants' l_nf: the volume's min world voxel, w ready.
     void constants(bool on, float out[4]) const;
 

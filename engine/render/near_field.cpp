@@ -20,8 +20,10 @@ struct NfConstants {
     int32_t origin[4];
     uint32_t edits, probes, pad0, pad1;
     float rot[3][4];   // rows of this update's random rotation of the ray set
+    float cloud[4];    // the clouds' shadow map
+    uint32_t lights, pad2, pad3, pad4;
 };
-static_assert(sizeof(NfConstants) == 80, "NfConstants must match near_field.hlsl");
+static_assert(sizeof(NfConstants) == 112, "NfConstants must match near_field.hlsl");
 
 // A uniformly random rotation (Shoemake's quaternion from three uniforms),
 // as matrix rows. Presentation; sin and cos are fine here.
@@ -71,7 +73,7 @@ void uav_barrier(ID3D12GraphicsCommandList* cmd, ID3D12Resource* r) {
 }
 }  // namespace
 
-bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::string& error) {
+bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT cloud_shadow_srv, std::string& error) {
     ready_ = false;
     dev_ = device;
     heap_ = heap;
@@ -206,7 +208,16 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::stri
     // one table (the density and occupancy UAVs, the occupancy and probes'
     // SRVs, the heightfield's maps), the three lists, the probes, the mip.
     {
-        D3D12_DESCRIPTOR_RANGE r[5] = {};
+        D3D12_DESCRIPTOR_RANGE r[8] = {};
+        // A ray's hit is lit by the sun's cascades (t8 at [0]), the local
+        // lights and their atlas (t20..t24 at [24..28]) and the clouds'
+        // shadow (t60).
+        r[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r[5].NumDescriptors = 1; r[5].BaseShaderRegister = 8;
+        r[5].OffsetInDescriptorsFromTableStart = 0;
+        r[6].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r[6].NumDescriptors = 5; r[6].BaseShaderRegister = 20;
+        r[6].OffsetInDescriptorsFromTableStart = 24;
+        r[7].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r[7].NumDescriptors = 1; r[7].BaseShaderRegister = 60;
+        r[7].OffsetInDescriptorsFromTableStart = cloud_shadow_srv;
         r[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; r[4].NumDescriptors = 1; r[4].BaseShaderRegister = 7;
         r[4].OffsetInDescriptorsFromTableStart = kUavTop;
         r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; r[0].NumDescriptors = 1; r[0].BaseShaderRegister = 0;
@@ -226,7 +237,7 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::stri
             p[3 + k].Descriptor.ShaderRegister = UINT(11 + k);
         }
         p[13].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[13].DescriptorTable.NumDescriptorRanges = 5;
+        p[13].DescriptorTable.NumDescriptorRanges = 8;
         p[13].DescriptorTable.pDescriptorRanges = r;
         p[14].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[14].Descriptor.ShaderRegister = 2;
         p[15].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[15].Descriptor.ShaderRegister = 3;
@@ -236,7 +247,7 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::stri
         p[18].Constants.ShaderRegister = 3;
         p[18].Constants.Num32BitValues = 1;
         for (int k = 0; k < 19; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_STATIC_SAMPLER_DESC ss[2] = {};
+        D3D12_STATIC_SAMPLER_DESC ss[3] = {};
         for (int k = 0; k < 2; ++k) {
             ss[k].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
             ss[k].MaxLOD = D3D12_FLOAT32_MAX;
@@ -246,10 +257,18 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::stri
         ss[0].ShaderRegister = 3;   // g_gi_linear (shadow.hlsli): the heightfield's maps
         ss[1].AddressU = ss[1].AddressV = ss[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
         ss[1].ShaderRegister = 6;   // g_nf_wrap: the toroidal occupancy
+        // s1: g_shadow_cmp (shadow.hlsli), the cascades and the light atlas.
+        ss[2].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+        ss[2].AddressU = ss[2].AddressV = ss[2].AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        ss[2].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+        ss[2].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        ss[2].MaxLOD = D3D12_FLOAT32_MAX;
+        ss[2].ShaderRegister = 1;
+        ss[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
         rsd.NumParameters = 19;
         rsd.pParameters = p;
-        rsd.NumStaticSamplers = 2;
+        rsd.NumStaticSamplers = 3;
         rsd.pStaticSamplers = ss;
         ComPtr<ID3DBlob> sig, err;
         if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
@@ -404,7 +423,15 @@ void NearField::plan(const float cam[3], const BrickStore* edits, bool settle) {
         std::fill(probe_dirty_.begin(), probe_dirty_.end(), uint8_t(0));
         dirty_probes_.clear();
     } else {
-        while (probe_list_.size() < pbudget) {
+        // The box round the camera, every frame: what is near enough to see
+        // closely, where a carried torch's bounce must keep up with it.
+        const int cp[3] = {int(std::floor((cam[0] - 1.0f) * 0.5f)), int(std::floor((cam[1] - 1.0f) * 0.5f)),
+                           int(std::floor((cam[2] - 1.0f) * 0.5f))};
+        const int h = kCameraBox / 2;
+        for (int z = cp[2] - h; z < cp[2] + h; ++z)
+            for (int y = cp[1] - h; y < cp[1] + h; ++y)
+                for (int x = cp[0] - h; x < cp[0] + h; ++x) probe_list_.push_back(probe_storage(x, y, z));
+        while (probe_list_.size() < pbudget + size_t(kCameraBox * kCameraBox * kCameraBox)) {
             probe_list_.push_back(cursor_);
             cursor_ = (cursor_ + 1) % uint32_t(kProbes);
         }
@@ -419,7 +446,7 @@ void NearField::plan(const float cam[3], const BrickStore* edits, bool settle) {
 }
 
 void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGpu& world,
-                       D3D12_GPU_VIRTUAL_ADDRESS shadow_cb) {
+                       D3D12_GPU_VIRTUAL_ADDRESS shadow_cb, const float cloud[4]) {
     if (!root_ || (blocks_.empty() && probe_list_.empty())) return;
     const UINT f = frame & 1u;
     NfConstants c = {};
@@ -427,6 +454,8 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
     c.edits = uint32_t(edit_list_.size() / 4);
     c.probes = uint32_t(probe_list_.size());
     random_rotation(rng_, c.rot);
+    for (int k = 0; k < 4; ++k) c.cloud[k] = cloud ? cloud[k] : 0.0f;
+    c.lights = uint32_t(kHitLights);
     std::memcpy(cb_cpu_[f], &c, sizeof c);
     if (!blocks_.empty()) std::memcpy(blocks_cpu_[f], blocks_.data(), blocks_.size() * 4);
     if (!edit_list_.empty()) std::memcpy(edits_cpu_[f], edit_list_.data(), edit_list_.size() * 4);

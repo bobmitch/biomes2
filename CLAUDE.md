@@ -1933,12 +1933,34 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   a random rotation each update), marched through the occupancy at 1 m;
   the coarse mips only SKIP empty 4 m cells. A ray that rises above the
   heightfield's top surface, or leaves the volume, carries back the
-  heightfield's sky visibility and bounce in its direction; a ray that
-  meets rock carries nothing (yet). L1 SH in the heightfield's own
-  convention, blended 0.85 over updates (DDGI's way); an edit's probes
-  start over. 4096 probes a frame, dirty first then round robin. A probe
-  in rock moves 0.9 m along an axis into air or switches off; one at or
-  over the top surface copies the heightfield.
+  heightfield's sky visibility and bounce in its direction. L1 SH in the
+  heightfield's own convention, blended 0.85 over updates (DDGI's way); an
+  edit's probes start over. 4096 probes a frame, dirty first then round
+  robin, plus the 8 x 8 x 8 round the camera every frame (a carried
+  torch's bounce keeps up). A probe in rock moves 0.9 m along an axis into
+  air or switches off. Only probes under REAL cover trace -- under the 1 m
+  top map by half a metre, or 1.5 m under the heightfield's (a narrow pit)
+  -- the rest copy the heightfield: open air over a slope sits under the
+  2 m map's texel maximum, and tracing it doubled the walking cost.
+- **A ray that meets rock is lit** (`nf_hit`, step 2): the surface found by
+  three bisections, its normal from the occupancy's gradient, then the sun
+  (one cascade tap half a metre out along the normal -- the volume's wall
+  is a metre-resolution guess at the mesh -- times the clouds' shadow),
+  the frame's first 32 local lights through their atlas, and the probes
+  round the hit (read from the buffer being written, with the reader's
+  rock-in-between test): every further bounce, a frame at a time. Times a
+  fixed wall albedo (0.26, 0.23, 0.20) over pi. The rt-last DDGI's hit
+  shading without the hardware rays. Glowing things are meant to be local
+  lights (an algae pool a few dim unshadowed ones), so they reach walls
+  and bounce the same way a torch does.
+- **Measured**: 8 m into `--dig-tunnel` at 11:00 and EV100 11, the walls
+  round the camera 2.1 -> 5.8 luma (the sunlit shaft bouncing in), the
+  floor near the mouth 73 -> 80; sealed and unlit still 0.001 nits, the
+  sealed chamber with a torch 0.046 -> 0.053 (its walls bouncing). A torch
+  down a STRAIGHT tunnel barely changes: it lights every wall seen
+  directly, and 0.26-albedo walls send back ~2% of a lux. Frame-to-frame
+  change in that tunnel view (`--shake 60`, raw frames): 0.23 levels on
+  average against 0.14 with the probes unread.
 - **Cones leaked; rays do not.** The first version traced six 45-degree
   cones through the occupancy mips. At 8-16 m a cone samples 16 m cells,
   where a 6 m roof averages to half open: `--leak-test`'s sealed chamber
@@ -1967,8 +1989,10 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   looking down it; `--tunnel-in <m>` stands it that far in, looking back;
   `--tunnel-up` looks up the shaft. From spawn: `--cam -96 32.5 -440 0
   -0.55 --dig-tunnel --time 11 --ev100 11`.
-- **Cost** at 1440p, walking: 8.27 / 8.34 ms against 8.13 / 8.14 (+0.17);
-  the update pass 0.11 ms. It was +0.8 ms twice over before two finds: the
+- **Cost** at 1440p, walking: +0.17 ms before the hits were lit, +0.22 /
+  +0.25 with them (8.27 / 8.40 against 8.05 / 8.15). A still re-traces all
+  131k probes every frame; in a torch-lit tunnel that pass is 0.23 ms, so
+  normal play's ~4,600 a frame is well under it. It was +0.8 ms twice over before two finds: the
   shallow cover test (above), and **HLSL's `&&` does not short-circuit**:
   `knf > 0 && nf_sample(...)` ran the eight probes on every terrain pixel
   and threw the result away. Call anything costly inside an `if`.
@@ -1976,8 +2000,8 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   probes, the occupancy, the top map; [112..119] the near field's own;
   [120..122] the mist's openness volumes (t16 in post). The mist root and
   the heightfield's camera pass declare the range too.
-- **Not done**: see gaps.md -- wall bounce, local lights and emitters into
-  the probes (step 2), and the volume's reach.
+- **Not done**: see gaps.md -- the walls' own material, emitters as a
+  kind of light, and the volume's reach.
 
 ### Screen-space bounce (ADR-004 L6, an experiment, OFF by default)
 

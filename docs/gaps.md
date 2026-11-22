@@ -67,14 +67,19 @@ Last gathered: 2026-11-21, after the exploration fog.
 - **Grass grows through rock footprints and puddles**: the bake is cached
   per 16 m tile and sees neither rocks nor puddles (it does see dig edits
   now). [Rocks; Ground cover; The wet world]
-- **Nothing under the ground bounces yet** (the near field, step 1): its
-  probes' rays carry the open air's light in from the mouth and nothing
-  from what they hit. A sunlit pit wall does not light the pit floor, a
-  torch lights only what it sees directly, and glowing things (algae pools,
-  lit particles) have no way in. Step 2 is the rays' hits: the sun through
-  the cascades, local lights through their shadow atlas, an emissive term,
-  and last update's probes (multi-bounce) -- the rt-last DDGI's hit
-  shading, without the hardware rays. [Near field]
+- **Underground walls bounce with one fixed albedo** (0.26, 0.23, 0.20):
+  a dug wall in the badlands sends back the same grey-brown as one in a
+  meadow. The mesher's per-biome rock material (`terrain_material`) at the
+  hit would tint it. [Near field]
+- **Emitters are not a kind of light yet.** The plan is that glowing
+  things (algae pools, lit particles) are local lights -- dim, unshadowed,
+  no visible model -- so they light walls directly and through the probes
+  like a torch. Nothing places one, and the local light list (256, sorted
+  by importance; the probes' hits take the first 32) has not been sized
+  for many small ones. [Near field; Local lights]
+- **The probes' hits see only the frame's first 32 local lights**, by
+  importance from the CAMERA, not from the hit. A fire 40 m down a tunnel
+  behind 32 nearer lights does not bounce. [Near field]
 - **The near field reaches 64 m round the camera and 32 m up and down**:
   past it, the heightfield's old covered branch answers (a search for a
   way out, else black). A mine deeper than 32 m below the eye is fine (the

@@ -2765,7 +2765,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         // The heightfield GI (L6): the diffuse GI.
         if (!hfgi_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         // The near field: the light under it.
-        if (!near_.init(device_.Get(), srv_heap_.Get(), error)) return false;
+        if (!near_.init(device_.Get(), srv_heap_.Get(), Clouds::kShadowSrv, error)) return false;
         // The key light's shadow past the cascades.
         if (!far_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         canopy_.set_models(trees_.models(), trees_.looks());
@@ -3747,7 +3747,28 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     prof_.mark(cmd_.Get(), "shadows (rest)");
     // The near field (after the shadow constants, which carry the heightfield's
     // corner, and before anything lit, or the camera's sky share, reads it).
-    if (near_live) near_.record(cmd_.Get(), UINT(frame_), world_, shadow_cb_[frame_]->GetGPUVirtualAddress());
+    if (near_live) {
+        // A ray's hit is lit by the sun's cascades and the light atlas, which
+        // the scene reads from pixel shaders: readable by compute too, for it.
+        float cloud[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (clouds_on_ && clouds_.ready() && clouds_.shadow_ready()) clouds_.shadow_params(cloud);
+        const D3D12_RESOURCE_STATES ps = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        const D3D12_RESOURCE_STATES nps = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+            D3D12_RESOURCE_BARRIER br = {};
+            br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            br.Transition.pResource = r;
+            br.Transition.StateBefore = a;
+            br.Transition.StateAfter = b;
+            br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            cmd_->ResourceBarrier(1, &br);
+        };
+        tr(shadow_map_.Get(), ps, ps | nps);
+        tr(light_atlas_.Get(), ps, ps | nps);
+        near_.record(cmd_.Get(), UINT(frame_), world_, shadow_cb_[frame_]->GetGPUVirtualAddress(), cloud);
+        tr(shadow_map_.Get(), ps | nps, ps);
+        tr(light_atlas_.Get(), ps | nps, ps);
+    }
     prof_.mark(cmd_.Get(), "near field");
     // The heightfield's sky share at the eye, for the haze and the mist.
     if (hfgi_on_ && mode_ != Mode::Wireframe)
