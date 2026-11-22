@@ -52,6 +52,9 @@ public:
     // two frames late; `slot` the frame in flight).
     void record_camera(ID3D12GraphicsCommandList* cmd, UINT slot, D3D12_GPU_VIRTUAL_ADDRESS shadow_cb);
     float camera_sky() const { return camera_sky_; }
+    // The eye's share of open sky by geometry alone (sky visibility, no
+    // bounce, no light): 1 in the open, 0 sealed in. Dark vision's floor.
+    float camera_open() const { return camera_open_; }
     // ShadowConstants' l_hf: the map's min corner x, z; w on. Zero until the
     // first rebuild.
     void constants(bool on, float out[4]) const;
@@ -71,6 +74,7 @@ private:
     ComPtr<ID3D12Resource> cam_, cam_rb_[2];
     bool cam_pending_[2] = {};
     float camera_sky_ = 1.0f;
+    float camera_open_ = 1.0f;
 };
 
 }  // namespace engine

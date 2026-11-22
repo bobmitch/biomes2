@@ -18,7 +18,8 @@ namespace {
 // Matches cbuffer NfConstants in near_field.hlsl.
 struct NfConstants {
     int32_t origin[4];
-    uint32_t edits, probes, pad0, pad1;
+    uint32_t edits, probes;
+    float keep_box, keep_rr;   // the blend over history: the camera's box (and a still), the round robin
     float rot[3][4];   // rows of this update's random rotation of the ray set
     float cloud[4];    // the clouds' shadow map
     uint32_t lights, pad2, pad3, pad4;
@@ -332,7 +333,18 @@ void NearField::invalidate_all() {
     std::fill(dirty_.begin(), dirty_.end(), uint8_t(1));
 }
 
-void NearField::plan(const float cam[3], const BrickStore* edits, bool settle) {
+void NearField::plan(const float cam[3], const BrickStore* edits, bool settle, float dt) {
+    // The frame's seconds: given (a simulated clock), else the wall clock's.
+    {
+        LARGE_INTEGER now, freq;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&freq);
+        const unsigned long long t = static_cast<unsigned long long>(now.QuadPart);
+        if (dt < 0.0f) dt = last_tick_ ? float(double(t - last_tick_) / double(freq.QuadPart)) : 1.0f / 60.0f;
+        last_tick_ = t;
+        dt = dt < 1e-4f ? 1e-4f : (dt > 0.25f ? 0.25f : dt);
+        dt_smooth_ += (dt - dt_smooth_) * 0.05f;
+    }
     blocks_.clear();
     edit_list_.clear();
     probe_list_.clear();
@@ -411,27 +423,58 @@ void NearField::plan(const float cam[3], const BrickStore* edits, bool settle) {
     const size_t pbudget = settle ? size_t(kProbes) : size_t(kProbesPerFrame);
     size_t take = (std::min)(dirty_probes_.size(), pbudget);
     // The top bit: start the probe over rather than blend into its history,
-    // which predates the edit or the block that scrolled in.
+    // which predates the edit or the block that scrolled in. The next bit:
+    // traced every frame, so it keeps more history (near_field.hlsl).
     for (size_t i = 0; i < take; ++i) {
         probe_list_.push_back(dirty_probes_[i] | 0x80000000u);
         probe_dirty_[dirty_probes_[i]] = 0;
     }
     dirty_probes_.erase(dirty_probes_.begin(), dirty_probes_.begin() + std::ptrdiff_t(take));
+    const float rate = sched_.box_rate > 0.1f ? sched_.box_rate : 0.1f;
     if (settle) {
+        // A still: every probe every frame, blended as the camera's box is
+        // at its rate -- the look a player standing there sees.
         probe_list_.clear();
-        for (uint32_t i = 0; i < uint32_t(kProbes); ++i) probe_list_.push_back(i);   // blended: a still runs 16 frames
+        for (uint32_t i = 0; i < uint32_t(kProbes); ++i) probe_list_.push_back(i | 0x40000000u);
         std::fill(probe_dirty_.begin(), probe_dirty_.end(), uint8_t(0));
         dirty_probes_.clear();
+        keep_box_ = std::exp(-1.0f / (rate * (std::max)(sched_.near_memory, 0.01f)));
+        keep_rr_ = keep_box_;
     } else {
-        // The box round the camera, every frame: what is near enough to see
-        // closely, where a carried torch's bounce must keep up with it.
+        // The box round the camera, on a timer: what is near enough to see
+        // closely, where a carried torch's bounce must keep up with it. Its
+        // slices are a fixed parity of the WORLD probe grid, so a moving
+        // camera does not reshuffle them; each frame traces the slices its
+        // time has paid for. Below the rate (a slow frame), every slice, and
+        // the blend follows the frame's real interval.
+        box_credit_ += dt * rate * float(kBoxSlices);
+        int slices = int(box_credit_);
+        if (slices > kBoxSlices) slices = kBoxSlices;
+        box_credit_ -= float(slices);
+        if (box_credit_ > float(kBoxSlices)) box_credit_ = float(kBoxSlices);
         const int cp[3] = {int(std::floor((cam[0] - 1.0f) * 0.5f)), int(std::floor((cam[1] - 1.0f) * 0.5f)),
                            int(std::floor((cam[2] - 1.0f) * 0.5f))};
         const int h = kCameraBox / 2;
-        for (int z = cp[2] - h; z < cp[2] + h; ++z)
-            for (int y = cp[1] - h; y < cp[1] + h; ++y)
-                for (int x = cp[0] - h; x < cp[0] + h; ++x) probe_list_.push_back(probe_storage(x, y, z));
-        while (probe_list_.size() < pbudget + size_t(kCameraBox * kCameraBox * kCameraBox)) {
+        for (int s = 0; s < slices; ++s) {
+            const uint32_t sl = (box_slice_ + uint32_t(s)) % uint32_t(kBoxSlices);
+            const int sx = int(sl & 1u), sy = int((sl >> 1) & 1u), sz = int((sl >> 2) & 1u);
+            for (int z = cp[2] - h; z < cp[2] + h; ++z) {
+                if ((z & 1) != sz) continue;
+                for (int y = cp[1] - h; y < cp[1] + h; ++y) {
+                    if ((y & 1) != sy) continue;
+                    for (int x = cp[0] - h; x < cp[0] + h; ++x)
+                        if ((x & 1) == sx) probe_list_.push_back(probe_storage(x, y, z) | 0x40000000u);
+                }
+            }
+        }
+        box_slice_ = (box_slice_ + uint32_t(slices)) % uint32_t(kBoxSlices);
+        const float box_interval = (std::max)(1.0f / rate, dt_smooth_);
+        keep_box_ = std::exp(-box_interval / (std::max)(sched_.near_memory, 0.01f));
+        // The round robin: a lap is kProbes / kProbesPerFrame frames.
+        const float lap = float(kProbes) / float(kProbesPerFrame) * dt_smooth_;
+        keep_rr_ = std::exp(-lap / (std::max)(sched_.far_memory, 0.01f));
+        const size_t rr_end = probe_list_.size() + pbudget;
+        while (probe_list_.size() < rr_end) {
             probe_list_.push_back(cursor_);
             cursor_ = (cursor_ + 1) % uint32_t(kProbes);
         }
@@ -453,9 +496,11 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
     for (int k = 0; k < 3; ++k) c.origin[k] = origin_[k];
     c.edits = uint32_t(edit_list_.size() / 4);
     c.probes = uint32_t(probe_list_.size());
+    c.keep_box = keep_box_;
+    c.keep_rr = keep_rr_;
     random_rotation(rng_, c.rot);
     for (int k = 0; k < 4; ++k) c.cloud[k] = cloud ? cloud[k] : 0.0f;
-    c.lights = uint32_t(kHitLights);
+    c.lights = 0u;   // hits are no longer lit by local lights (near_field.hlsl nf_hit)
     std::memcpy(cb_cpu_[f], &c, sizeof c);
     if (!blocks_.empty()) std::memcpy(blocks_cpu_[f], blocks_.data(), blocks_.size() * 4);
     if (!edit_list_.empty()) std::memcpy(edits_cpu_[f], edit_list_.data(), edit_list_.size() * 4);
@@ -506,7 +551,9 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
     if (!probe_list_.empty()) {
         if (probes_is_srv_) { transition(cmd, probes_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); probes_is_srv_ = false; }
         cmd->SetPipelineState(probe_pso_.Get());
-        cmd->Dispatch(UINT((probe_list_.size() + 63) / 64), 1, 1);
+        // A group a probe (a thread a ray), in rows of 256 groups: a still's
+        // list is longer than one dimension's 65,535.
+        cmd->Dispatch(256u, UINT((probe_list_.size() + 255) / 256), 1);
     }
     if (!probes_is_srv_) { transition(cmd, probes_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead); probes_is_srv_ = true; }
 }

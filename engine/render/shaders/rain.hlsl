@@ -59,6 +59,27 @@ float canopy_through(float3 p) {
     return p.y < top ? saturate(c.w) : 1.0f;
 }
 
+// Under the top surface: no rain falls there and nothing drips. The depth
+// test alone hid a drop only behind a wall, so a tunnel under a wood drew its
+// drips in the tunnel's own air -- white streaks in the dark, which a
+// dark-adapted eye shows at full strength. The heightfield GI's map (2 m
+// texels, the highest point of each) by the LOWEST of the four texels round
+// the point, so a drop near ground on a slope is not hidden early; a dug
+// shaft is in the map, so rain still falls down one. False with no map.
+bool under_top_surface(float3 p) {
+    if (hf.w < 0.5f) return false;
+    const float2 huv = float2((p.x - hf.x) / kHfExtent, 1.0f - (p.z - hf.y) / kHfExtent);
+    if (any(huv <= 0.0f) || any(huv >= 1.0f)) return false;
+    const int2 t0 = int2(floor(huv * float(kHfSize) - 0.5f));
+    const int2 hi = int2(kHfSize - 1u, kHfSize - 1u);
+    const float h00 = g_hf_height.Load(int3(clamp(t0, int2(0, 0), hi), 0));
+    const float h10 = g_hf_height.Load(int3(clamp(t0 + int2(1, 0), int2(0, 0), hi), 0));
+    const float h01 = g_hf_height.Load(int3(clamp(t0 + int2(0, 1), int2(0, 0), hi), 0));
+    const float h11 = g_hf_height.Load(int3(clamp(t0 + int2(1, 1), int2(0, 0), hi), 0));
+    const float h = min(min(h00, h10), min(h01, h11));
+    return h > kHfNone * 0.5f && p.y < h - 0.25f;
+}
+
 struct StreakOut {
     float4 clip : SV_Position;
     float2 uv   : TEXCOORD0;   // across 0..1, along 0 (head) .. 1 (tail)
@@ -98,6 +119,7 @@ StreakOut vs_streak(uint vid : SV_VertexID) {
     const float dist = length(to);
     if (dist < 0.6f) return degenerate_streak();
     if (far_layer && max(abs(to.x), abs(to.z)) < box - 4.0f && abs(to.y) < height - 3.0f) return degenerate_streak();
+    if (under_top_surface(p)) return degenerate_streak();
     const float through = canopy_through(p);
     if (drip_drop) {
         // A drip: only under crowns, as many as the crowns are dense and wet.

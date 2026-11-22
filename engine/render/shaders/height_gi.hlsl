@@ -129,7 +129,7 @@ void cs_hf_light(uint3 id : SV_DispatchThreadID) {
 void cs_hf_camera() {
     const float3 dirs[6] = {float3(1, 0, 0), float3(-1, 0, 0), float3(0, 1, 0),
                             float3(0, -1, 0), float3(0, 0, 1), float3(0, 0, -1)};
-    float lit = 0.0f, open_sum = 0.0f;
+    float lit = 0.0f, open_sum = 0.0f, sky = 0.0f, sky_open = 0.0f;
     [loop] for (int k = 0; k < 6; ++k) {
         const float3 d = dirs[k];
         const float up = 0.5f + 0.5f * d.y;
@@ -139,8 +139,14 @@ void cs_hf_camera() {
         hfgi_sample(shadow_cam, d, vis_e, b, cover);
         lit += gi_luma(lerp(open, kSkyMean * vis_e + b, cover));
         open_sum += gi_luma(open);
+        // The sky alone, by geometry: no bounce, no light. What the eye's
+        // dark floor goes by (dark vision) -- the light share above counts a
+        // torch's bounce, which read a torch-lit tunnel at night as open air.
+        const float vis_open = kPi * up;
+        sky += lerp(vis_open, vis_e, cover);
+        sky_open += vis_open;
     }
-    u_cam[0] = float4(saturate(lit / max(open_sum, 1e-4f)), 0.0f, 0.0f, 0.0f);
+    u_cam[0] = float4(saturate(lit / max(open_sum, 1e-4f)), saturate(sky / max(sky_open, 1e-4f)), 0.0f, 0.0f);
 }
 
 // One band of elevation [a, b] in an azimuth wedge, into an L1 harmonic:

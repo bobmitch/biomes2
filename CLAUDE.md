@@ -532,6 +532,28 @@ last run's.
   `build/engine_error.txt` after; numbers identical to the digit to an earlier
   run are the tell.
 
+### Snapshots: standing exactly where someone was (F8, `--snapshot`)
+
+F8 in the window writes `build/snapshots/<yyyymmdd-hhmmss>/`: `edits.bin`
+and `trees.bin` (F6's saves), `shot.bmp` (the view as a still) and
+`snapshot.txt`, whose `args:` line is command-line flags -- `--cam`,
+`--time`, the weather fixed as it was (`--sea-state --wind --wind-dir
+--swell`), `--wet` (the ground's wetness is the weather's HISTORY: fixing
+the dial alone replayed a soaked tunnel dry, and dry soil is twice as
+bright), `--ev-comp`, `--torch`, `--rain`, and `--snap-walk` with the feet
+and camera distance when walking -- plus the exposure the still adapted
+to. `engine.exe --snapshot <dir>` appends those flags to its own command
+line (anything typed first wins), loads the edits and trees, and opens
+there (walking again once the ground has streamed in, 90 frames);
+`--snapshot <dir> --shot <path>` makes the still. `--shot ...
+--write-snapshot` writes one headless (its folder in
+`build/last_snapshot.txt`). Campfires (V) are kept as `--fire x y z`,
+one each; `--fire-ground x z` puts one on the edited ground under a point
+(a pit's floor, for a test). V itself now lands a fire on the EDITED
+ground, found down from eye height: it used the generated height, so a
+fire dropped into a pit floated where the surface had been. Not kept:
+logs' poses beyond trees.bin, the clock's own weather.
+
 ### UI and scripting: Lua and RmlUi
 
 Esc opens the pause menu (resume, options, controls, tuning panel, quit) and
@@ -809,6 +831,17 @@ trees hidden behind rock (0 PS invocations, which is how it showed).
   `depth_only` flag skips the vertex GI in the prepass. Impostors stay one
   ordinary pass. Colour LOD 0 went to 0.76 invocations a pixel, and terrain
   drawn after the prepass 3.5 -> 1.7 ms. 22.4 -> 16.3 ms.
+  **Underground the terrain goes first.** Looking level along a tunnel the
+  whole wood overhead is in the frustum, and the prepass rasterised and
+  leaf-tested its cards over half the screen before the rock that hides
+  them all was drawn: the LOD 1 prepass 2.89 ms at 4K, the frame 14.9 ms.
+  With the eye's open sky (`HeightGi::camera_open`, geometric) under 0.3
+  the terrain draws before the prepass and its depth rejects them: 0.25 ms,
+  the frame 11.5. The colour pass tests EQUAL, so the picture is the same
+  (two runs of one order differ as much as the two orders).
+  `BIOMES_TREES_FIRST=1` keeps the old order. `--gpu-profile` also prints
+  the wall clock a frame (a still's frame waits for the GPU, so wall minus
+  GPU is the CPU's share).
 - **Level-major draw slots**: every model's LOD 0, then every model's LOD 1
   (`tree_cull.hlsl`'s `mesh0/mesh1`). Interleaved per model, a far LOD 1
   drew before the near LOD 0 in front of it; 24.1 -> 22.4 without the
@@ -1310,10 +1343,69 @@ as a STAND-IN for inter-leaf bounce (`gi_fill`).
 
 **Auto-exposure** meters a 256-bin log2 histogram of what TAA produced and
 puts the mean of its 10-90% band at middle grey 0.18, adapting like an eye
-(faster into light than out). A still adapts instantly. Every `--shot`
+(dark vision, below). A still adapts instantly. Every `--shot`
 writes the EV100, the band and the histogram to `<shot>.txt`: spawn EV100
 13.7, the badlands hillside 14.9, a sea view 15.4. Shift + `,` `.` step the
 compensation; `U` cycles AgX / ACES / raw.
+
+**Dark vision: darkness is the eye's and the display's, never added
+light.** No flat or minimum ambient term anywhere in the lighting -- it
+would relight sealed spaces, flatten a torch's contrast and make emitters
+worth less. `Renderer::DarkVision` (renderer.h; defaults there, as there
+is no exposure block in archetypes.json), the tuning panel's Exposure
+group (floors open / underground / lit, the lit key, both time constants,
+the display floor), `--ev-floor <open> <under>`, `--no-dark-display`,
+`--brightness`.
+
+- **The floor, by context**: how far down the eye adapts, EV100 -0.5 under
+  the open sky (night) and +1.5 with none over it (underground), blended on
+  the CPU by the eye's open sky BY GEOMETRY -- `HeightGi::camera_open`, the
+  camera pass's sky visibility with no bounce. The light share
+  (`camera_sky`) counted a torch's bounce as sky and read a torch-lit tunnel
+  at night as open air. The old single floor was -1, tuned for moonlit
+  meadows; it let a tunnel 20 m past its mouth read clearly at noon.
+- **A light in view sets the exposure; the floors only make the UNLIT
+  dark.** The first dark vision held a torch-lit tunnel (walls 0.05-0.2
+  nits) 1-3 stops under middle grey on the +1.5 floor, and a slow rod
+  phase took 75 s to settle it after walking in from daylight: "everything
+  artificially dark, and the eye opens up gradually". Now the CPU sums the
+  illuminance the lights put on the GROUND under the eye (a physics ray
+  down; at the eye itself a torch carried by a camera 22 m up counted in
+  full and lit nothing in view) -- the carried torch always, a placed light
+  only in clear view of that point (a physics ray, `set_ray_query`) -- and
+  between 0.03 and 0.3 lux that becomes a light presence 0..1 (the shot
+  report's `dark vision:` line). It lowers the floor towards `floor_lit`
+  (EV100 -2) and, in a dark scene only (EV100 under 3), keys the meter on
+  the lit part of the view: the mean of its 70th-97th percentiles
+  `lit_key` (1.5) stops over middle grey, INSTEAD of the frame's mean. The
+  90th percentile alone jumped between a torch-lit tunnel's two humps; the
+  max of the lit key and the mean let the unlit depths' slow settle drag
+  the exposure along.
+- **Adaptation** (`cs_exposure`): one time constant each way, 0.8 s into
+  the dark and 0.3 s into the light, twice as slow for changes under a
+  stop (a flame's quarter-stop flicker does not pump the picture; four
+  times left a ten-second tail). The lightning hold is unchanged; stills
+  snap. `--shot ... --dig-tunnel ... --adapt-test [--torch]` walks from
+  daylight into the test tunnel, holds 20 m in for 75 s and walks out, a
+  simulated 1/30 s a frame (`Renderer::set_post_dt_override`), logging
+  every frame's target, adapted EV100, light presence and the meter's 10th
+  and 90th percentiles to `build/adapt_test.txt`. With the torch: within a
+  stop 1 s after arriving, settled in ~4 s (EV100 -0.7, steady to +-0.13);
+  unlit: the floor (1.5) in ~3.5 s; back to the day in ~2 s.
+  `live_exposure()` reads u_expo[0..1] back every frame.
+- **The display's dark floor** (`ps_final`'s `dark_floor`, after the
+  tonemap): colour fades below 0.015 scene nits (gone by a tenth of it)
+  towards a slightly blue grey -- rod vision, the Purkinje shift: a
+  moonlit meadow (~0.005) goes grey, a torch-lit tunnel (0.05-0.2) keeps
+  its colour; then true black lifts 1.5% of the range towards a dark
+  blue-grey; then the player's Brightness (Graphics, saved: a gamma).
+- **Measured** (the dead-end test tunnel, `--cam -96 32.5 -440 3.14159
+  -0.55 --dig-tunnel --tunnel-ramp --tunnel-len 55 --tunnel-r 2
+  --tunnel-depth 8 --tunnel-in <m> --tunnel-inward`), adapted EV100: 11:00
+  20 m and 35 m in, unlit, 1.5 (black); 20 m in with `--torch`, 11:00 or
+  23:00, -0.9 (was clamped at 1.5); a moonlit meadow at spawn, 23:00,
+  -0.48, and the same with a torch carried by that airborne camera.
+  `--leak-test` sealed 0.001 nits, with a torch 0.053.
 
 **AgX, with the reference "punchy" look** (power 1.35, saturation 1.4). Base
 AgX drew every view pastel; punchy matched a fitted ACES on the A/B stills
@@ -1436,6 +1528,13 @@ archetypes.json `clouds` block. F3 / `--no-clouds`.
   the scene's depth (the sea's included). **Under crowns** the canopy
   map's vertical transmittance thins the drops and dims them (they see
   leaves above, not sky). The mist's density rises x(1 + 1.5 x rain).
+  **Under the ground** no drop draws (`under_top_surface`: below the
+  lowest of the heightfield GI map's four texels round it, less 25 cm; a
+  dug shaft is in the map, so rain still falls down one). The depth test
+  alone hid a drop only behind a wall: a tunnel under a wood drew the
+  crowns' drips in its own air, white streaks that a dark-adapted eye
+  showed at full strength -- the "sparkles" 20 m into a sealed tunnel.
+  `--no-rain` (Shift+F3) now takes the drips too; with `--wet` it did not.
 - **Splashes are WORLD points.** The first version picked random screen
   pixels and read the depth there, so every splash rode along with the
   view and looked fake. Now each of 2500 has a world (x, z) for its 0.4 s
@@ -1648,11 +1747,12 @@ by its depth. Scene shaders no longer fog.
 - **Night is a full moon opposite the sun**, 0.19 lux on the ground. The
   meter's floor decides what night looks like: anything metered darker
   renders darker than middle grey. At EV100 -2 a moonlit meadow metered up
-  to a dim blue day; the floor is now **EV100 -1** (`cs_exposure`'s clamp),
-  so moonlight renders a stop under middle grey -- ambience -- and a torch
-  or a fire, far above the scene's mean, carries the picture. EV100 0 was
-  tried: two stops read as near black. No stars, no moon phases, no
-  Purkinje shift yet.
+  to a dim blue day; -1 rendered moonlight a stop under middle grey. Dark
+  vision (above) made the floor depend on the open sky: under it at night
+  **EV100 -0.5** by default (the tuning panel's Exposure group; +1.0 gives
+  the ~2 stops darker a survival night wants), underground +1.5. The
+  display's dark floor greys and blues what is under 0.05 nits (the
+  Purkinje shift). No stars, no moon phases yet.
 - Cost: walking 2.08 -> 2.10 ms; flying 2.05 -> 1.99 ms (the scene shaders
   lost their fog).
 
@@ -1673,8 +1773,9 @@ BRDF as the sun (`direct_light`, `leaf_light` in `lighting.hlsli`).
   `OffsetInDescriptorsFromTableStart = 24`. The cluster parameters ride in
   the shadow constants. The sea is not lit by them (its pipeline has no
   such table) -- yet.
-- **Shadows: a 4096^2 atlas of 512^2 tiles**, a cube of six for a point
-  light. The eight most important shadowed lights hold slots and keep
+- **Shadows: a 6144^2 atlas of 512^2 tiles** (144 MB), a cube of six for
+  a point light. The 24 most important shadowed lights (8 until a ninth
+  fire lit through rock) hold slots and keep
   them while they stay in the eight, so their faces stay cached; at most
   twelve faces are redrawn a frame -- never drawn or moved first, then a
   static light's faces every 240 frames so a dug hole or a felled tree
@@ -1690,6 +1791,16 @@ BRDF as the sun (`direct_light`, `leaf_light` in `lighting.hlsli`).
   it caught in itself: a frozen clock cached the torch's shadow and called
   it free, and 255 campfires in the 64-campfire disc overflowed every
   cluster; the report now runs a clock and keeps density constant.
+- **Each light's bounce is an instant fill** (`local_fill_irradiance` in
+  `local_lights.hlsli`): 20% of what it puts at a distance of at least
+  1.5 m, wrapped round the normal, diffuse only, its visibility one tap of
+  the light's own shadow from a point moved up to 1.5 m towards it -- it
+  wraps round a pillar, never through thicker rock. It replaced the
+  probes' torch bounce (near field). A light past the 24th shadowed one
+  lights through everything, fill included. `--lights-report` at 1280 x
+  720, 23:00: torch held 4.27 -> 4.30 ms with the fill; 64 campfires, 24
+  shadowed, 6.78 -> 7.74 (the fill's four-tap shadow cost 1.2 ms, one tap
+  0.96); no lights 4.07 either way.
 - **Local light goes into the AMBIENT target**, so GTAO darkens it in
   creases -- not quite right for a point light, cheap and honest until the
   composite has a third target. The torch has no visible model yet.
@@ -1929,15 +2040,35 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   its blocks and dirties every probe within 12 m. Occupancy (a 1 m ramp of
   the density, R32 so typed UAV loads are guaranteed) with mips to 16 m,
   and a per-column map of the REAL top surface at 1 m (`cs_nf_top`).
-- **Probes**: 64 x 32 x 64 at 2 m, 32 rays each (a Fibonacci set turned by
+- **Probes**: 64 x 32 x 64 at 2 m, 64 rays each (a Fibonacci set turned by
   a random rotation each update), marched through the occupancy at 1 m;
   the coarse mips only SKIP empty 4 m cells. A ray that rises above the
   heightfield's top surface, or leaves the volume, carries back the
   heightfield's sky visibility and bounce in its direction. L1 SH in the
-  heightfield's own convention, blended 0.85 over updates (DDGI's way); an
-  edit's probes start over. 4096 probes a frame, dirty first then round
-  robin, plus the 8 x 8 x 8 round the camera every frame (a carried
-  torch's bounce keeps up). A probe in rock moves 0.9 m along an axis into
+  heightfield's own convention, blended over updates (DDGI's way) by
+  exp(-interval / memory): 0.35 s for the camera's box, 3.3 s for the round
+  robin; an edit's probes start over. 4096 probes a frame, dirty first
+  then round robin, plus the 8 x 8 x 8 round the camera (a carried torch's
+  bounce keeps up) ON A TIMER: 60 Hz in 8 interleaved slices, as many a
+  frame as its time has paid for, so neither the look nor the cost a
+  second changes with the frame rate (`NearField::Schedule`, the tuning
+  panel's Near field group, `--nf-schedule <Hz> <near s> <far s>`).
+  - **32 rays at 0.85 everywhere made the walls DANCE** where the sky came
+    in through a small opening -- the bottom of a stairwell 10 m down: a
+    few of the 32 rays found it, a different few each frame. Settled at a
+    fixed EV100 3.5 (300 frames, then `--shake`), 39k pixels a frame
+    jumped more than 20 levels; 64 rays and the box's longer memory, 10.
+    The level is unchanged (luma 102 -> 107): that stairwell sees the sky.
+  - **A thread a probe was latency, not work.** The pass cost 0.8 ms at
+    1440p whether it traced 4,608 probes (play) or all 131k, and doubled
+    with the rays: each thread walked its 64 rays in series (up to 96 steps,
+    and a lit hit gathering 8 probes), and the pass lasted as long as the
+    slowest. A GROUP a probe and a THREAD a ray (the SH summed in group
+    memory): **0.818 -> 0.052 ms**, same rays, same image. The timer was
+    meant to win that back and could not: the box at 10 Hz cost the same
+    as every frame. `BIOMES_NF_PLAY=<fps>` runs a still on play's schedule
+    at that frame rate after settling, and `--gpu-profile` prints probes
+    traced a frame -- the two that found it. A probe in rock moves 0.9 m along an axis into
   air or switches off. Only probes under REAL cover trace -- under the 1 m
   top map by half a metre, or 1.5 m under the heightfield's (a narrow pit)
   -- the rest copy the heightfield: open air over a slope sits under the
@@ -1945,14 +2076,34 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
 - **A ray that meets rock is lit** (`nf_hit`, step 2): the surface found by
   three bisections, its normal from the occupancy's gradient, then the sun
   (one cascade tap half a metre out along the normal -- the volume's wall
-  is a metre-resolution guess at the mesh -- times the clouds' shadow),
-  the frame's first 32 local lights through their atlas, and the probes
-  round the hit (read from the buffer being written, with the reader's
-  rock-in-between test): every further bounce, a frame at a time. Times a
-  fixed wall albedo (0.26, 0.23, 0.20) over pi. The rt-last DDGI's hit
-  shading without the hardware rays. Glowing things are meant to be local
-  lights (an algae pool a few dim unshadowed ones), so they reach walls
-  and bounce the same way a torch does.
+  is a metre-resolution guess at the mesh -- times the clouds' shadow) and
+  the probes round the hit (read from the buffer being written, with the
+  reader's rock-in-between test): every further bounce, a frame at a time.
+  Times a fixed wall albedo (0.26, 0.23, 0.20) over pi. **The probes carry
+  the sky and the sun only.** Local lights were in the hits too, and came
+  OUT: their bounce faded in through the probes' history, and a ray that
+  struck rock beside a flame (the inverse square at a few tens of cm) lit
+  its probe tenfold for a frame. A light's bounce is its own instant fill
+  now (Local lights). Putting it back properly is the next pass (gaps.md).
+- **Three things made a lit tunnel pulse and creep** (the torch walk of
+  `--adapt-test --torch`, its meter's 90th percentile per frame):
+  - **One rotation of the ray set for every probe.** Down a straight
+    tunnel the sunlit ramp at its mouth is a sliver most rays miss; on the
+    frame the shared rotation aimed one up the tunnel, every probe caught
+    100 klx at once and the whole tunnel flared 10x -- 16 pulses in 75 s.
+    Each probe now turns the set by its own hash (`nf_probe_turn`).
+  - **The sun at a FAR hit.** Turned per probe, the same rare rays still
+    lit single probes tenfold (the meter wandered 0.25-1.25 nits; 0.22-0.29
+    with the near field off). The sun at a hit now fades out over 4-12 m
+    of ray (`kNfSunNear/Far`): near the patch many rays find it smoothly,
+    further off its light arrives second-hand through those probes. A
+    radiance clamp at the sky's mean did nothing more and cut real bounce;
+    it went. A second, coarser probe level would do this properly (the
+    next pass, gaps.md).
+  - **Stale probes in the toroidal store**: a block that scrolls in
+    clears its probes in the fill pass, so no neighbour reads a probe from
+    the far side through `nf_hit_irradiance`. The round robin's memory
+    is 1.5 s (3.3 s took half a minute to settle a tunnel walked into).
 - **Measured**: 8 m into `--dig-tunnel` at 11:00 and EV100 11, the walls
   round the camera 2.1 -> 5.8 luma (the sunlit shaft bouncing in), the
   floor near the mouth 73 -> 80; sealed and unlit still 0.001 nits, the
@@ -1986,13 +2137,37 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   spawn view differs from `--no-near-field` on 3 pixels in 921,600.
 - **`--shot ... --dig-tunnel`** digs a shaft 6 m down at the camera and a
   22 m tunnel along its heading, and stands the camera in the shaft
-  looking down it; `--tunnel-in <m>` stands it that far in, looking back;
-  `--tunnel-up` looks up the shaft. From spawn: `--cam -96 32.5 -440 0
-  -0.55 --dig-tunnel --time 11 --ev100 11`.
+  looking down it; `--tunnel-in <m>` stands it that far in, looking back
+  (`--tunnel-inward`: further in); `--tunnel-up` looks up the shaft;
+  `--tunnel-len`, `--tunnel-r`, `--tunnel-depth` its size; `--tunnel-ramp`
+  a ramp in from the surface instead of the shaft. From spawn: `--cam -96
+  32.5 -440 0 -0.55 --dig-tunnel --time 11 --ev100 11`. A dead end 8 m
+  down, 4 m wide, entered by a ramp (`--cam -96 32.5 -440 3.14159 -0.55
+  --dig-tunnel --tunnel-ramp --tunnel-len 55 --tunnel-r 2 --tunnel-depth 8
+  --tunnel-in <m> --tunnel-inward --time 11`), adapted exposure: the mouth
+  EV100 4.6, 10 m in 2.6, from 20 m the meter's floor (-1).
+- **Three leaks a long 4 m tunnel found** (a player's report: "my eyes
+  adjusted and it was very well lit, with noise"):
+  - **The sun at a ray's hit took the cascade by distance.** The near two
+    are fitted to slices of the VIEW; a hit behind or beside the camera
+    fell outside their maps, where the border reads lit -- full sun on the
+    walls of a SEALED tunnel 12 m down, adapted to EV100 0.2-3.4 from run to
+    run. Hits take the third cascade, fitted round the camera: -1.
+  - **A froxel in rock counted as open air** (chosen so haze over hills
+    would not thin). Down a tunnel the last slice before a wall often
+    samples inside it, and lit the fog along the whole ray: bright bands a
+    metre apart (`--texture 0` showed them; the rock texture hid them).
+    Rock now holds no air: no mist, and no part of the ray's openness
+    average. Open ground still 1 pixel in 921,600 off `--no-near-field`.
+  - **The heightfield's old covered branch** (where the near field does
+    not reach) took light from any column within 16 m whose surface lies
+    below the point -- any slope -- and lit that sealed tunnel to EV100 5.
+    More than 4 m under its map it is now enclosed.
+  The reader's probe visibility marches the occupancy every half metre
+  (`nf_clear`) instead of two samples, which could straddle a 1 m roof.
 - **Cost** at 1440p, walking: +0.17 ms before the hits were lit, +0.22 /
-  +0.25 with them (8.27 / 8.40 against 8.05 / 8.15). A still re-traces all
-  131k probes every frame; in a torch-lit tunnel that pass is 0.23 ms, so
-  normal play's ~4,600 a frame is well under it. It was +0.8 ms twice over before two finds: the
+  +0.25 with them (8.27 / 8.40 against 8.05 / 8.15); the probe pass is
+  ~0.05 ms in a tunnel since it went to a thread a ray (above). It was +0.8 ms twice over before two finds: the
   shallow cover test (above), and **HLSL's `&&` does not short-circuit**:
   `knf > 0 && nf_sample(...)` ran the eight probes on every terrain pixel
   and threw the result away. Call anything costly inside an `if`.
@@ -2001,7 +2176,10 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   [120..122] the mist's openness volumes (t16 in post). The mist root and
   the heightfield's camera pass declare the range too.
 - **Not done**: see gaps.md -- the walls' own material, emitters as a
-  kind of light, and the volume's reach.
+  kind of light, and the volume's reach. How dark a deep tunnel LOOKS is
+  not the near field's: it gives the light (none, sealed), and dark vision
+  (the exposure floor by open sky, slow adaptation, the display's floor)
+  decides what the eye makes of it.
 
 ### Screen-space bounce (ADR-004 L6, an experiment, OFF by default)
 

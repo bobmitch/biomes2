@@ -223,13 +223,16 @@ struct PostConstants {
     float sun_disk[3];     float cam_sky;
     float moon_disk[3];    float clouds_on;
     float cam_fwd[3];      float fog_on;
-    float fog_near;        float fog_log_ratio; float pad_rt[2];   // was RT shadows / RT sky (rt-last)
+    float fog_near;        float fog_log_ratio;
+    float ev_floor;        float cam_open;   // dark vision: the eye's floor (EV100), blended by its open sky (0..1)
     float cloud_shadow[4]; // ADR-005 C2: the cloud-shadow map's centre x, z, half extent, base altitude
     float wet[4];          // ADR-005 C4: rain, the ripples' clock, radians a pixel, puddles on
     float storm[4];        // ADR-005 C5: x the storm deck's dimming of the sky's light (storm_dim)
     float hfog[3][4];      // the exploration fog (haze.hlsli): layers, base and on, colour
+    float adapt[4];        // dark vision: into the dark fast, slow (s); into the light (s); fast stops
+    float dark[4];         // dark vision's display floor: lift, threshold nits, on; the player's brightness
 };
-static_assert(sizeof(PostConstants) == 512, "PostConstants must match post.hlsl");
+static_assert(sizeof(PostConstants) == 544, "PostConstants must match post.hlsl");
 
 // Matches cbuffer FogConstants in fog.hlsl.
 struct FogConstants {
@@ -1912,7 +1915,7 @@ bool Renderer::create_lights(std::string& error) {
         stats_pending_[f] = false;
     }
 
-    // The shadow atlas: 4096^2 of depth, 64 tiles of 512^2.
+    // The shadow atlas: 6144^2 of depth, 144 tiles of 512^2 (local_lights.h).
     {
         D3D12_RESOURCE_DESC rd = {};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -2069,6 +2072,48 @@ void Renderer::record_lights(const ViewConstants& view) {
         act.push_back(a);
     }
     std::stable_sort(act.begin(), act.end(), [](const Active& x, const Active& y) { return x.importance > y.importance; });
+
+    // Dark vision's light presence: the illuminance the lights put on the
+    // ground under the eye -- where the player stands and looks, not the eye
+    // itself, or a torch carried by a camera 22 m up lit "the view" and
+    // opened the night -- as lumens over 4 pi d^2 inside each light's range.
+    // A light counts only in clear view of that point (the application's
+    // physics ray); the carried torch always, it is in the player's hand.
+    {
+        float at[3] = {cam[0], cam[1], cam[2]};
+        // No physics hit (a still has no terrain bodies): the generated
+        // ground if it lies below the eye, else (under rock) standing height.
+        const float gen = world_.height(cam[0], cam[2]);
+        at[1] = gen < cam[1] ? gen + 0.5f : cam[1] - 1.6f;
+        if (ray_query_) {
+            const float down[3] = {0.0f, -1.0f, 0.0f};
+            const float h = ray_query_(cam, down, 40.0f);
+            if (h >= 0.0f) at[1] = cam[1] - (std::max)(0.0f, h - 0.5f);
+        }
+        float lux = 0.0f;
+        for (size_t i = 0; i < act.size() && i < 64; ++i) {
+            const LocalLight& l = act[i].l;
+            const float dx = l.pos[0] - at[0], dy = l.pos[1] - at[1], dz = l.pos[2] - at[2];
+            const float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 >= l.range * l.range) continue;
+            const float w = 1.0f - d2 / (l.range * l.range);
+            const float e = l.lumens / (12.566371f * (std::max)(d2, 0.25f)) * w * w;
+            if (e * 8.0f < dark_.lit_lux_lo) continue;   // too faint to matter: no ray
+            const bool torch = torch_on_ && l.id == 0u;
+            if (!torch && ray_query_) {
+                const float d = std::sqrt(d2);
+                if (d > 0.6f) {
+                    const float dir[3] = {dx / d, dy / d, dz / d};
+                    if (ray_query_(at, dir, d - 0.5f) >= 0.0f) continue;   // something in between
+                }
+            }
+            lux += e;
+        }
+        light_lux_eye_ = lux;
+        const float lo = dark_.lit_lux_lo, hi = (std::max)(dark_.lit_lux_hi, lo + 1e-4f);
+        const float s = (std::min)(1.0f, (std::max)(0.0f, (lux - lo) / (hi - lo)));
+        light_presence_ = s * s * (3.0f - 2.0f * s);
+    }
     if (act.size() > kMaxLights) act.resize(kMaxLights);
 
     // --- shadows: the most important shadowed lights keep or take a slot
@@ -2864,6 +2909,11 @@ void Renderer::next_frame() {
         WaitForSingleObject(fence_event_, INFINITE);
     }
     fence_values_[frame_] = current + 1;
+    read_live_exposure(frame_);   // that slot's frame has finished
+}
+
+void Renderer::read_live_exposure(UINT slot) {
+    if (slot < kFrameCount && expo_live_cpu_[slot]) std::memcpy(live_expo_, expo_live_cpu_[slot], sizeof live_expo_);
 }
 
 void Renderer::resize(UINT width, UINT height) {
@@ -3089,7 +3139,7 @@ bool Renderer::create_post_pipelines(std::string& error) {
             up.Type = D3D12_HEAP_TYPE_UPLOAD;
             D3D12_RESOURCE_DESC bd = {};
             bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            bd.Width = 512;
+            bd.Width = 768;   // PostConstants, 544 bytes
             bd.Height = 1;
             bd.DepthOrArraySize = 1;
             bd.MipLevels = 1;
@@ -3108,7 +3158,9 @@ bool Renderer::create_post_pipelines(std::string& error) {
             dh.Type = D3D12_HEAP_TYPE_DEFAULT;
             D3D12_RESOURCE_DESC bd = {};
             bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            bd.Width = k == 0 ? 256 * 4 : 2 * 16;
+            // The exposure state: [0] adapted, exposure, EV100, target; [1] the
+            // meter's band; [2] the light the eye last adapted to (dark vision).
+            bd.Width = k == 0 ? 256 * 4 : 3 * 16;
             bd.Height = 1;
             bd.DepthOrArraySize = 1;
             bd.MipLevels = 1;
@@ -3119,6 +3171,22 @@ bool Renderer::create_post_pipelines(std::string& error) {
                                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                                   IID_PPV_ARGS(k == 0 ? &lumhist_ : &expo_));
             if (FAILED(hr)) { error = hr_text("exposure meter buffer", hr); return false; }
+        }
+        for (UINT f = 0; f < kFrameCount; ++f) {
+            D3D12_HEAP_PROPERTIES rh = {};
+            rh.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rb = {};
+            rb.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rb.Width = 256;
+            rb.Height = 1;
+            rb.DepthOrArraySize = 1;
+            rb.MipLevels = 1;
+            rb.SampleDesc.Count = 1;
+            rb.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            hr = device_->CreateCommittedResource(&rh, D3D12_HEAP_FLAG_NONE, &rb, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                  nullptr, IID_PPV_ARGS(&expo_live_rb_[f]));
+            if (FAILED(hr)) { error = hr_text("exposure readback", hr); return false; }
+            expo_live_rb_[f]->Map(0, nullptr, &expo_live_cpu_[f]);
         }
     }
     const char* kPost = "engine/render/shaders/post.hlsl";
@@ -3248,9 +3316,10 @@ float Renderer::rain_intensity() const {
 }
 
 float Renderer::drips() const {
-    if (mode_ == Mode::Wireframe) return 0.0f;
+    // Rain drawn off (--no-rain, Shift+F3) takes the drips with it, --wet or
+    // not: they are drawn by the same pass.
+    if (mode_ == Mode::Wireframe || !rain_on_) return 0.0f;
     if (wet_override_ >= 0.0f) return wet_override_ > 1.0f ? 1.0f : wet_override_;
-    if (!rain_on_) return 0.0f;
     if (rain_override_ >= 0.0f)
         return weather_.drip_for(weather_.steady_leaf_soak(rain_override_ > 1.0f ? 1.0f : rain_override_));
     return clouds_on_ && clouds_.ready() ? weather_now_.drip : 0.0f;
@@ -3476,7 +3545,26 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
         const double dt = last_post_tick_ ? double(t - last_post_tick_) / double(freq.QuadPart) : 0.0;
         last_post_tick_ = t;
         pc.dt = static_cast<float>(dt < 0.0 ? 0.0 : (dt > 0.25 ? 0.25 : dt));
+        if (post_dt_override_ >= 0.0f) pc.dt = post_dt_override_;
     }
+    // Dark vision (DarkVision in renderer.h).
+    // The floor, blended by the eye's open sky (geometry, not light).
+    {
+        const float open = hfgi_on_ ? hfgi_.camera_open() : 1.0f;
+        const float unlit = dark_.floor_under + (dark_.floor_open - dark_.floor_under) * open;
+        // A light in view lowers it (DarkVision::floor_lit): the floors make
+        // the unlit dark and must not hold down a lit view.
+        pc.ev_floor = unlit + ((std::min)(dark_.floor_lit, unlit) - unlit) * light_presence_;
+        pc.cam_open = open;
+    }
+    pc.adapt[0] = dark_.dark;
+    pc.adapt[1] = light_presence_;
+    pc.adapt[2] = dark_.light;
+    pc.adapt[3] = dark_.lit_key;
+    pc.dark[0] = dark_.lift;
+    pc.dark[1] = dark_.threshold;
+    pc.dark[2] = dark_.on ? 1.0f : 0.0f;
+    pc.dark[3] = dark_.brightness;
     pc.ev_comp = ev_comp_;
     pc.ev100_fixed = ev100_fixed_;
     pc.tonemap = wire ? 0u : tonemap_;
@@ -3599,6 +3687,20 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     cmd_->SetPipelineState(expo_pso_.Get());
     cmd_->Dispatch(1, 1, 1);
     uavb(expo_.Get());
+    // This frame's exposure state into its readback slot (live_exposure).
+    if (expo_live_rb_[frame_]) {
+        D3D12_RESOURCE_BARRIER eb = {};
+        eb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        eb.Transition.pResource = expo_.Get();
+        eb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        eb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        eb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        cmd_->ResourceBarrier(1, &eb);
+        cmd_->CopyBufferRegion(expo_live_rb_[frame_].Get(), 0, expo_.Get(), 0, 32);
+        eb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        eb.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        cmd_->ResourceBarrier(1, &eb);
+    }
 
     // Sharpen and tonemap into the back buffer.
     D3D12_VIEWPORT vp = {};
@@ -3742,7 +3844,17 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     // The near field plans here: its readiness goes into the shadow constants.
     // A still (exposure_snap_) settles it whole.
     const bool near_live = near_on_ && hfgi_on_ && hfgi_.ready() && mode_ != Mode::Wireframe;
-    if (near_live) near_.plan(view.cam_pos, &edits_, exposure_snap_);
+    // BIOMES_NF_PLAY=<fps>: a still settles it once, then runs play's
+    // schedule as if at that frame rate -- what --gpu-profile and --shake
+    // must see to measure what the near field costs and how it moves in play
+    // (settled, every probe is traced every frame).
+    static const char* nf_play_env = std::getenv("BIOMES_NF_PLAY");
+    static const float nf_play_fps = nf_play_env ? float(std::atof(nf_play_env)) : 0.0f;
+    if (near_live) {
+        const bool play = nf_play_env && near_.ready();
+        const float dt = play && nf_play_fps > 1.0f ? 1.0f / nf_play_fps : post_dt_override_;
+        near_.plan(view.cam_pos, &edits_, exposure_snap_ && !play, dt);
+    }
     record_shadows(view);
     prof_.mark(cmd_.Get(), "shadows (rest)");
     // The near field (after the shadow constants, which carry the heightfield's
@@ -3854,6 +3966,16 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     // The trees' depth prepass, BEFORE the terrain: in a wood most of the
     // ground behind the trunks and crowns is then rejected by early depth
     // instead of shaded and painted over (tree_renderer.h).
+    // UNDERGROUND the other way round. Looking level along a tunnel the whole
+    // wood overhead is in the frustum, and its leaf cards were rasterised and
+    // leaf-tested over half the screen before the rock that hides every one
+    // of them was drawn: the LOD 1 prepass alone 2.9 ms at 4K. With little
+    // open sky over the eye (HeightGi::camera_open, the geometric share dark
+    // vision uses) the terrain goes first and its depth rejects them. The
+    // colour pass tests EQUAL against the prepass's depth, so the picture is
+    // the same either way. BIOMES_TREES_FIRST=1 keeps the old order (A/B).
+    static const bool force_trees_first = std::getenv("BIOMES_TREES_FIRST") != nullptr;
+    const bool trees_first = force_trees_first || !hfgi_on_ || hfgi_.camera_open() > 0.3f;
     TreeFrameInputs ti = {};
     const bool trees_drawn = trees_on_ && trees_.ready() && mode_ != Mode::Wireframe;
     if (trees_drawn) {
@@ -3867,7 +3989,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         ti.time = view.time;
         ti.far_plane = kFarPlane;
         ti.shadow_cb = shadow_cb_[frame_]->GetGPUVirtualAddress();
-        trees_.record_prepass(cmd_.Get(), frame_, ti, tree_settings_);
+        if (trees_first) trees_.record_prepass(cmd_.Get(), frame_, ti, tree_settings_);
     }
 
     {
@@ -3904,6 +4026,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         // The player's character, on the same root.
         if (!wire) character_.record(cmd_.Get(), UINT(frame_));
     }
+    if (trees_drawn && !trees_first) trees_.record_prepass(cmd_.Get(), frame_, ti, tree_settings_);
 
     // Trees after the ground, before the sea. Not in wireframe: the wire view
     // is for reading the terrain mesh, and a forest over it hides the mesh.
@@ -4403,6 +4526,7 @@ void Renderer::step_offscreen(const ViewConstants& view) {
     ID3D12CommandList* wl[] = {cmd_.Get()};
     queue_->ExecuteCommandLists(1, wl);
     wait_for_gpu();
+    read_live_exposure(frame_);
 }
 
 bool Renderer::capture(const ViewConstants& view, const char* path, std::string& error) {

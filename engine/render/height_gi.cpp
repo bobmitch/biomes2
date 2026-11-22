@@ -291,6 +291,7 @@ void HeightGi::record_camera(ID3D12GraphicsCommandList* cmd, UINT slot, D3D12_GP
         D3D12_RANGE rr = {0, 16};
         if (SUCCEEDED(cam_rb_[rs]->Map(0, &rr, reinterpret_cast<void**>(&v)))) {
             camera_sky_ = (v[0] >= 0.0f && v[0] <= 1.0f) ? v[0] : 1.0f;
+            camera_open_ = (v[1] >= 0.0f && v[1] <= 1.0f) ? v[1] : 1.0f;
             D3D12_RANGE nr = {0, 0};
             cam_rb_[rs]->Unmap(0, &nr);
         }

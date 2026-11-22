@@ -73,12 +73,14 @@ static const uint32_t kClusterCount     = kClusterX * kClusterY * kClusterZ;
 static const uint32_t kClusterMaxItems  = 128;   // lights.hlsl kMaxItems, local_lights.hlsli
 static const float    kClusterNear      = 0.5f;
 static const float    kClusterFar       = 400.0f;
-// Shadows: a 4096^2 atlas of 512^2 tiles. The eight most important shadowed
-// lights hold six tiles each (a cube); at most twelve faces are redrawn a
-// frame, and a light that has not moved keeps the faces it has.
-static const uint32_t kLightAtlas       = 4096;
+// Shadows: a 6144^2 atlas of 512^2 tiles (144 MB). The 24 most important
+// shadowed lights hold six tiles each (a cube); at most twelve faces are
+// redrawn a frame, and a light that has not moved keeps the faces it has.
+// Eight before: a ninth fire lit straight through rock, its fill with it.
+// A light past the 24th still does.
+static const uint32_t kLightAtlas       = 6144;
 static const uint32_t kLightTile        = 512;
-static const uint32_t kMaxShadowLights  = 8;
+static const uint32_t kMaxShadowLights  = 24;
 static const uint32_t kMaxFacesPerFrame = 12;
 
 }  // namespace engine

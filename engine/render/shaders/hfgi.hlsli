@@ -48,6 +48,21 @@ bool nf_depth(float3 p, out float dh) {
     return true;
 }
 
+// Whether the straight line from a to b crosses no rock: the occupancy's
+// nearest 1 m point every half metre. Two loads, at a half and 0.85 of the
+// way, stepped clean over a metre-thick roof wherever the rounding put both
+// in air -- a 4 m tunnel under a thin roof took the open-air probes over it
+// in bright bands a metre apart along every wall.
+bool nf_clear(float3 a, float3 b) {
+    const float3 v = b - a;
+    const int n = int(ceil(length(v) * 2.0f));
+    [loop] for (int i = 1; i <= n; ++i) {
+        const float3 q = a + v * (float(i) / float(n + 1));
+        if (g_nf_occ.Load(int4(nf_wrap(int3(floor(q + 0.5f)), kNfDims), 0)) > 0.5f) return false;
+    }
+    return true;
+}
+
 // The probes round a point, as the heightfield's SH. Each of the eight is
 // weighted by trilinear position, by facing (a probe behind the surface
 // sees the other side of it), and by whether rock lies between it and the
@@ -78,10 +93,7 @@ bool nf_sample(float3 world, float3 n, out float4 vis, out float4 sr, out float4
         const float len = length(v);
         const float bf = 0.5f + 0.5f * dot(v / max(len, 1e-4f), n);
         w *= bf * bf + 0.05f;
-        const float3 m1 = p + v * 0.5f, m2 = p + v * 0.85f;
-        const float o1 = g_nf_occ.Load(int4(nf_wrap(int3(floor(m1 + 0.5f)), kNfDims), 0));
-        const float o2 = g_nf_occ.Load(int4(nf_wrap(int3(floor(m2 + 0.5f)), kNfDims), 0));
-        if (o1 > 0.5f || o2 > 0.5f) continue;
+        if (!nf_clear(p, pc)) continue;
         vis += w * g_nf_probes[i4 + 0u];
         sr  += w * g_nf_probes[i4 + 1u];
         sg  += w * g_nf_probes[i4 + 2u];
@@ -99,6 +111,7 @@ bool nf_sample(float3 world, float3 n, out float4 vis, out float4 sr, out float4
 // surface -- the probes' mean sky visibility over the sphere, doubled so an
 // open hemisphere reads 1 -- and how far to trust it over the caller's own
 // rule for open air (`k`: 0 above the top surface, 1 from 1.5 m under it).
+// -1 (k 1): the point is in rock.
 // Open air keeps the caller's rule: lighting it by the heightfield's sky
 // visibility instead moved 63% of an open meadow's pixels, by up to 47
 // levels, against haze and height fog tuned to the old one.
@@ -110,14 +123,18 @@ float nf_openness(float3 p, out float k) {
     float dh;
     if (!nf_depth(p, dh) || dh > -0.5f) return 1.0f;
     // Most of what lies under the top surface is rock -- every froxel behind
-    // the terrain in view -- and nobody sees it: one load, not the probes,
-    // and it darkens nothing (k 0). A ray ending on a hillside averages in
-    // its last slice, metres long at range and partly in the hill; counting
-    // that rock as dark would thin the haze over every hill.
+    // the terrain in view -- and holds no air at all: -1, one load, not the
+    // probes. The caller gives it no mist and leaves it out of the openness
+    // averaged along the ray. Neither "open" nor "dark" is right: open (1)
+    // lit a tunnel's fog wherever a ray's last slice sampled inside the wall
+    // -- bright bands a metre apart down a 4 m tunnel -- and dark (0) would
+    // thin the haze over every hillside a ray's last slice cuts into.
     const int3 vox = int3(floor(p + 0.5f));
     const int3 rel = vox - int3(l_nf.xyz);
-    if (all(rel >= 0) && all(rel < kNfDims) && g_nf_occ.Load(int4(nf_wrap(vox, kNfDims), 0)) > 0.5f)
-        return 1.0f;
+    if (all(rel >= 0) && all(rel < kNfDims) && g_nf_occ.Load(int4(nf_wrap(vox, kNfDims), 0)) > 0.5f) {
+        k = 1.0f;
+        return -1.0f;
+    }
     float4 v, r, g, b;
     if (!nf_sample(p, float3(0.0f, 0.0f, 0.0f), v, r, g, b)) return 1.0f;
     k = smoothstep(-0.5f, -1.5f, dh);
@@ -188,6 +205,12 @@ void hfgi_sample(float3 world, float3 n, out float vis_e, out float3 bounce, out
             if (best < 1e8f) break;
         }
         k = saturate(1.0f - best / 12.0f) * (best < 1e8f ? 1.0f : 0.0f);
+        // The search is for an overhang's underside, open to the side. More
+        // than 4 m under the top surface it is a tunnel or a chamber, and a
+        // column whose surface lies below the point -- any slope nearby --
+        // lit a sealed tunnel 12 m down to EV100 5 where the near field does
+        // not reach (or is not ready yet). Enclosed: nothing.
+        if (dh < -4.0f) k = 0.0f;
     }
     vis_e = hf_irradiance(g_hf_vis.SampleLevel(g_gi_linear, suv, 0.0f), n) * k;
     bounce = float3(hf_irradiance(g_hf_r.SampleLevel(g_gi_linear, suv, 0.0f), n),

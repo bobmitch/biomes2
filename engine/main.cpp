@@ -29,6 +29,8 @@
 //   , .         dig radius, 0.5 m (one voxel) to 8 m; Shift: exposure
 //   - =         tree draw distance, 100 to 2000 m in 50 m steps
 //   F6 / F9     save / load: dig edits and felled trees, under build/
+//   F8          snapshot: camera, time, weather, edits and a still, under
+//               build/snapshots/<time>/; --snapshot <that dir> stands you there
 //   L           sun shadows on / off
 //   G           ground cover (grass, flowers, bushes) on / off
 //   Y O J       TAA, ambient occlusion, contact shadows on / off
@@ -66,6 +68,13 @@ worldgen::SpawnPoint g_spawn;
 bool  g_walk = false;
 bool  g_want_chop = false;
 bool  g_want_save = false, g_want_load = false;
+// F8: a snapshot -- everything needed to stand exactly here again
+// (write_snapshot; --snapshot <dir> reads it back).
+bool  g_want_snapshot = false;
+std::string g_snapshot_dir;          // --snapshot: the folder being reproduced
+int   g_snap_walk_frames = -1;       // frames until the snapshot's character is placed
+float g_snap_feet[3] = {0, 0, 0};
+float g_snap_cam_dist = -1.0f;
 char  g_tree_msg[96] = "";
 // Digging (right mouse): a sphere carved where the screen centre meets the
 // ground. The smallest removes ONE 0.5 m edit voxel; , and . step the size.
@@ -389,6 +398,9 @@ engine::ui::DisplayState g_display;
 // (1280 x 720 by default), so a cost can be measured at the resolution it
 // will be played at.
 float g_res_w = 1280.0f, g_res_h = 720.0f;
+// --dig-tunnel's geometry, for --adapt-test's walk in: the entrance (x, z),
+// the heading, the floor's height and the ground's at the entrance.
+struct TestTunnel { bool dug = false; float x0 = 0, z0 = 0, fx = 0, fz = 1, floor_y = 0, h0 = 0; } g_tunnel;
 bool g_want_shot = false;
 // Time of day running on its own (H): an hour every ten seconds.
 bool g_time_lapse = false;
@@ -544,7 +556,15 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 engine::LocalLight l = engine::make_campfire();
                 l.pos[0] = g_camera.x + (hl > 1e-3f ? f[0] / hl : 0.0f) * 4.0f;
                 l.pos[2] = g_camera.z + (hl > 1e-3f ? f[2] / hl : 1.0f) * 4.0f;
-                l.pos[1] = g_renderer.world().height(l.pos[0], l.pos[2]) + 0.5f;
+                // On the EDITED ground, found down from eye height: the
+                // generated height left a fire dropped into a pit floating
+                // where the surface had been, and one in a tunnel on the
+                // ground above it. Eye height inside rock (ahead is a rising
+                // hill): from over the generated surface instead.
+                const float eye = g_walk ? g_feet[1] + 1.6f : g_camera.y;
+                const float gen = g_renderer.world().height(l.pos[0], l.pos[2]);
+                const float from = g_renderer.edited_density(l.pos[0], eye, l.pos[2]) > 0.0f ? gen + 1.0f : eye;
+                l.pos[1] = g_renderer.ground_below(l.pos[0], l.pos[2], from, true) + 0.5f;
                 g_renderer.add_light(l);
                 return 0;
             }
@@ -571,6 +591,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (wp == VK_F6) { g_want_save = true; return 0; }
+            if (wp == VK_F8) { g_want_snapshot = true; return 0; }
             if (wp == VK_F9) { g_want_load = true; return 0; }
             if (wp == VK_F5) {
                 std::string err;
@@ -633,6 +654,74 @@ void fill_view(const engine::Camera& cam, float w, float h, float t,
     v.cap_pos[2] = g_feet[2];
     v.cap_r = g_walk ? kCapsuleRadius : 0.0f;
     v.cap_half = kCapsuleHalf;
+}
+
+// F8: a folder that stands someone else exactly here. snapshot.txt's "args:"
+// line is command-line flags (camera, time, fixed weather, exposure, torch,
+// walking), which --snapshot <dir> appends to the command line; edits.bin
+// and trees.bin are F6's saves; shot.bmp and shot.bmp.txt are this view as
+// a still, its exposure report included (the meter, the histogram), so what
+// the screen showed can be compared with what a rerun shows. Returns the
+// folder, or "" if it could not be written.
+std::string write_snapshot(const engine::ViewConstants& view) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char name[64];
+    std::snprintf(name, sizeof name, "%04d%02d%02d-%02d%02d%02d", st.wYear, st.wMonth, st.wDay, st.wHour,
+                  st.wMinute, st.wSecond);
+    CreateDirectoryA("build/snapshots", nullptr);
+    const std::string dir = std::string("build/snapshots/") + name;
+    if (!CreateDirectoryA(dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return "";
+    std::string err;
+    g_renderer.save_edits((dir + "/edits.bin").c_str(), err);
+    g_felling.save((dir + "/trees.bin").c_str(), g_renderer.world().field_id(), err);
+    FILE* f = std::fopen((dir + "/snapshot.txt").c_str(), "w");
+    if (!f) return "";
+    const engine::WeatherState& ws = g_renderer.weather_state();
+    float heading = std::atan2(ws.wind_dir[1], ws.wind_dir[0]) * 57.29578f;
+    if (heading < 0.0f) heading += 360.0f;
+    std::fprintf(f, "args: --cam %.3f %.3f %.3f %.5f %.5f --time %.4f --sea-state %.4f --wind %.3f --wind-dir %.2f "
+                    "--swell %.3f --ev-comp %.2f",
+                 g_camera.x, g_camera.y, g_camera.z, g_camera.yaw, g_camera.pitch, g_renderer.time_of_day(),
+                 g_renderer.sea_state(), ws.wind_speed, heading, ws.swell_hs, g_renderer.ev_comp());
+    if (g_renderer.rain_override() >= 0.0f) std::fprintf(f, " --rain %.3f", g_renderer.rain_override());
+    // The ground's wetness is the weather's recent history, not its state
+    // now: fixing the storm dial alone left a soaked tunnel dry on replay,
+    // and dry soil is twice as bright.
+    {
+        float wet_now = 0.0f, puddle_now = 0.0f;
+        g_renderer.wetness(wet_now, puddle_now);
+        std::fprintf(f, " --wet %.3f", wet_now);
+    }
+    if (g_renderer.carried_torch()) std::fprintf(f, " --torch");
+    // Campfires (V), each where it stands.
+    for (const engine::LocalLight& l : g_renderer.lights())
+        std::fprintf(f, " --fire %.3f %.3f %.3f", l.pos[0], l.pos[1], l.pos[2]);
+    if (g_walk) std::fprintf(f, " --snap-walk %.3f %.3f %.3f %.3f", g_feet[0], g_feet[1], g_feet[2], g_cam_dist);
+    std::fprintf(f, "\n");
+    std::fprintf(f, "# Reproduce: engine.exe --snapshot %s   (window, standing here)\n", dir.c_str());
+    std::fprintf(f, "#            engine.exe --snapshot %s --shot build/repro.bmp   (this view as a still)\n",
+                 dir.c_str());
+    std::fprintf(f, "# world: field id %08x; walking: %s; feet (%.2f, %.2f, %.2f); edits: %zu voxels in %zu bricks\n",
+                 g_renderer.world().field_id(), g_walk ? "yes" : "no", g_feet[0], g_feet[1], g_feet[2],
+                 g_renderer.edits().edited_voxels(), g_renderer.edits().brick_count());
+    std::fprintf(f, "# near field: %s, %s; heightfield GI %s\n", g_renderer.near_field_on() ? "on" : "off",
+                 g_renderer.near_field().ready() ? "ready" : "not ready", g_renderer.hfgi() ? "on" : "off");
+    std::fprintf(f, "# campfires: %zu; not kept: logs' poses beyond trees.bin, the clock's own weather\n",
+                 g_renderer.lights().size());
+    std::fclose(f);
+    g_renderer.capture(view, (dir + "/shot.bmp").c_str(), err);
+    // What the meter made of it: the still adapts instantly, so this is the
+    // fully adapted eye -- the number to compare a rerun against.
+    const engine::Renderer::ExposureReport& ex = g_renderer.last_exposure();
+    if (ex.valid) {
+        if (FILE* fa = std::fopen((dir + "/snapshot.txt").c_str(), "a")) {
+            std::fprintf(fa, "# exposure (adapted): EV100 %.2f, metered mean %.4g nits, band %.4g..%.4g nits\n",
+                         ex.ev100, ex.metered, ex.lo_nits, ex.hi_nits);
+            std::fclose(fa);
+        }
+    }
+    return dir;
 }
 
 // --- The script host: what game/scripts may read and set ---------------------
@@ -757,6 +846,9 @@ void register_tunables() {
     toggle("canopy", G, "Canopy shade", [&] { return R.canopy(); }, [&](bool b) { R.set_canopy(b); });
     toggle("foliage", G, "Grass and flowers", [&] { return R.foliage_on(); }, [&](bool b) { R.set_foliage(b); });
     toggle("trees", G, "Trees", [&] { return R.trees_on(); }, [&](bool b) { R.set_trees(b); });
+    // The player's Brightness: a display gamma (dark vision's last step).
+    range("brightness", G, "Brightness", 0.6f, 1.8f, 0.05f, "", [&] { return R.dark_vision().brightness; },
+          [&](float v) { R.dark_vision().brightness = v; });
     range("tree_distance", G, "Tree draw distance", 100.0f, 2000.0f, 50.0f, "m",
           [&] { return R.tree_settings().max_dist; }, [&](float v) { R.tree_settings().max_dist = v; });
     choice("texture", G, "Surface texture", {"Flat", "Scans", "Grid", "Scans + grid"},
@@ -854,6 +946,18 @@ void register_tunables() {
           [&] { return R.fog_settings().valley_wind; }, [&](float v) { R.fog_settings().valley_wind = v; });
 
     // Exposure.
+    // The near field's probes (near_field.h Schedule): how often the box round
+    // the camera is traced, and how long probes remember, in Hz and seconds.
+    {
+        const char* NF = "Near field";
+        static engine::NearField::Schedule& S = R.near_field_schedule();
+        range("nf_box_rate", NF, "Probes round the camera, traced", 2.0f, 60.0f, 1.0f, "Hz",
+              [] { return S.box_rate; }, [](float v) { S.box_rate = v; });
+        range("nf_near_memory", NF, "Their memory", 0.05f, 3.0f, 0.05f, "s",
+              [] { return S.near_memory; }, [](float v) { S.near_memory = v; });
+        range("nf_far_memory", NF, "The rest's memory", 0.5f, 10.0f, 0.1f, "s",
+              [] { return S.far_memory; }, [](float v) { S.far_memory = v; });
+    }
     const char* E = "Exposure";
     range("ev_comp", E, "Exposure compensation", -4.0f, 4.0f, 0.25f, "EV", [&] { return R.ev_comp(); },
           [&](float v) { R.set_ev_comp(v); });
@@ -863,6 +967,28 @@ void register_tunables() {
           [&](float v) { R.set_agx_saturation(v); });
     range("agx_power", E, "AgX power (contrast)", 0.5f, 2.5f, 0.05f, "", [&] { return R.agx_power(); },
           [&](float v) { R.set_agx_power(v); });
+    // Dark vision (renderer.h DarkVision): the eye's floor by its sky, how it
+    // adapts, and the display's dark floor.
+    {
+        engine::Renderer::DarkVision& dv = R.dark_vision();
+        range("ev_floor_open", E, "Darkest the eye adapts to, open sky", -3.0f, 4.0f, 0.25f, "EV100",
+              [&dv] { return dv.floor_open; }, [&dv](float v) { dv.floor_open = v; });
+        range("ev_floor_under", E, "Darkest the eye adapts to, underground", -3.0f, 6.0f, 0.25f, "EV100",
+              [&dv] { return dv.floor_under; }, [&dv](float v) { dv.floor_under = v; });
+        range("ev_floor_lit", E, "Darkest the eye adapts to, a light in view", -4.0f, 4.0f, 0.25f, "EV100",
+              [&dv] { return dv.floor_lit; }, [&dv](float v) { dv.floor_lit = v; });
+        range("lit_key", E, "A light in the dark: its lit part over grey", 0.0f, 4.0f, 0.25f, "stops",
+              [&dv] { return dv.lit_key; }, [&dv](float v) { dv.lit_key = v; });
+        range("adapt_dark", E, "Into the dark", 0.1f, 10.0f, 0.1f, "s",
+              [&dv] { return dv.dark; }, [&dv](float v) { dv.dark = v; });
+        range("adapt_light", E, "Into the light", 0.1f, 5.0f, 0.05f, "s",
+              [&dv] { return dv.light; }, [&dv](float v) { dv.light = v; });
+        toggle("dark_display", E, "Dark vision display floor", [&dv] { return dv.on; }, [&dv](bool b) { dv.on = b; });
+        range("dark_lift", E, "Dark floor lift", 0.0f, 0.06f, 0.0025f, "",
+              [&dv] { return dv.lift; }, [&dv](float v) { dv.lift = v; });
+        range("dark_threshold", E, "Colour fades below", 0.01f, 3.0f, 0.01f, "nits",
+              [&dv] { return dv.threshold; }, [&dv](float v) { dv.threshold = v; });
+    }
 
     // Digging (right mouse; , . step it). The HUD reads this too.
     {
@@ -1128,6 +1254,36 @@ static int run_sea_report(const char* path) {
 }
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
+    // --snapshot <dir> (F8 writes them): the snapshot's own flags -- camera,
+    // time, weather, exposure, torch -- appended to this command line, so
+    // every mode reads them as if typed, and anything typed first wins.
+    static std::string full_cmdline;
+    full_cmdline = cmdline ? cmdline : "";
+    {
+        const size_t at = full_cmdline.find("--snapshot ");
+        if (at != std::string::npos) {
+            size_t p = full_cmdline.find_first_not_of(" \t", at + 11);
+            size_t e;
+            if (p != std::string::npos && full_cmdline[p] == '"') {
+                e = full_cmdline.find('"', p + 1);
+                ++p;
+            } else {
+                e = full_cmdline.find_first_of(" \t", p);
+            }
+            g_snapshot_dir = full_cmdline.substr(p, e == std::string::npos ? std::string::npos : e - p);
+            if (FILE* f = std::fopen((g_snapshot_dir + "/snapshot.txt").c_str(), "r")) {
+                char line[2048];
+                while (std::fgets(line, sizeof line, f)) {
+                    if (std::strncmp(line, "args:", 5) != 0) continue;
+                    std::string a = line + 5;
+                    while (!a.empty() && (a.back() == '\n' || a.back() == '\r')) a.pop_back();
+                    full_cmdline += " " + a;
+                }
+                std::fclose(f);
+            }
+        }
+    }
+    cmdline = &full_cmdline[0];
     // --sky-report (ADR-004 L2): the atmosphere model against published
     // clear-sky references. CPU only -- no device, no window, no world.
     if (std::string(cmdline ? cmdline : "").find("--sky-report") != std::string::npos) {
@@ -1396,6 +1552,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     }
     const double init_t0 = engine::startup_now_ms();
     const bool init_ok = g_renderer.init(hwnd, error, debug_layer);
+    // Dark vision's rays (the ground under the eye, whether a light is in
+    // clear view of it): through the physics world -- terrain near the
+    // player, edits included, trunks, rocks.
+    g_renderer.set_ray_query([](const float from[3], const float dir[3], float len) {
+        int prop = 0;
+        return g_physics.probe_ray(from, dir, len, prop);
+    });
     if (init_ok && g_renderer.character().ready()) {
         // The clips, retargeted onto this character; without them the
         // procedural gait.
@@ -1476,6 +1639,32 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fclose(sf);
         }
     }
+    // A snapshot: its camera (the window opens there; --shot re-applies it),
+    // its edits and felled trees, and -- in the window -- the character back
+    // at its feet once the ground round them has streamed in.
+    if (have_cam) {
+        g_camera.x = cam_arg[0]; g_camera.y = cam_arg[1]; g_camera.z = cam_arg[2];
+        g_camera.yaw = cam_arg[3]; g_camera.pitch = cam_arg[4];
+    }
+    if (!g_snapshot_dir.empty()) {
+        std::string err;
+        bool mismatch = false;
+        g_renderer.load_edits((g_snapshot_dir + "/edits.bin").c_str(), err, mismatch);
+        g_felling.load((g_snapshot_dir + "/trees.bin").c_str(), g_renderer.world().field_id(), err, mismatch);
+        const std::string cl = cmdline;
+        const size_t sw = cl.find("--snap-walk ");
+        if (sw != std::string::npos &&
+            std::sscanf(cl.c_str() + sw + 12, "%f %f %f %f", &g_snap_feet[0], &g_snap_feet[1], &g_snap_feet[2],
+                        &g_snap_cam_dist) == 4)
+            g_snap_walk_frames = 90;
+        if (mismatch) {
+            if (FILE* sf = std::fopen("build/startup.txt", "a")) {
+                std::fprintf(sf, "           snapshot %s was made in ANOTHER world (seed or generator version)\n",
+                             g_snapshot_dir.c_str());
+                std::fclose(sf);
+            }
+        }
+    }
     if (start_overlay) g_renderer.set_mode(engine::Mode::Wireframe);
     if (sea_state >= 0.0f) g_renderer.set_sea_state(sea_state);
     if (wind_mps >= 0.0f) g_renderer.weather().set_wind(wind_mps);
@@ -1554,6 +1743,40 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (c2.find("--no-ssgi") != std::string::npos) g_renderer.set_ssgi(false);
         if (c2.find("--no-hfgi") != std::string::npos) g_renderer.set_hfgi(false);
         if (c2.find("--no-near-field") != std::string::npos) g_renderer.set_near_field(false);
+        // --fire x y z (any number): a campfire there -- what a snapshot
+        // writes for each one dropped with V.
+        for (size_t fp = c2.find("--fire "); fp != std::string::npos; fp = c2.find("--fire ", fp + 7)) {
+            engine::LocalLight l = engine::make_campfire();
+            if (std::sscanf(c2.c_str() + fp + 7, "%f %f %f", &l.pos[0], &l.pos[1], &l.pos[2]) == 3)
+                g_renderer.add_light(l);
+        }
+        // --fire-ground x z (any number): a campfire on the edited ground
+        // under (x, z) -- the floor of a pit, for a test.
+        for (size_t fp = c2.find("--fire-ground "); fp != std::string::npos; fp = c2.find("--fire-ground ", fp + 14)) {
+            engine::LocalLight l = engine::make_campfire();
+            if (std::sscanf(c2.c_str() + fp + 14, "%f %f", &l.pos[0], &l.pos[2]) == 2) {
+                const float gen = g_renderer.world().height(l.pos[0], l.pos[2]);
+                l.pos[1] = g_renderer.ground_below(l.pos[0], l.pos[2], gen + 1.0f, true) + 0.5f;
+                g_renderer.add_light(l);
+            }
+        }
+        // --nf-schedule <Hz> <near s> <far s>: the probes' timer and memories.
+        {
+            const size_t ns = c2.find("--nf-schedule ");
+            engine::NearField::Schedule& s = g_renderer.near_field_schedule();
+            if (ns != std::string::npos)
+                std::sscanf(c2.c_str() + ns + 14, "%f %f %f", &s.box_rate, &s.near_memory, &s.far_memory);
+        }
+        // Dark vision for A/B: --ev-floor <open> <under> (EV100), the display
+        // floor off, the player's brightness.
+        {
+            engine::Renderer::DarkVision& dv = g_renderer.dark_vision();
+            const size_t ef = c2.find("--ev-floor ");
+            if (ef != std::string::npos) std::sscanf(c2.c_str() + ef + 11, "%f %f", &dv.floor_open, &dv.floor_under);
+            if (c2.find("--no-dark-display") != std::string::npos) dv.on = false;
+            const size_t br = c2.find("--brightness ");
+            if (br != std::string::npos) dv.brightness = float(std::atof(c2.c_str() + br + 13));
+        }
         if (c2.find("--no-far-shadow") != std::string::npos) g_renderer.set_far_shadow(false);
         if (c2.find("--no-pom") != std::string::npos) g_renderer.set_pom(false);
         if (c2.find("--no-rocks") != std::string::npos) g_renderer.set_rocks(false);
@@ -1770,14 +1993,38 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // floor, looking down the tunnel. The scene for light under the
         // ground: sky down the shaft, dark along the tunnel. With --tunnel-up
         // it looks up the shaft instead.
+        //
+        // --tunnel-len <m> and --tunnel-r <m> its length (22) and radius
+        // (1.4); --tunnel-ramp a ramp in from the surface instead of the
+        // shaft (walking in from outside: the mouth's light is the open
+        // horizon, not a well); --tunnel-inward looks further in, not back;
+        // --tunnel-depth <m> how far under the ground its floor is (6).
         if (std::string(cmdline ? cmdline : "").find("--dig-tunnel") != std::string::npos) {
+            const std::string tcl = cmdline;
+            auto tnum = [&](const char* name, float def) {
+                const size_t a = tcl.find(name);
+                return a == std::string::npos ? def : float(std::atof(tcl.c_str() + a + std::strlen(name)));
+            };
+            const float len = tnum("--tunnel-len ", 22.0f), rad = tnum("--tunnel-r ", 1.4f);
+            const bool ramp = tcl.find("--tunnel-ramp") != std::string::npos;
             const float x0 = g_camera.x, z0 = g_camera.z;
             const float h0 = g_renderer.world().height(x0, z0);
             const float fx = std::sin(g_camera.yaw), fz = std::cos(g_camera.yaw);
-            for (int k = 0; k <= 4; ++k) g_renderer.dig(x0, h0 - 1.5f * float(k), z0, 2.5f, -4.0f, 1);
-            const float floor_y = h0 - 6.0f;
-            for (int k = 0; k <= 22; ++k)
-                g_renderer.dig(x0 + fx * float(k), floor_y + 0.9f, z0 + fz * float(k), 1.4f, -4.0f, 1);
+            const float floor_y = h0 - tnum("--tunnel-depth ", 6.0f);
+            g_tunnel.dug = true;
+            g_tunnel.x0 = x0; g_tunnel.z0 = z0; g_tunnel.fx = fx; g_tunnel.fz = fz;
+            g_tunnel.floor_y = floor_y; g_tunnel.h0 = h0;
+            if (ramp) {
+                // 20 m down from the surface, its floor meeting the tunnel's.
+                const float slope = (h0 - floor_y) / 20.0f;
+                for (int k = -24; k <= 0; ++k)
+                    g_renderer.dig(x0 + fx * float(k), floor_y + rad * 0.65f - slope * float(k), z0 + fz * float(k),
+                                   rad, -4.0f, 1);
+            } else {
+                for (int k = 0; k <= 4; ++k) g_renderer.dig(x0, h0 - 1.5f * float(k), z0, 2.5f, -4.0f, 1);
+            }
+            for (int k = 0; k <= int(len); ++k)
+                g_renderer.dig(x0 + fx * float(k), floor_y + rad * 0.65f, z0 + fz * float(k), rad, -4.0f, 1);
             g_camera.x = x0 - fx * 1.0f;
             g_camera.z = z0 - fz * 1.0f;
             g_camera.y = floor_y + 1.6f;
@@ -1790,14 +2037,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 g_camera.x = x0 + fx * m;
                 g_camera.z = z0 + fz * m;
                 g_camera.y = floor_y + 1.4f;
-                g_camera.yaw += 3.14159265f;
+                if (tcl.find("--tunnel-inward") == std::string::npos) g_camera.yaw += 3.14159265f;
                 g_camera.pitch = 0.0f;
             }
             fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
             if (FILE* tf = std::fopen((shot_path + ".tunnel.txt").c_str(), "w")) {
-                std::fprintf(tf, "shaft at (%.1f, %.1f, %.1f), 6 m deep; tunnel heading (%.2f, %.2f), 22 m; "
+                std::fprintf(tf, "%s at (%.1f, %.1f, %.1f), 6 m deep; tunnel heading (%.2f, %.2f), %.0f m, radius %.1f m; "
                                  "camera (%.2f, %.2f, %.2f) yaw %.3f pitch %.3f\n",
-                             x0, h0, z0, fx, fz, g_camera.x, g_camera.y, g_camera.z, g_camera.yaw, g_camera.pitch);
+                             ramp ? "ramp" : "shaft", x0, h0, z0, fx, fz, len, rad, g_camera.x, g_camera.y, g_camera.z,
+                             g_camera.yaw, g_camera.pitch);
                 std::fclose(tf);
             }
         }
@@ -1841,6 +2089,66 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         }
 
         bool ok = g_renderer.capture(v, shot_path.c_str(), error);
+        // --adapt-test (with --dig-tunnel): the eye's adaptation, timed. From
+        // 10 m outside the tunnel's entrance in daylight (3 s), down it and
+        // 20 m in at walking pace, holding there for 75 s, then back out --
+        // every frame a simulated 1/30 s, so the curve does not depend on how
+        // fast this renders. build/adapt_test.txt: time, where, the meter's
+        // target and the adapted EV100, every 0.1 s.
+        if (ok && g_tunnel.dug && std::string(cmdline).find("--adapt-test") != std::string::npos) {
+            const float step = 1.0f / 30.0f;
+            g_renderer.set_post_dt_override(step);
+            FILE* af = std::fopen("build/adapt_test.txt", "w");
+            if (af) std::fprintf(af, "t_s  phase  metres_in  target_EV100  adapted_EV100  light_presence  p10_nits  p90_nits\n");
+            const TestTunnel& tt = g_tunnel;
+            // Where the camera is, metres along the tunnel's axis from its
+            // entrance (negative: back up the ramp and out on the surface).
+            auto place = [&](float m) {
+                g_camera.x = tt.x0 + tt.fx * m;
+                g_camera.z = tt.z0 + tt.fz * m;
+                const float ground = g_renderer.world().height(g_camera.x, g_camera.z);
+                const float in_tunnel = tt.floor_y + 1.4f;
+                // On the ramp the floor rises 1/20 of the depth a metre.
+                const float ramp = tt.floor_y + 1.4f + (tt.h0 - tt.floor_y) * (-m / 20.0f);
+                g_camera.y = m >= 0.0f ? in_tunnel : (m > -20.0f ? ramp : ground + 1.6f);
+                g_camera.yaw = std::atan2(tt.fx, tt.fz);
+                g_camera.pitch = -0.05f;
+            };
+            float t = 0.0f;
+            int frame = 0;
+            auto run = [&](const char* phase, float seconds, float from, float to) {
+                const int n = int(seconds / step + 0.5f);
+                for (int i = 0; i < n; ++i) {
+                    const float m = from + (to - from) * (float(i + 1) / float(n));
+                    place(m);
+                    t += step;
+                    fill_view(g_camera, g_res_w, g_res_h, t, v);
+                    g_renderer.step_offscreen(v);
+                    const float* ex = g_renderer.live_exposure();
+                    if (af)
+                        std::fprintf(af, "%6.2f  %-5s  %6.1f  %6.2f  %6.2f  %4.2f  %8.4f %8.4f\n", t, phase, m,
+                                     ex[3] + 3.0f, ex[2], g_renderer.light_presence(), ex[4], ex[5]);
+                    ++frame;
+                }
+            };
+            run("out", 3.0f, -30.0f, -30.0f);     // on the surface, adapted to the day
+            run("in", 6.0f, -30.0f, 20.0f);       // down the ramp and in, ~8 m/s
+            run("hold", 75.0f, 20.0f, 20.0f);     // standing 20 m in
+            run("back", 6.0f, 20.0f, -30.0f);     // out again
+            run("out", 4.0f, -30.0f, -30.0f);
+            if (af) std::fclose(af);
+            g_renderer.set_post_dt_override(-1.0f);
+        }
+
+        // --write-snapshot: the still's scene as an F8 snapshot (the window's
+        // key, headless), its folder named in build/last_snapshot.txt.
+        if (ok && std::string(cmdline).find("--write-snapshot") != std::string::npos) {
+            const std::string dir = write_snapshot(v);
+            if (FILE* lf = std::fopen("build/last_snapshot.txt", "w")) {
+                std::fprintf(lf, "%s\n", dir.c_str());
+                std::fclose(lf);
+            }
+        }
         {
             // --shake <frames>: a still camera through a session's worth of
             // frames with the clock running, then eight consecutive raw
@@ -1908,15 +2216,22 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 g_renderer.set_profiling(true);
                 prof.set_detail(false);
                 prof.reset(2);
+                LARGE_INTEGER w0, w1, wf;
+                QueryPerformanceFrequency(&wf);
+                QueryPerformanceCounter(&w0);
                 run(n);
                 g_renderer.flush();
+                QueryPerformanceCounter(&w1);
+                const double wall_ms = double(w1.QuadPart - w0.QuadPart) * 1000.0 / double(wf.QuadPart) / n;
                 prof.harvest_all();
                 const unsigned whole_frames = prof.frames();
                 const double whole_ms = whole_frames ? prof.total_ms() / whole_frames : 0.0;
                 // Pass by pass, serialised.
                 prof.set_detail(true);
                 prof.reset(2);
+                const unsigned long long nf_probes0 = g_renderer.near_field().probes_traced();
                 run(n);
+                const double nf_probes_frame = double(g_renderer.near_field().probes_traced() - nf_probes0) / n;
                 g_renderer.flush();
                 prof.harvest_all();
                 g_renderer.set_profiling(false);
@@ -1929,8 +2244,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                  W, H, g_camera.x, g_camera.y, g_camera.z, g_camera.yaw, g_camera.pitch, n);
                     std::fprintf(gf, "frame, as it runs (first to last mark, passes overlapping): %.3f ms over %u frames\n",
                                  whole_ms, whole_frames);
+                    std::fprintf(gf, "frame, wall clock (CPU and GPU, a still's frame waits for the GPU): %.3f ms\n",
+                                 wall_ms);
                     std::fprintf(gf, "frame, every pass serialised by a barrier:                  %.3f ms over %u frames\n\n",
                                  prof.total_ms() / pf, prof.frames());
+                    std::fprintf(gf, "near field: %.0f probes traced a frame%s\n\n", nf_probes_frame,
+                                 std::getenv("BIOMES_NF_PLAY") ? " (BIOMES_NF_PLAY: play's schedule)" : "");
                     std::fprintf(gf, "%-58s %9s %9s %7s\n", "pass (named by the mark that ends it)", "ms/frame", "max ms", "frames");
                     double sum = 0.0;
                     const std::vector<std::pair<std::string, engine::GpuProfiler::Segment> > segs = prof.ordered_segments();
@@ -2374,7 +2693,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                  er.ev100, std::exp2(er.adapted_log2), std::exp2(er.target_log2), er.exposure,
                                  g_renderer.ev_comp(),
                                  g_renderer.tonemap() == 1u ? "AgX" : g_renderer.tonemap() == 2u ? "ACES" : "raw");
-                    std::fprintf(f, "exposure: %.0f pixels metered; 10th percentile %.0f nits, 90th %.0f nits "
+                    std::fprintf(f, "dark vision: light presence %.2f (%.3g lux at the eye from visible local lights)\n",
+                                 g_renderer.light_presence(), g_renderer.light_lux_at_eye());
+                    std::fprintf(f, "exposure: %.0f pixels metered; 10th percentile %.3g nits, 90th %.3g nits "
                                     "(%.1f stops apart)\n",
                                  er.metered, er.lo_nits, er.hi_nits,
                                  er.lo_nits > 0.0f ? std::log2(er.hi_nits / er.lo_nits) : 0.0f);
@@ -5320,6 +5641,21 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (!d.hit) std::snprintf(g_tree_msg, sizeof g_tree_msg, "dig: no ground within %.0f m", kDigReach);
             else std::snprintf(g_tree_msg, sizeof g_tree_msg, "dug r %.2f m at %.1f m, %zu voxels, %.1f ms",
                                kDigRadii[g_dig_size], d.dist, d.voxels, d.ms);
+        }
+        if (g_snap_walk_frames >= 0 && --g_snap_walk_frames < 0) {
+            g_walk = true;
+            g_physics.place_character(g_snap_feet[0], g_snap_feet[1] + 0.2f, g_snap_feet[2]);
+            g_char_yaw = g_camera.yaw;
+            g_have_prev_feet = false;
+            if (g_snap_cam_dist >= 0.0f) g_cam_dist = g_snap_cam_dist;
+        }
+        if (g_want_snapshot) {
+            g_want_snapshot = false;
+            engine::ViewConstants sv = {};
+            fill_view(g_camera, w, h, t, sv);
+            const std::string dir = write_snapshot(sv);
+            std::snprintf(g_tree_msg, sizeof g_tree_msg, dir.empty() ? "snapshot FAILED" : "snapshot %s",
+                          dir.c_str());
         }
         if (g_want_save || g_want_load) {
             std::string err;

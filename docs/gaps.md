@@ -24,6 +24,48 @@ Last gathered: 2026-11-21, after the exploration fog.
 - The froxel mist's reprojection goes through float world space (TAA's no
   longer does); low-frequency and not seen to shake. [Gotchas: TAA shook]
 
+- **Dark vision's floors and constants were set from timed headless runs,
+  not judged in play**: night -0.5 (+1.0 is the ~2 stops darker a
+  survival night wants), underground +1.5, lit -2, the lit key 1.5 stops,
+  0.8 s / 0.3 s. The light presence measures at the ground under the eye
+  with physics rays; a fire round a corner lighting a wall you see does
+  not count (no clear line to it). [Dark vision]
+- **After walking into a tunnel its unlit depths still darken for 10-20
+  s** (the meter's 10th percentile, 0.2 -> 0.02 nits) as the near field's
+  bounce settles. The exposure no longer follows them (it keys on the lit
+  part when a light is present; unlit, the floor holds it). Not run down:
+  neither shorter memories nor clearing stale probes removed it.
+  [Near field; Dark vision]
+- **The dark floor's colour fade is by each pixel's own luminance**, not
+  by the eye's adaptation: a dim wall beside a bright one greys even while
+  the eye is light-adapted. A real eye's rods take over only once it is
+  dark-adapted. [Dark vision]
+
+- **The near field's per-pixel reader costs ~1 ms at 4K on a screen of
+  tunnel wall** (terrain 5.85 -> 4.83 ms with `BIOMES_NF_NOREAD`): eight
+  probes a pixel, each checked for rock in between by a 0.5 m march
+  (`nf_clear`). Cheaper visibility (a precomputed per-probe mask, or the
+  march at half rate) would win most of it back. [Near field]
+- **Three campfires in a pit at 4K cost ~1.6 ms**: terrain +0.9, grass +0.7
+  (every lit pixel walks its cluster, each light with its shadow cube).
+  Grass is the bigger share for its overdraw. [Local lights]
+
+## The next lighting pass (planned)
+- **Two probe levels in the near field, radiance-cascades style** (Split
+  Radiance Cascades, Freeman, Sannikov and Pitt-Francis, the PDF in
+  docs/): the 2 m probes keep short rays (a few metres) and a second level
+  (4-8 m spacing, ~256 directions) takes 6-48 m, merged as RC merges
+  intervals. It replaces the sun-at-hits fade (`kNfSunNear/Far`), which
+  drops real light from far sunlit patches to kill their noise. The paper
+  as written needs hardware ray tracing and ~10 ms; only its core idea
+  fits here. [Near field]
+- **Local lights back in the probes, properly**: their bounce is an
+  instant per-light fill today (20%, shadowed by the light's own map). In
+  the probes it lagged through their history and pulsed when a ray struck
+  rock beside a flame; a near level with short rays and a clamp on the
+  inverse square near the light are the candidates. Emitters (below) want
+  the same path. [Near field; Local lights]
+
 ## Shadows and light
 
 - **Moving casters past 28 m shadow at 30 or 15 Hz**: the cascades are
@@ -75,11 +117,15 @@ Last gathered: 2026-11-21, after the exploration fog.
   things (algae pools, lit particles) are local lights -- dim, unshadowed,
   no visible model -- so they light walls directly and through the probes
   like a torch. Nothing places one, and the local light list (256, sorted
-  by importance; the probes' hits take the first 32) has not been sized
-  for many small ones. [Near field; Local lights]
-- **The probes' hits see only the frame's first 32 local lights**, by
-  importance from the CAMERA, not from the hit. A fire 40 m down a tunnel
-  behind 32 nearer lights does not bounce. [Near field]
+  by importance; 24 shadowed, the rest light through rock) has not been
+  sized for many small ones. [Near field; Local lights]
+- **`--no-near-field` leaves a sealed space's mist glowing**: the old path
+  lights the air near the eye by the camera's sky share, which the
+  heightfield cannot see is zero 8 m underground. Only the A/B switch
+  takes that path near the camera (the volume always holds the eye).
+  [Near field]
+- **A light past the 24 shadowed ones lights through rock**, its fill
+  with it. [Local lights]
 - **The near field reaches 64 m round the camera and 32 m up and down**:
   past it, the heightfield's old covered branch answers (a search for a
   way out, else black). A mine deeper than 32 m below the eye is fine (the

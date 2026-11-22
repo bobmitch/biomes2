@@ -124,7 +124,12 @@ void cs_fog_inject(uint3 id : SV_DispatchThreadID) {
     const float z = slice_z(float(id.z) + jitter);
     const float3 p = froxel_world(uv, z);
     const float3 d = normalize(p - cam_pos);
-    const float sigma_t = fog_density(p);
+    // Rock holds no air (nf_openness -1, where the near field reaches): no
+    // mist in it, and nothing for the ray's openness average.
+    float k_here;
+    const float open_here = nf_openness(p, k_here);
+    const bool in_rock = open_here < 0.0f;
+    const float sigma_t = in_rock ? 0.0f : fog_density(p);
     const float sigma_s = sigma_t * albedo;
 
     // Radiance arriving at the point, weighted by the phase towards the eye.
@@ -141,9 +146,8 @@ void cs_fog_inject(uint3 id : SV_DispatchThreadID) {
     // Where the near field (hfgi.hlsli nf_openness) knows the point itself --
     // under the top surface, a tunnel's air -- its own share instead: the
     // eye's share lit a whole tunnel's mist from a sunlit shaft.
-    float k_here;
-    const float open_here = nf_openness(p, k_here);
-    const float share = lerp(lerp(cam_sky, 1.0f, saturate((length(p - shadow_cam) - 64.0f) / 192.0f)), open_here, k_here);
+    const float share = in_rock ? 0.0f
+                                : lerp(lerp(cam_sky, 1.0f, saturate((length(p - shadow_cam) - 64.0f) / 192.0f)), open_here, k_here);
     L += 0.5f * (kSkyMean + kGroundRadiance) * share;
     // For the composite, how much the ground over it darkens this air: 1 in
     // the open, the probes' openness under the top surface. Averaged along
@@ -151,7 +155,7 @@ void cs_fog_inject(uint3 id : SV_DispatchThreadID) {
     // composite lights by its own rule, which open air keeps exactly: a
     // tunnel seen from a sunlit shaft glowed with height fog (luma 58
     // against 2 without it).
-    u_open[id] = lerp(1.0f, open_here, k_here);
+    u_open[id] = in_rock ? -1.0f : lerp(1.0f, open_here, k_here);
     if (l_cluster.w > 0.5f) {
         const uint c = cluster_of(p, float4(uv * float2(screen_w, screen_h), 0.0f, 1.0f));
         const uint n = g_cluster_n[c];
@@ -205,7 +209,7 @@ void cs_fog_integrate(uint3 id : SV_DispatchThreadID) {
     float3 S = float3(0.0f, 0.0f, 0.0f);
     float T = 1.0f;
     float z0 = 0.0f;
-    float open_sum = 0.0f;
+    float open_sum = 0.0f, open_len = 0.0f;
     for (uint s = 0; s < kFZ; ++s) {
         const float z1 = slice_z(float(s + 1));
         const float4 v = g_inject_in[uint3(id.xy, s)];
@@ -214,9 +218,15 @@ void cs_fog_integrate(uint3 id : SV_DispatchThreadID) {
         S += T * (v.rgb - v.rgb * Ts) / st;
         T *= Ts;
         u_integrated[uint3(id.xy, s)] = float4(min(S, kSceneMaxNits), T);
-        // Slice 0 reaches from the eye.
-        open_sum += u_open[uint3(id.xy, s)] * (z1 - (s == 0u ? 0.0f : z0));
-        u_open_avg[uint3(id.xy, s)] = open_sum / z1;
+        // Slice 0 reaches from the eye. A slice in rock (-1) counts for
+        // nothing either way: the average is over the air the ray crossed.
+        const float o = u_open[uint3(id.xy, s)];
+        if (o >= 0.0f) {
+            const float dz = z1 - (s == 0u ? 0.0f : z0);
+            open_sum += o * dz;
+            open_len += dz;
+        }
+        u_open_avg[uint3(id.xy, s)] = open_len > 0.0f ? open_sum / open_len : 1.0f;
         z0 = z1;
     }
 }

@@ -345,6 +345,72 @@ public:
     void set_ev_comp(float stops) { ev_comp_ = stops; }
     float ev_comp() const { return ev_comp_; }
     void set_ev100_fixed(float ev) { ev100_fixed_ = ev; }
+    // Dark vision: darkness underground and at night comes from the eye and
+    // the display, never from added light. No ambient floor in any lighting:
+    // it would relight sealed spaces, flatten a torch's contrast and make
+    // emitters worth less. The defaults are here, not in archetypes.json:
+    // there is no exposure block there, and these are the eye's, not the
+    // world's. The tuning panel's Exposure group sets them live.
+    struct DarkVision {
+        // How far down the eye adapts (EV100) with NOTHING lighting the view,
+        // by its share of open sky (camera_open): under the open sky at night,
+        // and with none over it -- a tunnel, a cave. Blended between, so a
+        // shaft or a cave mouth passes smoothly. These make the unlit dark;
+        // they must not hold down a lit one (floor_lit, below).
+        float floor_open = -0.5f;
+        float floor_under = 1.5f;
+        // A light in the view sets the exposure. The CPU sums the illuminance
+        // the torch and every fire in clear view (a physics ray) put on the
+        // ground under the eye -- where the player looks; at the eye itself, a
+        // torch carried by a camera 22 m up counted in full and lit nothing in
+        // view; between lit_lux_lo and lit_lux_hi lux that becomes a light
+        // presence 0..1, which lowers the floor towards floor_lit and, in a
+        // dark scene only, keys the meter on the lit part of the view -- the
+        // mean of its 70th-97th percentiles `lit_key` stops over middle grey
+        // -- instead of the mean of a mostly dark frame. Before this a
+        // torch-lit tunnel (walls 0.05-0.2 nits) was held 1-3 stops under
+        // middle grey by floor_under.
+        float floor_lit = -2.0f;
+        float lit_key = 1.5f;
+        float lit_lux_lo = 0.03f, lit_lux_hi = 0.3f;
+        // Adaptation, one time constant each way (seconds). The darkness is
+        // the floors', not a wait: a slow rod phase (2 s for 4 stops, then
+        // 20-40 s) took 75 s to settle a torch-lit tunnel entered from
+        // daylight, and read as the eye "opening up" on an artificial dark.
+        float dark = 0.8f;
+        float light = 0.3f;
+        // The display's dark floor (ps_final, after the tonemap): true black
+        // lifted towards a dark blue-grey, this share of the display range;
+        // and colour fading out below `threshold` scene nits (gone by a tenth
+        // of it) -- rod vision, with the Purkinje shift's blue.
+        bool  on = true;
+        float lift = 0.015f;
+        // A moonlit meadow is ~0.005 nits and goes grey; a torch-lit tunnel
+        // is 0.05-0.2 and keeps its colour (0.05 greyed its darkest quarter,
+        // 0.3 the whole wall).
+        float threshold = 0.015f;
+        // The player's Brightness (Graphics, saved): a display gamma, 1 none.
+        float brightness = 1.0f;
+    };
+    DarkVision& dark_vision() { return dark_; }
+    // A ray through the application's physics (terrain near the player,
+    // trunks, rocks): metres to the first hit within `len`, or < 0 for none.
+    // Dark vision uses it to find the ground under the eye and whether a light
+    // is in clear view of it. None set: the eye's own height, every light.
+    void set_ray_query(std::function<float(const float from[3], const float dir[3], float len)> f) { ray_query_ = std::move(f); }
+    // Dark vision's light presence, 0..1 (DarkVision::floor_lit), and the
+    // illuminance behind it (lux at the eye from visible local lights).
+    float light_presence() const { return light_presence_; }
+    float light_lux_at_eye() const { return light_lux_eye_; }
+    const DarkVision& dark_vision() const { return dark_; }
+    // A simulated time step for the eye's adaptation instead of the wall
+    // clock's (< 0: the wall clock), so a timed test is the same curve
+    // however fast it renders.
+    void set_post_dt_override(float s) { post_dt_override_ = s; }
+    // The exposure state as the GPU last left it: adapted log2 nits, the
+    // exposure multiplier, EV100, this frame's target log2 nits. Read back
+    // per frame, a frame or two late (immediately after step_offscreen).
+    const float* live_exposure() const { return live_expo_; }
     void set_tonemap(unsigned mode) { tonemap_ = mode; }
     unsigned tonemap() const { return tonemap_; }
     void set_agx_saturation(float s) { agx_saturation_ = s; }
@@ -374,6 +440,7 @@ public:
         return lights_.back().id;
     }
     void clear_lights() { lights_.clear(); }
+    const std::vector<LocalLight>& lights() const { return lights_; }
     size_t light_count() const { return lights_.size() + (torch_on_ ? 1 : 0); }
     void set_light_shadows(bool on) { light_shadows_on_ = on; }
     bool light_shadows() const { return light_shadows_on_; }
@@ -426,6 +493,7 @@ public:
     void set_near_field(bool on) { near_on_ = on; }
     bool near_field_on() const { return near_on_; }
     const NearField& near_field() const { return near_; }
+    NearField::Schedule& near_field_schedule() { return near_.schedule(); }
     // Parallax occlusion on the scans' height (pom.hlsli; --no-pom, P).
     void set_pom(bool on) { pom_on_ = on; }
     bool pom() const { return pom_on_; }
@@ -810,6 +878,14 @@ private:
     CrackCount cracks_;
     float post_debug_ = 0.0f;
     float ev_comp_ = 0.0f, ev100_fixed_ = -1000.0f, agx_saturation_ = 1.4f, agx_power_ = 1.35f;
+    DarkVision dark_;
+    std::function<float(const float from[3], const float dir[3], float len)> ray_query_;
+    float light_presence_ = 0.0f, light_lux_eye_ = 0.0f;
+    float post_dt_override_ = -1.0f;
+    float live_expo_[8] = {};   // u_expo[0] (adapted, exposure, EV100, target) and [1] (the band in nits)
+    ComPtr<ID3D12Resource> expo_live_rb_[kFrameCount];
+    void* expo_live_cpu_[kFrameCount] = {};
+    void read_live_exposure(UINT slot);
     unsigned tonemap_ = 1;
     bool  exposure_snap_ = false;            // a still: adapt instantly
     unsigned long long last_post_tick_ = 0;

@@ -55,11 +55,25 @@ public:
     static const int kBlocksPerFrame = 48;
     static const int kProbesPerFrame = 4096;
     static const int kMaxEdits = 65536;
-    // Probes round the camera traced every frame, so a carried torch's
-    // bounce follows it: a box this many probes a side (2 m each).
+    // Probes round the camera traced on a TIMER, so a carried torch's bounce
+    // follows it: a box this many probes a side (2 m each), in 8 interleaved
+    // slices (every other probe each way), as many slices a frame as its
+    // time has paid for.
     static const int kCameraBox = 8;
-    // Local lights a ray's hit is lit by: the frame's first, most important.
-    static const int kHitLights = 32;
+    static const int kBoxSlices = 8;
+    // How often the box is traced and how long probes remember -- in Hz and
+    // seconds, so the look and the cost a second do not depend on the frame
+    // rate (at 144 fps the box is not traced 144 times a second). A probe's
+    // blend over its history is exp(-interval / memory). Since the kernel
+    // went to a thread a ray the rate barely moves the cost (0.050 ms at 20
+    // Hz, 0.053 at 60, in a tunnel at 1440p); a higher rate is less flicker
+    // (pixels a frame jumping 20 levels: 8 at 60 Hz, ~40 at 20).
+    struct Schedule {
+        float box_rate = 60.0f;      // Hz: the camera's box traced this often
+        float near_memory = 0.35f;   // s: the box's probes' history (0.95 a frame at 60)
+        float far_memory = 1.5f;     // s: the round robin's (0.70 a lap at 60 fps; 3.3 s took half a minute to settle a tunnel walked into)
+    };
+    Schedule& schedule() { return sched_; }
 
     // `cloud_shadow_srv`: the clouds' shadow map's heap slot (Clouds::kShadowSrv),
     // which a sunlit wall's light passes through.
@@ -73,8 +87,8 @@ public:
 
     // CPU, every frame before record: which blocks to fill, which edits to
     // scatter over them, which probes to re-trace. `settle` does it all at
-    // once, for a still.
-    void plan(const float cam[3], const BrickStore* edits, bool settle);
+    // once, for a still. `dt`: this frame's seconds (< 0: the wall clock).
+    void plan(const float cam[3], const BrickStore* edits, bool settle, float dt = -1.0f);
     // GPU. Needs the frame's shadow constants (the heightfield's corner)
     // and the heightfield's maps already built this frame.
     // `cloud` the clouds' shadow parameters (Clouds::shadow_params; zero extent
@@ -99,6 +113,12 @@ public:
 private:
     template <class T> using ComPtr = Microsoft::WRL::ComPtr<T>;
     bool ready_ = false;
+    Schedule sched_;
+    float box_credit_ = 0.0f;            // slices of the camera's box paid for, not yet traced
+    uint32_t box_slice_ = 0;             // the next slice
+    float dt_smooth_ = 1.0f / 60.0f;     // the frame's seconds, smoothed (the round robin's lap)
+    unsigned long long last_tick_ = 0;   // the wall clock at the last plan
+    float keep_box_ = 0.95f, keep_rr_ = 0.85f;   // this frame's blends (NfConstants)
     int origin_[3] = {0, 0, 0};          // min world voxel, a multiple of kBlock
     bool have_origin_ = false;
     int pending_ = kBlocks;

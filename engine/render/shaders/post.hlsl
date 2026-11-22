@@ -50,13 +50,16 @@ cbuffer PostConstants : register(b0) {
     float3 sun_disk;     float cam_sky;      // disk radiance seen from the camera, nits; cam_sky: the heightfield GI's share of open sky at the eye
     float3 moon_disk;    float clouds_on;   // ADR-005: the clouds' resolved textures at t12, t13
     float3 cam_fwd;      float fog_on;       // the mist (L4): fog.hlsl's integrated volume
-    float  fog_near;     float fog_log_ratio; float2 pad_rt;   // pad_rt: was RT shadows / RT sky (rt-last)   // L5's traced key-light visibility, L6's traced sky
+    float  fog_near;     float fog_log_ratio;
+    float  ev_floor;     float cam_open;      // dark vision: how far down the eye adapts (EV100), by its open sky (0..1, geometry)
     float4 cloud_shadow; // ADR-005 C2: the cloud-shadow map's centre x, z (cloud-base plane), half extent m, base altitude m
     float4 wet;          // ADR-005 C4: the rain now, the ripples' clock (s), radians a pixel, w > 0.5 puddles to reflect
     float4 storm;        // ADR-005 C5: x the storm deck's dimming of the sky's light, 1 none
     float4 hfog_a;       // the exploration fog (haze.hlsli): ground sigma, scale height; valley sigma, scale height
     float4 hfog_b;       // ... deep sigma, scale height; base altitude; w on
     float4 hfog_c;       // ... greying, dimming, albedo, the eye's sky share
+    float4 adapt;        // dark vision: into the dark (s); light presence 0..1; into the light (s); lit key (stops)
+    float4 dark;         // dark vision's display floor: lift, threshold nits, on; the player's brightness (gamma)
 };
 
 Texture2D<float>  g_depth   : register(t0);
@@ -661,31 +664,59 @@ void cs_exposure(uint3 id : SV_DispatchThreadID) {
     // near the sun, a glint) do not pull the exposure around.
     const float lo = float(total) * meter_lo, hi = float(total) * meter_hi;
     float acc = 0.0f, wsum = 0.0f, cum = 0.0f;
+    // The lit part of the view, for a light in the dark: the mean log
+    // luminance of the 70th-97th percentiles. A single percentile (the 90th)
+    // jumped between the two humps of a torch-lit tunnel -- walls by the
+    // flame and the dark beyond -- and the target with it, 2.5 stops a frame.
+    const float klo = float(total) * 0.70f, khi = float(total) * 0.97f;
+    float kacc = 0.0f, ksum = 0.0f;
     float lo_log = kLumLogMin, hi_log = kLumLogMax;
     bool lo_found = false, hi_found = false;
     for (uint k = 0u; k < 256u; ++k) {
         const float c = float(gs_bins[k]);
         const float a = max(cum, lo), e = min(cum + c, hi);
         if (e > a) { acc += (e - a) * bin_log2(k); wsum += e - a; }
+        const float ka = max(cum, klo), ke = min(cum + c, khi);
+        if (ke > ka) { kacc += (ke - ka) * bin_log2(k); ksum += ke - ka; }
         if (!lo_found && cum + c >= lo && c > 0.0f) { lo_log = bin_log2(k); lo_found = true; }
         if (!hi_found && cum + c >= hi && c > 0.0f) { hi_log = bin_log2(k); hi_found = true; }
         cum += c;
     }
-    // EV100 -1 to 18 (snow in full sun), as log2 nits: EV100 = log2(L * 100 /
-    // 12.5), the reflected-light meter's calibration. The floor is where the
-    // eye stops compensating, and it decides what night looks like: at EV100
-    // -2 a full-moon meadow metered all the way up to a dim blue day. At -1
-    // moonlight renders a stop under middle grey (0 was tried: two stops read
-    // as near black) -- ambience -- and a
-    // torch or a fire, far above the scene's mean, carries the picture.
+    // EV100 to 18 (snow in full sun), as log2 nits: EV100 = log2(L * 100 /
+    // 12.5), the reflected-light meter's calibration. The FLOOR (ev_floor,
+    // blended on the CPU) is where the eye stops compensating with nothing
+    // lighting the view -- dark vision: the dark underground and at night is
+    // the eye's and the display's, never light added to the scene. By the
+    // eye's open sky (geometry): EV100 -0.5 under a night sky, +1.5 with none
+    // over it, so an unlit tunnel stays black. A light in view (adapt.y, the
+    // CPU's light presence 0..1) lowers it, and in a DARK scene keys the
+    // meter on the lit part of the view: the 90th percentile adapt.w stops
+    // over middle grey (the 70th-97th percentiles' mean), so a torch-lit wall reads bright and the dark around
+    // it stays dark. The mean of a mostly dark frame opened the eye instead,
+    // and the floor then held a torch-lit tunnel 1-3 stops under grey.
     float target = wsum > 0.0f ? acc / wsum : (valid ? prev.w : 10.0f);
-    target = clamp(target, -4.0f, 15.0f);
+    {
+        const float dark_scene = 1.0f - smoothstep(0.0f, 3.0f, target + 3.0f);   // EV100 3 down: dark
+        // The lit part ALONE, not the larger of it and the mean: the unlit
+        // depths of a tunnel settle over tens of seconds (the near field's
+        // bounce), and the mean dragged the exposure along with them -- a
+        // slow "eye opening" after a torch was lit. The lit part held steady.
+        const float lit_log = ksum > 0.0f ? kacc / ksum : target;
+        const float keyed = lit_log - adapt.w;
+        target = lerp(target, keyed, saturate(adapt.y) * dark_scene);
+    }
+    const float floor_log2 = ev_floor - 3.0f;
+    target = clamp(target, floor_log2, 15.0f);
     float adapted = target;
     if (valid && (expo_flags & 1u) == 0u) {
-        // Into the light in about a second, out of it in about three: the eye
-        // closes faster than it opens.
-        const float rate = target > prev.x ? 3.0f : 1.0f;
-        adapted = prev.x + (target - prev.x) * (1.0f - exp2(-dt * rate));
+        // One time constant each way, seconds (adapt.x into the dark, adapt.z
+        // into the light) -- for a real change. A slow rod phase took 75 s to
+        // settle a torch-lit tunnel entered from daylight. Under a stop the
+        // eye is twice as slow, so a flame's flicker (a quarter of a stop)
+        // does not pump the picture. 4x left a ten-second tail on every change.
+        const float big = saturate(abs(target - prev.x) - 0.25f);
+        const float tc = (target > prev.x ? adapt.z : adapt.x) * lerp(2.0f, 1.0f, big);
+        adapted = prev.x + (target - prev.x) * (1.0f - exp(-dt / max(tc, 1e-3f)));
     }
     // A lightning flash (ADR-005 C5): the eye does not adapt to a tenth of a
     // second of light, so the meter HOLDS where it was -- else the frame
@@ -780,6 +811,25 @@ float3 linear_to_srgb(float3 c) {
     return c <= 0.0031308f ? c * 12.92f : 1.055f * pow(c, 1.0f / 2.4f) - 0.055f;
 }
 
+// Dark vision's display floor, on the display-encoded colour, after the
+// tonemap -- never in the lighting, so a sealed space stays sealed and a
+// torch keeps its contrast. Below `dark.y` scene nits colour fades (gone by a
+// tenth of it) towards a slightly blue grey: rod vision and its Purkinje
+// shift. Then true black is lifted towards a dark blue-grey, `dark.x` of the
+// display range, so the darkest shapes near the player are not a void. Then
+// the player's Brightness, a gamma (1 none).
+float3 dark_floor(float3 o, float scene_nits) {
+    if (dark.z > 0.5f) {
+        const float rods = 1.0f - smoothstep(0.1f * dark.y, dark.y, scene_nits);
+        const float l = dot(o, float3(0.2126f, 0.7152f, 0.0722f));
+        o = lerp(o, saturate(l * float3(0.86f, 0.96f, 1.14f)), 0.85f * rods);
+        const float3 lift = dark.x * float3(0.78f, 0.88f, 1.0f);
+        o = lift + o * (1.0f - lift);
+    }
+    if (abs(dark.w - 1.0f) > 1e-3f) o = pow(saturate(o), 1.0f / max(dark.w, 0.1f));
+    return o;
+}
+
 float4 ps_final(FsOut i) : SV_Target {
     const int2 p = int2(i.pos.xy);
     const float4 c4 = metered(p);
@@ -799,7 +849,8 @@ float4 ps_final(FsOut i) : SV_Target {
     }
     o = max(o, 0.0f);
     if (tonemap == 0u) return float4(tonemap_raw(o), 1.0f);
+    const float scene_nits = dot(o, float3(0.2126f, 0.7152f, 0.0722f));
     o *= u_expo[0].y;
-    if (tonemap == 2u) return float4(linear_to_srgb(aces_fitted(o)), 1.0f);
-    return float4(agx(o), 1.0f);
+    o = tonemap == 2u ? linear_to_srgb(aces_fitted(o)) : agx(o);
+    return float4(dark_floor(o, scene_nits), 1.0f);
 }

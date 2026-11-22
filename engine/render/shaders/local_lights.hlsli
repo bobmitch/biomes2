@@ -65,7 +65,7 @@ float3 light_illuminance(LocalLightGpu L, float3 world, out float3 l) {
 // The light's visibility at `world`, from its cube (or, for a spot, its one
 // face) in the atlas. 2x2 PCF through the comparison sampler, clamped
 // inside the tile so a neighbour's depths never bleed in.
-float local_shadow(LocalLightGpu L, float3 world, float3 n, float3 l) {
+float local_shadow_taps(LocalLightGpu L, float3 world, float3 n, float3 l, bool one_tap) {
     if (L.shadow < 0) return 1.0f;
     const float3 d = world - L.pos;
     const float3 a = abs(d);
@@ -88,6 +88,7 @@ float local_shadow(LocalLightGpu L, float3 world, float3 n, float3 l) {
     const float m = 1.5f / 512.0f;
     const float2 uv = f.rect.xy + clamp(tuv, m, 1.0f - m) * f.rect.z;
     const float t = f.rect.w;
+    if (one_tap) return g_light_atlas.SampleCmpLevelZero(g_shadow_cmp, uv, ndc.z);
     float s = 0.0f;
     s += g_light_atlas.SampleCmpLevelZero(g_shadow_cmp, uv + float2(-0.5f, -0.5f) * t, ndc.z);
     s += g_light_atlas.SampleCmpLevelZero(g_shadow_cmp, uv + float2( 0.5f, -0.5f) * t, ndc.z);
@@ -95,8 +96,42 @@ float local_shadow(LocalLightGpu L, float3 world, float3 n, float3 l) {
     s += g_light_atlas.SampleCmpLevelZero(g_shadow_cmp, uv + float2( 0.5f,  0.5f) * t, ndc.z);
     return s * 0.25f;
 }
+float local_shadow(LocalLightGpu L, float3 world, float3 n, float3 l) {
+    return local_shadow_taps(L, world, n, l, false);
+}
 
-// Radiance from every local light in this pixel's cluster.
+// A light's bounce, instantly: a soft fill, kLocalFill of what the light
+// puts at a distance of at least kFillNear (the fill is room-scale; the
+// inverse square at the flame is not), wrapped round the normal, diffuse
+// only. Rock bounces a quarter to a third of what lands on it in an
+// enclosure; 0.2 is a little under. It came through the near field's
+// probes before, which faded it in over seconds and pulsed (near_field.hlsl).
+// Its visibility is the light's own shadow, tested from a point moved
+// towards the light by up to kFillReach: it wraps round a pillar or a
+// person, never through rock thicker than that. A light with no shadow
+// map lights through everything, fill included.
+static const float kLocalFill = 0.2f;
+static const float kFillNear = 1.5f;
+static const float kFillReach = 1.5f;
+float3 local_fill_irradiance(LocalLightGpu L, float3 world, float3 n) {
+    const float3 v = L.pos - world;
+    const float d2 = max(dot(v, v), 1e-6f);
+    const float d = sqrt(d2);
+    const float3 l = v / d;
+    const float x = d2 / (L.range * L.range);
+    const float w = saturate(1.0f - x * x);
+    if (w <= 0.0f) return float3(0.0f, 0.0f, 0.0f);
+    float3 E = L.intensity * (w * w / max(d2, kFillNear * kFillNear));
+    if (L.type > 0.5f) E *= smoothstep(L.cos_outer, L.cos_inner, dot(-l, L.spot_dir));
+    const float3 q = world + l * min(kFillReach, 0.5f * d);
+    // One tap: the fill is soft; the direct light's 2x2 PCF here cost 1.2 ms
+    // with 64 campfires.
+    const float vis = local_shadow_taps(L, q, l, l, true);
+    return E * (kLocalFill * vis * (0.5f + 0.5f * dot(n, l)));
+}
+
+// Radiance from every local light in this pixel's cluster: direct, and its
+// fill (diffuse, so the albedo over pi).
 float3 local_lights(Surface s, float3 world, float4 clip) {
     // No lights this frame -- a uniform branch, the whole draw takes it --
     // and no cluster is read at all: walking by day, 2.26 -> 2.18 ms (L2: 2.10).
@@ -108,7 +143,9 @@ float3 local_lights(Surface s, float3 world, float4 clip) {
         const LocalLightGpu L = g_lights[g_cluster_ix[c * kClusterMaxItems + i]];
         float3 l;
         const float3 E = light_illuminance(L, world, l);
-        if (dot(s.n, l) <= 0.0f || max(E.r, max(E.g, E.b)) <= 0.0f) continue;
+        if (max(E.r, max(E.g, E.b)) <= 0.0f) continue;
+        acc += s.albedo * (1.0f - s.metal) / kPi * local_fill_irradiance(L, world, s.n);
+        if (dot(s.n, l) <= 0.0f) continue;
         acc += direct_light(s, l, E, local_shadow(L, world, s.n, l));
     }
     return acc;
@@ -127,6 +164,7 @@ float3 local_lights_leaf(float3 albedo, float3 n, float3 v, float wrap, float th
         const float3 E = light_illuminance(L, world, l);
         if (max(E.r, max(E.g, E.b)) <= 0.0f) continue;
         acc += leaf_light(albedo, n, v, l, E, wrap, through, local_shadow(L, world, n, l));
+        acc += albedo / kPi * local_fill_irradiance(L, world, n);
     }
     return acc;
 }

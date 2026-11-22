@@ -36,7 +36,8 @@ cbuffer NfConstants : register(b0) {
     int4 nf_origin;    // the volume's min world voxel (a multiple of 8); w unused
     uint nf_edits;     // entries in g_edits
     uint nf_probes;    // entries in g_probe_list
-    uint nf_pad0, nf_pad1;
+    float nf_keep_box;   // the blend over history: probes traced on the camera's box's timer (and a still)
+    float nf_keep_rr;    // the round robin's (near_field.h Schedule: exp(-interval / memory))
     float4 nf_rot0, nf_rot1, nf_rot2;   // this update's random rotation of the ray set (rows)
     float4 nf_cloud;                    // the clouds' shadow map: centre x, z, half extent (0: none), base
     uint   nf_lights;                   // local lights to light a hit with (the frame's first, most important)
@@ -45,8 +46,13 @@ cbuffer NfConstants : register(b0) {
 // A dug wall's albedo: soil and rock, a little warm. The terrain's own
 // material per biome would be better (gaps.md); this is its mean.
 static const float3 kNfWallAlbedo = float3(0.26f, 0.23f, 0.20f);
-static const int   kNfRays = 32;
-static const float kNfHysteresis = 0.85f;
+// 64 rays an update, and history kept in SECONDS by how often a probe is
+// traced (the blends come from the CPU, near_field.h Schedule). 32 rays and
+// 0.85 everywhere made the probes round the camera DANCE wherever the sky
+// came in through a small opening (a stairwell 10 m down): a few of 32 rays
+// find it, a different few each update.
+static const int   kNfRays = 64;
+static const float kNfSunNear = 4.0f, kNfSunFar = 12.0f;   // the sun at a ray's hit, faded out over this ray length (nf_hit)
 cbuffer NfLevel : register(b3) { uint nf_level; };
 
 StructuredBuffer<int4>   g_blocks     : register(t2);   // world block (8 m units) to fill
@@ -62,6 +68,16 @@ SamplerState             g_nf_wrap    : register(s6);   // toroidal: wraps
 void cs_nf_fill(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
     const int3 w = g_blocks[g.x].xyz * 8 + int3(t);
     u_density[nf_wrap(w, kNfDims)] = real_terrain_density(float(w.x), float(w.y), float(w.z), 1.0f);
+    // The block's probes are off until traced again (the plan queues them).
+    // The volume is toroidal: a slot that scrolls in still held a probe from
+    // the far side -- daylight from the surface, say -- and a neighbour's hit
+    // read it through nf_hit_irradiance and passed it round the bounce loop.
+    // Walking into a tunnel, its darkest tenth drained from 0.2 to 0.02 nits
+    // over half a minute: a slow "eye opening" that was the probes.
+    if (all((t & 1u) == 0u)) {
+        const uint o4 = nf_probe_index(w / 2) * uint(kNfProbeFloat4s);
+        [unroll] for (int z = 0; z < 5; ++z) u_probes[o4 + uint(z)] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
 }
 
 [numthreads(64, 1, 1)]
@@ -135,15 +151,19 @@ bool nf_hf_uv(float2 xz, out float2 uv, out float top) {
     return top > kHfNone * 0.5f;
 }
 
-// The key light's visibility at a hit: one tap of the cascades, as the mist
-// takes it (fog.hlsl key_visibility), and the clouds' shadow over it.
+// The key light's visibility at a hit: one tap of the third cascade, and
+// the clouds' shadow over it. NOT the cascade by distance, as the mist takes
+// it: the near two are fitted to slices of the VIEW, and a hit behind or
+// beside the camera falls outside their maps, where the border reads "lit"
+// -- full sun on the walls of a sealed tunnel 12 m down. The third is fitted
+// round the camera (380 m), so it holds the whole volume; its 0.19 m texels
+// are far finer than the volume's metre.
 float nf_key_visibility(float3 p) {
     float v = 1.0f;
     if (shadow_res >= 0.0f) {
         const float d = length(p - shadow_cam);
         if (d < shadow_split.w) {
-            const uint c = max(d < shadow_split.x ? 0u : (d < shadow_split.y ? 1u : (d < shadow_split.z ? 2u : 3u)),
-                               uint(l_shadow_frame.z + 0.5f));
+            const uint c = max(2u, uint(l_shadow_frame.z + 0.5f));
             const float4 lp = mul(float4(p, 1.0f), light_vp[c]);
             const float2 suv = float2(lp.x * 0.5f + 0.5f, 0.5f - lp.y * 0.5f) * shadow_scale[c];
             v = g_shadow.SampleCmpLevelZero(g_shadow_cmp, float3(suv, float(c)), lp.z - 0.12f / shadow_depth_range[c]);
@@ -173,7 +193,7 @@ float3 nf_hit_irradiance(float3 p, float3 n) {
         if (meta.x < 0.5f) continue;
         const float3 pc = float3(pq * 2 + 1) + meta.yzw;
         const float3 v = pc - q;
-        if (nf_occ_point(q + v * 0.5f) > 0.5f) continue;
+        if (!nf_clear(q, pc)) continue;
         const float3 tw = lerp(1.0f - t, t, float3(o));
         const float bf = 0.5f + 0.5f * dot(v * rsqrt(max(dot(v, v), 1e-6f)), n);
         const float w = tw.x * tw.y * tw.z * (bf * bf + 0.05f);
@@ -195,7 +215,7 @@ float nf_occ_lin(float3 wp) {
 
 // The radiance a wall sends back along -d from hit point p (in air, just
 // short of the rock), its normal from the occupancy's gradient.
-float3 nf_hit(float3 p, float3 d) {
+float3 nf_hit(float3 p, float3 d, float t) {
     const float e = 0.5f;
     const float3 g = float3(nf_occ_lin(p + float3(e, 0, 0)) - nf_occ_lin(p - float3(e, 0, 0)),
                             nf_occ_lin(p + float3(0, e, 0)) - nf_occ_lin(p - float3(0, e, 0)),
@@ -205,18 +225,21 @@ float3 nf_hit(float3 p, float3 d) {
     float3 E = float3(0.0f, 0.0f, 0.0f);
     // The sun. The volume's wall is a metre-resolution guess at the real
     // mesh, so the shadow is taken half a metre out along the normal.
+    // Only for a hit near the probe (faded from kNfSunNear to kNfSunFar
+    // metres of ray): a sunlit patch far down a tunnel is a sliver rays
+    // rarely find, and each that did lit its probe tenfold -- the torch-lit
+    // tunnel's meter wandered 0.25-1.25 nits with it, 0.22-0.29 without.
+    // Near the patch many rays find it, smoothly; further off its light
+    // arrives second-hand, through those probes (nf_hit_irradiance below).
     const float nl = dot(n, kSunDir);
-    if (nl > 0.0f) E += kSunLux * (nl * nf_key_visibility(p + n * 0.5f));
-    // Local lights: a torch, a fire -- and anything that glows.
-    const uint nlights = min(uint(l_cluster.w), nf_lights);
-    [loop] for (uint i = 0u; i < nlights; ++i) {
-        const LocalLightGpu Lg = g_lights[i];
-        float3 l;
-        const float3 El = light_illuminance(Lg, p, l);
-        const float ndl = dot(n, l);
-        if (ndl <= 0.0f || max(El.r, max(El.g, El.b)) <= 0.0f) continue;
-        E += El * (ndl * local_shadow(Lg, p, n, l));
-    }
+    const float sun_w = 1.0f - smoothstep(kNfSunNear, kNfSunFar, t);
+    if (nl > 0.0f && sun_w > 0.0f) E += kSunLux * (nl * sun_w * nf_key_visibility(p + n * 0.5f));
+    // NOT local lights. Their bounce came in through the probes' history --
+    // faded in over seconds, and a ray that struck rock beside a flame (the
+    // inverse square at a few tens of centimetres) lit its probe tenfold for
+    // a frame: a torch-lit tunnel pulsed 2 stops every few seconds. A light's
+    // bounce is now its own instant fill (local_lights.hlsli), shadowed by
+    // its own map. The probes carry the sky and the sun.
     E += nf_hit_irradiance(p, n);
     const float3 L = kNfWallAlbedo * (E * (1.0f / kPi));
     return (any(isnan(L)) || any(isinf(L))) ? float3(0.0f, 0.0f, 0.0f) : L;
@@ -259,7 +282,7 @@ void nf_ray(float3 o, float3 d, out float vis, out float3 rad) {
                 if (nf_occ_lin(o + d * tm) > 0.5f) tb = tm;
                 else ta = tm;
             }
-            rad = nf_hit(o + d * ta, d);
+            rad = nf_hit(o + d * ta, d, ta);
             return;
         }
         t_air = t;
@@ -270,10 +293,51 @@ void nf_ray(float3 o, float3 d, out float vis, out float3 rad) {
     }
 }
 
-[numthreads(64, 1, 1)]
-void cs_nf_probe(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= nf_probes) return;
-    const uint pi = g_probe_list[id.x] & 0x7FFFFFFFu;
+// One GROUP a probe and one THREAD a ray. A probe a thread walked its 64
+// rays one after another -- up to 96 steps each, and a lit hit gathering 8
+// neighbouring probes -- and the pass lasted as long as the slowest probe's
+// serial chain: 0.8 ms at 1440p whether it traced 4,608 probes (play) or
+// all 131k (a still), and twice that of 32 rays. A thread a ray makes the
+// chain one ray long; the group sums the rays' SH in group memory.
+// Dispatched (kNfProbeRowGroups, rows): the list is longer than one
+// dimension's 65,535 groups in a still.
+static const uint kNfProbeRowGroups = 256u;
+// Each probe's own turn of the ray set, from a hash of its index, on top of
+// the update's shared rotation. With the rotation SHARED, every probe's rays
+// pointed the same way in the same frame: down a straight tunnel the sunlit
+// ramp at its mouth is a sliver of sky most rays miss, and on the frame the
+// rotation aimed one up the tunnel, every probe caught 100 klx at once and
+// the whole tunnel flared 10x (the torch walk's meter: 16 pulses in 75 s).
+// Turned per probe, the same rare rays land in a few probes a frame, which
+// their history averages.
+uint nf_pcg(uint v) {
+    const uint s = v * 747796405u + 2891336453u;
+    const uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+float3x3 nf_probe_turn(uint pi) {
+    const uint h0 = nf_pcg(pi * 3u + 1u), h1 = nf_pcg(h0 + 7u), h2 = nf_pcg(h1 + 13u);
+    const float u1 = float(h0 & 0xFFFFFFu) / 16777216.0f;
+    const float u2 = float(h1 & 0xFFFFFFu) / 16777216.0f * 6.2831853f;
+    const float u3 = float(h2 & 0xFFFFFFu) / 16777216.0f * 6.2831853f;
+    const float a = sqrt(1.0f - u1), b = sqrt(u1);
+    const float x = a * sin(u2), y = a * cos(u2), z = b * sin(u3), w = b * cos(u3);
+    return float3x3(1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
+                    2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+                    2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y));
+}
+
+groupshared float4 gs_nf_v[kNfRays];
+groupshared float4 gs_nf_r[kNfRays];
+groupshared float4 gs_nf_g[kNfRays];
+groupshared float4 gs_nf_b[kNfRays];
+
+[numthreads(kNfRays, 1, 1)]
+void cs_nf_probe(uint3 gid : SV_GroupID, uint k : SV_GroupIndex) {
+    const uint li = gid.y * kNfProbeRowGroups + gid.x;
+    const bool live = li < nf_probes;
+    const uint entry = live ? g_probe_list[li] : 0u;
+    const uint pi = entry & 0x3FFFFFFFu;
     const int3 s = int3(pi % uint(kNfProbeDims.x), (pi / uint(kNfProbeDims.x)) % uint(kNfProbeDims.y),
                         pi / uint(kNfProbeDims.x * kNfProbeDims.y));
     const int3 op = nf_origin.xyz / 2;
@@ -281,6 +345,10 @@ void cs_nf_probe(uint3 id : SV_DispatchThreadID) {
     const float3 c = float3(p * 2 + 1);
     const uint o4 = pi * uint(kNfProbeFloat4s);
 
+    // What the probe needs, the same in every thread of its group (so the
+    // barriers below stay in uniform flow): 0 nothing (past the list), 1 a
+    // copy of the heightfield, 2 switched off, 3 traced.
+    //
     // At or over the top surface: open air, which the heightfield already
     // answers -- and a probe there only matters to a reader under the
     // surface as a neighbour, which its occupancy test mostly rejects.
@@ -291,10 +359,66 @@ void cs_nf_probe(uint3 id : SV_DispatchThreadID) {
     // pit, which the map's texel maximum spans). Open air over a slope also
     // sits under that maximum; tracing it -- and since the hits are lit,
     // lighting every hit -- doubled the walking cost.
-    float2 uv;
-    float top;
-    const float ttop = u_top[nf_wrap(int3(int(floor(c.x + 0.5f)), 0, int(floor(c.z + 0.5f))), kNfDims).xz];
-    if (nf_hf_uv(c.xz, uv, top) && c.y > top - 1.5f && c.y > ttop - 0.5f) {
+    uint mode = 0u;
+    float2 uv = 0.0f;
+    float3 off = float3(0.0f, 0.0f, 0.0f);
+    if (live) {
+        float top;
+        const float ttop = u_top[nf_wrap(int3(int(floor(c.x + 0.5f)), 0, int(floor(c.z + 0.5f))), kNfDims).xz];
+        if (nf_hf_uv(c.xz, uv, top) && c.y > top - 1.5f && c.y > ttop - 0.5f) {
+            mode = 1u;
+        } else {
+            // In rock: move it out into the nearest air along an axis, or
+            // switch it off. A probe in rock would see nothing and darken the
+            // air beside it.
+            mode = 3u;
+            if (nf_occ_point(c) > 0.5f) {
+                mode = 2u;
+                static const float3 kTry[6] = {float3(0, 0.9f, 0), float3(0.9f, 0, 0), float3(-0.9f, 0, 0),
+                                               float3(0, 0, 0.9f), float3(0, 0, -0.9f), float3(0, -0.9f, 0)};
+                [loop] for (int q = 0; q < 6 && mode == 2u; ++q) {
+                    if (nf_occ_point(c + kTry[q]) < 0.5f) { off = kTry[q]; mode = 3u; }
+                }
+            }
+        }
+    }
+
+    // This thread's ray of the N over the sphere (a Fibonacci set, turned by
+    // this update's random rotation), projected into L1 SH as radiance:
+    // c0 += L Y00 dw, c1 += L Y1 d dw.
+    float4 sv = 0.0f, sr = 0.0f, sg = 0.0f, sb = 0.0f;
+    if (mode == 3u) {
+        const float dw = 4.0f * 3.14159265f / float(kNfRays);
+        const float zf = 1.0f - (2.0f * float(k) + 1.0f) / float(kNfRays);
+        const float rr = sqrt(saturate(1.0f - zf * zf));
+        const float ph = 2.39996323f * float(k);
+        const float3 d0 = mul(nf_probe_turn(pi), float3(rr * cos(ph), zf, rr * sin(ph)));
+        const float3 d = float3(dot(nf_rot0.xyz, d0), dot(nf_rot1.xyz, d0), dot(nf_rot2.xyz, d0));
+        float vis;
+        float3 rad;
+        nf_ray(c + off, d, vis, rad);
+        const float4 basis = float4(kHfY00, kHfY1 * d) * dw;
+        sv = vis * basis;
+        sr = rad.r * basis;
+        sg = rad.g * basis;
+        sb = rad.b * basis;
+    }
+    gs_nf_v[k] = sv;
+    gs_nf_r[k] = sr;
+    gs_nf_g[k] = sg;
+    gs_nf_b[k] = sb;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint h = kNfRays / 2u; h > 0u; h >>= 1u) {
+        if (k < h) {
+            gs_nf_v[k] += gs_nf_v[k + h];
+            gs_nf_r[k] += gs_nf_r[k + h];
+            gs_nf_g[k] += gs_nf_g[k + h];
+            gs_nf_b[k] += gs_nf_b[k + h];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (k != 0u || mode == 0u) return;
+    if (mode == 1u) {
         u_probes[o4 + 0] = g_hf_vis.SampleLevel(g_gi_linear, uv, 0.0f);
         u_probes[o4 + 1] = g_hf_r.SampleLevel(g_gi_linear, uv, 0.0f);
         u_probes[o4 + 2] = g_hf_g.SampleLevel(g_gi_linear, uv, 0.0f);
@@ -302,51 +426,18 @@ void cs_nf_probe(uint3 id : SV_DispatchThreadID) {
         u_probes[o4 + 4] = float4(1.0f, 0.0f, 0.0f, 0.0f);
         return;
     }
-
-    // In rock: move it out into the nearest air along an axis, or switch it
-    // off. A probe in rock would see nothing and darken the air beside it.
-    float3 off = float3(0.0f, 0.0f, 0.0f);
-    float valid = 1.0f;
-    if (nf_occ_point(c) > 0.5f) {
-        valid = 0.0f;
-        static const float3 kTry[6] = {float3(0, 0.9f, 0), float3(0.9f, 0, 0), float3(-0.9f, 0, 0),
-                                       float3(0, 0, 0.9f), float3(0, 0, -0.9f), float3(0, -0.9f, 0)};
-        [loop] for (int k = 0; k < 6 && valid < 0.5f; ++k) {
-            if (nf_occ_point(c + kTry[k]) < 0.5f) { off = kTry[k]; valid = 1.0f; }
-        }
-    }
-    if (valid < 0.5f) {
+    if (mode == 2u) {
         [unroll] for (int z = 0; z < 5; ++z) u_probes[o4 + uint(z)] = float4(0.0f, 0.0f, 0.0f, 0.0f);
         return;
     }
-
-    // N rays over the sphere (a Fibonacci set, turned by this update's random
-    // rotation), projected into L1 SH as radiance: c0 += L Y00 dw,
-    // c1 += L Y1 d dw. Blended into what the probe held, DDGI's way, so 32
-    // rays an update average to hundreds; a probe an edit dirtied starts
-    // over (its index carries the top bit).
-    const bool fresh = (g_probe_list[id.x] & 0x80000000u) != 0u;
-    const float dw = 4.0f * 3.14159265f / float(kNfRays);
-    float4 sv = 0.0f, sr = 0.0f, sg = 0.0f, sb = 0.0f;
-    [loop] for (int k = 0; k < kNfRays; ++k) {
-        const float zf = 1.0f - (2.0f * float(k) + 1.0f) / float(kNfRays);
-        const float rr = sqrt(saturate(1.0f - zf * zf));
-        const float ph = 2.39996323f * float(k);
-        const float3 d0 = float3(rr * cos(ph), zf, rr * sin(ph));
-        const float3 d = float3(dot(nf_rot0.xyz, d0), dot(nf_rot1.xyz, d0), dot(nf_rot2.xyz, d0));
-        float vis;
-        float3 rad;
-        nf_ray(c + off, d, vis, rad);
-        const float4 basis = float4(kHfY00, kHfY1 * d) * dw;
-        sv += vis * basis;
-        sr += rad.r * basis;
-        sg += rad.g * basis;
-        sb += rad.b * basis;
-    }
-    const float keep = (fresh || u_probes[o4 + 4].x < 0.5f) ? 0.0f : kNfHysteresis;
-    u_probes[o4 + 0] = lerp(sv, u_probes[o4 + 0], keep);
-    u_probes[o4 + 1] = lerp(sr, u_probes[o4 + 1], keep);
-    u_probes[o4 + 2] = lerp(sg, u_probes[o4 + 2], keep);
-    u_probes[o4 + 3] = lerp(sb, u_probes[o4 + 3], keep);
+    // Blended into what the probe held, DDGI's way, by how often it is traced
+    // (nf_keep_*); a probe an edit dirtied starts over (the entry's top bit).
+    const bool fresh = (entry & 0x80000000u) != 0u;
+    const bool every = (entry & 0x40000000u) != 0u;
+    const float keep = (fresh || u_probes[o4 + 4].x < 0.5f) ? 0.0f : every ? nf_keep_box : nf_keep_rr;
+    u_probes[o4 + 0] = lerp(gs_nf_v[0], u_probes[o4 + 0], keep);
+    u_probes[o4 + 1] = lerp(gs_nf_r[0], u_probes[o4 + 1], keep);
+    u_probes[o4 + 2] = lerp(gs_nf_g[0], u_probes[o4 + 2], keep);
+    u_probes[o4 + 3] = lerp(gs_nf_b[0], u_probes[o4 + 3], keep);
     u_probes[o4 + 4] = float4(1.0f, off);
 }
