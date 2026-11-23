@@ -990,6 +990,28 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
     HRESULT hr = device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
     if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (mesh)", hr); return false; }
 
+    // The depth prepass (record_scene): depth only, through ps_depth's LOD
+    // fade clip; then the colour pass over that depth with EQUAL and no
+    // depth write, so each terrain pixel is shaded once. Both from the main
+    // pipeline's description, so culling and the vertex shader are the same.
+    ComPtr<ID3D12PipelineState> eq, prepass;
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC q = pd;
+        q.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_EQUAL;
+        q.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        hr = device_->CreateGraphicsPipelineState(&q, IID_PPV_ARGS(&eq));
+        if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (mesh, equal)", hr); return false; }
+        ComPtr<ID3DBlob> ps_depth;
+        if (!compile_shader(kMeshShaderPath, "ps_depth", "ps_5_1", ps_depth, error)) return false;
+        q = pd;
+        q.PS.pShaderBytecode = ps_depth->GetBufferPointer();
+        q.PS.BytecodeLength = ps_depth->GetBufferSize();
+        q.NumRenderTargets = 0;
+        for (UINT k = 0; k < 3; ++k) q.RTVFormats[k] = DXGI_FORMAT_UNKNOWN;
+        hr = device_->CreateGraphicsPipelineState(&q, IID_PPV_ARGS(&prepass));
+        if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (mesh, prepass)", hr); return false; }
+    }
+
     // The same mesh as wireframe, for drawing over the raymarch. Depth off and
     // no culling: the point is to see where the edges land relative to the
     // marched surface, including the far side.
@@ -1037,6 +1059,8 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
 
     if (ready_) wait_for_gpu();
     mesh_pso_ = pso;
+    mesh_eq_pso_ = eq;
+    mesh_prepass_pso_ = prepass;
     mesh_wire_pso_ = wire;
     mesh_shadow_pso_ = shadow;
     mesh_top_pso_ = top;
@@ -4102,6 +4126,21 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         // One command per slot. A retired or never-used slot has all-zero
         // arguments and the command processor skips it, which is cheaper than
         // compacting the array every time a chunk moves.
+        //
+        // The depth prepass first: the chunks draw in slot order, not near to
+        // far, so without it every wall behind a wall was shaded and painted
+        // over -- 1.63 shaded pixels per screen pixel in a dug chamber. Depth
+        // costs 0.08 ms at 4K; the colour pass then tests EQUAL and shades
+        // each pixel once: terrain 8.6 -> 5.8 ms there, 5.7 -> 3.6 in an open
+        // pit, the picture the same. The rocks and the character after it
+        // keep their own pipelines (LESS, writing), and test against it.
+        const bool prepass = terrain_prepass_ && !wire;
+        if (prepass) {
+            cmd_->SetPipelineState(mesh_prepass_pso_.Get());
+            cmd_->ExecuteIndirect(cmd_sig_.Get(), kSlots, mesher_.draw_args(), 0, nullptr, 0);
+            prof_.mark(cmd_.Get(), "terrain prepass");
+            cmd_->SetPipelineState(mesh_eq_pso_.Get());
+        }
         prof_.stat_begin(cmd_.Get(), "terrain");
         cmd_->ExecuteIndirect(cmd_sig_.Get(), kSlots, mesher_.draw_args(), 0, nullptr, 0);
         prof_.stat_end(cmd_.Get());

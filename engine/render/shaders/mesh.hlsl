@@ -430,12 +430,26 @@ float4 ps_top(VSOut i) : SV_Target0 {
     return float4(albedo, 1.0f);
 }
 
-SceneOut ps_main(VSOut i) {
+// A chunk cross-fading between LOD levels: the 4x4 dither it is drawn
+// through, complementary for the one coming in and the one going out.
+void lod_fade_clip(VSOut i) {
     if (i.fade.x > 0.5f) {
         const float t = dither_threshold(i.clip.xy);
         if (i.fade.x < 1.5f) clip(i.fade.y - t);   // fading in
         else                 clip(t - i.fade.y);   // fading out
     }
+}
+
+// The terrain's depth prepass (renderer.cpp): depth only, through the same
+// fade dither as ps_main, so the colour pass's EQUAL test passes on exactly
+// the pixels it would have drawn. Both run vs_main, so the depths match bit
+// for bit, as the trees' prepass does.
+void ps_depth(VSOut i) {
+    lod_fade_clip(i);
+}
+
+SceneOut ps_main(VSOut i) {
+    lod_fade_clip(i);
     if (wire > 0.5f) return scene_flat(float3(1.0f, 0.25f, 0.65f));
     // Debug views. The first attempt at "where is the curtain visible" tested
     // the interpolated normal's length, which a sharp CREASE also shortens --

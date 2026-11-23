@@ -1017,6 +1017,9 @@ void register_tunables() {
     // Trees: the depth prepass, live, for A/B (--no-tree-prepass).
     toggle("tree_prepass", "Trees", "Depth prepass", [&] { return R.tree_prepass(); },
            [&](bool b) { R.set_tree_prepass(b); });
+    // Terrain: its depth prepass, live, for A/B (--no-terrain-prepass).
+    toggle("terrain_prepass", "Terrain", "Depth prepass", [&] { return R.terrain_prepass(); },
+           [&](bool b) { R.set_terrain_prepass(b); });
 }
 
 // Brings the UI up over the window loop. Failure leaves the engine as it was
@@ -1730,6 +1733,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (tg != std::string::npos) g_renderer.tree_settings().debug = float(std::atof(c2.c_str() + tg + 12));
         if (c2.find("--no-trees") != std::string::npos) g_renderer.set_trees(false);
         if (c2.find("--no-tree-prepass") != std::string::npos) g_renderer.set_tree_prepass(false);
+        if (c2.find("--no-terrain-prepass") != std::string::npos) g_renderer.set_terrain_prepass(false);
         if (c2.find("--no-shadows") != std::string::npos) g_renderer.set_shadows(false);
         if (c2.find("--no-foliage") != std::string::npos) g_renderer.set_foliage(false);
         if (c2.find("--no-taa") != std::string::npos) g_renderer.set_taa(false);

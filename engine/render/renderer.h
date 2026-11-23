@@ -319,6 +319,10 @@ public:
     // The trees' depth prepass (tree_renderer.h); on by default, --no-tree-prepass for A/B.
     void set_tree_prepass(bool on) { trees_.set_prepass(on); }
     bool tree_prepass() const { return trees_.prepass(); }
+    // The terrain's depth prepass: each terrain pixel shaded once. On by
+    // default; --no-terrain-prepass and the Terrain tunable for A/B.
+    void set_terrain_prepass(bool on) { terrain_prepass_ = on; }
+    bool terrain_prepass() const { return terrain_prepass_; }
     // Ground cover: grass, flowers, bushes. --no-foliage and G for A/B.
     void set_foliage(bool on) { foliage_on_ = on; }
     bool foliage_on() const { return foliage_on_; }
@@ -660,6 +664,9 @@ private:
     ComPtr<ID3D12Resource>         depth_;
     ComPtr<ID3D12RootSignature>    mesh_root_;
     ComPtr<ID3D12PipelineState>    mesh_pso_, mesh_wire_pso_;
+    // The terrain's depth prepass and its EQUAL colour pass (record_scene).
+    ComPtr<ID3D12PipelineState>    mesh_prepass_pso_, mesh_eq_pso_;
+    bool terrain_prepass_ = true;
     ComPtr<ID3D12RootSignature> water_root_;
     ComPtr<ID3D12PipelineState> water_pso_;
     ComPtr<ID3D12Resource>      water_indices_;

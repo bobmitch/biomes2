@@ -109,7 +109,7 @@ Every mode takes `--character male|female` (which pack; male by default) and
 pre-L2 sun), the weather's `--sea-state <0..1>`, `--wind <m/s>`,
 `--wind-dir <deg>` and `--swell <m>` (automatic weather otherwise), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
 `--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`,
-`--aniso <1|2|4|8|16>` (the scans' filtering), `--no-rocks`,
+`--aniso <1|2|4|8|16>` (the scans' filtering), `--no-terrain-prepass`, `--no-rocks`,
 `--no-forest-shell`, `--no-clouds`, `--no-rain`, `--rain <0..1>`, `--wet <0..1>`,
 `--no-lightning`, `--no-height-fog` and `--height-fog <k>` (a multiplier on the
 exploration fog); `--shot` also
@@ -658,6 +658,24 @@ confirmed it twice.
   default), 5.96 (8x, the old fixed sampler), 6.16 (16x); 4x and 8x differ
   on 0.04% of pixels by more than 8 levels. Graphics, "Texture filtering",
   saved; `--aniso <n>`. It covers terrain, rocks, the character and bark.
+- **The terrain draws a depth prepass** (`record_scene`; `--no-terrain-prepass`
+  and the Terrain tunable for A/B). The chunks draw in slot order, not near
+  to far, so every wall behind a wall was shaded and painted over: 1.63
+  terrain pixel-shader invocations per screen pixel in a dug chamber. Now
+  `vs_main` with `ps_depth` (the LOD fade clip, nothing else) writes depth,
+  0.11 ms at 4K, and the colour pass tests EQUAL with no write -- the
+  trees' scheme. Measured at 4K: the dug chamber (`build/snapshots/
+  20261122-192039`) terrain 8.44 -> 5.74 ms, frame 14.6 -> 11.9; the lit pit
+  5.59 -> 3.49, frame 15.7 -> 13.7; a 1440p flight's median 5.90 -> 4.92;
+  invocations exactly 1.000 a pixel; stills the same to 2 levels; flight
+  holes 0. Rocks and the character keep their LESS, writing pipelines and
+  test against it. **The fade clip must be identical in both passes**
+  (`lod_fade_clip`, shared). It was checked by forcing every chunk
+  mid-fade: the pit's still matched with and without; the chamber's
+  differed on 1.4% of far pixels, scattered singly, where the forced test
+  (not complementary, unlike a real fade) drew two LOD levels over the same
+  ground and their depths rounded equal -- LESS keeps the first, EQUAL the
+  last. A real fade's dithers are complementary, so no pixel is drawn twice.
 - **s5 is a TABLE, not a static sampler**, on the terrain's and the trees'
   root signatures: `Renderer`'s sampler heap holds one sampler per level,
   made once and never rewritten, and the option only changes which one the
