@@ -47,6 +47,12 @@ inline void biome_colour(int b, unsigned char* c) {
     c[2] = static_cast<unsigned char>(40 + 190 * bl);
 }
 
+// Water a player can wade (still-water depth under PhysicsWorld::kSwimLeave,
+// 0.85 m; tools/shared/reach.h has the same number). Its own colour, so the
+// layer 0 shelf shows as what it is for: the crossings.
+static const float kShallowDepth = 0.85f;
+inline void shallows_colour(unsigned char* c) { c[0] = 112; c[1] = 178; c[2] = 172; }
+
 // Shaded relief. The A4 exit criterion is whether this reads as a world
 // rather than as noise, and that is not a thing an assertion can answer.
 inline void render_relief_tile(const SeedWorld& w, const WorldParams& wp,
@@ -69,7 +75,9 @@ inline void render_relief_tile(const SeedWorld& w, const WorldParams& wp,
                 const float h0 = terrain_height(w, wp, table, x, z, rr);
                 float rw = 0.0f, rd = 0.0f;
                 const float rdist = nearest_river(w, wp, x, z, rw, rd);
-                if (h0 <= 0.0f) {
+                if (h0 <= 0.0f && -h0 < kShallowDepth) {
+                    shallows_colour(c);
+                } else if (h0 <= 0.0f) {
                     const float d = wg_saturate(-h0 / 160.0f);
                     c[0] = static_cast<unsigned char>(46 - 30 * d);
                     c[1] = static_cast<unsigned char>(78 - 46 * d);
@@ -124,7 +132,9 @@ inline void render_tile(const SeedWorld& w, const WorldParams& wp,
                 c[0] = 10; c[1] = 12; c[2] = 18;              // void past the terminator
             } else {
                 const float h = layer0_height(x, z, rr, w.l0);
-                if (h <= wp.sea_level) {
+                if (h <= wp.sea_level && still_water_depth(w, wp, x, z, rr) < kShallowDepth) {
+                    shallows_colour(c);
+                } else if (h <= wp.sea_level) {
                     const float d = wg_saturate(-h * 1.2f);      // deeper water, darker
                     c[0] = static_cast<unsigned char>(46 - 30 * d);
                     c[1] = static_cast<unsigned char>(78 - 46 * d);
