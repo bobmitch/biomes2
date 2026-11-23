@@ -102,7 +102,7 @@ struct WorldParams {
     // --- layer 0 PROTOTYPE: land as a lottery with fences ------------------
     // docs/worldgen-design.md, "Layer 0, proposed". Every default below is
     // today's world: the regime off (amplitude, mean and fine weight 0), no
-    // per-seed draws. layer0_noise evaluates
+    // per-seed draws, no knee. layer0_noise evaluates
     // nothing new while they are, so the golden hashes do not move.
     float fine_freq         = 1.0f / 1500.0f;   // the fine continent noise, islets
     int   fine_octaves      = 4;
@@ -118,6 +118,12 @@ struct WorldParams {
     float regime_size_lo    = 2500.0f, regime_size_hi = 8000.0f;   // metres
     float regime_mean_lo    = -0.05f,  regime_mean_hi = 0.05f;
     float regime_amp_lo     = 0.0f,    regime_amp_hi  = 0.15f;
+    // The land knee: a seed whose raw land fraction L is over knee_k has its
+    // offset lowered until land is k + (c-k)(L-k)/((L-k)+(c-k)).
+    bool  knee              = false;
+    float knee_k            = 0.35f;
+    float knee_c            = 0.40f;
+    int   knee_grid         = 256;    // coarse layer-0 grid the knee measures on
 
     // layer 1
     float danger_w          = 0.60f;      // the feel parameter; see tools/validate/README.md
@@ -165,6 +171,13 @@ struct WorldParams {
 // the knee (if on) and keeps the result in SeedWorld::l0, which is what every
 // caller of layer 0 reads -- CPU here, and the GPU through world_gpu.cpp.
 Layer0Params make_layer0(const WorldParams& wp, uint64_t world_seed);
+
+// The land knee. Measures the raw land fraction on a knee_grid^2 layer-0
+// grid and, when it is over knee_k, bisects l0.land_offset down until the
+// grid's land count reaches the knee's target. Comparisons only. Reports the
+// raw and final grid fractions and the milliseconds it took.
+void apply_land_knee(Layer0Params& l0, const WorldParams& wp,
+                     float& raw_land, float& knee_land, float& ms);
 
 // Thin adapter onto the canonical field function in worldgen/shaders/field.h.
 // The arithmetic lives there so the harness, the engine and the viewer cannot
@@ -305,6 +318,9 @@ struct SeedWorld {
     float    land_fraction = 0.0f;
     // Layer 0 as this seed uses it: draws made, knee applied.
     Layer0Params l0;
+    float    knee_raw_land = 0.0f;   // knee grid's land fraction before the knee
+    float    knee_land = 0.0f;       // and after (equal when it did not bite)
+    float    knee_ms = 0.0f;
 
     // --- layer 5 ---
     // The drainage network as segments, each from a grid cell to the one it

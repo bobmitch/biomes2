@@ -77,8 +77,8 @@ struct WorldConstants {
     float    detail_gain;
     unsigned s_detail;
 
-    // Layer 0 prototype: SeedWorld::l0, the seed's draws. Defaults evaluate
-    // nothing new.
+    // Layer 0 prototype: SeedWorld::l0 (the seed's draws; land_offset above
+    // is l0's, so the knee reaches the GPU too). Defaults evaluate nothing new.
     float    fine_freq;
     int      fine_octaves;
     float    fine_weight;

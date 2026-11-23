@@ -60,7 +60,7 @@ cbuffer WorldConstants : register(b1) {
     uint  w_s_detail;
 
     // Layer 0 prototype (docs/worldgen-design.md, "Layer 0, proposed"), this
-    // seed's values, draws made.
+    // seed's values: draws made, and w_land_offset is the knee's if it bit.
     float w_fine_freq;
     int   w_fine_octaves;
     float w_fine_weight;

@@ -31,9 +31,10 @@ namespace view {
 // a plain bisection.
 inline float land_fraction_for(const worldgen::WorldParams& wp, uint64_t seed, int grid) {
     using namespace worldgen;
-    // The seed's own layer 0, its draws included, exactly as build_world
-    // makes it.
-    const Layer0Params l0 = make_layer0(wp, seed);
+    // The seed's own layer 0: its draws, and the knee if it is on, exactly as
+    // build_world makes it.
+    Layer0Params l0 = make_layer0(wp, seed);
+    if (wp.knee) { float a, b, c; apply_land_knee(l0, wp, a, b, c); }
     const float R = wp.radius;
     const float step = 2.0f * R / grid;
     long long disc = 0, land = 0;

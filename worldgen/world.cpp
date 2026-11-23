@@ -1,6 +1,7 @@
 #include "worldgen/world.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <functional>
 #include <queue>
@@ -189,6 +190,57 @@ Layer0Params make_layer0(const WorldParams& wp, uint64_t world_seed) {
     p.seed_fine = feature_seed(world_seed, FEATURE_CONTINENT_FINE);
     p.seed_regime = feature_seed(world_seed, FEATURE_REGIME);
     return p;
+}
+
+void apply_land_knee(Layer0Params& l0, const WorldParams& wp,
+                     float& raw_land, float& knee_land, float& ms) {
+    const std::chrono::high_resolution_clock::time_point t0 = std::chrono::high_resolution_clock::now();
+    // The noise once per sample; the offset only enters layer0_shape, so each
+    // pass of the bisection is the radial shape and a comparison.
+    const int   G = wp.knee_grid > 8 ? wp.knee_grid : 8;
+    const float R = wp.radius;
+    const float step = 2.0f * R / G;
+    std::vector<float> nn, rr;
+    nn.reserve(static_cast<size_t>(G) * G);
+    rr.reserve(static_cast<size_t>(G) * G);
+    for (int j = 0; j < G; ++j) {
+        const float z = -R + (j + 0.5f) * step;
+        for (int i = 0; i < G; ++i) {
+            const float x = -R + (i + 0.5f) * step;
+            const float r = std::sqrt(x * x + z * z) / R;
+            if (r > 1.0f) continue;
+            nn.push_back(layer0_noise(x, z, l0, 0.0f).n);
+            rr.push_back(r);
+        }
+    }
+    const long long disc = static_cast<long long>(nn.size());
+    auto land_at = [&](float off) {
+        long long land = 0;
+        for (size_t k = 0; k < nn.size(); ++k) {
+            if (layer0_shape(nn[k] + off, rr[k], l0.centre_floor, l0.edge_drop) > wp.sea_level) ++land;
+        }
+        return land;
+    };
+    const long long raw = land_at(l0.land_offset);
+    raw_land = disc > 0 ? static_cast<float>(static_cast<double>(raw) / disc) : 0.0f;
+    knee_land = raw_land;
+    const float k = wp.knee_k, c = wp.knee_c;
+    if (disc > 0 && raw_land > k && c > k) {
+        const float e = raw_land - k;
+        const float target = k + (c - k) * e / (e + (c - k));
+        const long long want = static_cast<long long>(target * static_cast<float>(disc) + 0.5f);
+        // Land is monotone in the offset (smax is), so bisect: hi keeps
+        // land >= want, lo has less. 16 passes is 1e-5 of mask.
+        float hi = l0.land_offset, lo = l0.land_offset - 0.6f;
+        for (int it = 0; it < 16; ++it) {
+            const float mid = 0.5f * (lo + hi);
+            if (land_at(mid) >= want) hi = mid; else lo = mid;
+        }
+        l0.land_offset = hi;
+        knee_land = static_cast<float>(static_cast<double>(land_at(hi)) / disc);
+    }
+    const std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
+    ms = static_cast<float>(std::chrono::duration<double, std::milli>(t1 - t0).count());
 }
 
 // Distance to the nearest river segment, with that channel's shape. Shared by
@@ -1079,9 +1131,12 @@ SeedWorld build_world(uint64_t world_seed,
     w.s_flats = feature_seed(world_seed, FEATURE_FLATS);
     const uint32_t s_dang = w.s_dang, s_wx = w.s_wx, s_wz = w.s_wz;
 
-    // Layer 0 first: everything from the raster (layers 2 and 3) down reads
-    // the seed's own parameters.
+    // Layer 0 first: the knee moves the offset, and everything from the
+    // raster (layers 2 and 3) down reads the result.
     w.l0 = make_layer0(wp, world_seed);
+    if (wp.knee) {
+        apply_land_knee(w.l0, wp, w.knee_raw_land, w.knee_land, w.knee_ms);
+    }
     const uint32_t s_cell = feature_seed(world_seed, FEATURE_CELLS);
 
     w.pts = scatter_cells(wp, s_cell);
@@ -1144,6 +1199,7 @@ SeedWorld build_world(uint64_t world_seed,
     }
 
     w.land_fraction = disc_area > 0.0 ? static_cast<float>(land_area / disc_area) : 0.0f;
+    if (!wp.knee) { w.knee_raw_land = w.land_fraction; w.knee_land = w.land_fraction; }
 
     // Build cell records from the rasterised truth.
     w.cells.resize(n);

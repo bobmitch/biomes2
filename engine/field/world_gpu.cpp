@@ -144,6 +144,7 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
                 else if (k == "regime_mean") p.regime_mean = v;
                 else if (k == "regime_amp") p.regime_amp = v;
                 else if (k == "regime_draw") p.regime_draw = v != 0.0f;
+                else if (k == "knee") p.knee = v != 0.0f;
             }
             at = end + 1;
         }
@@ -318,7 +319,7 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
     constants_.centre_floor = world_.l0.centre_floor;
     constants_.edge_drop = params_.edge_drop;
     constants_.sea_level = params_.sea_level;
-    constants_.land_offset = world_.l0.land_offset;
+    constants_.land_offset = world_.l0.land_offset;   // the seed's: the knee may have moved it
     constants_.danger_w = params_.danger_w;
     constants_.danger_freq = params_.danger_freq;
     constants_.danger_octaves = params_.danger_octaves;

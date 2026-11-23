@@ -2279,6 +2279,7 @@ int main(int argc, char** argv) {
         const uint32_t s_cont = feature_seed(dump_world_seed, FEATURE_CONTINENT);
         const uint32_t s_dang = feature_seed(dump_world_seed, FEATURE_DANGER);
         Layer0Params dl0 = make_layer0(wp, dump_world_seed);
+        if (wp.knee) { float a, b, c; apply_land_knee(dl0, wp, a, b, c); }
         const float R = wp.radius;
         const int   G = wp.grid;
         const float step = 2.0f * R / G;
