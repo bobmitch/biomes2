@@ -89,6 +89,8 @@ today's. `view.exe` has a slider for each part; `validate` takes a flag for
 each and prints the readings under `islandness` (reach on foot, biomes on
 foot, shelf area, knee, draws); the engine builds it from
 `BIOMES_L0="centre_floor=0,regime_amp=0.1,shelf_width=0.06,knee=1,..."`.
+The viewer's "copy settings" button writes both lines for what is on
+screen to the clipboard and `build/view_settings.txt`.
 
 `validate.exe`, `view.exe` and `engine.exe` all read data by paths relative to
 the repository root, so run them from there. `engine.exe --shot <path>` renders

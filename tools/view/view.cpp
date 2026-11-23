@@ -31,6 +31,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -41,7 +42,7 @@ namespace {
 
 enum {
     ID_SEED_PREV = 100, ID_SEED_NEXT, ID_MODE, ID_LANDOFF, ID_RECAL,
-    ID_DRAW, ID_KNEE, ID_RESET, ID_SLIDER0 = 200
+    ID_DRAW, ID_KNEE, ID_RESET, ID_COPY, ID_SLIDER0 = 200
 };
 
 // The islandness slider reads in LAND FRACTION, tenths of a percent, because
@@ -99,6 +100,7 @@ struct App {
     std::vector<Slider> sliders;
 
     // Readings of the world on screen, recomputed on every rebuild.
+    std::string copied;             // what the last "copy settings" said
     Landmasses lm;
     FootReach  reach;
     SpawnPoint spawn;
@@ -214,8 +216,85 @@ void set_status() {
                   w.l0.regime_on ? "" : "[regime off]",
                   static_cast<double>(g.spawn.x), static_cast<double>(g.spawn.z),
                   g.spawn.strict ? "" : " (fallback)");
-    SetWindowTextA(g.status, buf);
+    std::string text = buf;
+    if (!g.copied.empty()) text += "\r\n\r\n" + g.copied;
+    SetWindowTextA(g.status, text.c_str());
     set_land_label();
+}
+
+// The settings on screen as a validate command line and the engine's
+// BIOMES_L0 string, onto the clipboard and into build/view_settings.txt, so
+// a world found by eye can be swept over 200 seeds or walked. Every layer 0
+// value is written out, defaults included, so the line does not depend on
+// what the defaults are when it is read back.
+void copy_settings() {
+    const WorldParams& p = g.wp;
+    char v[2048], e[1024];
+    std::snprintf(v, sizeof(v),
+                  "build\\validate.exe --w %.2f --danger-feat %.0f --land-offset %.5f "
+                  "--centre-floor %.2f --regime-feat %.0f --regime-mean %.4f --regime-amp %.4f "
+                  "--fine-weight %.2f --fine-regime %.2f --fine-feat %.0f",
+                  p.danger_w, 1.0 / p.danger_freq, p.land_offset,
+                  p.centre_floor, 1.0 / p.regime_freq, p.regime_mean, p.regime_amp,
+                  p.fine_weight, p.fine_regime, 1.0 / p.fine_freq);
+    std::snprintf(e, sizeof(e),
+                  "danger_w=%.2f,danger_feat=%.0f,land_offset=%.5f,centre_floor=%.2f,"
+                  "regime_feat=%.0f,regime_mean=%.4f,regime_amp=%.4f,"
+                  "fine_weight=%.2f,fine_regime=%.2f,fine_feat=%.0f",
+                  p.danger_w, 1.0 / p.danger_freq, p.land_offset, p.centre_floor,
+                  1.0 / p.regime_freq, p.regime_mean, p.regime_amp,
+                  p.fine_weight, p.fine_regime, 1.0 / p.fine_freq);
+    std::string val = v, env = e;
+    char t[512];
+    if (p.regime_draw) {
+        std::snprintf(t, sizeof(t), " --regime-draw --regime-feat-range %.0f %.0f "
+                      "--regime-mean-range %.4f %.4f --regime-amp-range %.4f %.4f",
+                      p.regime_size_lo, p.regime_size_hi, p.regime_mean_lo, p.regime_mean_hi,
+                      p.regime_amp_lo, p.regime_amp_hi);
+        val += t;
+        std::snprintf(t, sizeof(t), ",regime_draw=1,regime_size_lo=%.0f,regime_size_hi=%.0f,"
+                      "regime_mean_lo=%.4f,regime_mean_hi=%.4f,regime_amp_lo=%.4f,regime_amp_hi=%.4f",
+                      p.regime_size_lo, p.regime_size_hi, p.regime_mean_lo, p.regime_mean_hi,
+                      p.regime_amp_lo, p.regime_amp_hi);
+        env += t;
+    }
+    if (p.shelf_width > 0.0f) {
+        std::snprintf(t, sizeof(t), " --shelf-width %.3f --shelf-depth %.2f --shelf-regime %.2f",
+                      p.shelf_width, p.shelf_depth, p.shelf_regime);
+        val += t;
+        std::snprintf(t, sizeof(t), ",shelf_width=%.3f,shelf_depth=%.2f,shelf_regime=%.2f",
+                      p.shelf_width, p.shelf_depth, p.shelf_regime);
+        env += t;
+    }
+    if (p.knee) {
+        std::snprintf(t, sizeof(t), " --knee --knee-k %.3f --knee-c %.3f", p.knee_k, p.knee_c);
+        val += t;
+        std::snprintf(t, sizeof(t), ",knee=1,knee_k=%.3f,knee_c=%.3f", p.knee_k, p.knee_c);
+        env += t;
+    }
+    std::snprintf(t, sizeof(t), "# view.exe settings, seed %llu on screen\r\n",
+                  static_cast<unsigned long long>(g.seed));
+    const std::string text = std::string(t) + val + "\r\n$env:BIOMES_L0=\"" + env +
+                             "\"; build\\engine.exe\r\n";
+
+    bool clip = false;
+    if (OpenClipboard(g.hwnd)) {
+        EmptyClipboard();
+        if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, text.size() + 1)) {
+            std::memcpy(GlobalLock(mem), text.c_str(), text.size() + 1);
+            GlobalUnlock(mem);
+            clip = SetClipboardData(CF_TEXT, mem) != 0;
+            if (!clip) GlobalFree(mem);
+        }
+        CloseClipboard();
+    }
+    bool file = false;
+    if (FILE* f = std::fopen("build/view_settings.txt", "wb")) {
+        file = std::fwrite(text.data(), 1, text.size(), f) == text.size();
+        std::fclose(f);
+    }
+    g.copied = std::string("settings copied: ") + (clip ? "clipboard" : "NOT to the clipboard") +
+               (file ? ", build/view_settings.txt" : ", could not write build/view_settings.txt");
 }
 
 void redraw(int px) {
@@ -395,8 +474,10 @@ void build_controls(HWND h) {
         POINT p = {r.left, r.bottom}; ScreenToClient(h, &p);
         if (p.y > ys) ys = p.y;
     }
+    CreateWindowA("BUTTON", "copy settings (validate flags + engine BIOMES_L0)",
+                  WS_CHILD | WS_VISIBLE, 8, ys + 8, PANEL - 16, 24, h, (HMENU)ID_COPY, 0, 0);
     g.status = CreateWindowA("STATIC", "", WS_CHILD | WS_VISIBLE,
-                             8, ys + 10, PANEL - 16, 220, h, 0, 0, 0);
+                             8, ys + 40, PANEL - 16, 250, h, 0, 0, 0);
     // The GUI font, not the bold system one, so the readouts fit the panel.
     EnumChildWindows(h, [](HWND c, LPARAM) -> BOOL {
         SendMessage(c, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
@@ -430,6 +511,12 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                 recalibrate();
                 g.world_dirty = true;
                 redraw(FULL_PX);
+            } else if (id == ID_COPY) {
+                // No read_controls: every control already applied itself, and
+                // re-reading the land slider through the curve would nudge
+                // the offset away from the world on screen.
+                copy_settings();
+                set_status();
             } else if (id == ID_RESET) {
                 const float keep_off = g.wp.land_offset;
                 g.wp = g.defaults;
@@ -446,6 +533,7 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         // only pay for detail once the slider is let go.
         case WM_HSCROLL: {
             const int code = LOWORD(wp);
+            g.copied.clear();
             read_controls();
             g.world_dirty = true;
             if (code == TB_THUMBTRACK) redraw(PREVIEW_PX);
@@ -503,7 +591,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     // Plain ASCII: this is the ANSI entry point, and an em-dash arrives mangled.
     HWND h = CreateWindowA("biomes2_view", "biomes2 - world viewer",
                            WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                           PANEL + 860, 940, 0, 0, inst, 0);
+                           PANEL + 860, 980, 0, 0, inst, 0);
     ShowWindow(h, show);
     redraw(FULL_PX);
 

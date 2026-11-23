@@ -148,6 +148,17 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
                 else if (k == "shelf_width") p.shelf_width = v;
                 else if (k == "shelf_regime") p.shelf_regime = v;
                 else if (k == "knee") p.knee = v != 0.0f;
+                else if (k == "knee_k") p.knee_k = v;
+                else if (k == "knee_c") p.knee_c = v;
+                else if (k == "regime_size_lo") p.regime_size_lo = v;
+                else if (k == "regime_size_hi") p.regime_size_hi = v;
+                else if (k == "regime_mean_lo") p.regime_mean_lo = v;
+                else if (k == "regime_mean_hi") p.regime_mean_hi = v;
+                else if (k == "regime_amp_lo") p.regime_amp_lo = v;
+                else if (k == "regime_amp_hi") p.regime_amp_hi = v;
+                // Layer 1, which view.exe also has a slider for.
+                else if (k == "danger_w") p.danger_w = v;
+                else if (k == "danger_feat") p.danger_freq = 1.0f / v;
             }
             at = end + 1;
         }
