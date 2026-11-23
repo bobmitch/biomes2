@@ -89,6 +89,7 @@ bool make_default(ID3D12Device* d, UINT64 bytes, ComPtr<ID3D12Resource>& out,
 static const size_t kArchFloats = 20;
 
 bool WorldGpu::diag_no_overhang = false;
+uint64_t WorldGpu::world_seed = 0;
 
 bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
                      uint64_t seed, std::string& error) {
@@ -124,44 +125,7 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
     // can walk a prototype world and --probe-field can check its GPU parity.
     // Unset, the world is the shipped one.
     if (const char* l0env = std::getenv("BIOMES_L0")) {
-        std::string spec(l0env);
-        size_t at = 0;
-        while (at < spec.size()) {
-            size_t end = spec.find(',', at);
-            if (end == std::string::npos) end = spec.size();
-            const std::string kv = spec.substr(at, end - at);
-            const size_t eq = kv.find('=');
-            if (eq != std::string::npos) {
-                const std::string k = kv.substr(0, eq);
-                const float v = static_cast<float>(std::atof(kv.c_str() + eq + 1));
-                worldgen::WorldParams& p = params_;
-                if (k == "centre_floor") p.centre_floor = v;
-                else if (k == "land_offset") p.land_offset = v;
-                else if (k == "fine_feat") p.fine_freq = 1.0f / v;
-                else if (k == "fine_weight") p.fine_weight = v;
-                else if (k == "fine_regime") p.fine_regime = v;
-                else if (k == "regime_feat") p.regime_freq = 1.0f / v;
-                else if (k == "regime_mean") p.regime_mean = v;
-                else if (k == "regime_amp") p.regime_amp = v;
-                else if (k == "regime_draw") p.regime_draw = v != 0.0f;
-                else if (k == "shelf_depth") p.shelf_depth = v;
-                else if (k == "shelf_width") p.shelf_width = v;
-                else if (k == "shelf_regime") p.shelf_regime = v;
-                else if (k == "knee") p.knee = v != 0.0f;
-                else if (k == "knee_k") p.knee_k = v;
-                else if (k == "knee_c") p.knee_c = v;
-                else if (k == "regime_size_lo") p.regime_size_lo = v;
-                else if (k == "regime_size_hi") p.regime_size_hi = v;
-                else if (k == "regime_mean_lo") p.regime_mean_lo = v;
-                else if (k == "regime_mean_hi") p.regime_mean_hi = v;
-                else if (k == "regime_amp_lo") p.regime_amp_lo = v;
-                else if (k == "regime_amp_hi") p.regime_amp_hi = v;
-                // Layer 1, which view.exe also has a slider for.
-                else if (k == "danger_w") p.danger_w = v;
-                else if (k == "danger_feat") p.danger_freq = 1.0f / v;
-            }
-            at = end + 1;
-        }
+        worldgen::apply_param_spec(params_, l0env);
     }
 
     worldgen::AssignParams ap;

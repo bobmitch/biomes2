@@ -107,6 +107,9 @@ public:
     // with layer 6's overhang term removed and nothing else moved. Applied
     // after build_world so rivers, cells and shafts are the real ones.
     static bool diag_no_overhang;
+    // The world seed the renderer builds (`--seed <n>`, 0 by default). The
+    // world viewer launches the engine with it to stand on a seed it shows.
+    static uint64_t world_seed;
 
     // Builds the seed on the CPU and uploads it. The CPU copy is kept: the
     // tolerance check compares against it, and physics has no other source.

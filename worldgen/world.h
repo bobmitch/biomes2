@@ -184,6 +184,14 @@ Layer0Params make_layer0(const WorldParams& wp, uint64_t world_seed);
 void apply_land_knee(Layer0Params& l0, const WorldParams& wp,
                      float& raw_land, float& knee_land, float& ms);
 
+// "key=value,key=value": the layer 0 prototype's parameters (and layer 1's
+// danger_w and danger_feat, which the viewer also has sliders for) by name.
+// What BIOMES_L0 holds: the engine and the viewer both read it, and the
+// viewer's Copy command writes it, so all three share these names. Feature
+// sizes are in metres (`*_feat`); unknown keys are ignored. Returns how many
+// keys were applied. Parsing, not generation: nothing here reaches the hash.
+int apply_param_spec(WorldParams& p, const char* spec);
+
 // Thin adapter onto the canonical field function in worldgen/shaders/field.h.
 // The arithmetic lives there so the harness, the engine and the viewer cannot
 // drift apart. voxel is the LOD sample spacing in metres; 0 means full detail.

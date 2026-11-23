@@ -22,7 +22,9 @@ using namespace worldgen;
 enum ViewMode {
     VIEW_BIOME = 0,
     VIEW_RELIEF = 1,
-    VIEW_DANGER = 2
+    VIEW_DANGER = 2,
+    VIEW_BIOME_RELIEF = 3,   // biome colours shaded by the relief
+    VIEW_SLOPE = 4           // buildability: slope classes
 };
 
 inline void biome_colour(int b, unsigned char* c) {
@@ -47,74 +49,137 @@ inline void biome_colour(int b, unsigned char* c) {
     c[2] = static_cast<unsigned char>(40 + 190 * bl);
 }
 
+// Shaded relief. The A4 exit criterion is whether this reads as a world
+// rather than as noise, and that is not a thing an assertion can answer.
+//
+// Split into a sample (height, gradient, what kind of surface) and a colour,
+// so the viewer's other modes -- biomes over relief, slope -- shade from the
+// same three heights a pixel and cannot disagree with this one about where
+// the water or the channels are.
+struct ReliefSample {
+    float h = 0.0f;              // terrain height, metres
+    float gx = 0.0f, gz = 0.0f;  // rise over run along x and z, over a 6 m arm
+    bool  outside = false;       // past the disc's edge
+    bool  water = false;         // at or below sea level
+    bool  channel = false;       // inside a river's channel
+};
+
+inline ReliefSample relief_sample(const SeedWorld& w, const WorldParams& wp,
+                                  const ArchetypeTable& table, float x, float z) {
+    ReliefSample s;
+    const float R = wp.radius;
+    const float rr = std::sqrt(x * x + z * z) / R;
+    if (rr > 1.0f) { s.outside = true; return s; }
+    s.h = terrain_height(w, wp, table, x, z, rr);
+    float rw = 0.0f, rd = 0.0f;
+    const float rdist = nearest_river(w, wp, x, z, rw, rd);
+    if (s.h <= 0.0f) { s.water = true; return s; }
+    // Inside the channel: draw the water, not the riverbed.
+    if (rdist < rw * 0.42f) { s.channel = true; return s; }
+    const float e = 6.0f;                       // metres, for the normal
+    const float hx = terrain_height(w, wp, table, x + e, z,
+                                    std::sqrt((x + e) * (x + e) + z * z) / R);
+    const float hz = terrain_height(w, wp, table, x, z + e,
+                                    std::sqrt(x * x + (z + e) * (z + e)) / R);
+    s.gx = (hx - s.h) / e;
+    s.gz = (hz - s.h) / e;
+    return s;
+}
+
+// Lambert-ish shade in [0, 1], light from the north-west.
+inline float relief_shade(const ReliefSample& s) {
+    const float lx = -0.55f, lz = -0.55f, ly = 0.63f;
+    const float inv = 1.0f / std::sqrt(s.gx * s.gx + s.gz * s.gz + 1.0f);
+    return wg_saturate((-s.gx * lx - s.gz * lz + ly) * inv * 1.25f);
+}
+
+inline void void_colour(unsigned char* c)    { c[0] = 10; c[1] = 12; c[2] = 18; }
+inline void channel_colour(unsigned char* c) { c[0] = 52; c[1] = 96; c[2] = 150; }
+inline void sea_colour(float h, unsigned char* c) {
+    const float d = wg_saturate(-h / 160.0f);
+    c[0] = static_cast<unsigned char>(46 - 30 * d);
+    c[1] = static_cast<unsigned char>(78 - 46 * d);
+    c[2] = static_cast<unsigned char>(130 - 62 * d);
+}
+
 // Water a player can wade (still-water depth under PhysicsWorld::kSwimLeave,
 // 0.85 m; tools/shared/reach.h has the same number). Its own colour, so the
-// layer 0 shelf shows as what it is for: the crossings.
+// shallows read as what they are.
 static const float kShallowDepth = 0.85f;
 inline void shallows_colour(unsigned char* c) { c[0] = 112; c[1] = 178; c[2] = 172; }
 
-// Shaded relief. The A4 exit criterion is whether this reads as a world
-// rather than as noise, and that is not a thing an assertion can answer.
+inline void relief_colour(const ReliefSample& s, unsigned char* c) {
+    if (s.outside) { void_colour(c); return; }
+    if (s.water && -s.h < kShallowDepth) { shallows_colour(c); return; }
+    if (s.water)   { sea_colour(s.h, c); return; }
+    if (s.channel) { channel_colour(c); return; }
+    const float shade = relief_shade(s);
+    const float t = wg_saturate(s.h / 220.0f);
+    float r3, g3, b3;
+    if (t < 0.4f) {
+        const float u = t / 0.4f;
+        r3 = 0.36f + 0.18f * u; g3 = 0.54f - 0.06f * u; b3 = 0.30f + 0.02f * u;
+    } else if (t < 0.78f) {
+        const float u = (t - 0.4f) / 0.38f;
+        r3 = 0.54f + 0.08f * u; g3 = 0.48f - 0.04f * u; b3 = 0.32f + 0.04f * u;
+    } else {
+        const float u = (t - 0.78f) / 0.22f;
+        r3 = 0.62f + 0.30f * u; g3 = 0.44f + 0.50f * u; b3 = 0.36f + 0.58f * u;
+    }
+    const float sh = 0.30f + 0.80f * shade;
+    c[0] = static_cast<unsigned char>(wg_saturate(r3 * sh) * 255.0f);
+    c[1] = static_cast<unsigned char>(wg_saturate(g3 * sh) * 255.0f);
+    c[2] = static_cast<unsigned char>(wg_saturate(b3 * sh) * 255.0f);
+}
+
 inline void render_relief_tile(const SeedWorld& w, const WorldParams& wp,
                                const ArchetypeTable& table,
                                std::vector<unsigned char>& img, int img_w,
                                int ox, int oy, int tile) {
     const float R = wp.radius;
     const float step = 2.0f * R / tile;
-    const float e = 6.0f;                       // metres, for the normal
-    const float lx = -0.55f, lz = -0.55f, ly = 0.63f;   // light from the north-west
     for (int py = 0; py < tile; ++py) {
         const float z = -R + (py + 0.5f) * step;
         for (int px = 0; px < tile; ++px) {
             const float x  = -R + (px + 0.5f) * step;
-            const float rr = std::sqrt(x * x + z * z) / R;
             unsigned char c[3];
-            if (rr > 1.0f) {
-                c[0] = 10; c[1] = 12; c[2] = 18;
-            } else {
-                const float h0 = terrain_height(w, wp, table, x, z, rr);
-                float rw = 0.0f, rd = 0.0f;
-                const float rdist = nearest_river(w, wp, x, z, rw, rd);
-                if (h0 <= 0.0f && -h0 < kShallowDepth) {
-                    shallows_colour(c);
-                } else if (h0 <= 0.0f) {
-                    const float d = wg_saturate(-h0 / 160.0f);
-                    c[0] = static_cast<unsigned char>(46 - 30 * d);
-                    c[1] = static_cast<unsigned char>(78 - 46 * d);
-                    c[2] = static_cast<unsigned char>(130 - 62 * d);
-                } else if (rdist < rw * 0.42f) {
-                    // Inside the channel: draw the water, not the riverbed.
-                    c[0] = 52; c[1] = 96; c[2] = 150;
-                } else {
-                    const float hx = terrain_height(w, wp, table, x + e, z,
-                                                    std::sqrt((x + e) * (x + e) + z * z) / R);
-                    const float hz = terrain_height(w, wp, table, x, z + e,
-                                                    std::sqrt(x * x + (z + e) * (z + e)) / R);
-                    const float gx = (hx - h0) / e, gz = (hz - h0) / e;
-                    const float inv = 1.0f / std::sqrt(gx * gx + gz * gz + 1.0f);
-                    const float shade = wg_saturate((-gx * lx - gz * lz + ly) * inv * 1.25f);
-                    const float t = wg_saturate(h0 / 220.0f);
-                    float r3, g3, b3;
-                    if (t < 0.4f) {
-                        const float u = t / 0.4f;
-                        r3 = 0.36f + 0.18f * u; g3 = 0.54f - 0.06f * u; b3 = 0.30f + 0.02f * u;
-                    } else if (t < 0.78f) {
-                        const float u = (t - 0.4f) / 0.38f;
-                        r3 = 0.54f + 0.08f * u; g3 = 0.48f - 0.04f * u; b3 = 0.32f + 0.04f * u;
-                    } else {
-                        const float u = (t - 0.78f) / 0.22f;
-                        r3 = 0.62f + 0.30f * u; g3 = 0.44f + 0.50f * u; b3 = 0.36f + 0.58f * u;
-                    }
-                    const float s = 0.30f + 0.80f * shade;
-                    c[0] = static_cast<unsigned char>(wg_saturate(r3 * s) * 255.0f);
-                    c[1] = static_cast<unsigned char>(wg_saturate(g3 * s) * 255.0f);
-                    c[2] = static_cast<unsigned char>(wg_saturate(b3 * s) * 255.0f);
-                }
-            }
+            relief_colour(relief_sample(w, wp, table, x, z), c);
             const size_t d = (static_cast<size_t>(oy + py) * img_w + (ox + px)) * 3;
             img[d + 0] = c[0]; img[d + 1] = c[1]; img[d + 2] = c[2];
         }
     }
+}
+
+// The biome of the layer-2 cell a point falls in, through layer 2's warp:
+// -1 for an ocean cell. What the biome map draws and the quotas count.
+inline int biome_cell_at(const SeedWorld& w, const WorldParams& wp, float x, float z) {
+    const float wx = x + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wx);
+    const float wz = z + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wz);
+    const int   ci = w.lookup.nearest(w.pts, wx, wz);
+    return ci >= 0 ? w.biome[ci] : -1;
+}
+
+// The biome map's pixel: the continent mask decides land, the cell its biome.
+// Returns the biome drawn, -1 for water or an ocean cell, -2 off the disc.
+inline int biome_pixel(const SeedWorld& w, const WorldParams& wp, float x, float z,
+                       unsigned char* c) {
+    const float rr = std::sqrt(x * x + z * z) / wp.radius;
+    if (rr > 1.0f) { void_colour(c); return -2; }        // void past the terminator
+    const float h = layer0_height(x, z, rr, w.l0);
+    if (h <= wp.sea_level && still_water_depth(w, wp, x, z, rr) < kShallowDepth) {
+        shallows_colour(c);
+        return -1;
+    }
+    if (h <= wp.sea_level) {
+        const float d = wg_saturate(-h * 1.2f);           // deeper water, darker
+        c[0] = static_cast<unsigned char>(46 - 30 * d);
+        c[1] = static_cast<unsigned char>(78 - 46 * d);
+        c[2] = static_cast<unsigned char>(130 - 62 * d);
+        return -1;
+    }
+    const int b = biome_cell_at(w, wp, x, z);
+    biome_colour(b, c);
+    return b;
 }
 
 inline void render_tile(const SeedWorld& w, const WorldParams& wp,
@@ -126,26 +191,8 @@ inline void render_tile(const SeedWorld& w, const WorldParams& wp,
         const float z = -R + (py + 0.5f) * step;
         for (int px = 0; px < tile; ++px) {
             const float x  = -R + (px + 0.5f) * step;
-            const float rr = std::sqrt(x * x + z * z) / R;
             unsigned char c[3];
-            if (rr > 1.0f) {
-                c[0] = 10; c[1] = 12; c[2] = 18;              // void past the terminator
-            } else {
-                const float h = layer0_height(x, z, rr, w.l0);
-                if (h <= wp.sea_level && still_water_depth(w, wp, x, z, rr) < kShallowDepth) {
-                    shallows_colour(c);
-                } else if (h <= wp.sea_level) {
-                    const float d = wg_saturate(-h * 1.2f);      // deeper water, darker
-                    c[0] = static_cast<unsigned char>(46 - 30 * d);
-                    c[1] = static_cast<unsigned char>(78 - 46 * d);
-                    c[2] = static_cast<unsigned char>(130 - 62 * d);
-                } else {
-                    const float wx = x + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wx);
-                    const float wz = z + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wz);
-                    const int   ci = w.lookup.nearest(w.pts, wx, wz);
-                    biome_colour(ci >= 0 ? w.biome[ci] : -1, c);
-                }
-            }
+            biome_pixel(w, wp, x, z, c);
             const size_t d = (static_cast<size_t>(oy + py) * img_w + (ox + px)) * 3;
             img[d + 0] = c[0]; img[d + 1] = c[1]; img[d + 2] = c[2];
         }
@@ -173,6 +220,13 @@ inline void danger_colour(float d, unsigned char* c) {
     c[2] = static_cast<unsigned char>(b * 255.0f);
 }
 
+inline void danger_pixel(const SeedWorld& w, const WorldParams& wp, float x, float z,
+                         unsigned char* c) {
+    const float rr = std::sqrt(x * x + z * z) / wp.radius;
+    if (rr > 1.0f) void_colour(c);
+    else           danger_colour(layer1_danger(x, z, rr, wp, w.s_dang), c);
+}
+
 inline void render_danger_tile(const SeedWorld& w, const WorldParams& wp,
                                std::vector<unsigned char>& img, int img_w,
                                int ox, int oy, int tile) {
@@ -182,19 +236,60 @@ inline void render_danger_tile(const SeedWorld& w, const WorldParams& wp,
         const float z = -R + (py + 0.5f) * step;
         for (int px = 0; px < tile; ++px) {
             const float x = -R + (px + 0.5f) * step;
-            const float rr = std::sqrt(x * x + z * z) / R;
             unsigned char c[3];
-            if (rr > 1.0f) {
-                c[0] = 10; c[1] = 12; c[2] = 18;
-            } else {
-                danger_colour(layer1_danger(x, z, rr, wp, w.s_dang), c);
-            }
+            danger_pixel(w, wp, x, z, c);
             const size_t d = (static_cast<size_t>(oy + py) * img_w + (ox + px)) * 3;
             img[d + 0] = c[0]; img[d + 1] = c[1]; img[d + 2] = c[2];
         }
     }
 }
 
+// Slope classes for the buildability view, in rise over run over relief's
+// 6 m arm. The edges are the game's own numbers where it has them: flat sites
+// accept 0.08 (FlatTable::max_grade), trees stop at 0.8 (TreeTable::max_slope)
+// and the character climbs to 50 degrees (physics_world.cpp, 1.19).
+struct SlopeClass { float upto; unsigned char rgb[3]; const char* label; };
+inline const SlopeClass* slope_classes(int& n) {
+    static const SlopeClass k[] = {
+        {0.08f,  { 70, 190,  80}, "level (flat-site grade)"},
+        {0.25f,  {165, 215, 105}, "gentle, < 14 deg"},
+        {0.60f,  {230, 212, 110}, "hilly, < 31 deg"},
+        {1.19f,  {230, 145,  70}, "steep, walkable < 50"},
+        {1.0e9f, {190,  60,  55}, "too steep to walk up"}
+    };
+    n = static_cast<int>(sizeof(k) / sizeof(k[0]));
+    return k;
+}
+
+inline void slope_colour(const ReliefSample& s, unsigned char* c) {
+    if (s.outside) { void_colour(c); return; }
+    if (s.water)   { sea_colour(s.h, c); return; }
+    if (s.channel) { channel_colour(c); return; }
+    const float g = std::sqrt(s.gx * s.gx + s.gz * s.gz);
+    int n = 0;
+    const SlopeClass* k = slope_classes(n);
+    int i = 0;
+    while (i + 1 < n && g >= k[i].upto) ++i;
+    // A little of the relief's shade, so the land's shape still reads.
+    const float sh = 0.72f + 0.38f * relief_shade(s);
+    for (int ch = 0; ch < 3; ++ch)
+        c[ch] = static_cast<unsigned char>(std::min(255.0f, k[i].rgb[ch] * sh));
+}
+
+// Biome colours shaded by the relief: where each biome is AND what its ground
+// does. The cell decides the colour, the real (carved) height decides water.
+inline int biome_relief_colour(const SeedWorld& w, const WorldParams& wp,
+                               const ReliefSample& s, float x, float z, unsigned char* c) {
+    if (s.outside) { void_colour(c); return -2; }
+    if (s.water)   { sea_colour(s.h, c); return -1; }
+    if (s.channel) { channel_colour(c); return biome_cell_at(w, wp, x, z); }
+    const int b = biome_cell_at(w, wp, x, z);
+    biome_colour(b, c);
+    const float sh = 0.38f + 0.78f * relief_shade(s);
+    for (int ch = 0; ch < 3; ++ch)
+        c[ch] = static_cast<unsigned char>(std::min(255.0f, c[ch] * sh));
+    return b;
+}
 
 // A vertical slice through the world. Rock, air, water and cave air are drawn
 // as four different things, because a cave below sea level is not water and
@@ -313,14 +408,43 @@ inline void render_section(const SeedWorld& w, const WorldParams& wp,
     }
 }
 
+// One pixel of any mode at world (x, z). Returns the biome under it for the
+// biome modes (-1 water or an ocean cell, -2 off the disc) and -3 otherwise,
+// so a caller can dim every biome but one.
+inline int view_pixel(const SeedWorld& w, const WorldParams& wp,
+                      const ArchetypeTable& table, ViewMode mode,
+                      float x, float z, unsigned char* c) {
+    switch (mode) {
+        case VIEW_BIOME:  return biome_pixel(w, wp, x, z, c);
+        case VIEW_DANGER: danger_pixel(w, wp, x, z, c); return -3;
+        case VIEW_SLOPE:  slope_colour(relief_sample(w, wp, table, x, z), c); return -3;
+        case VIEW_BIOME_RELIEF:
+            return biome_relief_colour(w, wp, relief_sample(w, wp, table, x, z), x, z, c);
+        case VIEW_RELIEF:
+        default:          relief_colour(relief_sample(w, wp, table, x, z), c); return -3;
+    }
+}
+
 // One entry point, so a caller picks a mode rather than a function.
 inline void render_view(const SeedWorld& w, const WorldParams& wp,
                         const ArchetypeTable& table, ViewMode mode,
                         std::vector<unsigned char>& img, int img_w,
                         int ox, int oy, int tile) {
-    if (mode == VIEW_RELIEF)      render_relief_tile(w, wp, table, img, img_w, ox, oy, tile);
-    else if (mode == VIEW_DANGER) render_danger_tile(w, wp, img, img_w, ox, oy, tile);
-    else                          render_tile(w, wp, img, img_w, ox, oy, tile);
+    if (mode == VIEW_RELIEF) { render_relief_tile(w, wp, table, img, img_w, ox, oy, tile); return; }
+    if (mode == VIEW_DANGER) { render_danger_tile(w, wp, img, img_w, ox, oy, tile); return; }
+    if (mode == VIEW_BIOME)  { render_tile(w, wp, img, img_w, ox, oy, tile); return; }
+    const float R = wp.radius;
+    const float step = 2.0f * R / tile;
+    for (int py = 0; py < tile; ++py) {
+        const float z = -R + (py + 0.5f) * step;
+        for (int px = 0; px < tile; ++px) {
+            const float x = -R + (px + 0.5f) * step;
+            unsigned char c[3];
+            view_pixel(w, wp, table, mode, x, z, c);
+            const size_t d = (static_cast<size_t>(oy + py) * img_w + (ox + px)) * 3;
+            img[d + 0] = c[0]; img[d + 1] = c[1]; img[d + 2] = c[2];
+        }
+    }
 }
 
 }  // namespace view

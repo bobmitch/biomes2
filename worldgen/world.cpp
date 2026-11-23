@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <string>
 #include <cmath>
 #include <functional>
 #include <queue>
@@ -162,6 +164,50 @@ float still_water_depth(const SeedWorld& w, const WorldParams& wp, float x, floa
     const float bed = layer4_height_shelf(cont, wp.continent_scale, 0.0f, wp.sea_level,
                                           w.l0.shelf_depth, layer0_shelf_width(w.l0, l0n.regime));
     return wp.sea_level * wp.continent_scale - bed;
+}
+
+int apply_param_spec(WorldParams& p, const char* spec) {
+    int applied = 0;
+    const std::string all = spec ? spec : "";
+    size_t at = 0;
+    while (at < all.size()) {
+        size_t end = all.find(',', at);
+        if (end == std::string::npos) end = all.size();
+        const std::string kv = all.substr(at, end - at);
+        at = end + 1;
+        const size_t eq = kv.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = kv.substr(0, eq);
+        while (!k.empty() && k[0] == ' ') k.erase(0, 1);
+        const float v = static_cast<float>(std::atof(kv.c_str() + eq + 1));
+        const float size = v > 1.0f ? v : 1.0f;
+        if (k == "centre_floor") p.centre_floor = v;
+        else if (k == "land_offset") p.land_offset = v;
+        else if (k == "fine_feat") p.fine_freq = 1.0f / size;
+        else if (k == "fine_weight") p.fine_weight = v;
+        else if (k == "fine_regime") p.fine_regime = v;
+        else if (k == "regime_feat") p.regime_freq = 1.0f / size;
+        else if (k == "regime_mean") p.regime_mean = v;
+        else if (k == "regime_amp") p.regime_amp = v;
+        else if (k == "regime_draw") p.regime_draw = v != 0.0f;
+        else if (k == "regime_size_lo") p.regime_size_lo = v;
+        else if (k == "regime_size_hi") p.regime_size_hi = v;
+        else if (k == "regime_mean_lo") p.regime_mean_lo = v;
+        else if (k == "regime_mean_hi") p.regime_mean_hi = v;
+        else if (k == "regime_amp_lo") p.regime_amp_lo = v;
+        else if (k == "regime_amp_hi") p.regime_amp_hi = v;
+        else if (k == "shelf_depth") p.shelf_depth = v;
+        else if (k == "shelf_width") p.shelf_width = v;
+        else if (k == "shelf_regime") p.shelf_regime = v;
+        else if (k == "knee") p.knee = v != 0.0f;
+        else if (k == "knee_k") p.knee_k = v;
+        else if (k == "knee_c") p.knee_c = v;
+        else if (k == "danger_w") p.danger_w = v;
+        else if (k == "danger_feat") p.danger_freq = 1.0f / size;
+        else continue;
+        ++applied;
+    }
+    return applied;
 }
 
 // --- layer 0 prototype: per-seed parameters and the land knee ----------------
