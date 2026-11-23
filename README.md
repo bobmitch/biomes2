@@ -14,7 +14,7 @@ Terrain is a pure function, never stored. Only player edits persist.
 | [`docs/worldgen-design.md`](docs/worldgen-design.md) | The design. Read this first. |
 | [`CLAUDE.md`](CLAUDE.md) | The invariants, the gotchas, and how every engine system works and what it measured. The current reference. |
 | [`docs/gaps.md`](docs/gaps.md) | What is built but not finished, and what has been seen but not fixed. |
-| [`docs/handover.md`](docs/handover.md) | The state of play as of v13, with baseline numbers. Older than CLAUDE.md where they differ. |
+| [`docs/handover.md`](docs/handover.md) | The state of play at v17: the baseline numbers to diff against, and what is open in the order to take it. |
 | ADRs | [001](docs/adr-001-field-function-authority.md) field function authority, [002](docs/adr-002-drop-wgsl-native-viewer.md) retire WGSL for a native viewer, [003](docs/adr-003-graphics-api.md) graphics API, [004](docs/adr-004-lighting.md) lighting, [005](docs/adr-005-clouds-and-rain.md) clouds and rain. |
 | [`docs/starter-prompt.md`](docs/starter-prompt.md) | Bootstrap prompt for the first implementation session. Historical. |
 
