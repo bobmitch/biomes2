@@ -853,6 +853,11 @@ void register_tunables() {
           [&] { return R.tree_settings().max_dist; }, [&](float v) { R.tree_settings().max_dist = v; });
     choice("texture", G, "Surface texture", {"Flat", "Scans", "Grid", "Scans + grid"},
            [&] { return R.texture_mode(); }, [&](float v) { R.set_texture_mode(std::floor(v + 0.5f)); });
+    // The scans' anisotropic filtering: 1, 2, 4, 8, 16 as choices 0..4.
+    choice("aniso", G, "Texture filtering", {"Trilinear", "Anisotropic 2x", "Anisotropic 4x", "Anisotropic 8x",
+                                             "Anisotropic 16x"},
+           [&] { return std::floor(std::log2(R.scan_aniso()) + 0.5f); },
+           [&](float v) { R.set_scan_aniso(std::exp2(std::floor(v + 0.5f))); });
 
     // Time.
     range("time", "Time", "Time of day", 0.0f, 24.0f, 0.05f, "h",
@@ -1779,6 +1784,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         }
         if (c2.find("--no-far-shadow") != std::string::npos) g_renderer.set_far_shadow(false);
         if (c2.find("--no-pom") != std::string::npos) g_renderer.set_pom(false);
+        {
+            // The scans' anisotropic filtering (1 trilinear, 2, 4, 8, 16).
+            const size_t an = c2.find("--aniso ");
+            if (an != std::string::npos) g_renderer.set_scan_aniso(float(std::atof(c2.c_str() + an + 8)));
+        }
         if (c2.find("--no-rocks") != std::string::npos) g_renderer.set_rocks(false);
         // Bare ground (GroundLook): --no-ground-look is the scans as they
         // were; the others set one part. Not "--ground-...": --ground is

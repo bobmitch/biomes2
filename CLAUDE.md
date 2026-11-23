@@ -108,7 +108,8 @@ Every mode takes `--character male|female` (which pack; male by default) and
 `--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), the weather's `--sea-state <0..1>`, `--wind <m/s>`,
 `--wind-dir <deg>` and `--swell <m>` (automatic weather otherwise), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
-`--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`, `--no-rocks`,
+`--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`,
+`--aniso <1|2|4|8|16>` (the scans' filtering), `--no-rocks`,
 `--no-forest-shell`, `--no-clouds`, `--no-rain`, `--rain <0..1>`, `--wet <0..1>`,
 `--no-lightning`, `--no-height-fog` and `--height-fog <k>` (a multiplier on the
 exploration fog); `--shot` also
@@ -254,6 +255,18 @@ last run's.
   at 1440p that way with no pixel using the result; a magenta debug paint
   showed none taking the path, which is what made it hard to see. Put
   anything costly inside an `if`.
+- **Never index a shader's local array by a value known only at run
+  time.** The terrain's `scan_surface` kept its four material candidates in
+  arrays (`sc[4]`, `wc[4]`, `tint[4]`, `rscale[4]`) and picked the heaviest
+  and the hex-tiled one BY INDEX; FXC kept all four in dynamically indexed
+  temps (`dcl_indexableTemp`, 32 float4), which this GPU's compiler puts in
+  scratch memory. Written as four named variables: terrain at 4K in a lit
+  pit 8.1 -> 6.0 ms, the image the same to 2 levels in 255. It looked like
+  "ALU cost": mip bias, fewer fetches and a quarter of the bytes all barely
+  moved it. Read the assembly before guessing -- `fxc /T ps_5_1 /E ps_main
+  /O3 /Ges /I . engine/render/shaders/mesh.hlsl /Fc out.asm` from the root,
+  and look for `dcl_indexableTemp` and `x0[r...]`. An array indexed only by
+  `[unroll]` loop counters (`top_two`'s `wts[12]`) is fine.
 - **A dual-compile header's OUT parameters must be spelled per language.**
   `T out[1]` decays to a pointer in C++ and works; in HLSL an array parameter
   is passed BY VALUE and the write never reaches the caller. The wave normal
@@ -635,9 +648,35 @@ confirmed it twice.
 - **Cost**, walking (`--walk 15 --uncapped`, packs present vs moved aside):
   2.75 / 2.89 ms against 2.69 / 2.72; startup +132 ms; 247 MB of textures
   at 1K. The flight's median rose to 2.50 ms with far more terrain on screen.
+- **What the scans cost at 4K, and the filtering option.** Measured on the
+  lit pit snapshot (`build/snapshots/20261122-175849`, `--res 3840 2160
+  --gpu-profile 60`): the terrain pass 8.05 ms before, 5.61 after the
+  array fix (the gotcha above) at 4x anisotropy; flat (`--texture 0`) ~3.4.
+  What is left of the scans is texture work, not arithmetic: one cached
+  texel per fetch costs what flat does. Of it, anisotropic filtering is the
+  biggest part: per level, terrain 5.10 (trilinear), 5.61 (4x, the
+  default), 5.96 (8x, the old fixed sampler), 6.16 (16x); 4x and 8x differ
+  on 0.04% of pixels by more than 8 levels. Graphics, "Texture filtering",
+  saved; `--aniso <n>`. It covers terrain, rocks, the character and bark.
+- **s5 is a TABLE, not a static sampler**, on the terrain's and the trees'
+  root signatures: `Renderer`'s sampler heap holds one sampler per level,
+  made once and never rewritten, and the option only changes which one the
+  table points at (`scan_sampler()`), so it is live with no pipeline
+  rebuilt. Limiting it in the shader instead (lengthening the short
+  gradient) was built and measured: ~480 instruction slots for 14 inlined
+  calls, and 8x -> 4x saved 0.1 ms where the real sampler saves 0.35.
+  **Every `SetDescriptorHeaps` goes through `bind_shader_heaps`**
+  (`shader_heaps.h`): the call unbinds every heap it is not given, and a
+  pass that bound only the CBV heap would leave the terrain, rock and tree
+  pipelines with no sampler -- with no debug layer here to say so. The
+  UI's own heap, drawn last, is the one exception. Every
+  `SetGraphicsRootSignature` of the terrain's or the trees' root sets the
+  table next to it.
 - **Not done**: anti-tiling on rock (see the next section for the ground),
-  BC compression (4x less memory), scans for the grass, leaves and placed
-  rocks, silhouettes.
+  BC compression -- 247 MB of scans at 1K would be ~62 MB, and the BC7
+  proxy (no fetch reading the top mip, a quarter of the bytes) took
+  0.35-0.4 ms off the 4K terrain pass: worth it for memory, not the frame --
+  scans for the grass, leaves and placed rocks, silhouettes.
 
 **Bare ground: hex-tiling and far detail** (archetypes.json `ground_look`,
 the tuning panel's Terrain group, `--no-ground-look` for A/B). A 2.5 m

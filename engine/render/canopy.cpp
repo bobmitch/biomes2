@@ -3,6 +3,7 @@
 #endif
 #include "engine/render/canopy.h"
 #include "engine/render/shader_compile.h"
+#include "engine/render/shader_heaps.h"
 
 #include <cmath>
 #include <cstring>
@@ -219,8 +220,7 @@ void CanopyMap::record(ID3D12GraphicsCommandList* cmd, UINT frame, const float c
     if (!first_) tr(read, ua, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
     first_ = false;
 
-    ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
-    cmd->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd);
     const UINT inc = dev_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_GPU_DESCRIPTOR_HANDLE gu = heap_->GetGPUDescriptorHandleForHeapStart(), gs = gu;
     gu.ptr += UINT64(kUavSlot) * inc;

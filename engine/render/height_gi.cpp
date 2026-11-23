@@ -3,6 +3,7 @@
 #endif
 #include "engine/render/height_gi.h"
 #include "engine/render/shader_compile.h"
+#include "engine/render/shader_heaps.h"
 
 #include <cmath>
 #include <cstring>
@@ -264,8 +265,7 @@ void HeightGi::record(ID3D12GraphicsCommandList* cmd, UINT frame, D3D12_GPU_VIRT
     tr(height_.Get(), kRead, ua);
     tr(rad_.Get(), kRead, ua);
 
-    ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
-    cmd->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd);
     const D3D12_GPU_DESCRIPTOR_HANDLE base = heap_->GetGPUDescriptorHandleForHeapStart();
     cmd->SetComputeRootSignature(root_.Get());
     cmd->SetComputeRootConstantBufferView(0, cb_[f]->GetGPUVirtualAddress());
@@ -299,8 +299,7 @@ void HeightGi::record_camera(ID3D12GraphicsCommandList* cmd, UINT slot, D3D12_GP
         }
         cam_pending_[rs] = false;
     }
-    ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
-    cmd->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd);
     const D3D12_GPU_DESCRIPTOR_HANDLE base = heap_->GetGPUDescriptorHandleForHeapStart();
     cmd->SetComputeRootSignature(root_.Get());
     cmd->SetComputeRootConstantBufferView(0, cb_[rs]->GetGPUVirtualAddress());

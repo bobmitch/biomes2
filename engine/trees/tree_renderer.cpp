@@ -1,6 +1,7 @@
 #include "engine/trees/tree_renderer.h"
 #include "engine/render/shader_compile.h"
 #include "engine/render/lighting_units.h"
+#include "engine/render/shader_heaps.h"
 
 #include <windows.h>
 
@@ -188,7 +189,7 @@ bool TreeRenderer::run_and_wait(ID3D12CommandQueue* queue, std::string& error) {
 }
 
 bool TreeRenderer::create_pipelines(std::string& error) {
-    // --- draw root signature: 1 + 2 * 7 + 1 = 16 DWORDs of the 64 ---
+    // --- draw root signature: 1 + 2 * 7 + 1 + 1 (the scans' sampler) = 17 DWORDs of the 64 ---
     {
         D3D12_DESCRIPTOR_RANGE range = {};
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -235,7 +236,7 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         srange[7].NumDescriptors = 2;
         srange[7].BaseShaderRegister = 44;
         srange[7].OffsetInDescriptorsFromTableStart = 67;
-        D3D12_ROOT_PARAMETER p[11] = {};
+        D3D12_ROOT_PARAMETER p[12] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         p[0].Constants.ShaderRegister = 1;
         p[0].Constants.Num32BitValues = 1;
@@ -291,18 +292,21 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         pt.MaxLOD = D3D12_FLOAT32_MAX;
         pt.ShaderRegister = 4;
         pt.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        // s5: the scans, anisotropic and wrapping (bark).
-        D3D12_STATIC_SAMPLER_DESC an = {};
-        an.Filter = D3D12_FILTER_ANISOTROPIC;
-        an.MaxAnisotropy = 8;
-        an.AddressU = an.AddressV = an.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-        an.MaxLOD = D3D12_FLOAT32_MAX;
-        an.ShaderRegister = 5;
-        an.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        const D3D12_STATIC_SAMPLER_DESC samplers[5] = {ssa[0], ssa[1], lin, pt, an};
-        rsd.NumParameters = 11;
+        // s5: the scans (bark) -- a table into the renderer's sampler heap,
+        // as on the terrain, so the Graphics option's anisotropy is live
+        // (set_scan_sampler). One more DWORD.
+        D3D12_DESCRIPTOR_RANGE scan_range = {};
+        scan_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+        scan_range.NumDescriptors = 1;
+        scan_range.BaseShaderRegister = 5;
+        p[kScanSamplerParam].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[kScanSamplerParam].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        p[kScanSamplerParam].DescriptorTable.NumDescriptorRanges = 1;
+        p[kScanSamplerParam].DescriptorTable.pDescriptorRanges = &scan_range;
+        const D3D12_STATIC_SAMPLER_DESC samplers[4] = {ssa[0], ssa[1], lin, pt};
+        rsd.NumParameters = 12;
         rsd.pParameters = p;
-        rsd.NumStaticSamplers = 5;
+        rsd.NumStaticSamplers = 4;
         rsd.pStaticSamplers = samplers;
         ComPtr<ID3DBlob> sig, err;
         HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
@@ -707,6 +711,7 @@ bool TreeRenderer::bake(ID3D12CommandQueue* queue, std::string& error) {
 
     ID3D12GraphicsCommandList* cmd = init_cmd_.Get();
     cmd->SetGraphicsRootSignature(draw_root_.Get());
+    cmd->SetGraphicsRootDescriptorTable(kScanSamplerParam, scan_sampler_);
     cmd->SetPipelineState(bake_pso_.Get());
     cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     D3D12_INDEX_BUFFER_VIEW ibv = {};
@@ -720,8 +725,7 @@ bool TreeRenderer::bake(ID3D12CommandQueue* queue, std::string& error) {
     cmd->SetGraphicsRootShaderResourceView(4, vb_->GetGPUVirtualAddress());
     cmd->SetGraphicsRootShaderResourceView(5, model_buf_->GetGPUVirtualAddress());
     cmd->SetGraphicsRootShaderResourceView(6, look_buf_->GetGPUVirtualAddress());
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_};
-    cmd->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd);
     {
         const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_GPU_DESCRIPTOR_HANDLE g = srv_heap_->GetGPUDescriptorHandleForHeapStart();
@@ -1057,8 +1061,8 @@ void TreeRenderer::cull(ID3D12GraphicsCommandList* cmd, UINT f, D3D12_GPU_VIRTUA
 void TreeRenderer::bind_draw(ID3D12GraphicsCommandList* cmd, UINT f, D3D12_GPU_VIRTUAL_ADDRESS cb,
                              D3D12_GPU_VIRTUAL_ADDRESS shadow_cb) {
     cmd->SetGraphicsRootSignature(draw_root_.Get());
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_};
-    cmd->SetDescriptorHeaps(1, heaps);
+    cmd->SetGraphicsRootDescriptorTable(kScanSamplerParam, scan_sampler_);
+    bind_shader_heaps(cmd);
     cmd->SetGraphicsRootConstantBufferView(1, cb);
     cmd->SetGraphicsRootShaderResourceView(2, vb_->GetGPUVirtualAddress());
     cmd->SetGraphicsRootShaderResourceView(3, inst_up_[f]->GetGPUVirtualAddress());

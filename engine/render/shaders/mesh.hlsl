@@ -210,8 +210,27 @@ void top_two(VSOut i, out uint m0, out uint m1, out float b0, out float b1) {
     if (b1 < 0.02f) b1 = 0.0f;
 }
 
+// One candidate's share of the height blend (scan_surface).
+void scan_blend_add(ScanSample s, float w, float top, float3 tint, float rscale,
+                    inout float wsum, inout ScanResult r, inout float3 nsum) {
+    if (w <= 0.0f) return;
+    const float hb = max(s.height * kScanHeightGain + w - top + kScanBlendDepth, 0.0f);
+    wsum += hb;
+    r.albedo += hb * s.albedo * tint;
+    r.rough += hb * saturate(s.rough * rscale);
+    r.ao += hb * s.ao;
+    r.height += hb * s.height;
+    nsum += hb * s.n;
+}
+
 // `dpx`, `dpy`: the world position's screen derivatives, taken by the caller
 // before any branch -- this runs only inside the detail fade.
+// The four candidates are four NAMED variables, never an array: written as
+// arrays (sc[4], wc[4], tint[4], rscale[4]) and indexed by the heaviest and
+// the hex-tiled candidate's index, FXC kept them in dynamically indexed
+// temps (dcl_indexableTemp, 32 float4), which this GPU's compiler puts in
+// scratch memory. That was most of what the scans cost: at 4K in a lit pit,
+// terrain 8.1 -> 6.0 ms, the image the same to 2 levels in 255.
 ScanResult scan_surface(VSOut i, float3 n, float level, float3 v, float3 dpx, float3 dpy, out float psh) {
     ScanResult r = (ScanResult)0;
     psh = 1.0f;
@@ -229,64 +248,54 @@ ScanResult scan_surface(VSOut i, float3 n, float level, float3 v, float3 dpx, fl
     bw /= (bw.x + bw.y + bw.z);
     float3 p = i.world;
 
-    float wc[4] = {b0 / tot * level, b0 / tot * (1.0f - level), b1 / tot * level, b1 / tot * (1.0f - level)};
-    ScanSample sc[4];
-    float3 tint[4];
-    float rscale[4];
-    [unroll] for (int c = 0; c < 4; ++c) {
-        ScanMaterial M = M1;   // FXC takes no ternary on a struct
-        if (c < 2) M = M0;
-        const bool ground = (c & 1) == 0;
-        sc[c] = (ScanSample)0;
-        tint[c] = ground ? M.ground_tint : M.rock_tint;
-        rscale[c] = ground ? M.ground_rough / M.ground_scan_rough : M.rock_rough / M.rock_scan_rough;
-        if (wc[c] < 0.005f) { wc[c] = 0.0f; continue; }
-    }
+    // The candidates: the first biome's ground and rock, then the second's.
+    float w0 = b0 / tot * level, w1 = b0 / tot * (1.0f - level);
+    float w2 = b1 / tot * level, w3 = b1 / tot * (1.0f - level);
+    w0 = w0 < 0.005f ? 0.0f : w0;
+    w1 = w1 < 0.005f ? 0.0f : w1;
+    w2 = w2 < 0.005f ? 0.0f : w2;
+    w3 = w3 < 0.005f ? 0.0f : w3;
+    const bool hex = l_look3.x > 0.5f;
+
     // Parallax (pom.hlsli): the heaviest candidate's height map, in the
     // plane the normal faces most; its shift moves every candidate's sample
     // point, and its self-shadow darkens the key light. Not on hex-tiled
     // ground: the march reads the height map straight, and under a scan
     // turned and offset per hex its shift would not match what is drawn.
     // Ground parallax is 3-5 cm out to ~10 m, barely seen under grass.
-    const bool hex = l_look3.x > 0.5f;
-    int cd = 0;
-    [unroll] for (int c4 = 1; c4 < 4; ++c4) if (wc[c4] > wc[cd]) cd = c4;
-    {
-        ScanMaterial MD = M1;
-        if (cd < 2) MD = M0;
-        const bool gd = (cd & 1) == 0;
-        if (!(gd && hex))
-            p += scan_pom_shift(gd ? MD.ground_layer : MD.rock_layer, gd ? MD.ground_inv_tile : MD.rock_inv_tile,
-                                gd ? MD.ground_depth : MD.rock_depth, p, n, v, bw, dpx, dpy,
-                                length(cam_pos - i.world), psh);
+    float wmax = w0;
+    bool d_second = false, d_rock = false;
+    if (w1 > wmax) { wmax = w1; d_second = false; d_rock = true; }
+    if (w2 > wmax) { wmax = w2; d_second = true; d_rock = false; }
+    if (w3 > wmax) { wmax = w3; d_second = true; d_rock = true; }
+    if (d_rock || !hex) {
+        ScanMaterial MD = M0;   // FXC takes no ternary on a struct
+        if (d_second) MD = M1;
+        p += scan_pom_shift(d_rock ? MD.rock_layer : MD.ground_layer, d_rock ? MD.rock_inv_tile : MD.ground_inv_tile,
+                            d_rock ? MD.rock_depth : MD.ground_depth, p, n, v, bw, dpx, dpy,
+                            length(cam_pos - i.world), psh);
     }
     // Hex-tiling for the heaviest GROUND candidate only: the second biome's
     // share at a boundary and the rock on a slope show no grid worth three
     // fetches.
-    const int cg = wc[2] > wc[0] ? 2 : 0;
-    [unroll] for (int c5 = 0; c5 < 4; ++c5) {
-        if (wc[c5] <= 0.0f) continue;
-        ScanMaterial M = M1;
-        if (c5 < 2) M = M0;
-        const bool ground = (c5 & 1) == 0;
-        sc[c5] = scan_triplanar(ground ? M.ground_layer : M.rock_layer,
-                                ground ? M.ground_inv_tile : M.rock_inv_tile, p, n, bw, dpx, dpy, hex && c5 == cg);
-    }
+    const bool g_second = w2 > w0;
+    ScanSample s0 = (ScanSample)0, s1 = (ScanSample)0, s2 = (ScanSample)0, s3 = (ScanSample)0;
+    if (w0 > 0.0f) s0 = scan_triplanar(M0.ground_layer, M0.ground_inv_tile, p, n, bw, dpx, dpy, hex && !g_second);
+    if (w1 > 0.0f) s1 = scan_triplanar(M0.rock_layer, M0.rock_inv_tile, p, n, bw, dpx, dpy, false);
+    if (w2 > 0.0f) s2 = scan_triplanar(M1.ground_layer, M1.ground_inv_tile, p, n, bw, dpx, dpy, hex && g_second);
+    if (w3 > 0.0f) s3 = scan_triplanar(M1.rock_layer, M1.rock_inv_tile, p, n, bw, dpx, dpy, false);
+
     float top = -1e9f;
-    [unroll] for (int c2 = 0; c2 < 4; ++c2)
-        if (wc[c2] > 0.0f) top = max(top, sc[c2].height * kScanHeightGain + wc[c2]);
+    if (w0 > 0.0f) top = max(top, s0.height * kScanHeightGain + w0);
+    if (w1 > 0.0f) top = max(top, s1.height * kScanHeightGain + w1);
+    if (w2 > 0.0f) top = max(top, s2.height * kScanHeightGain + w2);
+    if (w3 > 0.0f) top = max(top, s3.height * kScanHeightGain + w3);
     float wsum = 0.0f;
     float3 nsum = 0.0f;
-    [unroll] for (int c3 = 0; c3 < 4; ++c3) {
-        if (wc[c3] <= 0.0f) continue;
-        const float hb = max(sc[c3].height * kScanHeightGain + wc[c3] - top + kScanBlendDepth, 0.0f);
-        wsum += hb;
-        r.albedo += hb * sc[c3].albedo * tint[c3];
-        r.rough += hb * saturate(sc[c3].rough * rscale[c3]);
-        r.ao += hb * sc[c3].ao;
-        r.height += hb * sc[c3].height;
-        nsum += hb * sc[c3].n;
-    }
+    scan_blend_add(s0, w0, top, M0.ground_tint, M0.ground_rough / M0.ground_scan_rough, wsum, r, nsum);
+    scan_blend_add(s1, w1, top, M0.rock_tint, M0.rock_rough / M0.rock_scan_rough, wsum, r, nsum);
+    scan_blend_add(s2, w2, top, M1.ground_tint, M1.ground_rough / M1.ground_scan_rough, wsum, r, nsum);
+    scan_blend_add(s3, w3, top, M1.rock_tint, M1.rock_rough / M1.rock_scan_rough, wsum, r, nsum);
     if (wsum <= 0.0f) return r;
     r.albedo /= wsum;
     r.rough /= wsum;
@@ -297,12 +306,11 @@ ScanResult scan_surface(VSOut i, float3 n, float level, float3 v, float3 dpx, fl
     // scale, as a colour ratio over the blend -- structure over tens of
     // metres, coming in from 10 m out as the near scan's own goes to its mips.
     const float wfar = l_look3.y * smoothstep(10.0f, 40.0f, length(cam_pos - i.world)) * level;
-    if (wfar > 0.0f) {
-        ScanMaterial MG = M1;
-        if (cg < 2) MG = M0;
-        if (wc[cg] > 0.0f)
-            r.albedo *= lerp(float3(1.0f, 1.0f, 1.0f),
-                             scan_far_ratio(MG.ground_layer, MG.ground_inv_tile, l_look3.z, p, n, bw, dpx, dpy), wfar);
+    if (wfar > 0.0f && (g_second ? w2 : w0) > 0.0f) {
+        ScanMaterial MG = M0;
+        if (g_second) MG = M1;
+        r.albedo *= lerp(float3(1.0f, 1.0f, 1.0f),
+                         scan_far_ratio(MG.ground_layer, MG.ground_inv_tile, l_look3.z, p, n, bw, dpx, dpy), wfar);
     }
     r.ok = true;
     return r;

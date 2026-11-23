@@ -6,6 +6,7 @@
 #include "engine/render/gpu_profile.h"
 #include "engine/field/world_gpu.h"
 #include "engine/svdag/brick_store.h"
+#include "engine/render/shader_heaps.h"
 
 #include <algorithm>
 #include <climits>
@@ -604,8 +605,7 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
     if (!probe_list_.empty()) std::memcpy(probes_cpu_[f], probe_list_.data(), probe_list_.size() * 4);
     if (!coarse_list_.empty()) std::memcpy(coarse_cpu_[f], coarse_list_.data(), coarse_list_.size() * 4);
 
-    ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
-    cmd->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd);
     cmd->SetComputeRootSignature(root_.Get());
     cmd->SetComputeRootConstantBufferView(0, cb_[f]->GetGPUVirtualAddress());
     cmd->SetComputeRootConstantBufferView(1, world.world_cb()->GetGPUVirtualAddress());

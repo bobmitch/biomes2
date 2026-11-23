@@ -111,6 +111,9 @@ public:
     // then every model's LOD 1 -- so each level gets its own timestamp and
     // pipeline statistics; the impostors are one draw as always.
     void set_profiler(GpuProfiler* p) { prof_ = p; }
+    // The scans' sampler for bark (s5): the renderer's, for its current
+    // anisotropy (Renderer::scan_sampler). Set before recording.
+    void set_scan_sampler(D3D12_GPU_DESCRIPTOR_HANDLE h) { scan_sampler_ = h; }
 
     // The overdraw instrument (`--gpu-profile`): while on, the CAMERA's pass
     // draws with pixel shaders that count, per pixel, every fragment the tree
@@ -195,6 +198,8 @@ private:
     void* frame_cb_cpu_[2] = {};
     ComPtr<ID3D12Resource> atlas_albedo_, atlas_normal_;
     ID3D12DescriptorHeap* srv_heap_ = nullptr;   // the renderer's
+    static constexpr UINT kScanSamplerParam = 11;   // the draw root's s5 table
+    D3D12_GPU_DESCRIPTOR_HANDLE scan_sampler_ = {};
     UINT srv_slot_ = 1;
 
     // Init-time submission.

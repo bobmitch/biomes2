@@ -1,4 +1,5 @@
 #include "engine/render/renderer.h"
+#include "engine/render/shader_heaps.h"
 #include "engine/render/shader_compile.h"
 #include "engine/render/water_wave.h"
 #include "engine/render/lighting_units.h"
@@ -19,7 +20,22 @@
 #pragma comment(lib, "d3dcompiler.lib")
 
 namespace engine {
-namespace {
+
+D3D12_GPU_DESCRIPTOR_HANDLE Renderer::scan_sampler() const {
+    UINT i = 0;
+    while (i + 1 < kScanSamplers && float(1u << (i + 1)) <= scan_aniso_) ++i;
+    D3D12_GPU_DESCRIPTOR_HANDLE h = sampler_heap_->GetGPUDescriptorHandleForHeapStart();
+    h.ptr += UINT64(i) * sampler_inc_;
+    return h;
+}
+void Renderer::set_scan_aniso(float k) {
+    int i = 0;
+    while (i + 1 < int(kScanSamplers) && float(1 << (i + 1)) <= k * 1.41421356f) ++i;
+    scan_aniso_ = float(1 << i);
+    // The trees bind their own root signature; they take the handle here
+    // (and once at init, should this run before the heap exists).
+    if (sampler_heap_) trees_.set_scan_sampler(scan_sampler());
+}namespace {
 
 const char* kMeshShaderPath = "engine/render/shaders/mesh.hlsl";
 const char* kWaterShaderPath = "engine/render/shaders/water.hlsl";
@@ -783,8 +799,8 @@ bool Renderer::create_water_pipeline(std::string& error) {
 bool Renderer::create_mesh_pipeline(std::string& error) {
     if (!mesh_root_) {
         // 24 DWORDs of constants + four root SRVs at 2 each + the shadow CBV
-        // (2) and its table (1) = 35 of the 64.
-        D3D12_ROOT_PARAMETER params[7] = {};
+        // (2) and its table (1) + the scans' sampler table (1) = 36 of the 64.
+        D3D12_ROOT_PARAMETER params[8] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         params[0].Constants.ShaderRegister = 0;
@@ -889,20 +905,23 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         pt.MaxLOD = D3D12_FLOAT32_MAX;
         pt.ShaderRegister = 4;
         pt.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        // s5: the scans, anisotropic and wrapping.
-        D3D12_STATIC_SAMPLER_DESC an = {};
-        an.Filter = D3D12_FILTER_ANISOTROPIC;
-        an.MaxAnisotropy = 8;
-        an.AddressU = an.AddressV = an.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-        an.MaxLOD = D3D12_FLOAT32_MAX;
-        an.ShaderRegister = 5;
-        an.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        const D3D12_STATIC_SAMPLER_DESC samplers[4] = {cmp, lin, pt, an};
+        // s5: the scans, anisotropic and wrapping -- a TABLE into the sampler
+        // heap, not a static sampler, so the Graphics option's anisotropy is
+        // live (scan_sampler()). One DWORD: 36 of the 64.
+        D3D12_DESCRIPTOR_RANGE scan_range = {};
+        scan_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+        scan_range.NumDescriptors = 1;
+        scan_range.BaseShaderRegister = 5;
+        params[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[7].DescriptorTable.NumDescriptorRanges = 1;
+        params[7].DescriptorTable.pDescriptorRanges = &scan_range;
+        const D3D12_STATIC_SAMPLER_DESC samplers[3] = {cmp, lin, pt};
 
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 7;
+        rsd.NumParameters = 8;
         rsd.pParameters = params;
-        rsd.NumStaticSamplers = 4;
+        rsd.NumStaticSamplers = 3;
         rsd.pStaticSamplers = samplers;
         rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
@@ -1076,6 +1095,31 @@ bool Renderer::create_shadow_resources(std::string& error) {
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srv_heap_));
     if (FAILED(hr)) { error = hr_text("shared srv heap", hr); return false; }
+    // The scans' samplers (s5 on the terrain's and the trees' root
+    // signatures): one per anisotropy level, trilinear then 2x to 16x, made
+    // once and never written again, so the option only moves a table
+    // pointer -- no frame in flight ever sees a sampler change under it.
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC sh = {};
+        sh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        sh.NumDescriptors = kScanSamplers;
+        sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hr = device_->CreateDescriptorHeap(&sh, IID_PPV_ARGS(&sampler_heap_));
+        if (FAILED(hr)) { error = hr_text("scan sampler heap", hr); return false; }
+        sampler_inc_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+        D3D12_CPU_DESCRIPTOR_HANDLE h = sampler_heap_->GetCPUDescriptorHandleForHeapStart();
+        for (UINT k = 0; k < kScanSamplers; ++k) {
+            D3D12_SAMPLER_DESC s = {};
+            s.Filter = k == 0 ? D3D12_FILTER_MIN_MAG_MIP_LINEAR : D3D12_FILTER_ANISOTROPIC;
+            s.MaxAnisotropy = 1u << k;
+            s.AddressU = s.AddressV = s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            s.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+            s.MaxLOD = D3D12_FLOAT32_MAX;
+            device_->CreateSampler(&s, D3D12_CPU_DESCRIPTOR_HANDLE{h.ptr + SIZE_T(k) * sampler_inc_});
+        }
+    }
+    shader_heaps().srv = srv_heap_.Get();
+    shader_heaps().sampler = sampler_heap_.Get();
     D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
     sd.Format = DXGI_FORMAT_R32_FLOAT;
     sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -1300,7 +1344,6 @@ void Renderer::record_shadows(const ViewConstants& view) {
     ibv.BufferLocation = mesher_.indices()->GetGPUVirtualAddress();
     ibv.SizeInBytes = kSlots * kSlotIndices * 4;
     ibv.Format = DXGI_FORMAT_R32_UINT;
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
     const UINT dinc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     for (UINT c = 0; c < kCascades; ++c) {
         // Not due: its map and matrix stand from the frame that drew them.
@@ -1321,9 +1364,10 @@ void Renderer::record_shadows(const ViewConstants& view) {
         MeshConstants mc = {};
         std::memcpy(mc.view_proj, cascades_[c].vp, sizeof mc.view_proj);
         mc.slot_vertices = static_cast<float>(kSlotVertices);
-        cmd_->SetDescriptorHeaps(1, heaps);
+        bind_shader_heaps(cmd_.Get());
         cmd_->SetPipelineState(mesh_shadow_pso_.Get());
         cmd_->SetGraphicsRootSignature(mesh_root_.Get());
+        cmd_->SetGraphicsRootDescriptorTable(7, scan_sampler());
         cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
         cmd_->SetGraphicsRootShaderResourceView(1, mesher_.vertices()->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
@@ -1385,10 +1429,10 @@ void Renderer::record_far(const float vp[16]) {
     MeshConstants mc = {};
     std::memcpy(mc.view_proj, vp, sizeof mc.view_proj);
     mc.slot_vertices = static_cast<float>(kSlotVertices);
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
-    cmd_->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd_.Get());
     cmd_->SetPipelineState(mesh_shadow_pso_.Get());   // depth only
     cmd_->SetGraphicsRootSignature(mesh_root_.Get());
+    cmd_->SetGraphicsRootDescriptorTable(7, scan_sampler());
     cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
     cmd_->SetGraphicsRootShaderResourceView(1, mesher_.vertices()->GetGPUVirtualAddress());
     cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
@@ -1432,10 +1476,10 @@ void Renderer::record_hfgi(const float vp[16]) {
     MeshConstants mc = {};
     std::memcpy(mc.view_proj, vp, sizeof mc.view_proj);
     mc.slot_vertices = static_cast<float>(kSlotVertices);
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
-    cmd_->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd_.Get());
     cmd_->SetPipelineState(mesh_top_pso_.Get());
     cmd_->SetGraphicsRootSignature(mesh_root_.Get());
+    cmd_->SetGraphicsRootDescriptorTable(7, scan_sampler());
     cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
     cmd_->SetGraphicsRootShaderResourceView(1, mesher_.vertices()->GetGPUVirtualAddress());
     cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
@@ -1830,8 +1874,7 @@ void Renderer::record_fog() {
     tr(shadow_map_.Get(), ps, ps | nps);
     tr(light_atlas_.Get(), ps, ps | nps);
 
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
-    cmd_->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd_.Get());
     const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     auto at = [&](UINT i) {
         D3D12_GPU_DESCRIPTOR_HANDLE g = srv_heap_->GetGPUDescriptorHandleForHeapStart();
@@ -2334,7 +2377,6 @@ void Renderer::record_lights(const ViewConstants& view) {
     ibv.BufferLocation = mesher_.indices()->GetGPUVirtualAddress();
     ibv.SizeInBytes = kSlots * kSlotIndices * 4;
     ibv.Format = DXGI_FORMAT_R32_UINT;
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
     std::vector<UINT> slots;
     for (size_t q = 0; q < draws.size(); ++q) {
         const FaceDraw& d = draws[q];
@@ -2354,9 +2396,10 @@ void Renderer::record_lights(const ViewConstants& view) {
         MeshConstants mc = {};
         std::memcpy(mc.view_proj, d.vp, sizeof mc.view_proj);
         mc.slot_vertices = static_cast<float>(kSlotVertices);
-        cmd_->SetDescriptorHeaps(1, heaps);
+        bind_shader_heaps(cmd_.Get());
         cmd_->SetPipelineState(mesh_shadow_pso_.Get());
         cmd_->SetGraphicsRootSignature(mesh_root_.Get());
+        cmd_->SetGraphicsRootDescriptorTable(7, scan_sampler());
         cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
         cmd_->SetGraphicsRootShaderResourceView(1, mesher_.vertices()->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
@@ -2691,8 +2734,7 @@ void Renderer::record_atmosphere() {
     ac.far_plane = kFarPlane;
     std::memcpy(atm_cb_cpu_[frame_], &ac, sizeof ac);
 
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
-    cmd_->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd_.Get());
     const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_GPU_DESCRIPTOR_HANDLE srvs = srv_heap_->GetGPUDescriptorHandleForHeapStart();
     srvs.ptr += UINT64(16) * inc;
@@ -2826,6 +2868,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
             startup_log().push_back(std::make_pair(std::string(line), forest_.bake_ms()));
         }
         if (!trees_.init(device_.Get(), queue_.Get(), looks, srv_heap_.Get(), 1, error)) return false;
+        trees_.set_scan_sampler(scan_sampler());
         if (prof_.init(device_.Get(), queue_.Get())) trees_.set_profiler(&prof_);
         // The canopy map (ADR-004 L6) from the same models' crowns.
         if (!canopy_.init(device_.Get(), srv_heap_.Get(), error)) return false;
@@ -3301,8 +3344,7 @@ void Renderer::record_water() {
     cmd_->RSSetScissorRects(1, &sc);
     cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
-    cmd_->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd_.Get());
     // The ripples' tiles for this frame (ocean_fft.hlsl): compute, then
     // readable by the sea's pixel shader.
     if (detail_on_) ocean_.record(cmd_.Get(), UINT(frame_));
@@ -3403,8 +3445,7 @@ void Renderer::record_rain() {
     const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_GPU_DESCRIPTOR_HANDLE table = srv_heap_->GetGPUDescriptorHandleForHeapStart();
     table.ptr += UINT64(3) * inc;
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
-    cmd_->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd_.Get());
     rain_.record(cmd_.Get(), UINT(frame_), f, rtv, table);
 }
 
@@ -3426,8 +3467,7 @@ void Renderer::record_lightning() {
     const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_GPU_DESCRIPTOR_HANDLE table = srv_heap_->GetGPUDescriptorHandleForHeapStart();
     table.ptr += UINT64(3) * inc;   // the scene depth
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
-    cmd_->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd_.Get());
     lightning_.record(cmd_.Get(), UINT(frame_), f, rtv, table);
 }
 
@@ -3461,8 +3501,7 @@ void Renderer::record_clouds() {
         for (int k = 0; k < 3; ++k) f.flash[k] = strike_.flash_pt[k];
         f.flash[3] = strike_.candela;
     }
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
-    cmd_->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd_.Get());
     clouds_.record(cmd_.Get(), UINT(frame_), f);
 }
 
@@ -3636,8 +3675,7 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     tr(hdr_ambient_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
     tr(puddle_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
 
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
-    cmd_->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd_.Get());
     const UINT inc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_GPU_DESCRIPTOR_HANDLE srvs = srv_heap_->GetGPUDescriptorHandleForHeapStart();
     srvs.ptr += UINT64(3) * inc;
@@ -3679,7 +3717,7 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     if (bolt) record_lightning();
     if (water_pending_ || rain || bolt) {
         // Back to the post chain's bindings, which TAA and the meter use.
-        cmd_->SetDescriptorHeaps(1, heaps);
+        bind_shader_heaps(cmd_.Get());
         cmd_->SetComputeRootSignature(post_root_.Get());
         cmd_->SetComputeRootConstantBufferView(0, post_cb_[frame_]->GetGPUVirtualAddress());
         cmd_->SetComputeRootDescriptorTable(1, srvs);
@@ -4049,14 +4087,14 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         streamer_.fill_visibility(static_cast<float*>(fade_cpu_[frame_]));
         cmd_->SetPipelineState(wire ? mesh_wire_pso_.Get() : mesh_pso_.Get());
         cmd_->SetGraphicsRootSignature(mesh_root_.Get());
+        cmd_->SetGraphicsRootDescriptorTable(7, scan_sampler());
         cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
         cmd_->SetGraphicsRootShaderResourceView(
             1, mesher_.vertices()->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
         cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress()); cmd_->SetGraphicsRootShaderResourceView(6, mesher_.vertex_weights()->GetGPUVirtualAddress());
         {
-            ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
-            cmd_->SetDescriptorHeaps(1, heaps);
+            bind_shader_heaps(cmd_.Get());
             cmd_->SetGraphicsRootConstantBufferView(3, shadow_cb_[frame_]->GetGPUVirtualAddress());
             cmd_->SetGraphicsRootDescriptorTable(4, srv_heap_->GetGPUDescriptorHandleForHeapStart());
         }
@@ -4093,8 +4131,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         fi.far_plane = kFarPlane;
         fi.shadow_cb = shadow_cb_[frame_]->GetGPUVirtualAddress();
         fi.shadow_table = srv_heap_->GetGPUDescriptorHandleForHeapStart();
-        ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get()};
-        cmd_->SetDescriptorHeaps(1, heaps);
+        bind_shader_heaps(cmd_.Get());
         prof_.stat_begin(cmd_.Get(), "foliage");
         foliage_.record(cmd_.Get(), frame_, fi, foliage_settings_);
         prof_.stat_end(cmd_.Get());

@@ -497,6 +497,14 @@ public:
     // Parallax occlusion on the scans' height (pom.hlsli; --no-pom, P).
     void set_pom(bool on) { pom_on_ = on; }
     bool pom() const { return pom_on_; }
+    // The scans' anisotropic filtering (terrain, rocks, character, bark): 1
+    // trilinear, 2, 4 (default), 8 or 16 -- rounded to a power of two. Live:
+    // it picks which of the sampler heap's fixed samplers s5's table points
+    // at. --aniso <n>, Graphics.
+    void set_scan_aniso(float k);
+    float scan_aniso() const { return scan_aniso_; }
+    // The scans' sampler for the current setting, for s5's table.
+    D3D12_GPU_DESCRIPTOR_HANDLE scan_sampler() const;
     bool hfgi() const { return hfgi_on_; }
     unsigned long long hfgi_rebuilds() const { return hfgi_.rebuilds(); }
     // The far terrain shadow past the cascades (far_shadow.h; --no-far-shadow).
@@ -701,6 +709,10 @@ private:
     // impostor atlases. One heap, because only one can be bound at a time
     // and the terrain and the trees both sample the shadow.
     ComPtr<ID3D12DescriptorHeap> srv_heap_;
+    // The scans' samplers, trilinear and anisotropic 2x..16x (shader_heaps.h).
+    static constexpr UINT kScanSamplers = 5;
+    ComPtr<ID3D12DescriptorHeap> sampler_heap_;
+    UINT sampler_inc_ = 0;
     ComPtr<ID3D12Resource>       shadow_cb_[kFrameCount];
     void*                        shadow_cb_cpu_[kFrameCount] = {};
     ComPtr<ID3D12PipelineState>  mesh_shadow_pso_;
@@ -766,6 +778,7 @@ private:
     bool hfgi_on_ = true;
     bool near_on_ = true;
     bool pom_on_ = true;
+    float scan_aniso_ = 4.0f;
     ComPtr<ID3D12PipelineState> mesh_top_pso_;
     void record_hfgi(const float vp[16]);
     static bool gi_dbg_hf_off() { return false; }
