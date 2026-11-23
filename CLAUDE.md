@@ -20,8 +20,8 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `tools/models/` | `pack_character.py`: the rigged glTF characters and the animation library in `assets/models/` (not in git) to `assets/models/packed/` (`*.chr`, `ual.anim`). |
 | `engine/rocks/` | Layer 9's rocks: procedural meshes, the CPU tile streamer, instanced drawing on the terrain's root signature, static colliders. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
-| `tools/view/` | Native world viewer (Win32). Debug tool, Windows only. |
-| `tools/shared/` | Presentation, shared by the harness and the viewer. |
+| `tools/view/` | Native world viewer (Win32), Windows only: seeds as maps plus their gameplay numbers. See "The world viewer". |
+| `tools/shared/` | Presentation (`render.h`) and gameplay measures of a seed (`seed_metrics.h`), shared by the harness and the viewer. |
 | `assets/textures/` | `scans.json`, the CC0 surface scans' manifest. Downloads and packs are fetched, never committed. |
 | `tools/textures/` | `fetch_scans.py`: downloads the scans and packs them for the engine. |
 | `engine/` | Track B runtime (D3D12, `docs/adr-003-*`). Since M1 it evaluates the REAL field: `engine/field/real_field.hlsl` is the caller's side of ADR-001's line (which cells, rivers and shafts are near a point), and `world_gpu.{h,cpp}` uploads them. |
@@ -104,7 +104,8 @@ pipeline statistics and the trees' overdraw, `<shot>.gpu.txt`; see Trees),
 (ADR-004 L6: a sealed chamber, unlit and torch-lit, the heightfield GI against
 the bare fallback), `--lights-report` (ADR-004 L3: local lights at night, six
 configurations timed), `--fell` (with `--fell-save` / `--fell-verify`) and `--dig-settle`.
-Every mode takes `--character male|female` (which pack; male by default) and
+Every mode takes `--seed <n>` (which world; 0 by default, and every view
+measured in this file is seed 0), `--character male|female` (which pack; male by default) and
 `--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), the weather's `--sea-state <0..1>`, `--wind <m/s>`,
 `--wind-dir <deg>` and `--swell <m>` (automatic weather otherwise), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
@@ -2545,6 +2546,54 @@ path changes. Walking cost unchanged.
 The renderer owns the one shader-visible descriptor heap -- [0] the shadow
 map, [1..2] the impostor atlases -- because only one can be bound at a
 time and terrain and trees both sample the shadow.
+
+## The world viewer
+
+`build\view.exe`, from the repository root: the seed as a map, and the
+numbers a player meets, for judging seeds by gameplay rather than by eye.
+It links `worldgen/` and builds at grid 1024, the engine's own, so its
+spawn, biomes and flat sites are the engine's -- while the three sliders
+(danger wobble, danger feature size, land fraction) sit at the shipping
+values; the status says when they do not, and the engine never sees them.
+
+- **Views** (1-5): biome map, shaded relief, danger, biomes over relief,
+  slope. The slope classes are the game's own limits: 0.08 (a flat site's
+  `max_grade`), 0.8 (trees' `max_slope`), 50 degrees (the character's
+  climb, `physics_world.cpp`). A biome can be highlighted (the combo, or
+  click its legend row); the legend gives each biome's quota and preferred
+  danger.
+- **Overlays**: spawn (and `find_spawn`'s 60 m ring), km rings round it,
+  rivers at their channel width, flat sites (pad and shoulder), a
+  coordinate grid, and under 3 m a pixel every tree and rock
+  (`trees_in_cells`, `rocks_in_cells`, threaded).
+- **Wheel** zooms about the cursor, drag pans, Home fits; PgUp / PgDn step
+  the seed. Click pins a point for the inspector (height, slope, biome mix,
+  danger against the biome's preferred, river, flat site, distance from
+  spawn and whether it is on foot); right click drops a measuring marker.
+- **This seed** (`tools/shared/seed_metrics.h`, a 50 m grid, ~30 ms): the
+  spawn, landmasses, flat sites near spawn, and per biome its share of the
+  land, the straight-line distance from spawn to its nearest ground, the
+  same counting only land joined to spawn's without crossing water ("on
+  foot"; `NO` if none), and how much of it is on spawn's landmass; then
+  mean danger in rings of 0-1, 1-2, 2-4, 4-6, 6+ km from spawn.
+- **Scan** N seeds from the current one, on every core (32 in ~3 s): one row
+  each -- land, landmasses, spawn's landmass share, spawn's distance from
+  the centre (`!` a fallback spawn), flat sites within 2 km, biomes not on
+  foot, the furthest biome on foot -- and every number per biome in
+  `build/seed_scan.csv`. Double-click a row to open that seed.
+- **`archetypes.json` is watched**: save it and the world rebuilds (F5 by
+  hand). A file that does not load keeps the last good table and says why
+  in the status.
+- **Open in engine** starts `build\engine.exe --cam ... --seed <n>` 60 m
+  back from the pinned point (or the spawn), 40 m up; **Copy command** puts
+  that line on the clipboard.
+- `view.exe --shot <bmp> [--seed n] [--mode 1-5] [--view cx cz m/px] [--pin
+  x z] [--marker x z] [--highlight b] [--scan n] [--rivers] [--rings]
+  [--grid] [--no-props]` writes the window to a BMP and its panels' text to
+  `<bmp>.txt`, and exits. Run it with `Start-Process -Wait`.
+
+The view is drawn +x right and +z down, like the contact sheets; the
+engine's +x is WEST, so it is a mirror image of a north-up compass map.
 
 ## Testing
 
