@@ -4,7 +4,9 @@
 #include "worldgen/assign/json_lite.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <stdexcept>
 #include <vector>
 
@@ -115,6 +117,36 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
             h *= 1099511628211ull;
         }
         field_id_ = static_cast<uint32_t>(h ^ (h >> 32));
+    }
+
+    // PROTOTYPE: BIOMES_L0="key=value,..." sets the layer 0 prototype's
+    // WorldParams (docs/worldgen-design.md, "Layer 0, proposed") so the engine
+    // can walk a prototype world and --probe-field can check its GPU parity.
+    // Unset, the world is the shipped one.
+    if (const char* l0env = std::getenv("BIOMES_L0")) {
+        std::string spec(l0env);
+        size_t at = 0;
+        while (at < spec.size()) {
+            size_t end = spec.find(',', at);
+            if (end == std::string::npos) end = spec.size();
+            const std::string kv = spec.substr(at, end - at);
+            const size_t eq = kv.find('=');
+            if (eq != std::string::npos) {
+                const std::string k = kv.substr(0, eq);
+                const float v = static_cast<float>(std::atof(kv.c_str() + eq + 1));
+                worldgen::WorldParams& p = params_;
+                if (k == "centre_floor") p.centre_floor = v;
+                else if (k == "land_offset") p.land_offset = v;
+                else if (k == "fine_feat") p.fine_freq = 1.0f / v;
+                else if (k == "fine_weight") p.fine_weight = v;
+                else if (k == "fine_regime") p.fine_regime = v;
+                else if (k == "regime_feat") p.regime_freq = 1.0f / v;
+                else if (k == "regime_mean") p.regime_mean = v;
+                else if (k == "regime_amp") p.regime_amp = v;
+                else if (k == "regime_draw") p.regime_draw = v != 0.0f;
+            }
+            at = end + 1;
+        }
     }
 
     worldgen::AssignParams ap;
@@ -283,10 +315,10 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
     constants_.radius = params_.radius;
     constants_.continent_freq = params_.continent_freq;
     constants_.continent_octaves = params_.continent_octaves;
-    constants_.centre_floor = params_.centre_floor;
+    constants_.centre_floor = world_.l0.centre_floor;
     constants_.edge_drop = params_.edge_drop;
     constants_.sea_level = params_.sea_level;
-    constants_.land_offset = params_.land_offset;
+    constants_.land_offset = world_.l0.land_offset;
     constants_.danger_w = params_.danger_w;
     constants_.danger_freq = params_.danger_freq;
     constants_.danger_octaves = params_.danger_octaves;
@@ -320,6 +352,20 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
     constants_.detail_octaves = table_.detail.octaves;
     constants_.detail_gain = table_.detail.gain;
     constants_.s_detail = world_.s_detail;
+    {
+        const ::Layer0Params& l0 = world_.l0;
+        constants_.fine_freq = l0.fine_freq;
+        constants_.fine_octaves = l0.fine_octaves;
+        constants_.fine_weight = l0.fine_weight;
+        constants_.fine_regime = l0.fine_regime;
+        constants_.regime_freq = l0.regime_freq;
+        constants_.regime_octaves = l0.regime_octaves;
+        constants_.regime_mean = l0.regime_mean;
+        constants_.regime_amp = l0.regime_amp;
+        constants_.regime_on = l0.regime_on;
+        constants_.s_fine = l0.seed_fine;
+        constants_.s_regime = l0.seed_regime;
+    }
 
     // A constant buffer's size must be a multiple of 256 bytes.
     const UINT cb_bytes = (sizeof(WorldConstants) + 255u) & ~255u;

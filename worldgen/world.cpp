@@ -114,7 +114,8 @@ std::vector<std::pair<float, float> > scatter_cells(const WorldParams& wp, uint3
 // from worldgen/shaders/field.h.
 float terrain_base(const SeedWorld& w, const WorldParams& wp,
                    const ArchetypeTable& table, float x, float z, float r, float voxel) {
-    const float cont = layer0_height(x, z, r, wp, w.s_cont, voxel);
+    const Layer0Noise l0n = layer0_noise(x, z, w.l0, voxel);
+    const float cont = layer0_shape(l0n.n + w.l0.land_offset, r, w.l0.centre_floor, w.l0.edge_drop);
 
     const float wx = x + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wx);
     const float wz = z + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wz);
@@ -150,6 +151,44 @@ float terrain_base(const SeedWorld& w, const WorldParams& wp,
 
     const float blended = layer4_blend(h[0], wt[0], h[1], wt[1], h[2], wt[2], h[3], wt[3], wall);
     return layer4_height(cont, wp.continent_scale, blended, wp.sea_level);
+}
+
+// --- layer 0 prototype: per-seed parameters and the land knee ----------------
+static float unit_draw(uint64_t world_seed, uint32_t feature) {
+    return static_cast<float>(feature_seed(world_seed, feature) >> 8) * (1.0f / 16777216.0f);
+}
+
+Layer0Params make_layer0(const WorldParams& wp, uint64_t world_seed) {
+    Layer0Params p;
+    p.freq = wp.continent_freq;
+    p.octaves = wp.continent_octaves;
+    p.centre_floor = wp.centre_floor;
+    p.edge_drop = wp.edge_drop;
+    p.land_offset = wp.land_offset;
+    p.fine_freq = wp.fine_freq;
+    p.fine_octaves = wp.fine_octaves;
+    p.fine_weight = wp.fine_weight;
+    p.fine_regime = wp.fine_regime;
+    p.regime_freq = wp.regime_freq;
+    p.regime_octaves = wp.regime_octaves;
+    p.regime_mean = wp.regime_mean;
+    p.regime_amp = wp.regime_amp;
+    if (wp.regime_draw) {
+        const float us = unit_draw(world_seed, FEATURE_REGIME_SCALE);
+        const float um = unit_draw(world_seed, FEATURE_REGIME_MEAN);
+        const float ua = unit_draw(world_seed, FEATURE_REGIME_AMP);
+        const float size = wp.regime_size_lo + (wp.regime_size_hi - wp.regime_size_lo) * us;
+        p.regime_freq = 1.0f / (size > 1.0f ? size : 1.0f);
+        p.regime_mean = wp.regime_mean_lo + (wp.regime_mean_hi - wp.regime_mean_lo) * um;
+        p.regime_amp = wp.regime_amp_lo + (wp.regime_amp_hi - wp.regime_amp_lo) * ua;
+    }
+    // The regime is evaluated only if something reads it; off, the mask is
+    // today's bit for bit.
+    p.regime_on = (p.regime_mean != 0.0f || p.regime_amp != 0.0f || p.fine_regime != 0.0f) ? 1 : 0;
+    p.seed = feature_seed(world_seed, FEATURE_CONTINENT);
+    p.seed_fine = feature_seed(world_seed, FEATURE_CONTINENT_FINE);
+    p.seed_regime = feature_seed(world_seed, FEATURE_REGIME);
+    return p;
 }
 
 // Distance to the nearest river segment, with that channel's shape. Shared by
@@ -1038,7 +1077,11 @@ SeedWorld build_world(uint64_t world_seed,
     w.s_rock_patch = feature_seed(world_seed, FEATURE_ROCK_PATCH);
     w.s_detail = feature_seed(world_seed, FEATURE_DETAIL);
     w.s_flats = feature_seed(world_seed, FEATURE_FLATS);
-    const uint32_t s_cont = w.s_cont, s_dang = w.s_dang, s_wx = w.s_wx, s_wz = w.s_wz;
+    const uint32_t s_dang = w.s_dang, s_wx = w.s_wx, s_wz = w.s_wz;
+
+    // Layer 0 first: everything from the raster (layers 2 and 3) down reads
+    // the seed's own parameters.
+    w.l0 = make_layer0(wp, world_seed);
     const uint32_t s_cell = feature_seed(world_seed, FEATURE_CELLS);
 
     w.pts = scatter_cells(wp, s_cell);
@@ -1081,7 +1124,7 @@ SeedWorld build_world(uint64_t world_seed,
             acc_x[ci] += x;
             acc_z[ci] += z;
 
-            const float h = layer0_height(x, z, rr, wp, s_cont);
+            const float h = layer0_height(x, z, rr, w.l0);
             if (rr > 0.95f && h > w.max_h_outer) w.max_h_outer = h;
             if (h > wp.sea_level) {
                 acc_land[ci] += sample_area;

@@ -180,7 +180,7 @@ static SeedResult eval_seed(uint64_t world_seed,
         for (int k = 0; k < 720; ++k) {
             const float a = static_cast<float>(k) * (6.28318530718f / 720.0f);
             const float x = R * std::cos(a), z = R * std::sin(a);
-            const float h = layer0_height(x, z, 1.0f, wp, w.s_cont);
+            const float h = layer0_height(x, z, 1.0f, w.l0);
             if (h > worst) worst = h;
         }
         out.rim_height = worst;
@@ -322,7 +322,7 @@ static SeedResult eval_seed(uint64_t world_seed,
                 const float x = -R + (gi + 0.5f) * ss;
                 const float rr = std::sqrt(x * x + z * z) / R;
                 if (rr > 1.0f) continue;
-                if (layer0_height(x, z, rr, wp, w.s_cont) <= wp.sea_level) continue;
+                if (layer0_height(x, z, rr, w.l0) <= wp.sea_level) continue;
                 ++land_n;
                 const float h0 = terrain_height(w, wp, table, x, z, rr);
                 const float hx = terrain_height(w, wp, table, x + e, z,
@@ -565,7 +565,7 @@ static SeedResult eval_seed(uint64_t world_seed,
                 const float x = -R + (gi + 0.5f) * hstep;
                 const float rr = std::sqrt(x * x + z * z) / R;
                 if (rr > 1.0f) continue;
-                const float hh = layer0_height(x, z, rr, wp, w.s_cont);
+                const float hh = layer0_height(x, z, rr, w.l0);
                 const float dd = layer1_danger(x, z, rr, wp, w.s_dang);
                 const float tt = terrain_height(w, wp, table, x, z, rr);
                 h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(hh * 4096.0f)));
@@ -2229,7 +2229,7 @@ int main(int argc, char** argv) {
                     const float x = -CR + (gi + 0.5f) * cs;
                     const float rr = std::sqrt(x * x + z * z) / CR;
                     if (rr > 1.0f) continue;
-                    const float a = layer0_height(x, z, rr, cw, cwld.s_cont);
+                    const float a = layer0_height(x, z, rr, cwld.l0);
                     const float b = layer1_danger(x, z, rr, cw, cwld.s_dang);
                     // Split layer 4: the shaped noise alone (exercises abs and
                     // the ridge warp) versus the cell lookup alone (integers
@@ -2278,6 +2278,7 @@ int main(int argc, char** argv) {
         // comparable. It cannot be a hash: WGSL 15.7.5 rules that out.
         const uint32_t s_cont = feature_seed(dump_world_seed, FEATURE_CONTINENT);
         const uint32_t s_dang = feature_seed(dump_world_seed, FEATURE_DANGER);
+        Layer0Params dl0 = make_layer0(wp, dump_world_seed);
         const float R = wp.radius;
         const int   G = wp.grid;
         const float step = 2.0f * R / G;
@@ -2289,7 +2290,7 @@ int main(int argc, char** argv) {
                 const float rr = std::sqrt(x * x + z * z) / R;
                 if (rr > 1.0f) continue;
                 ++disc;
-                if (layer0_height(x, z, rr, wp, s_cont) > wp.sea_level) ++land;
+                if (layer0_height(x, z, rr, dl0) > wp.sea_level) ++land;
             }
         }
         std::printf("\nworld seed %llu, %d^2 grid, R = %.0f m\n",
@@ -2411,7 +2412,7 @@ int main(int argc, char** argv) {
         double ns = 1.0e30;
         {
             const int N = 1000000;
-            const uint32_t sd = feature_seed(0, FEATURE_CONTINENT);
+            const Layer0Params sd = make_layer0(wp, 0);
             for (int rep = 0; rep < 3; ++rep) {
                 double sink = 0.0;
                 const std::chrono::high_resolution_clock::time_point t0 =
@@ -2419,7 +2420,7 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < N; ++i) {
                     const float x = static_cast<float>(i & 2047) * 9.7f - 10000.0f;
                     const float z = static_cast<float>(i >> 11) * 9.7f - 10000.0f;
-                    sink += layer0_height(x, z, 0.5f, wp, sd);
+                    sink += layer0_height(x, z, 0.5f, sd);
                 }
                 const std::chrono::high_resolution_clock::time_point t1 =
                     std::chrono::high_resolution_clock::now();

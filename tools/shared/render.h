@@ -123,7 +123,7 @@ inline void render_tile(const SeedWorld& w, const WorldParams& wp,
             if (rr > 1.0f) {
                 c[0] = 10; c[1] = 12; c[2] = 18;              // void past the terminator
             } else {
-                const float h = layer0_height(x, z, rr, wp, w.s_cont);
+                const float h = layer0_height(x, z, rr, w.l0);
                 if (h <= wp.sea_level) {
                     const float d = wg_saturate(-h * 1.2f);      // deeper water, darker
                     c[0] = static_cast<unsigned char>(46 - 30 * d);

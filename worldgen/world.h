@@ -39,7 +39,14 @@ enum FeatureId : uint32_t {
     FEATURE_ROCKS     = 12u,   // which cells hold a rock, and its rolls
     FEATURE_ROCK_PATCH = 13u,  // the rock patch noise
     FEATURE_DETAIL    = 14u,   // layer 4's shared micro-relief
-    FEATURE_FLATS     = 15u    // layer 5b: which cells hold a flat site, and its rolls
+    FEATURE_FLATS     = 15u,   // layer 5b: which cells hold a flat site, and its rolls
+    // Layer 0 prototype (docs/worldgen-design.md, "Layer 0, proposed"). Each
+    // draw has its own id so retuning one range never reshuffles another.
+    FEATURE_CONTINENT_FINE = 16u,  // the fine (~1.5 km) continent noise
+    FEATURE_REGIME       = 17u,    // the regime field's noise
+    FEATURE_REGIME_SCALE = 18u,    // per-seed draw: regime feature size
+    FEATURE_REGIME_MEAN  = 19u,    // per-seed draw: regime mean
+    FEATURE_REGIME_AMP   = 20u     // per-seed draw: regime amplitude
 };
 
 inline uint64_t hash64(uint64_t x) {
@@ -92,6 +99,26 @@ struct WorldParams {
     // separate mode. validate --land-sweep / --land-target re-solve it.
     float land_offset       = -0.0540f;
 
+    // --- layer 0 PROTOTYPE: land as a lottery with fences ------------------
+    // docs/worldgen-design.md, "Layer 0, proposed". Every default below is
+    // today's world: the regime off (amplitude, mean and fine weight 0), no
+    // per-seed draws. layer0_noise evaluates
+    // nothing new while they are, so the golden hashes do not move.
+    float fine_freq         = 1.0f / 1500.0f;   // the fine continent noise, islets
+    int   fine_octaves      = 4;
+    float fine_weight       = 0.0f;   // its weight where the regime is average
+    float fine_regime       = 0.0f;   // weight change per std of regime (low regime, more fine)
+    float regime_freq       = 1.0f / 7000.0f;   // 1 / regime feature size
+    int   regime_octaves    = 3;
+    float regime_mean       = 0.0f;   // mask offset where the regime is average
+    float regime_amp        = 0.0f;   // mask offset per std of the regime
+    // Per-seed draws: when on, the three values above are drawn per seed,
+    // uniformly in these ranges, each from its own feature seed.
+    bool  regime_draw       = false;
+    float regime_size_lo    = 2500.0f, regime_size_hi = 8000.0f;   // metres
+    float regime_mean_lo    = -0.05f,  regime_mean_hi = 0.05f;
+    float regime_amp_lo     = 0.0f,    regime_amp_hi  = 0.15f;
+
     // layer 1
     float danger_w          = 0.60f;      // the feel parameter; see tools/validate/README.md
     float danger_freq       = 1.0f / 2000.0f;
@@ -133,13 +160,17 @@ struct WorldParams {
     float entrance_branch_p  = 0.6f;      // chance of a dead-end side passage
 };
 
-// Thin adapters onto the canonical field function in worldgen/shaders/field.h.
-// The arithmetic lives there so the harness, the engine and mapview cannot drift
-// apart -- these only unpack WorldParams into the scalars the dialect takes.
-// voxel is the LOD sample spacing in metres; 0 means full detail.
-static inline float layer0_height(float x, float z, float r, const WorldParams& wp, uint32_t seed, float voxel = 0.0f) {
-    return ::layer0_height(x, z, r, wp.continent_freq, wp.continent_octaves,
-                           wp.centre_floor, wp.edge_drop, wp.land_offset, seed, voxel);
+// Layer 0's parameters for one seed, before the knee: WorldParams plus the
+// per-seed draws, with the feature seeds filled in. build_world then applies
+// the knee (if on) and keeps the result in SeedWorld::l0, which is what every
+// caller of layer 0 reads -- CPU here, and the GPU through world_gpu.cpp.
+Layer0Params make_layer0(const WorldParams& wp, uint64_t world_seed);
+
+// Thin adapter onto the canonical field function in worldgen/shaders/field.h.
+// The arithmetic lives there so the harness, the engine and the viewer cannot
+// drift apart. voxel is the LOD sample spacing in metres; 0 means full detail.
+static inline float layer0_height(float x, float z, float r, const Layer0Params& l0, float voxel = 0.0f) {
+    return ::layer0_mask(x, z, r, l0, voxel);
 }
 
 static inline float layer1_danger(float x, float z, float r, const WorldParams& wp, uint32_t seed) {
@@ -272,6 +303,8 @@ struct SeedWorld {
     uint32_t s_rocks = 0, s_rock_patch = 0;
     uint32_t s_detail = 0, s_flats = 0;
     float    land_fraction = 0.0f;
+    // Layer 0 as this seed uses it: draws made, knee applied.
+    Layer0Params l0;
 
     // --- layer 5 ---
     // The drainage network as segments, each from a grid cell to the one it

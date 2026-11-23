@@ -44,6 +44,27 @@ void cs_probe(uint3 id : SV_DispatchThreadID) {
     acc += layer4_blend(1.0f, 0.5f, 2.0f, 0.25f, 3.0f, 0.125f, 4.0f, 0.125f, 1.0f);
     acc += layer4_height(0.3f, 140.0f, 12.0f, 0.0f);
 
+    // Layer 0 prototype: the regime and the fine noise.
+    Layer0Params l0;
+    l0.freq = 1.0f / 5200.0f;
+    l0.octaves = 5;
+    l0.centre_floor = 0.0f;
+    l0.edge_drop = 1.6f;
+    l0.land_offset = -0.05f;
+    l0.fine_freq = 1.0f / 1500.0f;
+    l0.fine_octaves = 4;
+    l0.fine_weight = 0.3f;
+    l0.fine_regime = 0.2f;
+    l0.regime_freq = 1.0f / 7000.0f;
+    l0.regime_octaves = 3;
+    l0.regime_mean = 0.0f;
+    l0.regime_amp = 0.1f;
+    l0.regime_on = 1;
+    l0.seed = 0x12345678u;
+    l0.seed_fine = 0x2345678Au;
+    l0.seed_regime = 0x345678ABu;
+    acc += layer0_mask(x, z, r, l0, 0.0f);
+
     // Layer 5: the river channel.
     acc += river_segment_distance(x, z, 0.0f, 0.0f, 100.0f, 100.0f);
     acc += river_carve(50.0f, 3.0f, 8.0f, 2.0f);

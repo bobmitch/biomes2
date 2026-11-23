@@ -76,6 +76,23 @@ struct WorldConstants {
     int      detail_octaves;
     float    detail_gain;
     unsigned s_detail;
+
+    // Layer 0 prototype: SeedWorld::l0, the seed's draws. Defaults evaluate
+    // nothing new.
+    float    fine_freq;
+    int      fine_octaves;
+    float    fine_weight;
+    float    fine_regime;
+
+    float    regime_freq;
+    int      regime_octaves;
+    float    regime_mean;
+    float    regime_amp;
+
+    int      regime_on;
+    unsigned s_fine;
+    unsigned s_regime;
+    float    l0_pad0;
 };
 
 class WorldGpu {
