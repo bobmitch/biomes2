@@ -1213,10 +1213,28 @@ Universal Animation Library[Standard]`, 43 clips on the same joint names).
 - **The draw** (`character_renderer.{h,cpp}`, `character.hlsl`): GPU
   skinning, four joints a vertex, bone matrices model -> world in a root
   SRV (t0), textures at heap [110..111] (t49..t50, a tenth range of the
-  terrain's table). On the TERRAIN's root signature after the rocks, and in
-  every cascade. Not in the local lights' faces (the carried torch is in its
-  hand) nor the heightfield GI's top-down map. Double sided, cull none, a
-  back face's normal flipped. Cost: within noise (`--walk 15 --uncapped` at
+  terrain's table). On the TERRAIN's root signature after the rocks, in
+  every cascade, and in every shadowed local light's faces. Not the
+  heightfield GI's top-down map. Double sided, cull none, a back face's
+  normal flipped.
+- **The body in the lights' shadows** (`record_light_shadow`,
+  `ps_character_light_shadow`). The faces are CACHED (a light redraws its
+  six only when it moves or every 240 frames), so the body keeps its own
+  bookkeeping: a bounding sphere from the skinned joints (+0.3 m), a
+  `pose_serial()` that moves when any joint has moved 3 mm, and per slot
+  the faces last drawn with the body in them. When the serial changes,
+  the faces the sphere is in now AND the ones it was in (to take the old
+  shadow out) are redrawn whole at the light's cached position, at most
+  `kMaxBodyFacesPerFrame` (12) a frame on top of the lights' own twelve --
+  the trees' face constants are 24 now. **The carried torch clears the
+  body within `kTorchBodyClear` (0.4 m) of the flame**: it sits 0.28 m
+  from the fist, and at 0.3 m the fist's far side still cast a hard black
+  blot down the shin. The body darkens what is behind it from a campfire
+  and throws a long shadow off a torch, its own far leg included.
+  `BIOMES_NO_BODY_LIGHT_SHADOW=1` is the A/B; `--pose-sheet --time 23
+  --torch` or `--fire-ground 0.4 1.7` the stills. Cost walking at 1440p
+  with a torch and two campfires: 7.92 / 7.98 ms against 7.90 / 7.92,
+  99th percentile +0.3 ms. Cost: within noise (`--walk 15 --uncapped` at
   1440p 5.94 ms against 6.08 in first person).
 - **The camera** (`main.cpp`, `place_walk_camera`): orbits a pivot 1.55 m
   over the feet at the mouse's yaw and pitch; the wheel sets the distance
@@ -1839,9 +1857,10 @@ BRDF as the sun (`direct_light`, `leaf_light` in `lighting.hlsli`).
   twelve faces are redrawn a frame -- never drawn or moved first, then a
   static light's faces every 240 frames so a dug hole or a felled tree
   reaches its shadow. A face draws only the chunks within the light's range
-  (`Streamer::slots_near`, one ExecuteIndirect a slot) and the trees through
+  (`Streamer::slots_near`, one ExecuteIndirect a slot), the trees through
   their own cull (`TreeRenderer::record_light_shadow`, the first cascade's
-  floor: real leaves).
+  floor: real leaves), the rocks, and the player's body -- which also
+  redraws the cached faces it moves through (see The player character).
 - **`--lights-report` is the instrument** -- at night, at ground level,
   frame mean over 400 frames: none 2.33 ms; torch held still 2.40; **torch
   carried at walking pace 2.51** (all six faces redrawn every frame, 72 chunk

@@ -2191,6 +2191,8 @@ void Renderer::record_lights(const ViewConstants& view) {
     light_stats_.shadowed = 0;
     light_stats_.faces_drawn = 0;
     light_stats_.chunk_draws = 0;
+    light_stats_.body_redraws = 0;
+    light_stats_.body_faces = 0;
     bool wanted[kMaxShadowLights] = {};
     std::vector<int> slot_of(act.size(), -1);
     if (light_shadows_on_) {
@@ -2266,35 +2268,104 @@ void Renderer::record_lights(const ViewConstants& view) {
     // --- the faces' matrices, for what is redrawn
     static const float kAxis[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
     static const float kUp[6][3] = {{0, 1, 0}, {0, 1, 0}, {0, 0, 1}, {0, 0, -1}, {0, 1, 0}, {0, 1, 0}};
-    struct FaceDraw { UINT tile; float vp[16]; float right[3], up[3]; float pos[3]; float range; };
+    struct FaceDraw { UINT tile; float vp[16]; float right[3], up[3]; float pos[3]; float range; bool body; float clear; };
     std::vector<FaceDraw> draws;
+    // The player's body: its bound, and the pose's serial (it moves 3 mm).
+    float body_c[3] = {0, 0, 0}, body_r = 0.0f;
+    // BIOMES_NO_BODY_LIGHT_SHADOW=1: the old behaviour, for A/B.
+    static const bool body_off = std::getenv("BIOMES_NO_BODY_LIGHT_SHADOW") != nullptr;
+    const bool body = !body_off && mode_ != Mode::Wireframe && character_.bounds(body_c, body_r);
+    const unsigned long long body_serial = character_.pose_serial();
+    auto face_of = [&](const LocalLight& L, const float pos[3], int fc, FaceDraw& d) {
+        const float* fwd = L.type == 1 ? L.spot_dir : kAxis[fc];
+        const float* uph = L.type == 1 ? kUp[0] : kUp[fc];
+        const float fov = L.type == 1 ? (std::min)(2.0f * L.spot_outer_deg + 10.0f, 150.0f) : 95.0f;
+        light_face(pos, fwd, uph, fov, L.range, d.vp, d.right, d.up);
+        for (int k = 0; k < 3; ++k) d.pos[k] = pos[k];
+        d.range = L.range;
+        d.clear = (torch_on_ && L.id == 0u) ? kTorchBodyClear : 0.0f;
+        // Does the body's sphere reach into this face's frustum?
+        d.body = false;
+        if (body) {
+            float pl[6][4];
+            planes_of(d.vp, pl);
+            d.body = true;
+            for (int p = 0; p < 6 && d.body; ++p)
+                d.body = pl[p][0] * body_c[0] + pl[p][1] * body_c[1] + pl[p][2] * body_c[2] + pl[p][3] >= -body_r;
+        }
+    };
+    auto push_face = [&](FaceDraw& d) {
+        LightFaceGpu& g = faces_cpu_[d.tile];
+        std::memcpy(g.view_proj, d.vp, sizeof g.view_proj);
+        const float sz = float(kLightTile) / float(kLightAtlas);
+        g.rect[0] = float(d.tile % (kLightAtlas / kLightTile)) * sz;
+        g.rect[1] = float(d.tile / (kLightAtlas / kLightTile)) * sz;
+        g.rect[2] = sz;
+        g.rect[3] = 1.0f / float(kLightAtlas);
+        draws.push_back(d);
+    };
+    std::vector<bool> whole(act.size(), false);
     for (size_t q = 0; q < redraw.size(); ++q) {
         const LocalLight& L = act[redraw[q]].l;
         const int s = slot_of[redraw[q]];
         const int faces = L.type == 1 ? 1 : 6;
+        uint32_t mask = 0;
         for (int fc = 0; fc < faces; ++fc) {
             FaceDraw d;
             d.tile = UINT(s) * 6 + UINT(fc);
-            const float* fwd = L.type == 1 ? L.spot_dir : kAxis[fc];
-            const float* uph = L.type == 1 ? kUp[0] : kUp[fc];
-            const float fov = L.type == 1 ? (std::min)(2.0f * L.spot_outer_deg + 10.0f, 150.0f) : 95.0f;
-            light_face(L.pos, fwd, uph, fov, L.range, d.vp, d.right, d.up);
-            for (int k = 0; k < 3; ++k) d.pos[k] = L.pos[k];
-            d.range = L.range;
-            LightFaceGpu& g = faces_cpu_[d.tile];
-            std::memcpy(g.view_proj, d.vp, sizeof g.view_proj);
-            const float sz = float(kLightTile) / float(kLightAtlas);
-            g.rect[0] = float(d.tile % (kLightAtlas / kLightTile)) * sz;
-            g.rect[1] = float(d.tile / (kLightAtlas / kLightTile)) * sz;
-            g.rect[2] = sz;
-            g.rect[3] = 1.0f / float(kLightAtlas);
-            draws.push_back(d);
+            face_of(L, L.pos, fc, d);
+            if (d.body) mask |= 1u << fc;
+            push_face(d);
         }
         ShadowSlot& sl = shadow_slots_[s];
         sl.ready = true;
         for (int k = 0; k < 3; ++k) sl.pos[k] = L.pos[k];
         sl.drawn = post_frame_;
         sl.faces = faces;
+        sl.body_faces = mask;
+        sl.body_serial = body_serial;
+        whole[redraw[q]] = true;
+    }
+    // A light not redrawn whole keeps its faces, which hold the body where
+    // it stood when they were drawn: redraw the faces it is in now and the
+    // ones it was in, at the light's cached position, when the pose moved
+    // or the body came or went. Most important lights first.
+    {
+        UINT budget = kMaxBodyFacesPerFrame;
+        for (size_t i = 0; i < act.size() && budget > 0; ++i) {
+            if (slot_of[i] < 0 || whole[i]) continue;
+            ShadowSlot& sl = shadow_slots_[slot_of[i]];
+            if (!sl.ready) continue;
+            if (!body && sl.body_faces == 0) continue;
+            const LocalLight& L = act[i].l;
+            const int faces = L.type == 1 ? 1 : 6;
+            FaceDraw fd[6];
+            uint32_t now = 0;
+            if (body) {
+                const float dx = body_c[0] - sl.pos[0], dy = body_c[1] - sl.pos[1], dz = body_c[2] - sl.pos[2];
+                const float reach = L.range + body_r;
+                if (dx * dx + dy * dy + dz * dz < reach * reach)
+                    for (int fc = 0; fc < faces; ++fc) {
+                        face_of(L, sl.pos, fc, fd[fc]);
+                        if (fd[fc].body) now |= 1u << fc;
+                    }
+            }
+            if (now == sl.body_faces && (now == 0 || body_serial == sl.body_serial)) continue;
+            const uint32_t want = now | sl.body_faces;
+            UINT n = 0;
+            for (int fc = 0; fc < faces; ++fc) n += (want >> fc) & 1u;
+            if (n > budget) continue;   // next frame
+            budget -= n;
+            for (int fc = 0; fc < faces; ++fc) {
+                if (!((want >> fc) & 1u)) continue;
+                if (!((now >> fc) & 1u)) face_of(L, sl.pos, fc, fd[fc]);   // not computed above
+                fd[fc].tile = UINT(slot_of[i]) * 6 + UINT(fc);
+                push_face(fd[fc]);
+            }
+            sl.body_faces = now;
+            sl.body_serial = body_serial;
+            ++light_stats_.body_redraws;
+        }
     }
 
     // --- the GPU records
@@ -2438,6 +2509,12 @@ void Renderer::record_lights(const ViewConstants& view) {
         light_stats_.chunk_draws += UINT(slots.size());
         // Rocks: the sun's list, culled by the face's own frustum on the GPU.
         if (rocks_on_ && rocks_.ready() && mode_ != Mode::Wireframe) rocks_.record_shadow(cmd_.Get(), UINT(frame_));
+        // The player's body, last on the terrain's root: it overwrites the
+        // constants' cam_pos and far_plane, which nothing after it reads.
+        if (d.body) {
+            character_.record_light_shadow(cmd_.Get(), UINT(frame_), d.pos, d.clear);
+            ++light_stats_.body_faces;
+        }
         if (trees_on_ && trees_.ready()) {
             TreeShadowInputs si = {};
             std::memcpy(si.view_proj, d.vp, sizeof si.view_proj);

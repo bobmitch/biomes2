@@ -101,8 +101,9 @@ public:
     // One face of a local light's shadow (ADR-004 L3): culled against the
     // face, levelled like the sun's first cascade (full detail, real
     // leaves). `face` is the frame's face counter, 0 .. kMaxLightFaces - 1,
-    // each with its own constants.
-    static const UINT kMaxLightFaces = 12;
+    // each with its own constants: twelve for the lights' own redraws and
+    // twelve for the faces the player's body moves through.
+    static const UINT kMaxLightFaces = 24;
     void record_light_shadow(ID3D12GraphicsCommandList* cmd, UINT frame, UINT face,
                              const TreeShadowInputs& in, const TreeDrawSettings& s);
 

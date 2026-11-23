@@ -5,9 +5,12 @@
 // bone matrices (model -> world) and the renderer copies them into this
 // frame's upload buffer. GPU skinning in the vertex shader (character.hlsl),
 // on the TERRAIN's root signature like the rocks: the main pass straight
-// after the rocks, and every cascade. Not the local lights' shadow faces: the
-// carried torch sits inside the character, and its own body would black out
-// its light. Not the heightfield GI's top-down map: a body is not terrain.
+// after the rocks, every cascade, and every local light's shadow faces
+// (record_light_shadow) -- for the carried torch with the body round the
+// flame cleared, or the hand would black out its whole light. Those faces
+// are cached, so the renderer redraws the ones the body is in (or was) when
+// pose_serial() changes. Not the heightfield GI's top-down map: a body is
+// not terrain.
 // ---------------------------------------------------------------------------
 #ifndef ENGINE_CHARACTER_RENDERER_H
 #define ENGINE_CHARACTER_RENDERER_H
@@ -41,12 +44,20 @@ public:
     // This frame's pose: 12 floats a joint. visible false draws nothing.
     void set_pose(const std::vector<float>& bones, bool visible);
     bool visible() const { return visible_; }
+    // The body's bounding sphere this frame; false when nothing is drawn.
+    bool bounds(float c[3], float& r) const;
+    // Changes whenever a joint has moved 3 mm since the last change.
+    unsigned long long pose_serial() const { return pose_serial_; }
 
     // Copy the pose into `frame`'s buffer. Once a frame, before recording.
     void prepare(UINT frame);
     // The terrain's root signature, constants, shadow CBV and table bound.
     void record(ID3D12GraphicsCommandList* cmd, UINT frame);
     void record_shadow(ID3D12GraphicsCommandList* cmd, UINT frame);
+    // A local light's face, its matrix in the bound constants. Nothing of
+    // the body within `clear` metres of the light casts. Sets root
+    // constants 16..19 (cam_pos, far_plane).
+    void record_light_shadow(ID3D12GraphicsCommandList* cmd, UINT frame, const float light_pos[3], float clear);
 
 private:
     template <class T> using ComPtr = Microsoft::WRL::ComPtr<T>;
@@ -56,11 +67,14 @@ private:
     std::string note_;
     CharacterModel model_;
     std::vector<float> pose_;
+    std::vector<float> joints_, committed_;   // joint positions, now and at the last serial
+    float bound_c_[3] = {0, 0, 0}, bound_r_ = 0.0f;
+    unsigned long long pose_serial_ = 0;
     ComPtr<ID3D12Resource> vb_, ib_, tex_a_, tex_b_, bones_[kFrames];
     float* bones_cpu_[kFrames] = {};
     D3D12_VERTEX_BUFFER_VIEW vbv_ = {};
     D3D12_INDEX_BUFFER_VIEW ibv_ = {};
-    ComPtr<ID3D12PipelineState> pso_, shadow_pso_;
+    ComPtr<ID3D12PipelineState> pso_, shadow_pso_, light_shadow_pso_;
 };
 
 }  // namespace engine

@@ -82,5 +82,12 @@ static const uint32_t kLightAtlas       = 6144;
 static const uint32_t kLightTile        = 512;
 static const uint32_t kMaxShadowLights  = 24;
 static const uint32_t kMaxFacesPerFrame = 12;
+// The player's body casts into the faces too. They are cached, so a face the
+// body is in -- or was in, to take its old shadow out -- is redrawn when the
+// pose moves: at most this many a frame, on top of the twelve.
+static const uint32_t kMaxBodyFacesPerFrame = 12;
+// The carried torch's flame sits just over the fist: nothing of the body
+// within this many metres of it casts, or the hand would black it out.
+static const float    kTorchBodyClear   = 0.4f;
 
 }  // namespace engine

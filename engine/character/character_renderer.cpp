@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -236,6 +237,15 @@ bool CharacterRenderer::init(ID3D12Device* device, ID3D12CommandQueue* queue, ID
     pd.RasterizerState.DepthBiasClamp = 0.002f;
     hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&shadow_pso_));
     if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (character shadow)", hr); return false; }
+    // A local light's faces: the same, with a pixel shader that clears the
+    // body round the flame (the carried torch).
+    ComPtr<ID3DBlob> vsl, psl;
+    if (!compile_shader(kCharacterShader, "vs_character_light_shadow", "vs_5_1", vsl, error)) return false;
+    if (!compile_shader(kCharacterShader, "ps_character_light_shadow", "ps_5_1", psl, error)) return false;
+    pd.VS = {vsl->GetBufferPointer(), vsl->GetBufferSize()};
+    pd.PS = {psl->GetBufferPointer(), psl->GetBufferSize()};
+    hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&light_shadow_pso_));
+    if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (character light shadow)", hr); return false; }
 
     char buf[256];
     std::snprintf(buf, sizeof buf, "%s: %zu joints, %zu vertices, %zu triangles, %u materials at %u^2",
@@ -248,6 +258,49 @@ bool CharacterRenderer::init(ID3D12Device* device, ID3D12CommandQueue* queue, ID
 void CharacterRenderer::set_pose(const std::vector<float>& bones, bool visible) {
     pose_ = bones;
     visible_ = visible && ready_ && pose_.size() == model_.joints.size() * 12;
+    if (!visible_) return;
+    // Every joint where this pose puts it: its skinning matrix times its
+    // rest position. Their box, padded for flesh past the joints (the top
+    // of the head, the fingertips), is the body's bound.
+    const size_t nj = model_.joints.size();
+    joints_.resize(nj * 3);
+    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+    for (size_t j = 0; j < nj; ++j) {
+        const float* m = &pose_[j * 12];
+        const float* r = model_.joints[j].rest_p;
+        for (int k = 0; k < 3; ++k) {
+            const float* row = m + k * 4;
+            const float p = row[0] * r[0] + row[1] * r[1] + row[2] * r[2] + row[3];
+            joints_[j * 3 + k] = p;
+            lo[k] = (std::min)(lo[k], p);
+            hi[k] = (std::max)(hi[k], p);
+        }
+    }
+    float r2 = 0.0f;
+    for (int k = 0; k < 3; ++k) {
+        bound_c_[k] = 0.5f * (lo[k] + hi[k]);
+        r2 += (hi[k] - bound_c_[k]) * (hi[k] - bound_c_[k]);
+    }
+    bound_r_ = std::sqrt(r2) + 0.3f;
+    // A new serial when any joint has moved 3 mm from the pose the last
+    // serial stood for: what the local lights' cached faces key on.
+    bool moved = committed_.size() != joints_.size();
+    for (size_t i = 0; !moved && i < nj; ++i) {
+        const float dx = joints_[i * 3] - committed_[i * 3], dy = joints_[i * 3 + 1] - committed_[i * 3 + 1],
+                    dz = joints_[i * 3 + 2] - committed_[i * 3 + 2];
+        moved = dx * dx + dy * dy + dz * dz > 9e-6f;
+    }
+    if (moved) {
+        committed_ = joints_;
+        ++pose_serial_;
+    }
+}
+
+bool CharacterRenderer::bounds(float c[3], float& r) const {
+    if (!visible_) return false;
+    for (int k = 0; k < 3; ++k) c[k] = bound_c_[k];
+    r = bound_r_;
+    return true;
 }
 
 void CharacterRenderer::prepare(UINT frame) {
@@ -274,6 +327,19 @@ void CharacterRenderer::record(ID3D12GraphicsCommandList* cmd, UINT frame) {
 void CharacterRenderer::record_shadow(ID3D12GraphicsCommandList* cmd, UINT frame) {
     if (!drawn_[frame]) return;
     cmd->SetPipelineState(shadow_pso_.Get());
+    bind(cmd, frame);
+    cmd->DrawIndexedInstanced(UINT(model_.indices.size()), 1, 0, 0, 0);
+}
+
+void CharacterRenderer::record_light_shadow(ID3D12GraphicsCommandList* cmd, UINT frame, const float light_pos[3],
+                                            float clear) {
+    if (!drawn_[frame]) return;
+    // MeshConstants: cam_pos at 16, far_plane at 19 -- the light and the
+    // clear radius for ps_character_light_shadow. The next face sets the
+    // whole block again.
+    const float c[4] = {light_pos[0], light_pos[1], light_pos[2], clear};
+    cmd->SetGraphicsRoot32BitConstants(0, 4, c, 16);
+    cmd->SetPipelineState(light_shadow_pso_.Get());
     bind(cmd, frame);
     cmd->DrawIndexedInstanced(UINT(model_.indices.size()), 1, 0, 0, 0);
 }

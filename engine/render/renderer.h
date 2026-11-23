@@ -453,6 +453,8 @@ public:
         uint32_t shadowed = 0;        // with a shadow ready
         uint32_t faces_drawn = 0;     // shadow faces redrawn this frame
         uint32_t chunk_draws = 0;     // terrain chunk draws in those faces
+        uint32_t body_redraws = 0;    // lights whose faces were redrawn for the player's body alone
+        uint32_t body_faces = 0;      // faces the body was drawn into
         // From the cluster pass, read back a couple of frames late.
         uint32_t overflowed = 0, max_in_cluster = 0, clusters_lit = 0, cluster_items = 0;
     };
@@ -850,6 +852,8 @@ private:
         unsigned long long drawn = 0;     // post_frame_ when its faces were drawn
         int      faces = 6;
         unsigned long long fast_until = 0;   // the near field traces its probes on the timer until then
+        uint32_t body_faces = 0;             // faces last drawn with the player's body in them
+        unsigned long long body_serial = 0;  // the pose they were drawn with
     };
     std::vector<LocalLight> lights_;
     uint32_t next_light_id_ = 1;

@@ -79,6 +79,29 @@ float4 vs_character_shadow(VSIn v) : SV_Position {
     return mul(float4(p, 1.0f), view_proj);
 }
 
+// A local light's shadow face (Renderer::record_lights). The caller puts
+// the light's position in cam_pos and a clear radius in far_plane: the
+// carried torch sits just over the fist, and the hand round it would black
+// out its whole light, so nothing of the body within that radius of the
+// flame casts. 0 for every other light.
+struct LightShadowOut {
+    float4 clip  : SV_Position;
+    float3 world : TEXCOORD0;
+};
+
+LightShadowOut vs_character_light_shadow(VSIn v) {
+    LightShadowOut o;
+    float3 n;
+    skin(v, o.world, n);
+    o.clip = mul(float4(o.world, 1.0f), view_proj);
+    return o;
+}
+
+void ps_character_light_shadow(LightShadowOut i) {
+    const float3 d = i.world - cam_pos;
+    if (dot(d, d) < far_plane * far_plane) discard;
+}
+
 SceneOut ps_character(VSOut i, bool front : SV_IsFrontFace) {
     // Every material in the kit is double sided, and the draw culls nothing:
     // a back face takes the other side's normal.
