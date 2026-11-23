@@ -83,6 +83,13 @@ names it. `validate --spawns` lists it per seed (24 of 24 strict, median
 Before v16 every one of those started at a fixed (0, 0) or (10, -70), which
 on the default seed was wetland.
 
+**Layer 0's prototype** ("land as a lottery with fences", docs/worldgen-design.md)
+is in `WorldParams`, every part off by default, so the golden hashes are
+today's. `view.exe` has a slider for each part; `validate` takes a flag for
+each and prints the readings under `islandness` (reach on foot, biomes on
+foot, shelf area, knee, draws); the engine builds it from
+`BIOMES_L0="centre_floor=0,regime_amp=0.1,shelf_width=0.06,knee=1,..."`.
+
 `validate.exe`, `view.exe` and `engine.exe` all read data by paths relative to
 the repository root, so run them from there. `engine.exe --shot <path>` renders
 one frame at a fixed camera and writes a BMP without opening a window.

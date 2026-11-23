@@ -101,7 +101,24 @@ Use OpenSimplex2 or simplex-family noise, not classic Perlin. Perlin's axis-alig
 
 ### Layer 0, proposed: land as a lottery with fences
 
-> **Not built, nothing here measured.** Agreed in discussion on 2026-11-23 as the direction for layer 0. Every number below is a starting point for a `validate` sweep, not a result. Building it moves every golden hash and needs a `generator_version` bump.
+> **Built as a prototype, off by default.** Agreed in discussion on 2026-11-23 as the direction for layer 0. Every part below is now a `WorldParams` field whose default is today's world, so the golden hashes have not moved; switching any of it on moves them, and shipping it needs a `generator_version` bump. Explore it in `view.exe` (the right-hand column, plus centre floor and the regime in the left), sweep it with `validate` (`--centre-floor`, `--regime-feat/-mean/-amp`, `--regime-draw` with `--regime-{feat,mean,amp}-range lo hi`, `--fine-feat/-weight/-regime`, `--shelf-width/-depth/-regime`, `--knee`, `--knee-k/-c`), and walk it in the engine with `BIOMES_L0="key=value,..."` (same names, snake_case). The GPU evaluates it too: `--probe-field` agreed to 15 µm at a shelf point with the knee biting. The field is `Layer0Params` / `layer0_noise` / `shelf_depth_at` in `worldgen/shaders/field.h`; the knee is `apply_land_knee` in `world.cpp`; the readings are `tools/shared/reach.h`. The numbers below are still starting points for a sweep.
+>
+> As built: the regime is normalised to standard deviations (a 3-octave fbm's std is 0.248), so `regime_amp` is mask offset per std and `fine_regime` is fine weight per std, lower regime giving more fine noise. The coarse/fine blend divides by `sqrt((1-w)^2 + w^2)` so mixing the two noises does not change how much land a region holds. The shelf is `depth·t/(t+0.1) + scale·u·t^4/(1+t^4)`, `t = u / width`, `u` the mask below sea level. The knee measures on a 256² grid, bisects 16 times, and takes ~25-35 ms a seed. The global offset is NOT re-solved after the knee yet (item 6).
+>
+> First readings, 200 seeds (`validate`, the `islandness` lines). A: centre floor 0, regime amp 0.1, fine weight 0.3 from the regime at 0.25/std, shelf width 0.06 at 0.3/std, knee. B: as A but the regime drawn per seed (size 2.5-8 km, mean ±0.05, amp 0-0.15) and offset -0.02.
+>
+> | | today | A | B |
+> | --- | --- | --- | --- |
+> | land, mean (range) | 32.1% (27.6-38.1) | 29.6% (24.4-34.4) | 32.9% (25.9-37.9) |
+> | before knee, max | -- | 34.3% (never bit) | 41.8% |
+> | landmasses / seed | 8.1 | 22.2 | 19.1 |
+> | spawn landmass, share of land | 66.9% (min 12.8) | 33.9% (min 0.1) | 43.3% (min 0.1) |
+> | on foot from spawn, share of land | 68.6% (12.3-97.7) | 48.9% (0.6-94.4) | 62.5% (3.4-98.4) |
+> | every biome on foot | 187 / 200 | 162 / 200 | 177 / 200 |
+> | shelf (water < 0.85 m), km² / seed | 2.2 | 12.0 | 12.5 |
+> | layer 0 cost (validate throughput) | 189 ns | 448 ns | 434 ns |
+>
+> What fails, as expected: `land fraction` (A's mean is 29.6% with the floor gone and the offset not re-solved; B has one seed under 26%), `home landmass` (a 1-cell start is now possible) and the golden hashes. Also `throughput`, over its 400 ns guard: the regime and the fine noise are two more fbm stacks per sample. A also failed `blend seams` on one seed, 0.066 m on the 3D term against the 0.05 m limit (B passed, worst 0.016 m); not looked into.
 
 **The problem.** Water exploration is meant to be central to the game, and most seeds still give the player a central continent: at v16, 8.1 landmasses a seed, but the spawn landmass holds 67% of all land. Land fraction is not what causes this any more. At a 32% mean the world is already below the percolation threshold ([`tools/validate/README.md`](../tools/validate/README.md) §8). Two things in this layer are:
 
