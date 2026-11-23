@@ -1,6 +1,6 @@
 # Voxel World Generation — Design Doc
 
-Draft · last updated 2026-11-10 · this file is canonical
+Draft · last updated 2026-11-23 · this file is canonical
 
 ## Summary and key decisions
 
@@ -98,6 +98,75 @@ Blend the floor out across `r` rather than letting `F` fall to zero. `smax(base,
 Relief is therefore layer 4's job, via the per-biome profiles, which is where it is controllable per biome. A mountain *near* spawn belongs in layer 3's adjacency cost, where it lands somewhere different each seed; a layer-0 dome puts it in the same place forever.
 
 Use OpenSimplex2 or simplex-family noise, not classic Perlin. Perlin's axis-aligned gradient artifacts are invisible at 10 m and glaring at 5 km, which is exactly the scale this layer works at.
+
+### Layer 0, proposed: land as a lottery with fences
+
+> **Not built, nothing here measured.** Agreed in discussion on 2026-11-23 as the direction for layer 0. Every number below is a starting point for a `validate` sweep, not a result. Building it moves every golden hash and needs a `generator_version` bump.
+
+**The problem.** Water exploration is meant to be central to the game, and most seeds still give the player a central continent: at v16, 8.1 landmasses a seed, but the spawn landmass holds 67% of all land. Land fraction is not what causes this any more. At a 32% mean the world is already below the percolation threshold ([`tools/validate/README.md`](../tools/validate/README.md) §8). Two things in this layer are:
+
+- **The home-landmass floor is a continent.** `centre_floor` 0.20, blended out over `smoothstep(0, 0.40, r)`, against noise with a standard deviation of about 0.22, makes a disc about 3 km in radius almost certainly land: roughly 30 km² of the ~100 km² a 32% world has. Nearby blobs attach to it.
+- **There are only about a dozen continent blobs in the world.** A 5.2 km feature on a 20 km disc. Below percolation the landmass count goes roughly as area / feature², so few blobs means few landmasses, each large. §8's "finer continent noise does not help" was measured at 55% land, above the threshold, and does not carry over.
+
+**The principle: random inputs, fenced outputs.** Every seed draws its own land character, and the generator fences only the outcomes that are bad for the game. How lucky a start is gets left to chance and is **never tuned to a rate**. A start can be a bare islet or a mainland you can walk across several biomes on, and finding the second is luck, not something the generator hands out on a schedule.
+
+What does not change: water is spacing, not structure. Biomes and danger stay the patchwork layer 3 lays over whatever land exists, still radial, still quota-matched to land area. Islands made here are land, so layer 3 assigns them like any other land. The unbuilt island-clusters work below (biomes placed on ocean cells) is a separate gap and this does not touch it.
+
+**1. Per-seed draws.** Three values, each from its own feature seed (`hash64(world_seed ^ FEATURE_ID)`, invariant 4), fixed for the whole seed:
+
+| Draw | What it sets | Range to sweep |
+| --- | --- | --- |
+| Regime scale | The size of the regime field's features | Large: 6–10 regimes over the disc, ~6–8 km across. Small: many, ~2–3 km across |
+| Regime mean | Whether the seed leans archipelago or continental | Centred so the mean land fraction comes out at its target |
+| Regime amplitude | How much one part of the world differs from another | From near-uniform to strongly mixed |
+
+A noise frequency that is constant for a whole seed is not the "never blend noise parameters" mistake: that is about varying them across space inside one world.
+
+**2. The regime field.** A low-frequency fBm at the seed's regime scale. It sets, locally:
+
+- **The land offset.** Where the regime is high, local land is above the percolation threshold and joins into continental areas. Where it is low, land falls below the threshold and breaks into islets and open sea.
+- **The mix of two continent noises.** A coarse one (~5 km, continental shapes) and a fine one (~1.5 km, islets), weighted by the regime. Their *outputs* are blended, which is allowed; their frequencies stay fixed.
+
+So "dozens of small islands" against "several large ones" is decided per seed by the draws, and within one seed per region by the field.
+
+**3. No centre floor and no centre bias.** `centre_floor` goes. Nothing nudges the odds near the centre either: an additive bias would be a dial on how often a start is good, which is exactly what is being left alone. The spawn rule (`find_spawn`) is unchanged, and it has its own practical minimum. It wants a point that is mostly the calmest biome, 1.5 m dry, with a 60 m ring of dry, gentle, calm ground round it, and takes the passing point nearest the centre. So the smallest start that passes strictly is about 150 m across, and an islet at the centre too small to pass is skipped for the nearest one that does. That is the spawn rule, not a guarantee of size, and it stays. When nothing passes, `find_spawn` already falls back to the driest, calmest point it found.
+
+**4. A shelf, for wading.** Today the seabed is the continent mask times `continent_scale` (140 m) with nothing in between, so it drops steeply from every coast. The mapping from mask to depth gets a shelf: nearly flat just under sea level, then falling to deep water further out. Two islands close together, with the mask sagging only slightly between them, are then joined by a bar or a flat you can wade, while open water stays deep. This is a curve in the mapping, not a clamp: a world-wide `smax(base, 0)` is the soft-ReLU trap above, which collapsed interior ocean depth sevenfold. The regime can scale the shelf's width, so archipelago regions read as shallow seas and continental coasts drop off faster. The curve must be rational (invariant 9).
+
+Wading is the only crossing that counts as "on foot". The threshold is the physics' own: `PhysicsWorld::kSwimLeave` (0.85 m), the depth under which a swimmer stands up again. Readings use still-water depth. Weather cannot make a flat deeper, only rougher, and `ww_depth_factor` caps the waves over it at 0.55 × depth.
+
+**5. A ceiling on land, approached softly.** Total land is part of the lottery, but a world over about 40% land feels too land-heavy. Each seed's raw land fraction `L` goes through a knee:
+
+```
+L' = L                                     if L <= k
+L' = k + (c - k)·(L - k) / ((L - k) + (c - k))   if L > k
+
+k = 0.35 (the knee), c = 0.40 (the ceiling, approached, never reached)
+```
+
+The curve keeps its slope at the knee, so a seed just over 35% is barely touched. At the top, a raw 40% comes out at 37.5% and a raw 50% at 38.75%. A hard clamp would stack every land-heavy seed at exactly 40%; the knee spreads them over 35–40%. World build then lowers that seed's offset until its land is `L'`. This is a bisection on a coarse grid, about a dozen layer-0 passes, comparing land counts only, so it is invariant 9-safe. The offset is already a parameter of `layer0_height`, so the GPU receives it the way it does now. The cost is a guess until measured.
+
+A useful side effect: trimming a land-heavy seed pushes it back below percolation, so what it breaks up first is the continent.
+
+**No floor, for now.** A very low-land seed still places every biome, since quotas are shares of land, just as smaller patches. Whether a seed can feel empty rather than unlucky gets judged on the sweep's low tail before anyone adds a floor.
+
+**6. One global offset.** The base offset is still solved once across all seeds, after the knee, so the *mean* land fraction stays a stated target (32% today). It is not solved per seed, because the per-seed spread is part of the lottery.
+
+**Validation changes**, when built:
+
+| Check | Today | Proposed |
+| --- | --- | --- |
+| Land fraction | Each seed within ±5% of the target | **Asserted:** no seed over 40%. The mean within a narrow band of the target, as a drift guard. The distribution is printed |
+| Home landmass | Spawn landmass ≥ 16 cells | **A reading.** A bare islet is an allowed start |
+| Spawn | Flat, coastal, calmest biome | **Still asserted** that a spawn exists. The strict count (24 of 24 today) will fall, and that is a reading |
+| Islandness | Landmass count, spawn's share of land | Adds the seed's three draws; land and biome count reachable from spawn on foot (land plus water under 0.85 m); shelf area |
+| Quota | ±10% per biome | Unchanged, and the one to watch: a low-land seed has fewer cells, so presence holds but accuracy may slip. The fixes, if it does: smaller cells, or a tolerance that widens with less land |
+
+**Luck still has a rate.** How often a start is good follows from land %, the regime's size and strength, and the shelf's width. Each of those gets tuned for its own reasons, and each moves the odds as a side effect. So the reach reading is printed and **never aimed**. It is there to catch the extremes: good starts on 1 seed in 200, or on 9 in 10. At either end it stops feeling like luck.
+
+**Expect downstream:** small islands carry few rivers (a river needs a catchment) and few flat sites. Both are correct, but they will show in the per-biome counts.
+
+**For the sweep to settle:** the regime scale range; the coarse and fine feature sizes; the regime amplitude range; the shelf's depth and width; the mean land target under the knee. Judge them on the contact sheet, with the readings beside it.
 
 ### Layer 1 — danger field
 
@@ -640,7 +709,7 @@ Recommendation: **build the brick hash map at B6, instrument it, and promote to 
 - **Voxel size — 0.5 m or 0.25 m?** Costs scale cubically in generation and quadratically in surface count. 0.5 m is the recommended default; 0.25 m should be justified by a specific gameplay need.
 - **Vertical extent?** Chunk indexing and the DAG root both want a bounded Y. ±512 m is a reasonable starting guess but should be set deliberately.
 - **Multiplayer?** If yes, determinism moves from convenience to correctness, and "GPU is the sole authority" stops working — a headless server has to generate terrain too. This is the single question whose answer most changes the architecture, and it is worth answering early even though gameplay is undecided.
-- **Is open water traversable content or just a boundary?** Determines whether ocean depth, currents and navigable channels need generation rules at all.
+- **Is open water traversable content or just a boundary?** Partly answered (2026-11-23): water is spacing between land, traversable by boat or, over shallows, on foot. Biomes do not follow it. See *Layer 0, proposed* for the shelf and the per-seed land lottery. Currents and navigable channels are still undecided.
 - **Do caves need to be biome-aware?** Currently they are a per-biome parameter. If caves become a destination rather than a feature, they need their own placement layer.
 
 ## Appendix A — starter prompt
