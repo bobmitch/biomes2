@@ -207,6 +207,12 @@ Last gathered: 2026-11-21, after the exploration fog.
 
 ## Terrain
 
+- **The CPU and GPU disagree by up to 2 cm in layer 6's overhang term** on
+  v18's rougher ground (`--probe-field --probe-at -4000 1500`; 0.2 mm with
+  `--no-overhang`, 1.6 mm on v17's layer 0 at the same spot). A tolerance,
+  not a hash, by invariant 8 -- but the trees and rocks stand on the CPU's
+  surface and the mesh is the GPU's. Not looked into. [The engine's own
+  checks]
 - **The river carve steps up to 0.37 m** where two segments of different
   widths meet; all five cases were within 35 m of an axis, unexplained.
   [Gotchas: the river carve]

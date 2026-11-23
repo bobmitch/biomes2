@@ -78,16 +78,30 @@ stands well inside the CALMEST biome (lowest `danger_preferred`; weight
 rivers and trunks. The engine opens the window over it, and `--walk`,
 `--flight`, `--fell`, `--tab-test`, `--lights-report` and `--shot`'s default
 vantage (70 m behind it, 22 m up) all start from it; `build/startup.txt`
-names it. `validate --spawns` lists it per seed (24 of 24 strict, median
-215 m from the centre, ~3 ms). It moves nothing in the golden hash.
-Before v16 every one of those started at a fixed (0, 0) or (10, -70), which
-on the default seed was wetland.
+names it. `validate --spawns` lists it per seed (v18: 200 of 200 strict,
+median 240 m from the centre, max 1.9 km, ~5 ms). It moves nothing in the
+golden hash. Before v16 every one of those started at a fixed (0, 0) or
+(10, -70), which on the default seed was wetland. On v18's default seed it
+is (736, 41.6, -288).
 
-**Layer 0's prototype** ("land as a lottery with fences", docs/worldgen-design.md)
-is in `WorldParams`, every part off by default, so the golden hashes are
-today's. `view.exe` has a slider for each part ("Layer 0 prototype..."); `validate` takes a flag for
-each and prints the readings under `islandness` (reach on foot, biomes on
-foot, shelf area, knee, draws); the engine builds it from
+**v18 moved the world, and this file's coordinates with it.** Layer 0 became
+an archipelago (below), so every position, `--cam` line, snapshot and
+measured view in this file that predates v18 -- the badlands hillside, the
+spawn tunnels at (-96, -440), the densest wood -- was taken on v17's world
+and now lands somewhere else, often in the sea. The measurements stand as
+records of what was found; re-find a view before reusing it (`--pick`,
+`validate --tree-sites`, the viewer's inspector).
+
+**Layer 0** ("land as a lottery with fences", docs/worldgen-design.md)
+ships in part since v18: no centre floor, a 7 km regime field (0.028 mask
+per std) and a fine 1564 m continent noise weighted 0.63 - 0.34 x regime,
+chosen by eye in the viewer -- 34 landmasses a seed, the spawn's holding
+22% of the land, 29.4% land, 2.8 flat sites (rare on purpose: building
+sites are meant to be dug). The per-seed draws, the shelf and the knee are
+still prototype, off by default. `view.exe` has a slider for each part
+("Layer 0 prototype..."); `validate` takes a flag for each and prints the
+readings under `islandness` (reach on foot, biomes on foot, shelf area,
+knee, draws); the engine builds a variant from
 `BIOMES_L0="centre_floor=0,regime_amp=0.1,shelf_width=0.06,knee=1,..."`.
 One parser, `worldgen::apply_param_spec`, reads that string for the engine
 and the viewer (which starts from it if it is set); the viewer's Copy
@@ -2620,8 +2634,8 @@ engine's +x is WEST, so it is a mirror image of a north-up compass map.
 ## Testing
 
 `tools/validate` runs 200 seeds and exits non-zero on any failure. It asserts
-presence, quota, radial ordering, land fraction, adjacency, edge taper, home
-landmass, boat connectivity, spawn, slope budget, river sanity, LOD agreement, blend seams,
+presence, quota, radial ordering, land fraction, adjacency, edge taper,
+boat connectivity, spawn, slope budget, river sanity, LOD agreement, blend seams,
 trees, cave entrances, throughput and the golden hashes, and emits a 64-seed contact
 sheet — look at it. Automated checks cannot tell you whether a world is
 interesting.
@@ -2635,11 +2649,13 @@ threshold as a literal `X%`. Whether a world should read as one continent or
 an archipelago is a feel call made on the contact sheet, not an assertion.
 `tools/validate/README.md` §8 has the measurement. **Land fraction is the
 lever** (`--land-target`, `--land-sweep`, and a slider in `view.exe` reading in
-percent). It is now a **32% mean** (v16; 35% before) — below the percolation
-threshold, so a typical seed is an archipelago of about 8 landmasses with the
-spawn mass holding roughly two thirds of the land, and the worst seeds far
-less. `validate --land-sweep` tabulates the neighbouring settings.
-The offset behind it is solved GLOBALLY for the mean and baked as a literal:
+percent). It is a **29.4% mean** since v18 (32% in v16-17, 35% before), and
+layer 0 itself is now the bigger lever: with no centre floor and a fine
+continent noise, a typical seed is ~34 landmasses with the spawn's holding
+about a fifth of the land (v17: 8 and two thirds). `home landmass` is a
+reading since v18, not a check: a bare islet is an allowed start (40 of 200
+seeds start on a landmass under 16 cells). `validate --land-sweep`
+tabulates the neighbouring settings. The offset is GLOBAL, never per seed:
 solving per seed would flatten the spread the islandness comes from.
 
 It also emits a shaded-relief sheet with `--relief`, and a single seed rendered
@@ -2730,7 +2746,10 @@ only asks whether the world is the pinned one, not whether it is any good.
 The GPU cannot be hashed (invariant 8), so CPU-to-GPU agreement is a tolerance
 comparison: `engine.exe --probe-field` meshes one chunk and compares its
 density grid against `worldgen::terrain_density` corner by corner. At M1 that
-was **6 µm over densities spanning 18 m**. It is also the first thing to run
+was **6 µm over densities spanning 18 m**. On v18's rougher ground layer 6's
+overhang term widens it: 31 µm at the spawn (the default chunk since v18),
+up to 20 mm at (-4000, 1500), 0.2 mm there with `--no-overhang` (v17's
+layer 0 at the same spot: 1.6 mm). It is also the first thing to run
 when the engine renders nothing — it says whether the two disagree, or whether
 they agree and the chunk really is empty.
 

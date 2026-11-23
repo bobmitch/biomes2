@@ -52,7 +52,7 @@ Two thresholds are judgement calls worth knowing about. **Home landmass** is
 16 cells, about two mean biome patches — a guard against spawning on a bare
 rock, not a requirement for a mainland (§8 explains why that distinction
 matters, and what the 75% foot-connectivity assertion it replaced was really
-doing). **Throughput** is gated at 400 ns/sample as a regression guard; the
+doing). **Throughput** is gated at 600 ns/sample (400 through v17) as a regression guard; the
 design doc's 20 ns is a serial-equivalent budget for the complete field
 function on the shipping path, and a scalar CPU reference build of layers 0–1
 cannot be judged against it.

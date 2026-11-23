@@ -88,30 +88,34 @@ struct WorldParams {
     // layer 0 stand-in
     float continent_freq    = 1.0f / 5200.0f;
     int   continent_octaves = 5;
-    float centre_floor      = 0.20f;      // home-landmass floor, not a lift
+    // The home-landmass floor, not a lift. 0 since v18: a start may be a
+    // bare islet or a mainland, and finding the second is luck (the layer 0
+    // proposal). The design doc's history of the floor still applies if it
+    // ever comes back above 0.
+    float centre_floor      = 0.0f;
     float edge_drop         = 1.60f;      // B
     float sea_level         = 0.0f;
-    // Stand-in only: shifts the continent mask to hit the 55% land target.
-    // In the real generator this is sea level, which is a world constant.
-    // Solved globally for a 32% MEAN land fraction, then baked (v16; 35% and
-    // -0.0248 before). Seeds run about 28-36% around it, and that spread is
-    // where the islandness is: the archipelagos are its low tail, not a
-    // separate mode. validate --land-sweep / --land-target re-solve it.
-    float land_offset       = -0.0540f;
+    // Shifts the continent mask, which sets how much of the disc is land.
+    // Chosen by eye in view.exe for v18 (-0.0540 in v16-17, solved there for
+    // a 32% mean): with the v18 layer 0 it gives a 29.4% MEAN, seeds about
+    // 25.5-33.3% around it, and that spread is part of the islandness. Not
+    // re-solved per seed. validate --land-sweep / --land-target re-solve it
+    // globally.
+    float land_offset       = -0.05442f;
 
-    // --- layer 0 PROTOTYPE: land as a lottery with fences ------------------
-    // docs/worldgen-design.md, "Layer 0, proposed". Every default below is
-    // today's world: the regime off (amplitude, mean and fine weight 0), no
-    // per-seed draws, no shelf (width 0), no knee. layer0_noise evaluates
-    // nothing new while they are, so the golden hashes do not move.
-    float fine_freq         = 1.0f / 1500.0f;   // the fine continent noise, islets
+    // --- layer 0: land as a lottery with fences -----------------------------
+    // docs/worldgen-design.md, "Layer 0, proposed". v18 ships the regime and
+    // the fine continent noise at values chosen by eye in view.exe: an
+    // archipelago of ~34 landmasses a seed, the spawn's holding ~22% of the
+    // land. The per-seed draws, the shelf and the knee stay off (prototype).
+    float fine_freq         = 1.0f / 1564.0f;   // the fine continent noise, islets
     int   fine_octaves      = 4;
-    float fine_weight       = 0.0f;   // its weight where the regime is average
-    float fine_regime       = 0.0f;   // weight change per std of regime (low regime, more fine)
+    float fine_weight       = 0.63f;  // its weight where the regime is average
+    float fine_regime       = 0.34f;  // weight change per std of regime (low regime, more fine)
     float regime_freq       = 1.0f / 7000.0f;   // 1 / regime feature size
     int   regime_octaves    = 3;
     float regime_mean       = 0.0f;   // mask offset where the regime is average
-    float regime_amp        = 0.0f;   // mask offset per std of the regime
+    float regime_amp        = 0.028f; // mask offset per std of the regime
     // Per-seed draws: when on, the three values above are drawn per seed,
     // uniformly in these ranges, each from its own feature seed.
     bool  regime_draw       = false;
