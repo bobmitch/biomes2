@@ -2914,7 +2914,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     allocators_[frame_]->Reset();
     cmd_->Reset(allocators_[frame_].Get(), nullptr);
     t0 = startup_now_ms();
-    if (!world_.build(device_.Get(), cmd_.Get(), 0, error)) return false;
+    if (!world_.build(device_.Get(), cmd_.Get(), WorldGpu::world_seed, error)) return false;
     startup_log().push_back(std::make_pair(std::string("phase: world build (CPU seed + upload)"), startup_now_ms() - t0));
     mesher_.set_world(&world_);
     {

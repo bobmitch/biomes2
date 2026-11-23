@@ -87,6 +87,7 @@ bool make_default(ID3D12Device* d, UINT64 bytes, ComPtr<ID3D12Resource>& out,
 static const size_t kArchFloats = 20;
 
 bool WorldGpu::diag_no_overhang = false;
+uint64_t WorldGpu::world_seed = 0;
 
 bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
                      uint64_t seed, std::string& error) {

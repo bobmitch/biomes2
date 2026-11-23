@@ -694,6 +694,8 @@ std::string write_snapshot(const engine::ViewConstants& view) {
         std::fprintf(f, " --wet %.3f", wet_now);
     }
     if (g_renderer.carried_torch()) std::fprintf(f, " --torch");
+    if (engine::WorldGpu::world_seed != 0)
+        std::fprintf(f, " --seed %llu", static_cast<unsigned long long>(engine::WorldGpu::world_seed));
     // Campfires (V), each where it stands.
     for (const engine::LocalLight& l : g_renderer.lights())
         std::fprintf(f, " --fire %.3f %.3f %.3f", l.pos[0], l.pos[1], l.pos[2]);
@@ -1439,6 +1441,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (cl.find("--no-overhang") != std::string::npos) {
             engine::WorldGpu::diag_no_overhang = true;
         }
+        // --seed <n>: which world. 0, the default, is the one every measured
+        // view in CLAUDE.md was taken on; the world viewer passes others.
+        {
+            const size_t sd = cl.find("--seed ");
+            if (sd != std::string::npos)
+                engine::WorldGpu::world_seed = std::strtoull(cl.c_str() + sd + 7, nullptr, 10);
+        }
         start_overlay = cl.find("--wire") != std::string::npos;
         debug_layer = cl.find("--debuglayer") != std::string::npos;
     }
@@ -1622,9 +1631,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         g_camera.z = g_spawn.z - 60.0f;
         g_camera.y = g_spawn.ground + 40.0f;
         if (FILE* sf = std::fopen("build/startup.txt", "a")) {
-            std::fprintf(sf, "%9.0f ms  spawn at (%.0f, %.1f, %.0f), %.0f m from the centre, "
+            std::fprintf(sf, "%9.0f ms  seed %llu: spawn at (%.0f, %.1f, %.0f), %.0f m from the centre, "
                              "calmest biome %d at weight %.2f%s\n",
-                         engine::startup_now_ms() - ts, g_spawn.x, g_spawn.ground, g_spawn.z,
+                         engine::startup_now_ms() - ts,
+                         static_cast<unsigned long long>(engine::WorldGpu::world_seed),
+                         g_spawn.x, g_spawn.ground, g_spawn.z,
                          std::sqrt(g_spawn.x * g_spawn.x + g_spawn.z * g_spawn.z),
                          g_spawn.biome, g_spawn.weight,
                          g_spawn.strict ? "" : " (FALLBACK: no point passed every test)");
