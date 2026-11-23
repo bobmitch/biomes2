@@ -31,8 +31,10 @@ cbuffer FogConstants : register(b0) {
     float3 cam_fwd;    float jitter;      // where in its slice this frame samples, 0..1
     float  near_z;     float log_ratio;   uint history_valid; float time_factor;
     float  map_extent; float haze;        float sea_level;    float patch;
-    float2 wind;       float phase_g;     float albedo;
-    float  screen_w;   float screen_h;    float density_scale; float cam_sky;   // cam_sky: DDGI's share of open sky at the eye
+    float2 drift;      float phase_g;     float albedo;   // drift: metres the patches have moved (weather.h)
+    float  screen_w;   float screen_h;    float density_scale; float cam_sky;   // cam_sky: the heightfield GI's share of open sky at the eye
+    float4 cloud_shadow;  // ADR-005 C2: the cloud-shadow map's centre x, z, half extent (0: none), base altitude
+    float4 mist_top;      // the exploration fog: the patches thin above x m by e-folding y m (peaks stay clear)
 };
 
 Texture2D<float4>   g_fog_map    : register(t0);   // fog.h: density, thinning height, surface y
@@ -40,7 +42,11 @@ Texture3D<float4>   g_history    : register(t1);
 Texture3D<float4>   g_inject_in  : register(t2);
 RWTexture3D<float4> u_inject     : register(u0);
 RWTexture3D<float4> u_integrated : register(u1);
+RWTexture3D<float>  u_open       : register(u2);   // how much the ground over each froxel darkens it (1 open)
+RWTexture3D<float>  u_open_avg   : register(u3);   // its mean along the ray to each slice's far side
 SamplerState        g_lin        : register(s0);
+Texture2D<float>    g_cloud_shadow : register(t60);   // clouds.hlsl cs_shadow, last frame's
+#include "engine/render/shaders/cloud_shadow.hlsli"
 
 static const uint kFX = 160, kFY = 90, kFZ = 128;
 
@@ -72,14 +78,21 @@ float vnoise3(float3 p) {
 
 // Extinction per metre. The map's mist, thinning with height above the
 // surface it lies on, times the hour; broken into patches that drift on the
-// wind and are flattened, as banks of mist are; and the haze everywhere.
+// wind and are flattened, as banks of mist are; and the haze everywhere. The
+// drift is the weather's integral of the wind, never wind x time, which
+// jumps the moment the wind changes.
 float fog_density(float3 p) {
     const float4 m = g_fog_map.SampleLevel(g_lin, p.xz / map_extent + 0.5f, 0);
     const float h = max(p.y - m.z, 0.0f);
     float d = m.x * exp(-h / max(m.y, 1.0f)) * time_factor;
-    const float3 q = (p - float3(wind.x, 0.0f, wind.y) * time) / patch * float3(1.0f, 3.0f, 1.0f);
+    const float3 q = (p - float3(drift.x, 0.0f, drift.y)) / patch * float3(1.0f, 3.0f, 1.0f);
     const float n = 0.65f * vnoise3(q) + 0.35f * vnoise3(q * 3.1f + 17.0f);
     d *= saturate(1.6f * n - 0.15f);
+    // The patches lie in the low land. The mist follows the ground, so over
+    // a summit it was as thick as over a valley floor and peaks inside the
+    // froxels' 6 km came out as hazy as the plain: thin it with altitude,
+    // as the exploration fog (haze.hlsli) is thin up there.
+    if (mist_top.y > 0.0f) d *= exp(-max(p.y - sea_level - mist_top.x, 0.0f) / mist_top.y);
     return (d + haze) * density_scale;
 }
 
@@ -111,18 +124,38 @@ void cs_fog_inject(uint3 id : SV_DispatchThreadID) {
     const float z = slice_z(float(id.z) + jitter);
     const float3 p = froxel_world(uv, z);
     const float3 d = normalize(p - cam_pos);
-    const float sigma_t = fog_density(p);
+    // Rock holds no air (nf_openness -1, where the near field reaches): no
+    // mist in it, and nothing for the ray's openness average.
+    float k_here;
+    const float open_here = nf_openness(p, k_here);
+    const bool in_rock = open_here < 0.0f;
+    const float sigma_t = in_rock ? 0.0f : fog_density(p);
     const float sigma_s = sigma_t * albedo;
 
     // Radiance arriving at the point, weighted by the phase towards the eye.
     // The cosine is between the light's direction of travel (-l) and the
     // scattered ray's (-d): looking into the light is the forward peak.
-    float3 L = kSunLux * (key_visibility(p) * hg_phase(dot(d, kSunDir), phase_g));
+    // Through the clouds' shadow too (ADR-005 C2): sunbeams through the gaps
+    // in a deck, and no sunlit glow under a closed one.
+    float3 L = kSunLux * (key_visibility(p) * cloud_shadow_at(g_cloud_shadow, g_lin, cloud_shadow, kSunDir, p) *
+                          hg_phase(dot(d, kSunDir), phase_g));
     // The sky above and the ground below, scattered isotropically: the mean
     // radiance over the sphere.
     // Near the camera, only the share of it the probes say reaches the eye:
     // mist in a sealed chamber glowed with daylight (--leak-test, 10 nits).
-    L += 0.5f * (kSkyMean + kGroundRadiance) * lerp(cam_sky, 1.0f, saturate((length(p - shadow_cam) - 64.0f) / 192.0f));
+    // Where the near field (hfgi.hlsli nf_openness) knows the point itself --
+    // under the top surface, a tunnel's air -- its own share instead: the
+    // eye's share lit a whole tunnel's mist from a sunlit shaft.
+    const float share = in_rock ? 0.0f
+                                : lerp(lerp(cam_sky, 1.0f, saturate((length(p - shadow_cam) - 64.0f) / 192.0f)), open_here, k_here);
+    L += 0.5f * (kSkyMean + kGroundRadiance) * share;
+    // For the composite, how much the ground over it darkens this air: 1 in
+    // the open, the probes' openness under the top surface. Averaged along
+    // each ray (cs_fog_integrate), it scales the haze and the height fog the
+    // composite lights by its own rule, which open air keeps exactly: a
+    // tunnel seen from a sunlit shaft glowed with height fog (luma 58
+    // against 2 without it).
+    u_open[id] = in_rock ? -1.0f : lerp(1.0f, open_here, k_here);
     if (l_cluster.w > 0.5f) {
         const uint c = cluster_of(p, float4(uv * float2(screen_w, screen_h), 0.0f, 1.0f));
         const uint n = g_cluster_n[c];
@@ -133,6 +166,16 @@ void cs_fog_inject(uint3 id : SV_DispatchThreadID) {
             if (max(E.r, max(E.g, E.b)) <= 0.0f) continue;
             L += E * (hg_phase(dot(d, l), phase_g) * local_shadow(Lt, p, l, l));
         }
+    }
+    // A lightning flash (ADR-005 C5, flash.hlsli's l_flash): in rain the mist
+    // is most of what is seen, and a flash lights all of it -- the sky
+    // flickers white -- where the clouds behind are lost in it.
+    float flash_lit = 0.0f;
+    if (l_flash.w > 0.0f) {
+        const float3 fd = l_flash.xyz - p;
+        const float r2 = max(dot(fd, fd), 1e4f);
+        L += l_flash_col.rgb * (l_flash.w / r2) * hg_phase(dot(d, fd * rsqrt(r2)), phase_g);
+        flash_lit = 1.0f;
     }
     float4 cur = float4(L * sigma_s, sigma_t);
 
@@ -146,7 +189,10 @@ void cs_fog_inject(uint3 id : SV_DispatchThreadID) {
             const float ps = log(max(c.w, 1e-3f) / near_z) / log_ratio * float(kFZ);
             if (all(puv >= 0.0f) && all(puv <= 1.0f) && ps >= 0.0f && ps <= float(kFZ)) {
                 const float4 h = g_history.SampleLevel(g_lin, float3(puv, ps / float(kFZ)), 0);
-                cur = lerp(h, cur, 0.08f);
+                // A flash lasts a few frames: take this frame whole while it
+                // is lit, or 1:12 smears a 30 ms stroke to nothing; the
+                // history's decay after it is a short afterglow.
+                cur = lerp(h, cur, flash_lit > 0.5f ? 1.0f : 0.08f);
             }
         }
     }
@@ -163,6 +209,7 @@ void cs_fog_integrate(uint3 id : SV_DispatchThreadID) {
     float3 S = float3(0.0f, 0.0f, 0.0f);
     float T = 1.0f;
     float z0 = 0.0f;
+    float open_sum = 0.0f, open_len = 0.0f;
     for (uint s = 0; s < kFZ; ++s) {
         const float z1 = slice_z(float(s + 1));
         const float4 v = g_inject_in[uint3(id.xy, s)];
@@ -171,6 +218,15 @@ void cs_fog_integrate(uint3 id : SV_DispatchThreadID) {
         S += T * (v.rgb - v.rgb * Ts) / st;
         T *= Ts;
         u_integrated[uint3(id.xy, s)] = float4(min(S, kSceneMaxNits), T);
+        // Slice 0 reaches from the eye. A slice in rock (-1) counts for
+        // nothing either way: the average is over the air the ray crossed.
+        const float o = u_open[uint3(id.xy, s)];
+        if (o >= 0.0f) {
+            const float dz = z1 - (s == 0u ? 0.0f : z0);
+            open_sum += o * dz;
+            open_len += dz;
+        }
+        u_open_avg[uint3(id.xy, s)] = open_len > 0.0f ? open_sum / open_len : 1.0f;
         z0 = z1;
     }
 }

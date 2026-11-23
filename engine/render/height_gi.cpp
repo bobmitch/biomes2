@@ -3,6 +3,7 @@
 #endif
 #include "engine/render/height_gi.h"
 #include "engine/render/shader_compile.h"
+#include "engine/render/shader_heaps.h"
 
 #include <cmath>
 #include <cstring>
@@ -49,7 +50,7 @@ bool HeightGi::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::strin
     cd.DepthStencil.Depth = 1.0f;
     if (!tex(albedo_, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, kRead, &cz) ||
         !tex(depth_, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, kRead, &cd) ||
-        !tex(height_, DXGI_FORMAT_R32_FLOAT, uav, kRead, nullptr) ||
+        !tex(height_, DXGI_FORMAT_R32G32_FLOAT, uav, kRead, nullptr) ||
         !tex(rad_, DXGI_FORMAT_R16G16B16A16_FLOAT, uav, kRead, nullptr)) {
         error = "heightfield gi targets";
         return false;
@@ -108,24 +109,28 @@ bool HeightGi::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::strin
         device->CreateUnorderedAccessView(r, nullptr, &ud, cpu(slot));
     };
     for (int k = 0; k < 4; ++k) srv(sh_[k].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, kSrvScene + UINT(k));
-    srv(height_.Get(), DXGI_FORMAT_R32_FLOAT, kSrvScene + 4);
+    srv(height_.Get(), DXGI_FORMAT_R32G32_FLOAT, kSrvScene + 4);   // height, curvature (6 m)
     srv(albedo_.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, kSrvTop + 0);
     srv(depth_.Get(), DXGI_FORMAT_R32_FLOAT, kSrvTop + 1);
     srv(rad_.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, kSrvTop + 2);
-    uavd(height_.Get(), DXGI_FORMAT_R32_FLOAT, kUav + 0);
+    uavd(height_.Get(), DXGI_FORMAT_R32G32_FLOAT, kUav + 0);
     uavd(rad_.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, kUav + 1);
     for (int k = 0; k < 4; ++k) uavd(sh_[k].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, kUav + 2 + UINT(k));
 
     // Root: the update's constants, the frame's shadow constants (the light,
     // the sky, the canopy), the SRVs it reads, the UAVs it writes.
     {
-        D3D12_DESCRIPTOR_RANGE sr[3] = {};
+        D3D12_DESCRIPTOR_RANGE sr[4] = {};
         sr[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; sr[0].NumDescriptors = 3; sr[0].BaseShaderRegister = 0;
         sr[0].OffsetInDescriptorsFromTableStart = kSrvTop;
         sr[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; sr[1].NumDescriptors = 5; sr[1].BaseShaderRegister = 38;
         sr[1].OffsetInDescriptorsFromTableStart = kSrvScene;
         sr[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; sr[2].NumDescriptors = 1; sr[2].BaseShaderRegister = 25;
         sr[2].OffsetInDescriptorsFromTableStart = 38;   // the canopy map
+        // The near field's probes and occupancy (near_field.h): the camera's
+        // sky share comes through hfgi_sample, which reads them under the ground.
+        sr[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; sr[3].NumDescriptors = 3; sr[3].BaseShaderRegister = 26;
+        sr[3].OffsetInDescriptorsFromTableStart = 40;
         D3D12_DESCRIPTOR_RANGE ur = {};
         ur.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; ur.NumDescriptors = 6; ur.BaseShaderRegister = 0;
         ur.OffsetInDescriptorsFromTableStart = kUav;
@@ -133,7 +138,7 @@ bool HeightGi::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::strin
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[2].DescriptorTable.NumDescriptorRanges = 3; p[2].DescriptorTable.pDescriptorRanges = sr;
+        p[2].DescriptorTable.NumDescriptorRanges = 4; p[2].DescriptorTable.pDescriptorRanges = sr;
         p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[3].DescriptorTable.NumDescriptorRanges = 1; p[3].DescriptorTable.pDescriptorRanges = &ur;
         p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; p[4].Descriptor.ShaderRegister = 6;   // the camera's share
@@ -146,7 +151,7 @@ bool HeightGi::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::strin
             ss[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         }
         ss[0].ShaderRegister = 0;
-        ss[1].ShaderRegister = 3;   // hfgi.hlsli samples through ddgi.hlsli's s3
+        ss[1].ShaderRegister = 3;   // hfgi.hlsli samples through s3 (shadow.hlsli g_gi_linear)
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
         rsd.NumParameters = 5;
         rsd.pParameters = p;
@@ -211,8 +216,10 @@ bool HeightGi::begin(const float cam[3], float hours, unsigned long long frame, 
     const float dx = cam[0] - centre_[0], dy = cam[1] - centre_[1], dz = cam[2] - centre_[2];
     // 8 m of the camera's travel, a minute of the clock, or a second.
     const bool due = !built_ || dx * dx + dz * dz > 64.0f || std::fabs(dy) > 8.0f ||
-                     std::fabs(hours - hours_) > 1.0f / 60.0f || frame - last_frame_ >= 60;
+                     std::fabs(hours - hours_) > 1.0f / 60.0f || frame - last_frame_ >= 60 || bounce_reset_ > 0;
     if (!due) return false;
+    drop_bounce_ = bounce_reset_ == 4;
+    if (bounce_reset_ > 0) --bounce_reset_;
     for (int k = 0; k < 3; ++k) centre_[k] = cam[k];
     hours_ = hours;
     last_frame_ = frame;
@@ -240,7 +247,7 @@ void HeightGi::record(ID3D12GraphicsCommandList* cmd, UINT frame, D3D12_GPU_VIRT
     hc.origin_xz[1] = origin_[1];
     hc.y_top = y_top_;
     hc.y_range = y_range_;
-    hc.first = built_ ? 0u : 1u;
+    hc.first = built_ ? (drop_bounce_ ? 2u : 0u) : 1u;   // 2: the last rebuild's sky, none of its bounce
     std::memcpy(cb_cpu_[f], &hc, sizeof hc);
     auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
         D3D12_RESOURCE_BARRIER rb = {};
@@ -258,8 +265,7 @@ void HeightGi::record(ID3D12GraphicsCommandList* cmd, UINT frame, D3D12_GPU_VIRT
     tr(height_.Get(), kRead, ua);
     tr(rad_.Get(), kRead, ua);
 
-    ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
-    cmd->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd);
     const D3D12_GPU_DESCRIPTOR_HANDLE base = heap_->GetGPUDescriptorHandleForHeapStart();
     cmd->SetComputeRootSignature(root_.Get());
     cmd->SetComputeRootConstantBufferView(0, cb_[f]->GetGPUVirtualAddress());
@@ -287,13 +293,13 @@ void HeightGi::record_camera(ID3D12GraphicsCommandList* cmd, UINT slot, D3D12_GP
         D3D12_RANGE rr = {0, 16};
         if (SUCCEEDED(cam_rb_[rs]->Map(0, &rr, reinterpret_cast<void**>(&v)))) {
             camera_sky_ = (v[0] >= 0.0f && v[0] <= 1.0f) ? v[0] : 1.0f;
+            camera_open_ = (v[1] >= 0.0f && v[1] <= 1.0f) ? v[1] : 1.0f;
             D3D12_RANGE nr = {0, 0};
             cam_rb_[rs]->Unmap(0, &nr);
         }
         cam_pending_[rs] = false;
     }
-    ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
-    cmd->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd);
     const D3D12_GPU_DESCRIPTOR_HANDLE base = heap_->GetGPUDescriptorHandleForHeapStart();
     cmd->SetComputeRootSignature(root_.Get());
     cmd->SetComputeRootConstantBufferView(0, cb_[rs]->GetGPUVirtualAddress());

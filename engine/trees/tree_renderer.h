@@ -17,6 +17,7 @@
 
 #include "engine/trees/tree_field.h"
 #include "engine/trees/tree_mesh.h"
+#include "engine/render/gpu_profile.h"
 
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -32,7 +33,11 @@ struct TreeDrawSettings {
     float max_dist = 500.0f;    // the draw-distance slider
     float lod0_dist = 45.0f;    // full mesh inside this
     float lod1_dist = 170.0f;   // simplified mesh inside this; impostors beyond
-    float wind = 1.0f;
+    float wind = 1.0f;          // a multiplier on the weather's sway
+    // The weather (weather.h), set by the renderer every frame: direction x,
+    // z; mean speed m/s; gustiness. And the metres the air has moved.
+    float wind_v[4] = {0.94f, 0.33f, 4.0f, 0.4f};
+    float wind_drift[2] = {0.0f, 0.0f};
     float debug = 0.0f;         // 1 tints by level
     // Towards the key light -- sun, or moon at night -- which an impostor's
     // shadow card faces. The renderer sets it every frame (ADR-004 L2).
@@ -76,8 +81,19 @@ public:
 
     // Culls and draws. Render target, depth, viewport and scissor must
     // already be bound; leaves the graphics root signature changed.
+    // After record_prepass in the same frame, draws colour over the
+    // prepass's depth (EQUAL) from the lists it culled.
     void record(ID3D12GraphicsCommandList* cmd, UINT frame, const TreeFrameInputs& in,
                 const TreeDrawSettings& s);
+    // The depth prepass: culls, then draws the mesh levels depth only with
+    // the coverage test (dither, cut, leaves), so record() shades each
+    // visible tree pixel once instead of once per surviving card. Called
+    // before the terrain, whose hidden pixels it also saves. A no-op when
+    // the prepass is off or the overdraw counter is running.
+    void record_prepass(ID3D12GraphicsCommandList* cmd, UINT frame, const TreeFrameInputs& in,
+                        const TreeDrawSettings& s);
+    void set_prepass(bool on) { prepass_on_ = on; }
+    bool prepass() const { return prepass_on_; }
     // Cull against one cascade and draw depth only. The depth target and
     // viewport must already be bound.
     void record_shadow(ID3D12GraphicsCommandList* cmd, UINT frame, UINT cascade,
@@ -85,10 +101,33 @@ public:
     // One face of a local light's shadow (ADR-004 L3): culled against the
     // face, levelled like the sun's first cascade (full detail, real
     // leaves). `face` is the frame's face counter, 0 .. kMaxLightFaces - 1,
-    // each with its own constants.
-    static const UINT kMaxLightFaces = 12;
+    // each with its own constants: twelve for the lights' own redraws and
+    // twelve for the faces the player's body moves through.
+    static const UINT kMaxLightFaces = 24;
     void record_light_shadow(ID3D12GraphicsCommandList* cmd, UINT frame, UINT face,
                              const TreeShadowInputs& in, const TreeDrawSettings& s);
+
+    // Per-pass GPU timing (gpu_profile.h). While it is enabled the mesh
+    // levels draw as separate ExecuteIndirect runs -- every model's LOD 0,
+    // then every model's LOD 1 -- so each level gets its own timestamp and
+    // pipeline statistics; the impostors are one draw as always.
+    void set_profiler(GpuProfiler* p) { prof_ = p; }
+    // The scans' sampler for bark (s5): the renderer's, for its current
+    // anisotropy (Renderer::scan_sampler). Set before recording.
+    void set_scan_sampler(D3D12_GPU_DESCRIPTOR_HANDLE h) { scan_sampler_ = h; }
+
+    // The overdraw instrument (`--gpu-profile`): while on, the CAMERA's pass
+    // draws with pixel shaders that count, per pixel, every fragment the tree
+    // pass rasterised and every one that survived its coverage and dither
+    // tests (and of those, which were leaf cards and which impostors). Two
+    // uints a pixel: invoked | survived << 16, leaf | impostor << 16. A UAV
+    // write forces late depth, so "invoked" is every rasterised fragment, not
+    // what early depth would have let through -- the pipeline statistics'
+    // PS invocations are that. Report modes only: the clear and the readback
+    // wait on the GPU.
+    bool overdraw_begin(ID3D12CommandQueue* queue, UINT width, UINT height, std::string& error);
+    bool overdraw_read(ID3D12CommandQueue* queue, std::vector<uint32_t>& out, std::string& error);
+    void overdraw_end();
 
     // What the models are, for physics and felling.
     const TreeModel& model(uint32_t species, uint32_t variant) const {
@@ -130,7 +169,24 @@ private:
     ComPtr<ID3D12PipelineState> mesh_pso_, imp_pso_, bake_pso_;
     ComPtr<ID3D12PipelineState> mesh_shadow_pso_, imp_shadow_pso_;
     void cull_and_draw(ID3D12GraphicsCommandList* cmd, UINT frame, UINT cb_index,
-                       const void* frame_constants, bool shadow, D3D12_GPU_VIRTUAL_ADDRESS shadow_cb);
+                       const void* frame_constants, bool shadow, D3D12_GPU_VIRTUAL_ADDRESS shadow_cb,
+                       const char* label);
+    void upload_instances(UINT f);
+    void write_cb(UINT f, UINT cb_index, const void* frame_constants);
+    D3D12_GPU_VIRTUAL_ADDRESS cb_address(UINT f, UINT cb_index) const;
+    void cull(ID3D12GraphicsCommandList* cmd, UINT f, D3D12_GPU_VIRTUAL_ADDRESS cb);
+    void bind_draw(ID3D12GraphicsCommandList* cmd, UINT f, D3D12_GPU_VIRTUAL_ADDRESS cb,
+                   D3D12_GPU_VIRTUAL_ADDRESS shadow_cb);
+    void draw_meshes(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, const char* label);
+    void draw_impostors(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, const char* label);
+    void release(ID3D12GraphicsCommandList* cmd);
+    ComPtr<ID3D12PipelineState> mesh_depth_pso_, mesh_eq_pso_;
+    bool prepass_on_ = true, prepassed_ = false;
+    GpuProfiler* prof_ = nullptr;
+    ComPtr<ID3D12PipelineState> mesh_od_pso_, imp_od_pso_;
+    ComPtr<ID3D12Resource> od_buf_, od_zero_, od_rb_;
+    UINT od_w_ = 0, od_h_ = 0;
+    bool od_on_ = false;
     ComPtr<ID3D12PipelineState> clear_pso_, cull_pso_, args_pso_;
     ComPtr<ID3D12CommandSignature> cmd_sig_;
 
@@ -143,6 +199,8 @@ private:
     void* frame_cb_cpu_[2] = {};
     ComPtr<ID3D12Resource> atlas_albedo_, atlas_normal_;
     ID3D12DescriptorHeap* srv_heap_ = nullptr;   // the renderer's
+    static constexpr UINT kScanSamplerParam = 11;   // the draw root's s5 table
+    D3D12_GPU_DESCRIPTOR_HANDLE scan_sampler_ = {};
     UINT srv_slot_ = 1;
 
     // Init-time submission.

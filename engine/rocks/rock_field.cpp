@@ -136,6 +136,13 @@ void RockField::rebuild() {
     rocks_.clear();
     for (auto it = tiles_.begin(); it != tiles_.end(); ++it)
         rocks_.insert(rocks_.end(), it->second.rocks.begin(), it->second.rocks.end());
+    if (!drops_.empty()) {
+        for (worldgen::RockInstance& r : rocks_) {
+            std::unordered_map<uint32_t, float>::const_iterator d = drops_.find(r.id);
+            if (d != drops_.end()) { r.y -= d->second; r.ground -= d->second; }
+        }
+    }
+    drops_dirty_ = false;
     ++version_;
 }
 

@@ -19,11 +19,15 @@ float hash11(float x) {
     return float((h ^ (h >> 13)) & 0xFFFFu) / 65535.0f;
 }
 
-float hash2(float2 c) {
+uint hash2u(float2 c) {
     const uint2 q = uint2(int2(floor(c)) + int2(0x4000, 0x4000));
     uint h = q.x * 0x8da6b343u ^ q.y * 0xd8163841u;
     h = (h ^ (h >> 13)) * 0xcb1ab31fu;
-    return float((h ^ (h >> 16)) & 0xFFFFu) / 65535.0f;
+    return h ^ (h >> 16);
+}
+
+float hash2(float2 c) {
+    return float(hash2u(c) & 0xFFFFu) / 65535.0f;
 }
 
 float vnoise(float2 p) {
@@ -48,9 +52,14 @@ float leaf_layer(float2 uv, float cells, float seed, float narrow) {
     const float2 g = uv * cells;
     const float2 c = floor(g);
     const float2 f = g - c - 0.5f;
-    const float h0 = hash2(c + seed * 97.0f);
-    const float h1 = hash2(c.yx + seed * 53.0f + 17.0f);
-    const float h2 = hash2(c + seed * 31.0f + 41.0f);
+    // One hash, three 10-bit draws. It was three hashes, each three integer
+    // multiplies at a quarter of the float rate, and this function runs for
+    // every leaf fragment in the depth prepass and the first shadow cascade:
+    // tens of millions a frame in a wood at 4K.
+    const uint hh = hash2u(c + seed * 97.0f);
+    const float h0 = float(hh & 0x3FFu) * (1.0f / 1023.0f);
+    const float h1 = float((hh >> 10) & 0x3FFu) * (1.0f / 1023.0f);
+    const float h2 = float((hh >> 20) & 0x3FFu) * (1.0f / 1023.0f);
     if (h2 < 0.06f) return 0.0f;   // a few gaps, so a card is not a lattice
     const float ang = h0 * 6.2831853f;
     const float2 d = f - (float2(h1, h2) - 0.5f) * 0.18f;
@@ -71,6 +80,42 @@ float leaf_coverage(float2 uv, float kind, float seed, float blur, float narrow)
     const float rim = 1.0f - saturate((length(uv - 0.5f) - 0.40f) / 0.1f);
     const float avg = kind < 1.5f ? 0.55f : 0.5f;
     return rim * lerp(leaf_coverage_sharp(uv, kind, seed, blur, narrow), avg, saturate(blur * 5.0f - 0.25f));
+}
+
+// A card's leaves as SOLID CLUSTERS, for once the card is too small for its
+// leaves (the lit pass only; trees.hlsl ps_mesh). A few blobs per card from
+// value noise seeded by the card, cut at a fixed level -- no dither: the
+// screen-fixed dither held the pixels still while the leaves slid under them,
+// so TAA threw its history away in motion and distant crowns went to a
+// see-through halftone; and every card tested against the SAME screen
+// pattern, so overlapping cards kept the same pixels and a crown of a hundred
+// cards stayed at one card's 55%. Cut so the share inside the rim is about
+// leaf_coverage's own average, 0.55 -- the same fill, placed per card, so
+// cards stack as leaves do. Returns a field whose 0.5 level is the edge, so it
+// blends with the sharp coverage under the same 0.5 test.
+// The shadow casters keep leaf_coverage.
+//
+// `narrow` cards (a willow's hanging strands: u across, v down the strand)
+// get STRANDS instead of blobs -- thin streaks running the card's length,
+// across its full width. Round blobs on a tall strand card read as fat
+// painted tongues, a different tree from the near one's fine curtain.
+float leaf_cluster(float2 uv, float kind, float seed, float narrow) {
+    const float2 o = float2(seed * 13.7f, seed * 29.3f);
+    if (narrow > 0.5f) {
+        // The card IS a strand (three thin ones a branch at both levels,
+        // tree_mesh.cpp): a leafy strip down its middle, broken along its
+        // length, tapering at the ends. Streaks within a card -- seven of
+        // them -- read as hatching, not hanging leaves.
+        const float w = 0.26f + 0.08f * vnoise(float2(uv.y * 5.0f, 0.5f) + o);
+        const float band = 1.0f - saturate((abs(uv.x - 0.5f) - w) / 0.06f);
+        const float ends = saturate(uv.y * 6.0f) * saturate((1.0f - uv.y) * 4.0f);
+        const float gaps = vnoise(float2(0.5f, uv.y * 4.5f) + o.yx);
+        return band * ends * saturate(0.5f + (gaps - 0.35f) * 8.0f);
+    }
+    const float rim = 1.0f - saturate((length(uv - 0.5f) - 0.40f) / 0.1f);
+    const float n = 0.65f * vnoise(uv * 3.2f + o) + 0.35f * vnoise(uv * 6.5f + o.yx + 7.0f);
+    const float cut = kind < 1.5f ? 0.485f : 0.5f;
+    return rim * saturate(0.5f + (n - cut) * 8.0f);
 }
 
 float leaf_coverage_sharp(float2 uv, float kind, float seed, float blur, float narrow) {

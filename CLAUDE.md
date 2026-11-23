@@ -14,6 +14,10 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `worldgen/golden/` | Pinned seed hashes. Changes must be deliberate. |
 | `engine/trees/` | Tree meshes (procedural, made here), the CPU tile streamer over layer 8, GPU culling and impostors, felling. |
 | `engine/foliage/` | Ground cover -- grass, flowers, bushes -- generated on the GPU each frame (`foliage.hlsl`). |
+| `engine/ui/` | The UI layer: RmlUi's D3D12 renderer, input routing, and the `engine` Lua module (tunables). |
+| `game/` | What the UI and scripts ARE: `scripts/*.lua` (entry `main.lua`) and `ui/*.rml`, `*.rcss`. |
+| `engine/character/` | The player's character: the packed model, the procedural animator, the skinned draw. |
+| `tools/models/` | `pack_character.py`: the rigged glTF characters and the animation library in `assets/models/` (not in git) to `assets/models/packed/` (`*.chr`, `ual.anim`). |
 | `engine/rocks/` | Layer 9's rocks: procedural meshes, the CPU tile streamer, instanced drawing on the terrain's root signature, static colliders. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32). Debug tool, Windows only. |
@@ -21,6 +25,10 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `assets/textures/` | `scans.json`, the CC0 surface scans' manifest. Downloads and packs are fetched, never committed. |
 | `tools/textures/` | `fetch_scans.py`: downloads the scans and packs them for the engine. |
 | `engine/` | Track B runtime (D3D12, `docs/adr-003-*`). Since M1 it evaluates the REAL field: `engine/field/real_field.hlsl` is the caller's side of ADR-001's line (which cells, rivers and shafts are near a point), and `world_gpu.{h,cpp}` uploads them. |
+
+Open gaps -- things built but not finished, and things seen but not fixed
+-- are gathered in `docs/gaps.md`; add to it when a section here grows a
+"Not done".
 
 **`worldgen/` is everything upstream of the golden hash; `tools/` is
 everything downstream.** That line is what makes invariant 9 checkable — the
@@ -44,6 +52,14 @@ and bark fall back to their procedural detail.
 python -I tools/textures/fetch_scans.py
 ```
 
+The player's character is packed the same way, from the CC0 kit in
+`assets/models/` (not in git either); without a pack the engine walks with
+no body drawn, and `build/startup.txt` says what to run.
+
+```bash
+python -I tools/models/pack_character.py
+```
+
 ```bash
 build\engine.exe
 ```
@@ -56,6 +72,17 @@ never worked. To drive cmake directly:
 cmake -S . -B build/cmake -G Ninja && cmake --build build/cmake
 ```
 
+**Spawn** is `worldgen::find_spawn`: the point nearest the centre that
+stands well inside the CALMEST biome (lowest `danger_preferred`; weight
+>= 0.75 there and a majority on a 60 m ring), on dry, gentle ground, clear of
+rivers and trunks. The engine opens the window over it, and `--walk`,
+`--flight`, `--fell`, `--tab-test`, `--lights-report` and `--shot`'s default
+vantage (70 m behind it, 22 m up) all start from it; `build/startup.txt`
+names it. `validate --spawns` lists it per seed (24 of 24 strict, median
+215 m from the centre, ~3 ms). It moves nothing in the golden hash.
+Before v16 every one of those started at a fixed (0, 0) or (10, -70), which
+on the default seed was wetland.
+
 `validate.exe`, `view.exe` and `engine.exe` all read data by paths relative to
 the repository root, so run them from there. `engine.exe --shot <path>` renders
 one frame at a fixed camera and writes a BMP without opening a window.
@@ -67,17 +94,28 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--shot`, `--flight <s>`, `--walk <s>`, `--overhang`, `--dig`, `--dig-save`,
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
 `--band-report`, `--sea-report`, `--swim`, `--blend-report`, `--tab-test`,
+`--clock-jump` (with `--shot`: the light under the ground after the clock
+jumps or runs, `build/time_jump.txt`; see The near field),
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
-references), `--rt-report` (ADR-004 L5: the ray-tracing scene at three
-views, and L6's sky visibility with and without crowns), `--leak-test`
-(ADR-004 L6: a sealed chamber, unlit and torch-lit, DDGI against the
-fallback), `--gi-report` (DDGI at three views), `--lights-report` (ADR-004 L3: local lights at night, six
-configurations timed) and `--fell` (with `--fell-save` / `--fell-verify`).
-Every mode takes `--time <hours>` (ADR-004 L2: 14 by default, which is the
-pre-L2 sun), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
-`--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`, `--no-rocks`,
-`--no-forest-shell`; `--shot` also
-takes `--lights <n>` (campfires round the camera) and `--ground` (the
+references), `--pose-sheet` (the character in sixteen fixed poses from fixed
+cameras -- idle, walk, jog, sprint, jump, swim, torch, the axe -- `build/pose_*.bmp` and `pose_sheet.txt`), `--shot ... --gpu-profile [frames]` (per-pass GPU times,
+pipeline statistics and the trees' overdraw, `<shot>.gpu.txt`; see Trees),
+`--leak-test`
+(ADR-004 L6: a sealed chamber, unlit and torch-lit, the heightfield GI against
+the bare fallback), `--lights-report` (ADR-004 L3: local lights at night, six
+configurations timed), `--fell` (with `--fell-save` / `--fell-verify`) and `--dig-settle`.
+Every mode takes `--character male|female` (which pack; male by default) and
+`--time <hours>` (ADR-004 L2: 14 by default, which is the
+pre-L2 sun), the weather's `--sea-state <0..1>`, `--wind <m/s>`,
+`--wind-dir <deg>` and `--swell <m>` (automatic weather otherwise), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
+`--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`,
+`--aniso <1|2|4|8|16>` (the scans' filtering), `--no-terrain-prepass`, `--no-rocks`,
+`--no-forest-shell`, `--no-clouds`, `--no-rain`, `--rain <0..1>`, `--wet <0..1>`,
+`--no-lightning`, `--no-height-fog` and `--height-fog <k>` (a multiplier on the
+exploration fog); `--shot` also
+takes `--lights <n>` (campfires round the camera), `--lightning <dist m>
+<bearing deg> [1]` (a strike for the still, at the peak of its first stroke,
+the bearing from the camera's forward; 1 in the cloud) and `--ground` (the
 `--cam` x and z at eye height on the ground). `--flight` also takes `--settle`, `--holes` and
 `--flight-speed <m/s>` and `--flight-from x y z`; `--shot` takes
 `--slot-report` and `--shake <frames>` (a still camera through that many
@@ -87,15 +125,18 @@ the streaming A/B switches `--no-lod-align`,
 `--no-lod-hold`, `--no-prioritise`, `--adaptive-budget` and
 `--lod-fade <frames>`, and the tree switches `--tree-distance <m>`,
 `--tree-debug 1|2|3|4` (tint by level; only LOD 0 / LOD 1 / impostors),
-`--check-rt` (ADR-004 L0: DXR end to end on one triangle),
 `--tree-lod0 <m>`, `--no-trees`, `--no-shadows`, `--no-foliage`,
 `--foliage-debug 1`, and the post chain's `--no-taa`, `--no-ao`,
-`--no-contact`, `--no-post` and `--post-debug 1|2` (AO alone, contact
-shadows alone), and exposure's `--ev-comp <stops>`, `--ev100 <v>` (fixed,
+`--no-contact`, `--no-post` and `--post-debug 1|2|4|5` (AO alone, contact
+shadows alone, how each puddle pixel found its reflection, the clouds' shadow on the key light), and exposure's `--ev-comp <stops>`, `--ev100 <v>` (fixed,
 no meter), `--tonemap 0|1|2` (raw pre-L1 path / AgX / fitted ACES),
-`--agx-sat` and `--agx-power`. `--sea-shot` only PLACES the camera: pair it with `--shot`,
+`--agx-sat` and `--agx-power`. `--shot` also takes `--ui "<lua>"`: bring up the UI, run the code
+(`menu.open()`, `menu.show_screen('options')`, `tuning.toggle();
+tuning.select('Fog')`, `engine.set('time', 19)`) and draw the UI into the
+still -- without it a shot holds no UI. `--sea-shot` only PLACES the camera: pair it with `--shot`,
 or it falls through to the window loop with no window and never exits. `--walk` takes `--uncapped` to time frames at ground
-level, where the grass is. It is a GUI subsystem binary, so a shell does not wait
+level, where the grass is, and `--cam-dist <m>` (the third-person camera's
+distance, 0 for first person). It is a GUI subsystem binary, so a shell does not wait
 on it: run it with `Start-Process -Wait` or the file you read will be the
 last run's.
 
@@ -208,6 +249,24 @@ last run's.
   memory. The impostor mip chain averaged each level by reading the one
   above out of the upload buffer it had just written: a 20 s startup for
   work that takes 180 ms in ordinary memory.
+- **HLSL's `&&` and `||` do NOT short-circuit** (before HLSL 2021): both
+  sides run. `cheap_test && costly_call(...)` pays for the call on every
+  pixel and discards it. The near field's reader cost the terrain 0.33 ms
+  at 1440p that way with no pixel using the result; a magenta debug paint
+  showed none taking the path, which is what made it hard to see. Put
+  anything costly inside an `if`.
+- **Never index a shader's local array by a value known only at run
+  time.** The terrain's `scan_surface` kept its four material candidates in
+  arrays (`sc[4]`, `wc[4]`, `tint[4]`, `rscale[4]`) and picked the heaviest
+  and the hex-tiled one BY INDEX; FXC kept all four in dynamically indexed
+  temps (`dcl_indexableTemp`, 32 float4), which this GPU's compiler puts in
+  scratch memory. Written as four named variables: terrain at 4K in a lit
+  pit 8.1 -> 6.0 ms, the image the same to 2 levels in 255. It looked like
+  "ALU cost": mip bias, fewer fetches and a quarter of the bytes all barely
+  moved it. Read the assembly before guessing -- `fxc /T ps_5_1 /E ps_main
+  /O3 /Ges /I . engine/render/shaders/mesh.hlsl /Fc out.asm` from the root,
+  and look for `dcl_indexableTemp` and `x0[r...]`. An array indexed only by
+  `[unroll]` loop counters (`top_two`'s `wts[12]`) is fine.
 - **A dual-compile header's OUT parameters must be spelled per language.**
   `T out[1]` decays to a pointer in C++ and works; in HLSL an array parameter
   is passed BY VALUE and the write never reaches the caller. The wave normal
@@ -488,6 +547,64 @@ last run's.
   `build/engine_error.txt` after; numbers identical to the digit to an earlier
   run are the tell.
 
+### Snapshots: standing exactly where someone was (F8, `--snapshot`)
+
+F8 in the window writes `build/snapshots/<yyyymmdd-hhmmss>/`: `edits.bin`
+and `trees.bin` (F6's saves), `shot.bmp` (the view as a still) and
+`snapshot.txt`, whose `args:` line is command-line flags -- `--cam`,
+`--time`, the weather fixed as it was (`--sea-state --wind --wind-dir
+--swell`), `--wet` (the ground's wetness is the weather's HISTORY: fixing
+the dial alone replayed a soaked tunnel dry, and dry soil is twice as
+bright), `--ev-comp`, `--torch`, `--rain`, and `--snap-walk` with the feet
+and camera distance when walking -- plus the exposure the still adapted
+to. `engine.exe --snapshot <dir>` appends those flags to its own command
+line (anything typed first wins), loads the edits and trees, and opens
+there (walking again once the ground has streamed in, 90 frames);
+`--snapshot <dir> --shot <path>` makes the still. `--shot ...
+--write-snapshot` writes one headless (its folder in
+`build/last_snapshot.txt`). Campfires (V) are kept as `--fire x y z`,
+one each; `--fire-ground x z` puts one on the edited ground under a point
+(a pit's floor, for a test). V itself now lands a fire on the EDITED
+ground, found down from eye height: it used the generated height, so a
+fire dropped into a pit floated where the surface had been. Not kept:
+logs' poses beyond trees.bin, the clock's own weather.
+
+### UI and scripting: Lua and RmlUi
+
+Esc opens the pause menu (resume, options, controls, tuning panel, quit) and
+stops the game clock, physics and the camera; the frame keeps drawing. F1 or
+` toggles the tuning panel over the running game. Submodules: `third_party/
+lua` (5.4, compiled as C++ so errors unwind), `RmlUi` (6.3, static, with its
+Lua plugin), `freetype` -- all built inside the engine block only; worldgen
+and validate do not see them.
+
+- **C++ routes, Lua decides.** `engine/ui/ui.cpp` feeds Win32 input to RmlUi
+  and calls `game.on_key` (Esc, F1, `) and `game.on_update`; what any key or
+  button DOES is in `game/scripts`. While paused the UI takes every key and
+  click; otherwise it takes the mouse only while uncaptured, and a click on
+  no element falls through to the game (and captures).
+- **Tunables are the API.** `main.cpp`'s `register_tunables` lists named
+  numbers with a range, getter and setter; `engine.tunables()` hands them to
+  Lua, which builds the options screen (group "Graphics", saved to
+  `build/settings.lua`) and the tuning panel (every other group, live, NOT
+  saved) from the list. A new knob is one line there and appears in the UI
+  with no script change. The fog layers are shown as sea-level visibility
+  (3.912 / sigma) and thickness.
+- **Display**: windowed (client size) or borderless (a popup over the
+  monitor, the swapchain at the chosen size and stretched by DXGI; WM_SIZE
+  keeps the chosen size). `--res` on the command line beats saved settings.
+- **The renderer** (`ui_render_d3d12.cpp`) is one pipeline, drawn last onto
+  the back buffer through its own descriptor heap via `Renderer::set_overlay`;
+  `capture()` skips it unless `--ui`. No clip masks: never centre with
+  `transform` -- an overflow box inside a transformed element then does not
+  clip (the options list spilled over its Back button until the menu was
+  centred with flexbox).
+- Script errors and RmlUi warnings go to `build/ui_log.txt` (no console). A
+  UI that fails to start leaves the engine as before (Esc releases the mouse,
+  then quits) and says why in `build/engine_error.txt`.
+- Fonts are RmlUi's sample Lato and Roboto Mono (OFL), read from the
+  submodule; the family is `LatoLatin`, not `Lato`.
+
 ### Surface texture
 
 `T` in the window, or `--texture 0|1|2|3`: flat, the scans (default), a
@@ -505,8 +622,8 @@ confirmed it twice.
 
 - **The authored colour stays.** A scan's albedo is RETINTED by authored /
   scan mean (both linear), and its roughness scaled to the authored value,
-  so a biome looks the colour it was tuned to and the GI, the RT scene and
-  the heightfield's top-down pass -- which still read the per-vertex
+  so a biome looks the colour it was tuned to and the GI and the
+  heightfield's top-down pass -- which still read the per-vertex
   blended colour -- see the same mean. The scan brings structure only.
 - **Per-vertex material WEIGHTS**, not colours, drive it: the mesher writes
   a second parallel buffer, `g_vertex_wts`, one byte per biome and one for
@@ -531,9 +648,100 @@ confirmed it twice.
 - **Cost**, walking (`--walk 15 --uncapped`, packs present vs moved aside):
   2.75 / 2.89 ms against 2.69 / 2.72; startup +132 ms; 247 MB of textures
   at 1K. The flight's median rose to 2.50 ms with far more terrain on screen.
-- **Not done**: anti-tiling beyond what the mips and the retint give (no
-  repetition shows from 160 m up on the badlands), BC compression (4x less
-  memory), scans for the grass, leaves and placed rocks, silhouettes.
+- **What the scans cost at 4K, and the filtering option.** Measured on the
+  lit pit snapshot (`build/snapshots/20261122-175849`, `--res 3840 2160
+  --gpu-profile 60`): the terrain pass 8.05 ms before, 5.61 after the
+  array fix (the gotcha above) at 4x anisotropy; flat (`--texture 0`) ~3.4.
+  What is left of the scans is texture work, not arithmetic: one cached
+  texel per fetch costs what flat does. Of it, anisotropic filtering is the
+  biggest part: per level, terrain 5.10 (trilinear), 5.61 (4x, the
+  default), 5.96 (8x, the old fixed sampler), 6.16 (16x); 4x and 8x differ
+  on 0.04% of pixels by more than 8 levels. Graphics, "Texture filtering",
+  saved; `--aniso <n>`. It covers terrain, rocks, the character and bark.
+- **The terrain draws a depth prepass** (`record_scene`; `--no-terrain-prepass`
+  and the Terrain tunable for A/B). The chunks draw in slot order, not near
+  to far, so every wall behind a wall was shaded and painted over: 1.63
+  terrain pixel-shader invocations per screen pixel in a dug chamber. Now
+  `vs_main` with `ps_depth` (the LOD fade clip, nothing else) writes depth,
+  0.11 ms at 4K, and the colour pass tests EQUAL with no write -- the
+  trees' scheme. Measured at 4K: the dug chamber (`build/snapshots/
+  20261122-192039`) terrain 8.44 -> 5.74 ms, frame 14.6 -> 11.9; the lit pit
+  5.59 -> 3.49, frame 15.7 -> 13.7; a 1440p flight's median 5.90 -> 4.92;
+  invocations exactly 1.000 a pixel; stills the same to 2 levels; flight
+  holes 0. Rocks and the character keep their LESS, writing pipelines and
+  test against it. **The fade clip must be identical in both passes**
+  (`lod_fade_clip`, shared). It was checked by forcing every chunk
+  mid-fade: the pit's still matched with and without; the chamber's
+  differed on 1.4% of far pixels, scattered singly, where the forced test
+  (not complementary, unlike a real fade) drew two LOD levels over the same
+  ground and their depths rounded equal -- LESS keeps the first, EQUAL the
+  last. A real fade's dithers are complementary, so no pixel is drawn twice.
+- **s5 is a TABLE, not a static sampler**, on the terrain's and the trees'
+  root signatures: `Renderer`'s sampler heap holds one sampler per level,
+  made once and never rewritten, and the option only changes which one the
+  table points at (`scan_sampler()`), so it is live with no pipeline
+  rebuilt. Limiting it in the shader instead (lengthening the short
+  gradient) was built and measured: ~480 instruction slots for 14 inlined
+  calls, and 8x -> 4x saved 0.1 ms where the real sampler saves 0.35.
+  **Every `SetDescriptorHeaps` goes through `bind_shader_heaps`**
+  (`shader_heaps.h`): the call unbinds every heap it is not given, and a
+  pass that bound only the CBV heap would leave the terrain, rock and tree
+  pipelines with no sampler -- with no debug layer here to say so. The
+  UI's own heap, drawn last, is the one exception. Every
+  `SetGraphicsRootSignature` of the terrain's or the trees' root sets the
+  table next to it.
+- **Not done**: anti-tiling on rock (see the next section for the ground),
+  BC compression -- 247 MB of scans at 1K would be ~62 MB, and the BC7
+  proxy (no fetch reading the top mip, a quarter of the bytes) took
+  0.35-0.4 ms off the 4K terrain pass: worth it for memory, not the frame --
+  scans for the grass, leaves and placed rocks, silhouettes.
+
+**Bare ground: hex-tiling and far detail** (archetypes.json `ground_look`,
+the tuning panel's Terrain group, `--no-ground-look` for A/B). A 2.5 m
+scan repeated on one square lattice read as rows from ~10 m out and a
+wallpaper grid over a clearing. Three parts (`scan.hlsli`, `mesh.hlsl`):
+
+- **Hex-tiling** (Mikkelsen, "Practical Real-Time Hex-Tiling", JCGT 2022,
+  `hex_sample`): a hex lattice over the uv, every hex its own random
+  offset and rotation (the rotation from the hash as a direction, no
+  trigonometry), three hexes per pixel blended by barycentric weight^7
+  biased by luminance; the normal map's xy turned back by each rotation.
+  Only for the heaviest GROUND candidate, only in its dominant triplanar
+  plane -- everywhere was +1.1 ms at 1440p -- and a corner under 1% of the
+  heaviest weight is not fetched, so most pixels take one sample. No
+  ground parallax under it: the march reads the height map straight and
+  would not match a turned scan (ground parallax was 3-5 cm to ~10 m).
+- **Far detail** (`scan_far_ratio`): the same scan at 5.3 x its tile,
+  hex-tiled, as a colour ratio to its own mean, multiplied over the near
+  scan from 10 m out (`far_detail` 1.2): clumps, bare patches and colour
+  shifts over metres, from the photograph rather than from noise. Two mips
+  coarser than the footprint asks: it is structure, the near scan is grain.
+- **Macro variation** (`ground_macro`): value noise at 97 and 41 m, a 63 m
+  dry/lush noise (dry warmer and paler, towards straw or dust -- going to
+  the luminance read as grey ash), and the terrain's curvature: hollows
+  darker and lusher, crests paler. The curvature is a channel of the
+  heightfield GI's map (R32G32: height, curvature over 6 m), written once
+  a texel by `cs_hf_light`; five height reads a pixel cost 0.15 ms.
+- **What did not work, and why it is gone.** The first attempt FADED the
+  scan to its mean from 30-110 m and laid noise and a far-grass colour on
+  top. It removed the grid by removing the detail: the ground past 50 m was
+  a flat colour, which read worse than the repetition, and the 10-50 m rows
+  were untouched. The fade remains only as a far LOD (350-700 m, under the
+  haze). Far grass changed nothing visible in meadows and cost 0.1 ms;
+  removed. Value-noise octaves at 17 and 7 m went when the far detail took
+  that band: every noise in this shader is paid by every pixel.
+- **Measured**: `tools/profile/tiling.py` on straight-down stills (the
+  autocorrelation at the tile's lattice lags after a high-pass, against
+  half-period lags): from 20 m up 0.416 -> 0.001, 60 m 0.240 -> -0.016,
+  140 m 0.105 -> -0.024 (baselines 0.00-0.05). Cost at 1440p: the terrain
+  pass +0.18 ms in a walk-like view; walking 6.69 / 6.53 against 6.36 /
+  6.30 ms. Profile THE WALK'S view, not an eye-level still: the third
+  person camera sees far more ground at 5-40 m, and an eye-level profile
+  understated the first version's cost by half.
+- **Flags**: `--no-hex`, `--far-detail <k>`, `--macro-var <k>`,
+  `--detail-fade a b`. Not `--ground-...`: `--ground` is a flag and
+  `find()` matches it inside one -- an A/B still was taken at eye height
+  for that.
 
 **Parallax occlusion** (`engine/render/shaders/pom.hlsli`; `P`, `--no-pom`)
 on the scans' height channel, terrain and bark. No silhouettes and no depth
@@ -544,6 +752,8 @@ bark 1.5-3 cm.
 
 - **Terrain**: the heaviest of the four candidates, in the triplanar plane
   the normal faces most; its shift moves every candidate's sample point.
+  Not when that candidate is hex-tiled ground (in practice, rock only):
+  the march reads the height map straight, under a scan turned per hex.
   Only where one plane clearly dominates (`dom`): where two weigh alike the
   dominant one flips pixel to pixel and the shift with it. Every triplanar
   fetch now takes EXPLICIT gradients from the unshifted position, or the
@@ -598,6 +808,123 @@ hemi-octahedral views, premultiplied, mip-chained on the CPU (~180 ms).
 Trees use the terrain's sun, sky term and fog. The draw-distance slider is
 `-`/`=` (100-2000 m, default 500); terrain is unaffected. Cost, uncapped:
 ~0.4 ms a frame at spawn, ~0.6 ms over the densest forest.
+
+**Trunks stand on roots** (`root_flare` in `tree_mesh.cpp`): a lobed tube
+round the base, from 0.6 m under the ground to 3.5 x the trunk's radius +
+0.25 m up, widening concave to (1 + 0.85 x `shape.roots`) at the ground in
+4-6 buttress ridges of random strength, normals from the lobes' own slope;
+the strongest send a root out along and into the ground. Its randomness is
+a COPY of the tree's generator, so every tree keeps its branches.
+**The flare was BLACK, and its winding was why.** The bark shader flips
+the normal of a back face (`ps_mesh`, for double-sided cards), and the
+flare's rings run counter-clockwise where `tube()`'s run clockwise:
+wound like `tube()`, every face of it was a back face, its normal pointed
+into the trunk, and it shaded black -- a dark skirt with teeth where it
+poked through. The first "fix" chased the teeth (an inset too shallow for
+the trunk's facets: the middle of a flat face is cos(pi / sides) of the
+radius out, 5% in at ten sides, 13% at six), was judged on a still where
+the black base passed for shade, and missed it. Both are fixed; the inset
+is now the facet depth + 3%, and each ring follows the trunk's axis.
+Hand-built geometry on this shader: wind it as `tube()` does, and check a
+SUNLIT close-up.
+archetypes.json `shape.roots`: beech 1.5, oak 1.3, willow 1.1, maple and
+spruce 1.0, fir, alder and snag 0.9, pine 0.8, birch 0.5, scrub 0.
+Presentation only (validate's golden hashes unchanged); walking cost within
+noise. The flare is bark, in the casters like the trunk.
+
+**Distant leaf cards are solid clusters, not a halftone.** Once a card is
+too small for its leaves (`blur * 6`, ~30 m on), its coverage used to be
+the pattern's average tested against the screen-fixed dither: the dots
+stayed still while the leaves slid under them, so TAA dropped its history in
+motion and mid-distance crowns went see-through and blurred; and every card
+tested against the SAME screen pattern, so overlapping cards kept the same
+pixels and a crown never got denser than one card. `leaf_cluster`
+(`leaf.hlsli`) takes over on that switch: per-card value-noise blobs at a
+fixed 0.5 cut, set so a card keeps leaf_coverage's own 55%.
+**Willows are the exception, and were a regression twice.** Blobs on a
+tall strand card read as fat painted tongues; streaks within it as
+hatching; one solid strip per card as blocks. A willow's `narrow` cards keep
+their own sharp leaves at every distance, cut at 0.5 -- fixed to the card,
+so TAA averages them into a soft curtain. And the willow's LOD 1 was a
+DIFFERENT TREE: 4-5 branches a limb and one strand 1.7x as wide where LOD 0
+had 7-8 and three, so it drew a different number of randoms and every
+branch after the first moved. Now both levels have the same branches and
+the same three strands, each from a generator of its own (`srng`, one
+draw from the tree's), so the far level's fewer, longer cards hang where
+the near level's do. Cost: +0.25 ms walking in a willow wood. Sky through the
+crowns' upper third of a woodland still: 10.7% before, 10.6% after. Lit pass
+only -- the shadow casters keep `leaf_coverage`. Walking cost within noise. The level cross-fades and far
+fade still dither on the screen (walking per frame), and the grass's clump
+cards fade against the blades the same way.
+
+**What a wood costs at 4K, and the depth prepass.** `--shot ...
+--gpu-profile [frames]` is the instrument (`gpu_profile.h`): `<shot>.gpu.txt`
+gives the frame's GPU time as it runs (first to last timestamp), then every
+pass timed alone behind a NULL UAV barrier (so the passes serialise), the
+pipeline statistics of each draw (PS invocations are the overdraw actually
+PAID, after early depth), and one frame through counting variants of the tree
+pixel shaders (`ps_mesh_od`, `ps_impostor_od`: per pixel, fragments
+rasterised and fragments surviving the dither and leaf tests, leaf and
+impostor shares) with a heat map, `<shot>.overdraw.bmp`. The test view is the
+densest stand of seed 0 (`validate --tree-sites 0`: (-704, -448)),
+`--cam -704 33.1 -448 0 0 --res 3840 2160` -- the eye height from `--pick`,
+because `--ground` put it inside an overhang and the first profile measured
+trees hidden behind rock (0 PS invocations, which is how it showed).
+`tools/profile/prof_ab.ps1 <label> "<flags>" [res] [cam|none]` runs one variant.
+- **Where it went, before**: 24.1 ms a frame, 6.8 without trees. The camera's
+  LOD 0 draw alone 8.6 ms at **13.1 PS invocations per screen pixel**: 42
+  fragments rasterised per pixel, max 261, and 14.9 surviving the leaf test
+  per covered pixel, every one fully shaded (PCSS, GI, local lights) and
+  then painted over. Tree shadow casters 3.9 ms (cascade 0's LOD 0 2.0, its
+  LOD 1 1.2). Terrain 3.5 ms, mostly ground later hidden by trunks. Not the
+  cause: distance (`--tree-distance 200` 24.0), impostors (alone 7.9),
+  foliage (`--no-foliage` 24.0), the level (LOD 0 only 18.4, LOD 1 only
+  17.3, `--tree-lod0 0` 20.3 -- LOD 1's cards are fewer but larger, the
+  same layers per pixel). `--no-shadows` 16.4.
+- **The depth prepass** (`record_prepass`, before the terrain;
+  `--no-tree-prepass` and the Trees tunable for A/B): the mesh levels drawn
+  depth-only with the dither, cut and leaf tests (`ps_mesh_depth`), then
+  colour over that depth with EQUAL, no depth write and
+  `[earlydepthstencil]` (`ps_mesh_eq`, no tests: depth already said). Both
+  run the SAME vertex shader so the depths match bit for bit; a uniform
+  `depth_only` flag skips the vertex GI in the prepass. Impostors stay one
+  ordinary pass. Colour LOD 0 went to 0.76 invocations a pixel, and terrain
+  drawn after the prepass 3.5 -> 1.7 ms. 22.4 -> 16.3 ms.
+  **Underground the terrain goes first.** Looking level along a tunnel the
+  whole wood overhead is in the frustum, and the prepass rasterised and
+  leaf-tested its cards over half the screen before the rock that hides
+  them all was drawn: the LOD 1 prepass 2.89 ms at 4K, the frame 14.9 ms.
+  With the eye's open sky (`HeightGi::camera_open`, geometric) under 0.3
+  the terrain draws before the prepass and its depth rejects them: 0.25 ms,
+  the frame 11.5. The colour pass tests EQUAL, so the picture is the same
+  (two runs of one order differ as much as the two orders).
+  `BIOMES_TREES_FIRST=1` keeps the old order. `--gpu-profile` also prints
+  the wall clock a frame (a still's frame waits for the GPU, so wall minus
+  GPU is the CPU's share).
+- **Level-major draw slots**: every model's LOD 0, then every model's LOD 1
+  (`tree_cull.hlsl`'s `mesh0/mesh1`). Interleaved per model, a far LOD 1
+  drew before the near LOD 0 in front of it; 24.1 -> 22.4 without the
+  prepass.
+- **The leaf test was the cost, not the raster**: with a trivial test the
+  prepass's LOD 0 is 1.4 ms against 4.65. Three fixes, in `card_coverage`
+  and `leaf.hlsli`: the clusters blend in from a tenth of the way (k was
+  never 0 -- ~0.02 at 10 m at 4K -- so every near leaf paid for both
+  patterns): 4.65 -> 4.12. Fragments where the card's round rim is under
+  0.5 return before the leaves -- 36% of a card, EXACT, since every pattern
+  is scaled by the rim: 4.12 -> 3.10 (it barely helps the shadow casters,
+  whose 40-texel cards put corner and middle in one wave). One hash per
+  leaf cell, three 10-bit draws, where it was three hashes of three integer
+  multiplies each: 3.10 -> 2.51, and cascade 0's casters 1.95 -> 1.33. The
+  leaves land elsewhere; shape, size and density are the same (mean luma of
+  the 4K still 101.55 both).
+- **Cascade 0's LOD 1 casters take the card path** (`ps_mesh_shadow`, packed
+  bit 29): a tree past 45 m is in cascade 0's box but its shadow mostly
+  lands past the 28 m slice. 1.16 -> 0.33 ms.
+- **After**: 12.3 ms at 4K (prepass off, the rest kept: 18.9); 1440p 7.9
+  (11.6 without the prepass); spawn at 1440p 6.9 against 9.1 -- the prepass
+  wins in thin woods too. Remaining at 4K: post chain 3.3, prepass 3.0,
+  tree shadow casters 2.3 (cascade 0's LOD 0 1.3), terrain 1.7, tree colour
+  1.3. Cracks 0, as before.
 
 **Felling** (`TreeFelling`): trunks within 40 m of the player are static
 capsules; a click swings from the eye; 2 + one per 6 cm of diameter fells it.
@@ -699,8 +1026,55 @@ EXPECTATION rather than its draw.
   Colour match unchanged (87.8, 117.0, 65.3); flight cost unchanged.
 - **Not done**: GPU-generated far cards (500-1500 m, for single trees on a
   skyline from the air) -- the shell was expected to carry most of it, and
-  does; the RT scene and DDGI do not see the shell (it starts where they
-  stop mattering); no altitude gate was needed.
+  does; no altitude gate was needed.
+
+### Micro-relief and flat sites (v17)
+
+Calm land read as one smooth sheet: the profiles' finest octave is ~110 m,
+so meadows and wetland were long even slopes. `validate --flatness` is the
+instrument -- the height range over pads of 10, 20 and 40 m radius at
+random land points, per dominant biome: the share under 0.5 / 1 / 2 m and
+the median.
+
+- **Micro-relief is part of layer 4.** ONE field (`layer4_detail`,
+  archetypes.json `detail`: 72 m, 3 octaves, gain 0.5, its own feature
+  seed) shared by every biome, each scaling it by its own `detail` metres
+  before the heights are blended -- which is blending heights, never noise
+  parameters. Meadows 4.0, wetland 2.8, forest 2.4; meadows' flatness 1.6
+  -> 1.3, wetland's 2.4 -> 1.8. The fbm's typical swing is about a quarter
+  of its amplitude: 1.8 m moved the median 0.2 m and did nothing visible.
+  Faded by voxel like every octave (LOD agreement still 0.39); the GPU's
+  amplitude is `g_arch` row 2's `w` (it was spare) and the field's shape is
+  in the world constants. Meadows' 20 m pads level to 0.5 m went 1.2% ->
+  0.3% of the land, 10 m pads 9.0% -> 1.9%; the median over a 10 m pad
+  1.4 -> 2.2 m. Rolling, not hills.
+- **Flat sites are layer 5b** (`build_flats`, after the rivers): one
+  candidate per 320 m cell, jittered inside its middle 56% so no two touch
+  (the load checks that), kept by the blended biome's `flats` chance where
+  the land is already gentle (max_grade 0.08 across the pad and out to the
+  shoulder), dry, and 15 m clear of every channel. The pad is pulled to the
+  mean of its own heights (`flat_apply`, field.h) and eases back over a
+  shoulder of 0.6 x radius, at least 10 m. `terrain_height` applies it
+  after the river carve; nothing upstream of `build_flats` sees one.
+  Trees and rocks keep 3 m past the shoulder (`TREE_FLAT`, `ROCK_FLAT`),
+  so every site is a glade. ~19 a seed: meadows 9.8, wetland 6.7, forest
+  2.5; radius 14-36 m, mean 26.
+- **On the GPU the sites ride in the RIVER buffers**, after the segments,
+  as entries with a negative width -- (x, z, radius, shoulder), (-1,
+  level) -- binned on the river grid's geometry. The mesher's root
+  signature is at 60 of 64 DWORDs: three more root UAVs would not fit.
+  `real_nearest_river` skips them, `real_apply_flats` reads the point's own
+  bin. `--probe-field --probe-at x z` compares a chunk anywhere: on the
+  default seed's nearest site the pad is exact and the shoulder 4 um.
+- **Hashed by buffer** (id, x, z, radius, level, in the per-layer slot 2):
+  a site is tens of metres across and the hash grid samples every 156 m.
+- `validate`'s **flat sites** check: every pad level to 2 cm through
+  `terrain_height` (measured 0.000), every shoulder under 0.6 rise over run
+  (0.49), every configured biome grows some and no unconfigured one more
+  than a trace. `startup.txt` names the count and the nearest to spawn.
+- **Cost**: `--walk 10 --uncapped` at 720p, v16 built beside it and run
+  alternately: 4.39 / 4.40 ms against 4.28 / 4.33 -- about +0.08 ms (the
+  shared fbm in every field call). Validate's throughput unchanged.
 
 ### Rocks
 
@@ -773,23 +1147,108 @@ level's top.
   every local light's shadow faces (the GPU culls it per face; +0.03-0.07
   ms in `--lights-report`) and the heightfield GI's top-down pass, with
   `ps_rock_top`'s albedo -- the scan's smallest mip times the retint, the
-  authored rock colour exactly. **The RT scene** has a BLAS per model from
-  its far level, appended to the tree buffers with its info at
-  `kRockInfoBase` (1024) + model, and an instance per rock within 300 m in
-  the trees' mask: InstanceID `0x200000 | rgb565(sqrt(albedo)) << 4 |
-  model`, so `gi_trace` decodes the biome's rock colour and the face normal
-  with no new binding. RT shadows and DDGI see rocks; `--rt-report` counts
-  them. **The far shadow does not**: it applies past 1.36 km at 8 m texels,
-  and rocks stream to ~760 m.
+  authored rock colour exactly. **The far shadow does not**: it applies
+  past 1.36 km at 8 m texels, and rocks stream to ~760 m.
 - **Not done**: grass grows through a rock's footprint -- the bake would
   need the rocks bound and its cached tiles re-baked when rocks stream in
   after them, so it waits; the LOD switch pops (no cross-fade, by choice
   for now). Shots do not run physics: the collision probe is in `--walk`.
-- **A pre-existing cascade artifact** turned up beside a badlands boulder:
-  blocky texel-sized squares of shadow on gently sloped sand at 16:00
-  (`--cam 2452 123 3366 0.99 -0.2 --time 16`), there with rocks and
-  parallax off and gone under `--rt-shadows` -- shadow acne in a middle
-  cascade, not investigated.
+- **"Cascade acne" beside a badlands boulder was the CONTACT shadow**:
+  blocky squares in bands on gently sloped sand at 16:00 (`--cam 2452 123
+  3366 0.99 -0.2 --time 16`), long filed as acne in a middle cascade. A 5x
+  depth bias changed nothing; `--no-shadows`, `--no-pom`, `--texture 0`,
+  `--no-hfgi`, `--no-foliage` and `--no-ao` left it; `--no-contact` removed
+  it. Fixed in the post chain's `contact_shadow` (see the frame section).
+  Turn things off one at a time before believing which pass a pattern is.
+
+### The player character
+
+Walk mode (Tab) is third person: Quaternius's **Universal Base Character**
+(CC0, `assets/models/Universal Base Characters[Standard]`), male by default,
+`--character female`. Chosen over the low-poly girl beside it, which has 36
+clips but no licence file, for its UE5-mannequin skeleton (65 joints): the
+skeleton most animation sets target. The kit ships no animation; its clips
+are Quaternius's **Universal Animation Library** (CC0, `assets/models/
+Universal Animation Library[Standard]`, 43 clips on the same joint names).
+
+- **The pack** (`tools/models/pack_character.py` -> `CHR1`): body and a
+  hairstyle merged on one skeleton, 1K albedo and (normal, roughness)
+  arrays. The kit's hairstyles were bound on the FEMALE skeleton -- 35 cm
+  out at the male's head -- so hair vertices are rebound per joint into the
+  body's rest pose. Hair textures are a grey mask meant for the kit's own
+  shader: tinted in linear light to an authored colour. Normals from the
+  kit's OpenGL folder, stored with +y DOWN the texture.
+- **The clips** (`ual.anim`, the same packer): the IN-PLACE glb, since
+  physics moves the body, resampled to 30 fps; each clip's speed measured
+  from the root-motion glb (walk 0.97 m/s, jog 5.36, sprint 8.25, swim
+  2.18), and for gaits the frame where the left foot leads (`phase0`), so
+  walk, jog and sprint blend IN STEP on one phase.
+- **Retargeting at load** (`AnimLibrary::load`): the library's rest pose is
+  not the characters' -- up to 17 degrees at the neck (20 on the female),
+  limbs up to 8 cm different -- so copying local rotations would bend every
+  joint by its rest difference. Each joint's GLOBAL rotation relative to the
+  library's rest is put on the character's rest (C = G Lrest^-1 Crest), then
+  turned back into locals; bone lengths stay the character's, and the
+  pelvis's translation is scaled by hip height (1.035 male, 1.016 female).
+- **The animator** (`character_model.{h,cpp}`) picks and blends from what
+  physics did -- speed measured from the feet physics moved, on the ground
+  or not, in the water or not. Locomotion is idle, then the pair of walk /
+  jog / sprint either side of the speed, the phase advanced by DISTANCE over
+  the blended stride so feet do not skate; `Jump_Loop` in the air;
+  `Jump_Land` after a fall of more than 0.35 s, faded out by speed;
+  `Swim_Idle_Loop` to `Swim_Fwd_Loop` by speed. Masked layers over that:
+  `Idle_Torch_Loop` on the right arm while a torch is carried, and
+  `Sword_Attack` on the upper body (spine up) for a swing of the axe, the
+  legs carrying on. The lowest heel or ball is planted on the capsule's
+  ground (`foot_drop`), no IK -- capped at 2 cm down with clips: uncapped it
+  pulled a run's flight phase 18 cm down and glued a foot to the ground. In
+  the water the head joint rides 1.3 m over the capsule's feet (buoyancy
+  holds them ~1.3 m under): the swim clips lay the body level at pelvis
+  height, which stood on the feet put the swimmer a metre under.
+  On foot: a jog (5 m/s) by default, Shift sprints (8), Caps Lock walks
+  (1.4) -- near each clip's own speed. A diagonal is no faster.
+- **Without the clips** the animator falls back to a procedural gait: every
+  delta a rotation about a MODEL-SPACE axis at the rest pose (`apply`), legs
+  on gait-lab curves (Winter's walking, Novacheck's running).
+- **The draw** (`character_renderer.{h,cpp}`, `character.hlsl`): GPU
+  skinning, four joints a vertex, bone matrices model -> world in a root
+  SRV (t0), textures at heap [110..111] (t49..t50, a tenth range of the
+  terrain's table). On the TERRAIN's root signature after the rocks, in
+  every cascade, and in every shadowed local light's faces. Not the
+  heightfield GI's top-down map. Double sided, cull none, a back face's
+  normal flipped.
+- **The body in the lights' shadows** (`record_light_shadow`,
+  `ps_character_light_shadow`). The faces are CACHED (a light redraws its
+  six only when it moves or every 240 frames), so the body keeps its own
+  bookkeeping: a bounding sphere from the skinned joints (+0.3 m), a
+  `pose_serial()` that moves when any joint has moved 3 mm, and per slot
+  the faces last drawn with the body in them. When the serial changes,
+  the faces the sphere is in now AND the ones it was in (to take the old
+  shadow out) are redrawn whole at the light's cached position, at most
+  `kMaxBodyFacesPerFrame` (12) a frame on top of the lights' own twelve --
+  the trees' face constants are 24 now. **The carried torch clears the
+  body within `kTorchBodyClear` (0.4 m) of the flame**: it sits 0.28 m
+  from the fist, and at 0.3 m the fist's far side still cast a hard black
+  blot down the shin. The body darkens what is behind it from a campfire
+  and throws a long shadow off a torch, its own far leg included.
+  `BIOMES_NO_BODY_LIGHT_SHADOW=1` is the A/B; `--pose-sheet --time 23
+  --torch` or `--fire-ground 0.4 1.7` the stills. Cost walking at 1440p
+  with a torch and two campfires: 7.92 / 7.98 ms against 7.90 / 7.92,
+  99th percentile +0.3 ms. Cost: within noise (`--walk 15 --uncapped` at
+  1440p 5.94 ms against 6.08 in first person).
+- **The camera** (`main.cpp`, `place_walk_camera`): orbits a pivot 1.55 m
+  over the feet at the mouse's yaw and pitch; the wheel sets the distance
+  (1.2-18 m, 15% a notch, 4.5 by default) and zooms through to the old
+  first-person eye with the body hidden. A physics ray (terrain, trunks,
+  rocks) and the heightfield pull it in at once and ease it back out.
+  Movement is relative to the camera; the character turns to where it is
+  going at 12 rad/s, and to the camera's heading when it swings the axe.
+  The axe swings from the head, and the carried torch sits over the right
+  fist (`Renderer::set_torch_anchor`).
+- `--swim` also writes `build/swim_char.bmp`, the same moment in third
+  person (its main still stays first person: it judges the waterline).
+- **Not done**: see gaps.md -- foot IK, motion vectors for TAA, starts,
+  stops and turns.
 
 ### Ground cover
 
@@ -804,7 +1263,7 @@ cached cells in the frustum into: blades (5 segments to 22 m, 2 beyond),
 full density inside 10 m and thinning as (10/d)^2 to 60 m with each blade
 widening by the square root so cover holds, the last blade of a cell
 shrinking rather than popping; crossed clump cards 48-150 m, dither-faded
-against the blades; leaf-card bushes; flowers on a few blade tips. A 6-8 m
+against the blades; bushes (below); flowers on a few blade tips. A 6-8 m
 tuft noise varies height and density inside a patch. Same sun, shadows and
 fog as everything else. `G` toggles it. Cost: +0.3 ms a frame walking
 through a meadow (`--walk 15 --uncapped`, with and without `--no-foliage`);
@@ -827,7 +1286,96 @@ tufts of 2 with the width +0.18. Tinting the terrain under grass toward
 the sward (a 256 m grass map from the cells, read by the terrain shader)
 was built and judged not to look right; left for a later quality pass.
 
-Not handled: grass does not know about dig edits, and floats over a dug hole.
+**Bushes have stems now** (`vs_bush`, 24 quads: six stems, eighteen leaf
+cards). They were fourteen cards round the inside of a ball -- a few
+textures with nothing solid in them -- and evenly 0.4-1.4 m in radius, so
+waist-high balls every few metres. Now up to six tapered stem ribbons from
+the base, facing the eye, with the leaf cards on their upper halves, in four
+kinds from the bush's hash (round, upright vase, low spreading, sparse
+twiggy), a tint per bush (most green, some yellower, bluer, a few red), one
+in seven needle-leaved, and radii 0.25-1.4 m skewed small (u^2). Leaves cut
+as the trees' are: sharp, then solid clusters (`leaf_cluster`), no dither.
+The index layout is 264 entries (`foliage_renderer.cpp` checks it).
+
+Dug ground grows nothing: see Digging, below.
+
+### Digging (right mouse)
+
+Right click digs where the screen centre (the HUD's crosshair) meets the
+ground, held it digs every 0.2 s; `,` `.` step the radius 0.5 m (ONE edit
+voxel) to 8 m (Shift + `,` `.` is exposure now). `Renderer::dig_aimed`
+marches `edited_density` -- the edit store at each lattice corner, else
+the field at the 0.5 m voxel, trilinear between: what LOD 0 meshes -- so a
+second click digs deeper into the first hole. It centres the sphere on the
+nearest SOLID lattice point half a voxel past the hit, so even the smallest
+dig removes rock. Under 1 ms a dig at any size. `--shot ... --dig-row` digs
+one of each size across the view before the still and writes
+`<shot>.dig.txt` (hit, centre, voxels written, how far the ray now goes).
+Two edit-store fixes came with it: `edit_sphere` measured each voxel from
+its middle while the mesher reads it at the lattice POINT (every edit sat a
+quarter voxel towards +xyz), and it wrote exactly 0 on the rim and
+overwrote earlier edits -- now strictly inside, never past -5 cm of its
+sign, and the deeper of old and new wins.
+
+- **Grass goes where an edit reaches the ground.** The edit store keeps a
+  derived map (`BrickStore::column_top`, rebuilt on load, not saved): per
+  0.5 m column, the highest edited lattice point that reaches it. Each
+  foliage bake gets that for its tile (t3, 32 x 32 floats) and marks each
+  1 m cell's four quarters bare where the top is within 1 m of the
+  generated ground (`Cell.bare`, now 28 bytes). `cs_emit` drops the blades
+  in a bare quarter and any card or bush in a cell with one. A dig
+  re-bakes the resident tiles under it, in their own slots, before the
+  frame's new tiles (`FoliageRenderer::invalidate_box`; a load re-bakes
+  all). A one-voxel pit bares a metre square. A tunnel more than a metre
+  under the grass leaves it.
+- **Trees drop straight down to the new ground** (`Renderer::settle_trees`).
+  A standing tree whose trunk column an edit reaches within 1.5 m of its
+  base is checked once per edit generation (`BrickStore::generation`):
+  `ground_below` marches the edited field down the trunk's axis from half
+  a metre over the generated base. If that ground is more than 10 cm lower,
+  the tree falls from rest under gravity and lands there, upright: not
+  physics. `TreeField::set_base` overrides by id, so `standing()` carries
+  the new base to drawing, shadows, the canopy map and felling. It also
+  persists across tile re-streams. Ground that comes back (a load) lifts it
+  at once. Felling rebuilds a trunk capsule whose tree moved
+  (`collider_y_`), so a sunk tree blocks and chops like any other.
+- **Rocks drop too** (`Renderer::settle_rocks`, `RockField::set_drop`),
+  by the LEAST ground lost under nine points of their footprint: the
+  middle and a ring at a third of their size. Each point compares the
+  generated field with the edited one (`ground_below(..., with_edits)`), so
+  an outcrop undercut on one side stays put, held up by the rest. Both `y`
+  and `ground` move. The rock renderer rebuilds a moved rock's body
+  (`collider_y_`); the draw reads the list every frame anyway.
+- `engine.exe --dig-settle` is the test, `build/dig_settle.txt`. Tree: a
+  3 m sphere under the nearest fellable tree to spawn. It checks the drop
+  (3.87 m in 0.88 s; free fall predicts 0.89), the landing height, a ray
+  at the new base hitting a prop, and felling from the bottom of the hole
+  (`build/dig_tree.bmp`). Boulder: the nearest over 1.5 m, a hole under
+  its whole footprint (3.48 m boulder: 3.35 m down in 0.83 s, free fall
+  0.83). A ray down its axis must hit a prop at its NEW top: it hits 6 cm
+  under, as `--walk`'s undisturbed probe does (`build/dig_rock.bmp`).
+  It also counts frames from the dig until every chunk it threw away is
+  redrawn: 1.
+- **A dig swaps its chunks, it does not cross-fade them.** `invalidate_box`
+  used the LOD change's hold: the old mesh stayed until the remesh, then
+  the two dithered over 16 frames, so every hole arrived ~18 frames
+  (0.3 s) late whatever its size, and faded in. Now an edited key goes on
+  `edit_swap_`, and `plan_work` frees its held mesh and draws the new one
+  the frame it is meshed (`edit_swaps_pending()`).
+- **Skirts over dug ground.** Every chunk-border cell hangs a curtain two
+  voxels into the rock to hide gaps between LOD levels. Under natural
+  ground that is always buried. After repeated small digs the rock can be
+  a lip a voxel thick. Undercut, its normal points down and the curtain
+  climbs out into the air. Thin, it pokes through into the next hole.
+  Those were the spiky fins with stretched streaks (a vertical face shaded
+  with its vertices' "up" normals). `cs_vertices` now drops the skirt of an
+  EDITED border cell unless it goes down and neither its middle nor its
+  end is in dug-out air. `--shot ... --dig-burst <n>` hammers the view's
+  middle with n small digs (0.5-1.5 m, fixed sequence). With
+  `--mesh-debug 1` at spawn (`--cam -96 32.5 -440 0 -0.55`, over two chunk
+  borders) the visible curtain went from 1427 pixels to 0, with 0 cracks.
+  A LOD seam over dug ground can show a sliver now; coarse levels
+  point-sample the edits and disagree with LOD 0 there anyway.
 
 ### The frame: HDR targets and the post chain
 
@@ -835,12 +1383,24 @@ Scene shaders write TWO R16G16B16A16F targets through `scene_out.hlsli`: the
 sun's direct light, and everything else (sky, bounce, fog). Then
 `post.hlsl`: horizon-based AO at half resolution from depth; a composite of
 direct x screen-space contact shadow (a 0.5 m march towards the sun through
-depth) + ambient x AO; TAA (Halton 2,3 jitter over 8 frames, reprojection by
+depth, for small occluders the cascades are too coarse for) + ambient x AO; TAA (Halton 2,3 jitter over 8 frames, reprojection by
 depth with the unjittered previous matrix, YCoCg variance clipping, 1:9
 blend); the exposure meter; then exposure, a light contrast-adaptive
 sharpen and AgX into the back buffer. Y / O / J toggle TAA, AO and contact
 shadows. A still renders 16 frames so TAA converges. Cost: ~0.3 ms a frame
 at ground level, 0.09 of it the effects.
+
+**The contact march must not find its own surface.** It started 2 cm
+along the light, so on any slope a low sun grazes it hugged the surface
+for its whole length, and the depth buffer -- one depth a pixel, ~15 cm
+wide at 60 m -- came out "in front" of it in pixel-sized steps: a field of
+dark squares in bands. Now it starts 1.5 pixel footprints above the surface
+along the depth buffer's own normal (`normal_at`), a hit must clear the
+surface by more than a footprint (`wet.z` carries the pixel angle), and the
+effect fades where N.L is under ~0.14, which the cascades already darken.
+It was most of the cascades' flicker too: the close-floor `--shake 60` view
+went from 1.77-3.50 mean luma change a frame to 0.51-1.04 (RT's denoised
+shadow, before its removal, 0.76-0.95). Walking cost within noise.
 
 ### Light in physical units (ADR-004 L1)
 
@@ -853,17 +1413,76 @@ the clamp. Every authored colour in the engine is still sRGB-encoded as typed;
 terrain materials). `lighting.hlsli` has the BRDF (Lambert + GGX, Smith
 height-correlated, Schlick, F0 0.04) and the ADR's shading-facing GI
 interface -- `gi_diffuse`, `gi_specular`, `gi_sky_visibility` -- with its
-no-RT fallback: sky irradiance from above, the ground's bounce from below.
-Terrain, trees, grass and the sea all light through it. Trees and grass
-keep a little extra fill as a STAND-IN for inter-leaf bounce; DDGI (L6)
-should remove those multipliers.
+fallback: sky irradiance from above, the ground's bounce from below, which
+the heightfield GI replaces where its map reaches. Terrain, trees, grass
+and the sea all light through it. Trees and grass keep a little extra fill
+as a STAND-IN for inter-leaf bounce (`gi_fill`).
 
 **Auto-exposure** meters a 256-bin log2 histogram of what TAA produced and
 puts the mean of its 10-90% band at middle grey 0.18, adapting like an eye
-(faster into light than out). A still adapts instantly. Every `--shot`
+(dark vision, below). A still adapts instantly. Every `--shot`
 writes the EV100, the band and the histogram to `<shot>.txt`: spawn EV100
-13.7, the badlands hillside 14.9, a sea view 15.4. `,` `.` step the
+13.7, the badlands hillside 14.9, a sea view 15.4. Shift + `,` `.` step the
 compensation; `U` cycles AgX / ACES / raw.
+
+**Dark vision: darkness is the eye's and the display's, never added
+light.** No flat or minimum ambient term anywhere in the lighting -- it
+would relight sealed spaces, flatten a torch's contrast and make emitters
+worth less. `Renderer::DarkVision` (renderer.h; defaults there, as there
+is no exposure block in archetypes.json), the tuning panel's Exposure
+group (floors open / underground / lit, the lit key, both time constants,
+the display floor), `--ev-floor <open> <under>`, `--no-dark-display`,
+`--brightness`.
+
+- **The floor, by context**: how far down the eye adapts, EV100 -0.5 under
+  the open sky (night) and +1.5 with none over it (underground), blended on
+  the CPU by the eye's open sky BY GEOMETRY -- `HeightGi::camera_open`, the
+  camera pass's sky visibility with no bounce. The light share
+  (`camera_sky`) counted a torch's bounce as sky and read a torch-lit tunnel
+  at night as open air. The old single floor was -1, tuned for moonlit
+  meadows; it let a tunnel 20 m past its mouth read clearly at noon.
+- **A light in view sets the exposure; the floors only make the UNLIT
+  dark.** The first dark vision held a torch-lit tunnel (walls 0.05-0.2
+  nits) 1-3 stops under middle grey on the +1.5 floor, and a slow rod
+  phase took 75 s to settle it after walking in from daylight: "everything
+  artificially dark, and the eye opens up gradually". Now the CPU sums the
+  illuminance the lights put on the GROUND under the eye (a physics ray
+  down; at the eye itself a torch carried by a camera 22 m up counted in
+  full and lit nothing in view) -- the carried torch always, a placed light
+  only in clear view of that point (a physics ray, `set_ray_query`) -- and
+  between 0.03 and 0.3 lux that becomes a light presence 0..1 (the shot
+  report's `dark vision:` line). It lowers the floor towards `floor_lit`
+  (EV100 -2) and, in a dark scene only (EV100 under 3), keys the meter on
+  the lit part of the view: the mean of its 70th-97th percentiles
+  `lit_key` (1.5) stops over middle grey, INSTEAD of the frame's mean. The
+  90th percentile alone jumped between a torch-lit tunnel's two humps; the
+  max of the lit key and the mean let the unlit depths' slow settle drag
+  the exposure along.
+- **Adaptation** (`cs_exposure`): one time constant each way, 0.8 s into
+  the dark and 0.3 s into the light, twice as slow for changes under a
+  stop (a flame's quarter-stop flicker does not pump the picture; four
+  times left a ten-second tail). The lightning hold is unchanged; stills
+  snap. `--shot ... --dig-tunnel ... --adapt-test [--torch]` walks from
+  daylight into the test tunnel, holds 20 m in for 75 s and walks out, a
+  simulated 1/30 s a frame (`Renderer::set_post_dt_override`), logging
+  every frame's target, adapted EV100, light presence and the meter's 10th
+  and 90th percentiles to `build/adapt_test.txt`. With the torch: within a
+  stop 1 s after arriving, settled in ~4 s (EV100 -0.7, steady to +-0.13);
+  unlit: the floor (1.5) in ~3.5 s; back to the day in ~2 s.
+  `live_exposure()` reads u_expo[0..1] back every frame.
+- **The display's dark floor** (`ps_final`'s `dark_floor`, after the
+  tonemap): colour fades below 0.015 scene nits (gone by a tenth of it)
+  towards a slightly blue grey -- rod vision, the Purkinje shift: a
+  moonlit meadow (~0.005) goes grey, a torch-lit tunnel (0.05-0.2) keeps
+  its colour; then true black lifts 1.5% of the range towards a dark
+  blue-grey; then the player's Brightness (Graphics, saved: a gamma).
+- **Measured** (the dead-end test tunnel, `--cam -96 32.5 -440 3.14159
+  -0.55 --dig-tunnel --tunnel-ramp --tunnel-len 55 --tunnel-r 2
+  --tunnel-depth 8 --tunnel-in <m> --tunnel-inward`), adapted EV100: 11:00
+  20 m and 35 m in, unlit, 1.5 (black); 20 m in with `--torch`, 11:00 or
+  23:00, -0.9 (was clamped at 1.5); a moonlit meadow at spawn, 23:00,
+  -0.48, and the same with a torch carried by that airborne camera.
+  `--leak-test` sealed 0.001 nits, with a torch 0.053.
 
 **AgX, with the reference "punchy" look** (power 1.35, saturation 1.4). Base
 AgX drew every view pastel; punchy matched a fitted ACES on the A/B stills
@@ -896,6 +1515,268 @@ and keeps AgX's hue handling, which a torch's orange will need.
   grazing reflection is mostly sky. L2 did not fix it -- the sky it reflects
   is real now and the sea is no better at noon (at sunset its glitter path
   is the best thing in the engine). L7 owns water reflections.
+
+### Volumetric clouds, rain, the wet world and lightning (ADR-005, C1-C5)
+
+`docs/adr-005-clouds-and-rain.md` is the plan: Schneider's Nubis (Horizon
+Zero Dawn, SIGGRAPH 2015/2017) with Hillaire's integration and multiple
+scattering, then rain. `engine/render/clouds.{h,cpp}`, `shaders/clouds.hlsl`;
+archetypes.json `clouds` block. F3 / `--no-clouds`.
+
+- **Passes** (compute, before the composite, after the atmosphere's tables):
+  noise volumes once at startup (128^3 tileable Perlin-Worley + Worley
+  octaves, 32^3 Worley detail); a 512^2 weather map every frame over +-64 km
+  (coverage, type, precipitation from the storm dial and a 2D noise carried
+  at `drift_factor` x the ground wind's drift); the cloud-shadow map; the
+  march at quarter resolution each axis, jittered per frame; a temporal
+  resolve reprojected by each pixel's cloud distance and clamped to the new
+  3x3, written into a fixed `out` the composite reads (heap [83..108]).
+- **Field**: a spherical shell on the atmosphere's planet (y = 0 on its
+  surface), base 1.5 km, the top by type (stratus 0.4 km, cumulus 1.8,
+  cumulonimbus 8); base shape remapped by its Worley octaves x a height
+  profile by type, coverage as a threshold, edges eroded by the detail
+  volume, sheared downwind with height. Beyond the map, the storm's mean.
+- **Coverage is the field's own QUANTILE, measured.** The shaped field
+  (Perlin-Worley remapped, times the height profile) is FLAT: its peak along
+  a sun ray lies between 0.80 and 0.90 over 80% of the sky in any weather
+  (`BIOMES_CLOUDS_DBG=4` writes that peak into the shadow map and the shot
+  report prints its percentiles). So the threshold is cut at the field's
+  (1 - coverage) quantile, 0.895 - 0.125 x cov - 0.08 x cov^8 (the last term
+  closes the deck), and past it a cloud ramps to full density over 0.06, so
+  the detail erosion shapes edges rather than deleting thin clouds. The
+  history: Schneider's plain 1 - coverage let nothing stand under half
+  cover; then 0.7 x (1 - coverage) sat BELOW the whole field, so coverage was
+  really set by a density scale and the erosion, the sky went from scattered
+  to closed between coverage 0.2 and 0.4, and "50% reads as overcast" was
+  this. Sunlit share of the shadow map at noon now: coverage 0.17 85%, 0.35
+  70%, 0.45 60%, 0.56 45%, 0.68 20%, 0.80 2%, closed from 0.93. The storm's
+  coverage reaches 1 at storm 0.85 (`clouds.cpp`), where the rain is a
+  downpour. `BIOMES_CLOUDS_DBG=1` paints the weather map over the screen.
+- **How bad the weather is belongs to the TIME, not the place**: the storm
+  dial sets coverage and type for the whole sky, and the map only varies them
+  +-0.15. At +-0.55 its low spots were clear holes kilometres wide, and with
+  the clouds barely drifted early in a session one sat over spawn: the sky
+  looked closed at the horizon and open above you wherever you stood (a
+  player's report). `BIOMES_CLOUDS_DBG=2` charts the real cover top-down --
+  a ray straight up from the ground under every pixel over +-10 km, bright
+  clear, dark cloud -- which the view from the ground cannot show (straight
+  up it looks between the clouds, at the horizon through all of them); `=3`
+  paints the camera's own rays' transmittance.
+- **Check where a looking-up camera stands**: `--ground` over water puts it on
+  the seabed, and the sky through the water's underside shows no clouds --
+  which read as a second cloud bug until the shot report said "over 3.8 m of
+  water".
+- **Lighting**: a 6-tap growing cone march to the key light (sun or moon);
+  the light reaching each sample from the atmosphere's transmittance table;
+  dual-lobe Henyey-Greenstein; four Hillaire octaves of multiple
+  scattering; Schneider's powder; ambient from the sky above and the ground
+  below by height in the cloud; energy-conserving steps, out at T 1%.
+  Far clouds fade into the sky-view table over `haze_km`.
+- **C2, the light under cloud**: a 512^2 cloud-shadow map, +-6 km, of the
+  key light's DIRECT beam through the layer (16 taps through the layer's
+  real height, with the detail erosion, no floor), indexed in the cloud BASE's plane so
+  a ground point finds its texel by sliding along the light -- one map for
+  every terrain height. The composite multiplies the DIRECT target by it, so
+  terrain, trees and grass darken in one place and no lit pipeline changed.
+  And `fill_light` greys the sky terms (not the ground's bounce) towards
+  their luminance by coverage^2 x 0.9: an overcast sky is as bright as a
+  clear one but colourless.
+- The sea's reflections read the composited sky, so clouds reflect.
+- **Cost** at 2560 x 1440: walking +0.1 ms, a flight at 300 m +0.1-0.25 ms
+  (median). One gale flight showed a 99th-percentile frame of 22 ms that a
+  rerun did not (8.0 ms); the 40 ms worst frames appear with clouds off too.
+- **The cloud shadow reaches every reader through one function**,
+  `cloud_shadow.hlsli`'s `cloud_shadow_at`: the composite's direct target,
+  the sea's body and glint (`water.hlsl`; under a storm deck the sea had
+  gone on sparkling), and the mist's in-scatter (`fog.hlsl`, t60 in its
+  shadow table -- LAST frame's map, because the clouds record after the
+  mist; none until the map has been made once, `Clouds::shadow_ready`).
+- **Rain (C3)**: `engine/render/rain.{h,cpp}`, `shaders/rain.hlsl`; drawn
+  onto the scene target after the sea and before TAA, alpha-blended, RGB
+  only. Intensity is `Clouds::precipitation()` (the storm dial past 0.55),
+  or `--rain <0..1>`; `--no-rain`, Shift+F3. Nothing stored: a drop is a
+  hash of its index with a FIXED world position wrapped into a box round
+  the camera, so walking does not drag the rain along. Two layers --
+  40k drops in 44 x 24 x 44 m, 60k in 132 x 36 x 132 m (the sheets a
+  downpour shows at distance) -- falling at 8.5 m/s and carried at 0.7 x
+  the 10 m wind. A streak is the path over 45 ms, at least 0.8 px wide with
+  its opacity cut to match; drops nearer than ~4 m fade out (they smeared
+  across the screen as wires). Occlusion is a manual depth test against
+  the scene's depth (the sea's included). **Under crowns** the canopy
+  map's vertical transmittance thins the drops and dims them (they see
+  leaves above, not sky). The mist's density rises x(1 + 1.5 x rain).
+  **Under the ground** no drop draws (`under_top_surface`: below the
+  lowest of the heightfield GI map's four texels round it, less 25 cm; a
+  dug shaft is in the map, so rain still falls down one). The depth test
+  alone hid a drop only behind a wall: a tunnel under a wood drew the
+  crowns' drips in its own air, white streaks that a dark-adapted eye
+  showed at full strength -- the "sparkles" 20 m into a sealed tunnel.
+  `--no-rain` (Shift+F3) now takes the drips too; with `--wet` it did not.
+- **Splashes are WORLD points.** The first version picked random screen
+  pixels and read the depth there, so every splash rode along with the
+  view and looked fake. Now each of 2500 has a world (x, z) for its 0.4 s
+  life, wrapped into a 72 m square round the camera like the drops, kept
+  within 36 m. `splash_ground` takes a first height from the heightfield
+  GI's top-surface map (heap [52]; splashes need `hfgi` on, the default),
+  projects it, reads the depth there for the surface plane, and puts the
+  splash where that plane meets its own vertical; it gives up if the
+  depth disagrees (a trunk in front, ground the 2 m map does not describe)
+  or the surface faces away from the sky. The map sees the seabed, the
+  depth the sea, so under sea level the guess is 0 with a wider tolerance.
+  Grass hides them (a depth test with 8 cm of tolerance), as it does real
+  ones. On the sea a ring spreads to ~12 cm; on land only a ~4 cm crown
+  -- rings on leaves read as bubbles. Never under ~1.5 px across, the
+  opacity cut LINEARLY to match, so they still read at 30 m.
+  `BIOMES_RAIN_DBG=1` draws them 0.3 m and opaque, `=2` also skips every
+  check (on the map's height): which check drops them, and whether they
+  hold still while the camera moves (two `--no-taa` shots a metre apart).
+- **A drop must be brighter than the sky's mean.** At the mean luminance
+  the rain vanished against an overcast sky and the mist, which are that
+  grey: the sea view showed a dozen streaks. It is 2 x the mean less 0.4 x
+  cover (a drop gathers the bright zenith and a highlight). Cloud cover
+  barely dims it because this engine's overcast is as bright as a clear sky,
+  only colourless (`fill_light`).
+- Cost: walking at 2560 x 1440 in a downpour 8.09 / 8.13 ms against 8.07 / 8.07
+  without -- within noise. Every `--shot` report has a `rain:` line.
+- **The wet world (C4)**: `shaders/wet.hlsli`, read by the terrain, rocks,
+  trees and grass through `l_wet` in the shadow constants (wetness,
+  puddles, the rain now, a ripple clock wrapped at 1000 s; 800 bytes).
+  - **State is the weather's, from its clock** (`weather.h`): `rain` from
+    the storm dial (`rain_storm`, 0.55-0.9, shared now with the rain pass),
+    and the rain of the last 45 min summed a minute at a time, each sample
+    weighted by exp(-age / `dry_s` 900 s) -- the sea's lag trick, so a
+    still and a long run agree with nothing stored. Wetness saturates over
+    `soak_s` (120 rain-seconds); puddles from 240 rain-seconds to full 600
+    later, and go first as it dries; the crowns' `drip` has its own 300 s
+    memory. A held downpour is soaked with puddles; ~17 min after it stops
+    the ground starts to dry and the trees have stopped dripping. `--rain`
+    gives its steady state; `--wet <k>` sets wetness, puddles and drips.
+    Every shot report's `rain:` line prints them.
+  - **Porosity is the lever** (Lagarde's wet surfaces): soil (ground,
+    0.9) darkens to x0.5 and reads MORE saturated but stays nearly matte;
+    rock (0.3, 0.35 on terrain rock) barely darkens and takes a glossy
+    film (roughness to 0.12-0.2), its fine normal partly filled. Wet soil
+    at roughness 0.35 mirrored the grey sky and the meadow read as frost.
+    Steep faces get 70% (they drain).
+  - **Shelter**: the canopy map's sky visibility (a wood's floor gets
+    45-100%) and the heightfield GI map -- under a top surface a metre and
+    more above, dry. Under an overhang stays dry; in a cave it would too.
+  - **Puddles** stand on flat GROUND (not rock, n.y > 0.93) where a fixed
+    two-scale noise, the scan's own height map and the terrain's REAL
+    hollows (the heightfield map's 4 m Laplacian, 2 m texels) are lowest,
+    the threshold rising with the puddle value: dark (x0.3), roughness
+    0.02, the normal up, and while it rains RINGS -- one drop per 0.4 m
+    cell at a time, 3x3 cells a pixel, faded as the pixel outgrows a 5 cm
+    ring. Most pixels leave before the hollow's four lookups.
+  - **Bark** x0.55 and roughness 0.85 -> 0.4; **leaves and grass** x0.82
+    and a SHEEN: a normalised Blinn-Phong sun lobe and the sky's mean
+    radiance, Fresnel-weighted. The first sheen was the full GGX lobe and
+    sky lookup and cost 0.55 ms walking -- leaves and blades overdraw --
+    and at 0.6 strength greyed whole crowns (edge-on cards, Fresnel).
+  - **Drips**: under crowns, drops the rain's roll rejected come back as
+    drips while the crowns are wet -- up to a third of a downpour's count,
+    slower (0.6 x) and barely blown -- and their splashes, so a wood keeps
+    dripping after the shower.
+  - **Puddles reflect the scene** (screen space). The scene has a THIRD
+    target, the puddle mask (RGBA16F, heap [109], t15 in post): every scene
+    shader writes it through `SceneOut` -- zero unless it is the terrain's
+    standing water -- so grass, a rock or a tree drawn over a puddle clears
+    it, and every scene PSO declares three targets (terrain, rocks, trees'
+    mesh and impostors, foliage). The terrain takes the puddle's share of
+    its sky reflection OUT of its ambient, exactly as `ambient_light` put
+    it in, and leaves it in the mask (rgb) with its weight (a, env_brdf x
+    puddle). `cs_composite` adds it back BEFORE the haze, after marching
+    the reflected ray -- bent by the same rain rings (`ripple.hlsli`,
+    shared) -- through the depth buffer in world space: 26 steps from 10 cm
+    growing 1.3x, a 5-step bisection where it passes behind a surface thin
+    enough to be the one it reached. The colour comes from LAST frame's
+    TAA history, reprojected through TAA's own matrix: lit, hazed, clouds
+    and all. No hit: what lies far along the reflected direction, if the
+    screen shows it there (sky, or anything beyond the march). Only a ray
+    that leaves the screen keeps the terrain's sky. Without the far case a
+    grazing ray from a distant puddle -- which runs above the ground and
+    hits nothing near -- took the bright horizon sky, and an evening's
+    puddles glowed white like snow. `--post-debug 4`: green a hit, blue far
+    along the ray, red the sky.
+  - **FXC crashes ("internal error: compilation aborted unexpectedly") on
+    a ternary between two TEXTURE objects** (`(c ? g_hist1 :
+    g_hist0).Sample`) in this compute shader. Branch instead.
+  - Cost walking at 2560 x 1440, wet against dry under the same weather:
+    8.66 / 8.73 ms against 8.28 -- about +0.4 ms, of which the reflections
+    ~0.2; the third target costs ~0.1 ms everywhere (dry was 8.19 before
+    it). `validate` passed with the `weather` block's new keys
+    (presentation only).
+  - Not done: reflections are screen space -- what is off screen or behind
+    a nearer object is not there; a far hit is fogged twice (its own haze in
+    the history, then the puddle's); grass still grows out of puddles (the foliage bake is cached per tile);
+    nothing runs down a slope or drips off a rock; wetness is the same
+    everywhere the sky reaches -- a beach does not dry faster than a bog.
+- **Lightning (C5)**: `engine/render/lightning.{h,cpp}`,
+  `shaders/lightning.hlsl` (the bolt), `shaders/flash.hlsli` (its light);
+  archetypes.json `weather.lightning`.
+  - **A strike is a pure function of seed, clock and the camera's 2 km
+    cell**: 2.5 s slots, each hashed for a strike (rate from storm 0.78,
+    14 a minute at storm 1), its start, place (within 6 km of the cell),
+    kind (40% to the ground) and 1-4 return strokes 40-150 ms apart, each a
+    30 ms decay over a quarter-second continuing current. Peak 5e10 cd,
+    about a real stroke's. The walk report counts strikes and lit frames;
+    `--walk` always starts the clock at 0, so every run sees the SAME
+    minute -- for the default seed, 1 ground strike in its first 15. That
+    looked like a bug in the ground share until a replay of the schedule
+    in Python matched the engine strike for strike (40.2% long run).
+  - **Its light goes into the AMBIENT target** (`flash_light` /
+    `flash_leaf`: inverse square from the channel's middle, or a point in
+    the cloud, times the surface's sky visibility -- a wood's floor
+    flickers, it does not light up like a field), never the direct target,
+    which the composite multiplies by the SUN's and the clouds' shadows.
+  - **The mist carries the flash**: in rain it is most of what is seen,
+    and the clouds behind are lost in it. `cs_fog_inject` adds the flash
+    and takes the frame whole while it is lit (1:12 history smeared a
+    stroke to nothing); the decay after is an afterglow. The clouds glow
+    round it too (diffused over ~1.5 km in the march).
+  - **The bolt**: midpoint displacement from the cloud base to the ground
+    (8 levels, sideways more than up), 3-7 dimmer branches, made on the CPU
+    once per strike; core >= 1.2 px and a glow 10x, additive, depth tested
+    by hand, drawn after the rain.
+  - **Exposure holds through a flash** (`expo_flags` 2), or the frame after
+    a stroke came out dark. At night the held exposure is a moonlit one and
+    the flash is fifteen stops over it -- a white screen -- so the flash's
+    own frames may stop down until it is 2.5 stops over middle grey; the
+    stored state stays the held one.
+  - **Storms are dark now** (`storm_dim`): a closed deck of tall cloud lets
+    down a fifth of the sky's light -- every sky term in `fill_light`, the
+    ground's bounce, the haze's in-scatter in the composite, the clouds'
+    own ambient, the rain's drops. Before it a storm was a grey day at
+    EV 14.4 and a flash added 2 luma; now EV 11.9, and a strike 2.5 km off
+    takes the sky from luma 93 to 133. A grey stratus overcast keeps its
+    light (storm 0.7: 0.98; 0.8: 0.4; 0.9: 0.2).
+  - **The cloud-shadow map's edge**: past it, `cloud_shadow_at` returned
+    full sun, and distant mist sliding out of the 12 km map lit a band down
+    the frame under a closed deck. It takes the edge texel now.
+  - Cost walking at 1440p through a storm with a flash lit a quarter of the
+    time: 9.78 / 9.77 ms against 9.74 / 9.72 without -- 0.05 ms.
+  - Not done: thunder (the report gives its delay; there is no audio); the
+    flash casts no shadows of its own; the sea's glint does not see it; no
+    sheet lightning across the cloud tops seen from above.
+- **Not done (later phases)**: rain on the camera lens;
+  underwater the rain still draws;
+  1/16-pixel-a-frame cloud rendering (Decima's cost path); the base can
+  look like a flat ceiling from the ground -- tuning.
+- **"The sun through a gap in the storm" was the shadow's 10% FLOOR, not a
+  gap.** The badlands lay in hard sun at storm 0.9 under a closed deck.
+  `--post-debug 5` (the cloud shadow on the key light) read exactly 0.1 on
+  every ground pixel: the floor was meant as "light scattered through", but
+  the composite multiplies the DIRECT target, so 10% of a 100 klx sun was
+  10 klx of sharp-shadowed beam beside a 14 klx sky, and auto-exposure
+  brightened it back. Scattered light comes out diffuse; the overcast sky
+  term stands for it. With the floor gone the map turned out opaque at
+  EVERY coverage, which the floor had hidden: the shadow march skipped the
+  detail erosion, so the faint fringe the eye never sees made every 600 m
+  step opaque. Hence the erosion in the march, the taps fitted to the
+  layer, and the coverage recalibration above. The shot report's `cloud
+  shadow:` line (sunlit share of the whole map, mean T) is the instrument --
+  one view's pixels sample too little sky to tell drift from calibration.
+  Cost: walking within noise, clouds on or off.
 
 ### The atmosphere and time of day (ADR-004 L2)
 
@@ -943,11 +1824,12 @@ by its depth. Scene shaders no longer fog.
 - **Night is a full moon opposite the sun**, 0.19 lux on the ground. The
   meter's floor decides what night looks like: anything metered darker
   renders darker than middle grey. At EV100 -2 a moonlit meadow metered up
-  to a dim blue day; the floor is now **EV100 -1** (`cs_exposure`'s clamp),
-  so moonlight renders a stop under middle grey -- ambience -- and a torch
-  or a fire, far above the scene's mean, carries the picture. EV100 0 was
-  tried: two stops read as near black. No stars, no moon phases, no
-  Purkinje shift yet.
+  to a dim blue day; -1 rendered moonlight a stop under middle grey. Dark
+  vision (above) made the floor depend on the open sky: under it at night
+  **EV100 -0.5** by default (the tuning panel's Exposure group; +1.0 gives
+  the ~2 stops darker a survival night wants), underground +1.5. The
+  display's dark floor greys and blues what is under 0.05 nits (the
+  Purkinje shift). No stars, no moon phases yet.
 - Cost: walking 2.08 -> 2.10 ms; flying 2.05 -> 1.99 ms (the scene shaders
   lost their fog).
 
@@ -968,15 +1850,17 @@ BRDF as the sun (`direct_light`, `leaf_light` in `lighting.hlsli`).
   `OffsetInDescriptorsFromTableStart = 24`. The cluster parameters ride in
   the shadow constants. The sea is not lit by them (its pipeline has no
   such table) -- yet.
-- **Shadows: a 4096^2 atlas of 512^2 tiles**, a cube of six for a point
-  light. The eight most important shadowed lights hold slots and keep
+- **Shadows: a 6144^2 atlas of 512^2 tiles** (144 MB), a cube of six for
+  a point light. The 24 most important shadowed lights (8 until a ninth
+  fire lit through rock) hold slots and keep
   them while they stay in the eight, so their faces stay cached; at most
   twelve faces are redrawn a frame -- never drawn or moved first, then a
   static light's faces every 240 frames so a dug hole or a felled tree
   reaches its shadow. A face draws only the chunks within the light's range
-  (`Streamer::slots_near`, one ExecuteIndirect a slot) and the trees through
+  (`Streamer::slots_near`, one ExecuteIndirect a slot), the trees through
   their own cull (`TreeRenderer::record_light_shadow`, the first cascade's
-  floor: real leaves).
+  floor: real leaves), the rocks, and the player's body -- which also
+  redraws the cached faces it moves through (see The player character).
 - **`--lights-report` is the instrument** -- at night, at ground level,
   frame mean over 400 frames: none 2.33 ms; torch held still 2.40; **torch
   carried at walking pace 2.51** (all six faces redrawn every frame, 72 chunk
@@ -985,6 +1869,21 @@ BRDF as the sun (`direct_light`, `leaf_light` in `lighting.hlsli`).
   it caught in itself: a frozen clock cached the torch's shadow and called
   it free, and 255 campfires in the 64-campfire disc overflowed every
   cluster; the report now runs a clock and keeps density constant.
+- **Each light's bounce is an instant fill** (`local_fill_irradiance` in
+  `local_lights.hlsli`): 20% of what it puts at a distance of at least
+  1.5 m, wrapped round the normal, diffuse only, its visibility one tap of
+  the light's own shadow from a point moved up to 1.5 m towards it -- it
+  wraps round a pillar, never through thicker rock. **Under cover it steps
+  aside** (`kFillUnderCover` 0, by `nf_cover`, the near field's own blend
+  rule): the near field's probes carry the bounce there. A/B, a torch-lit
+  tunnel at 23:00: the fill alone (before) EV100 -0.94, the probes alone
+  -0.90, both -0.65 (counted twice). In the open the probes only copy the
+  heightfield, which no local light reaches, so the fill stays -- and on
+  leaves and grass. A light past the 24th shadowed one lights through
+  everything, fill included; the probes leave it out. `--lights-report` at 1280 x
+  720, 23:00: torch held 4.27 -> 4.30 ms with the fill; 64 campfires, 24
+  shadowed, 6.78 -> 7.74 (the fill's four-tap shadow cost 1.2 ms, one tap
+  0.96); no lights 4.07 either way.
 - **Local light goes into the AMBIENT target**, so GTAO darkens it in
   creases -- not quite right for a point light, cheap and honest until the
   composite has a third target. The torch has no visible model yet.
@@ -1038,163 +1937,98 @@ atmosphere's aerial perspective, and its far end over the sky.
   been, or weather that rolls in. The hook is `FogMap` -- one density
   function, read in one place -- and ADR-004's L4 section lists the options.
 
-### The ray-tracing scene (ADR-004 L5)
+### The exploration fog: layered height fog
 
-DXR 1.1 inline RayQuery. **Denoised RT key-light shadows are the DEFAULT
-wherever DXR 1.1 is** (`Renderer::init` turns them on after `create_rt`);
-without it the cascades and PCSS, as before. `--no-rt-shadows` (`R` in the
-window) for the cascades -- it also stops building the RT scene when
-neither `--rt-sky` nor DDGI wants it; `--rt-shadows` still parses and
-changes nothing. Every headless mode now runs with RT shadows unless told
-otherwise, so a figure measured before this is a cascades figure;
-`--rt-report` measures. `engine/render/rt_scene.{h,cpp}` keeps a BLAS per
-drawn chunk at LOD 0-3 (+-512 m, the cascades' reach) -- pointing at the
-whole vertex pool and the slot's own index range, because the pool's
-indices are absolute -- and one per tree model from its LOD 1 mesh (bark
-opaque, leaf cards non-opaque); the TLAS is rebuilt every frame from the
-drawn chunks and the standing trees in range. `gi_trace.hlsli` is the
-ADR's tracer interface: `gi_occluded` and `gi_trace` (hit, normal,
-albedo), SM 6.5, compiled with DXC. `rt_shadow.hlsl` is the pass.
+How far the land can be seen is a game decision, not only an atmospheric
+one: climbing a hill must not show the shape of the island or what lies on
+the ground far off, while peaks and high things stay visible enough to want
+to go to. `haze.hlsli`'s `height_fog`, applied in `cs_composite` to every
+surface and to the sky (to infinity), and by the sea over itself and its sky
+reflection. archetypes.json `fog.layers`; `--no-height-fog`,
+`--height-fog <k>`.
 
-- **DXR 1.1 has no indirect build**, so a chunk's index count must reach the
-  CPU before its BLAS: read back three of RtScene's OWN ticks after it is
-  meshed (a still's warm-up records frames without advancing the renderer's
-  frame index), at most 32 builds a frame. **Three, not two**: a chunk is
-  noted before the tick its frame takes, and "two on" read the slot's old
-  zero before that frame's counter copy landed -- 834 of 858 chunks at spawn
-  were judged empty for good.
-- **Chunks are queued by looking, not by being told.** Headless modes fill
-  residency in a loop that meshes without recording a scene, so an event
-  queue never heard of those chunks. The TLAS pass walks every drawn slot
-  and queues any whose BLAS (or empty verdict) is not for its current key.
-- **A GPU hang reads back as zeros everywhere.** The first run's counts,
-  stats and timers were all 0 and looked like a queue bug;
-  `GetDeviceRemovedReason` said `DXGI_ERROR_DEVICE_HUNG`. The cause was the
-  tree builds' scratch going into the deferred-release list stamped 0 for
-  "not seen yet" -- which the release loop, running first, read as ancient,
-  freeing it while the build ran. Bisected with `BIOMES_RT_DBG` (1 no
-  trace, 2 no terrain BLAS, 4 no trees in the TLAS, 8 no scene at all, 16
-  no tree BLAS). `--rt-report` now says whether the device is alive.
-- **Leaf cards are alpha-tested in the ray query** with the raster's own
-  `leaf_coverage` at the card's uv (per-vertex uv, kind and seed uploaded
-  beside the positions). A flat 55% transmission per card was tried first:
-  a dawn sun crosses so many cards that the wood's floor lost every trunk
-  shadow under a uniform dimness.
-- **Terrain shadow rays start from Hanika's lifted point** ("Hacking the
-  Shadow Terminator"): the pixel's own triangle comes from a terrain-only
-  primary ray, and the start is lifted onto the curve its vertex normals
-  imply. Smooth normals over facets up to 8 m wide streaked every grazing
-  slope with self-shadow before it.
-- **Penumbra**: each shadow ray aims at a different point on the sun's (or
-  moon's) disk per pixel and frame, and TAA integrates the true penumbra.
-- **`--rt-report`** at three views: primary rays meet the drawn terrain
-  within 1% of the depth buffer on 93% of the badlands hillside (the rest
-  is trees, water and LOD 4+), nearer only 0.5%; `gi_trace`'s normals within
-  2.5-3.2 degrees of the depth buffer's near the camera; shadow agreement
-  with the cascades 94% on the hillside, 76-79% in woodland, where the
-  traced canopy is the leaf pattern and the cascades' is coarser.
-- **Cost**: BLAS + TLAS 0.18-0.23 ms steady; the shadow ray 0.29 ms on bare
-  ground to 1.4 ms through a forest (alpha-tested leaves). The cascades still
-  render under `--rt-shadows` -- the mist reads them -- so this is an A/B,
-  not a replacement yet. Memory: 94-270 MB of terrain BLAS, two 94 MB TLAS
-  sized for 67k instances, 103 MB scratch.
-- **The shadow is denoised** (`engine/render/rt_denoise.{h,cpp}`,
-  `shaders/rt_denoise.hlsl`; on with `--rt-shadows`, `--no-rt-denoise` /
-  `F8` for A/B). One ray a pixel a frame is grain that TAA cannot remove --
-  it clips history to each pixel's 3x3 neighbourhood, and a 1-sample
-  shadow's neighbourhood holds 0 and 1 -- so the shadow is filtered on its
-  own between the trace and the composite, SVGF's shape for a scalar: a
-  temporal pass through TAA's own clip-to-last-frame matrix (this frame's
-  jitter off, last frame's on, so the history stays on last frame's grid),
-  a long mean and second moment up to 24 frames, a fast 3-frame mean that
-  cuts the long one short where they part (anti-lag), and disocclusion by
-  the distance stored with the history; then four edge-aware a-trous
-  passes (steps 1, 2, 4, 8) written back into the visibility's x. Heap
-  [72..78], UAVs only, ~35 MB at 1280 x 720, ~140 MB at 2560 x 1440.
-  - **Full resolution is the default; two cheaper traces were tried.**
-    *Half resolution for everything* (one ray per 2x2 quad, rotating,
-    denoised on the quads, upsampled by distance) cut the RT pass ~4x at
-    2560 x 1440 (the 17:30 wood 5.7 -> 1.6 ms) and looked right in stills,
-    but BOILED on trees in motion, Lumen-like: a quad's history mixes four
-    pixels' leaves and a swaying crown keeps resetting it. Removed.
-    *Sparse terrain* (`--rt-sparse-terrain`, Shift+F8) keeps trees at
-    every pixel and traces terrain -- what the trace's terrain-only primary
-    ray says is terrain -- at one pixel of each quad a frame (`kRtQuad`,
-    the same table in `rt_shadow.hlsl` and `rt_denoise.hlsl`); a skipped
-    pixel carries its history and one with none is filled by the a-trous.
-    It must be TWO dispatches -- the quads' pixels, then the rest, which
-    leave after the terrain test -- because skipping three pixels in four
-    inside one dispatch saved a fifth, not three quarters: a wave waits for
-    its slowest lane. Two passes: close floor 4.0 -> 2.5 ms, the wood 5.9
-    -> 5.7, the forest from the air 6.1 -> 6.6, and walking 7.85 ms
-    against full resolution's 7.63 -- grass is not terrain to the trace,
-    and it covers the ground. Off by default.
-  - **Under RT shadows the near two cascades are not drawn**
-    (`first_cascade`, `l_shadow_frame.z`): no surface reads them, and the
-    mist's one tap starts at the third, fitted round the camera at 0.19 m
-    texels. They are marked invalid and redraw the frame RT goes off; the
-    RT instruments keep all four. Walking at 1440p, full-resolution RT
-    7.95-8.15 -> 7.60-7.63 ms.
-  - Edge-stopping is SVGF's, made gentler on converged pixels: 1.5 sigma
-    of the MEAN's variance (the sample's over n), a depth tolerance of 5%
-    of the local plane's prediction, and a pass runs only while its step
-    is within 8 / sqrt(frames) pixels (ReBLUR's shrinking reach). The
-    history test is 3% + 0.3 m, loose enough for swaying crowns. These
-    were chasing crowns that looked soft beside raw RT; together they
-    moved the image about 1 luma, and the softness turned out to be the
-    point: raw RT under TAA keeps 1-sample sparkle (TAA's 3x3 clip lets
-    it through), which reads as leaf detail. A wrong lead worth knowing:
-    `--no-taa` stills render ONE frame, so they show the denoiser with no
-    history at all.
-  - **The disk samples are an R2 sequence in time, offset per pixel by a
-    hash**, not interleaved gradient noise: IGN's diagonal structure
-    survived accumulation as hatching the filter could not tell from
-    shadow. Raw (`--no-rt-denoise`) is now white grain under TAA.
-  - Instruments: `BIOMES_DEN_DBG=1` the temporal pass alone, `=2` each
-    pixel's history length in place of the shadow (white is 24 frames);
-    `BIOMES_DEN_NOHIST=1` no history ever -- a just-disoccluded pixel, the
-    spatial filter alone, which is what motion shows at edges.
-  - Measured: still-frame flicker on the close floor view (`--cam -30 0 -60
-    3.14 -1.0 --ground --time 16 --no-foliage --shake 60`): cascades
-    1.77-3.50, RT raw 2.3-5.6, RT denoised 0.76-0.95; the 17:30 wood with
-    grass, cascades 2.12-2.90, raw 3.86-4.86, denoised 1.58-2.38.
-    Walking at **2560 x 1440** (`--walk 15 --uncapped --res 2560 1440`):
-    no shadows 4.49, PCSS 6.20-6.25, RT denoised 7.60-7.63 with the near
-    cascades skipped. The RT pass in stills: close floor 4.0 ms, the 17:30
-    wood 5.9, the forest from the air 6.1 -- the denoiser ~0.9 of each,
-    the rest the trace, most of it alpha-tested leaf cards.
-  - **RT woods are darker than the cascades' and it is the trace, not the
-    denoiser**: raw and denoised agree from the air; the RT scene shades
-    crowns with every tree's LOD 1 cards (see the 76-79% agreement).
+- **Extinction falls off with ALTITUDE above sea level, not with height
+  above the ground.** Three layers, sigma at sea level x exp(-h / H):
+  ground 0.0023 / 70 m (the lowland's ~1.5 km), valley 0.015 / 40 m
+  (dawn's sea of fog), deep 0.0001 / 1000 m (peaks fade by ~20 km). From
+  the lowland every near-level sight line runs through the dense air; a
+  summit rises out of it; from a hill above the layer the lowland a few km
+  off is hidden, because the line down to it crosses km of the dense air,
+  while the ground below, seen steeply, is not. The terrain-following mist
+  could do none of this: it thinned over a hilltop as much as over a
+  valley, so climbing cleared the view -- that was the complaint.
+- **Analytic**: an exponential layer's optical depth along a straight ray
+  has a closed form (`hfog_layer`), exact at any range, sky included, with
+  the stretch below the base at the base's density. The froxel mist keeps
+  the near field's patches, shafts and torch glow, and now thins above 60 m
+  by e-folding 120 m (`mist_top`): left alone it fogged summits inside its
+  6 km as thickly as the plain, and at dawn hid the far peak entirely.
+- **Its colour is the sky's own horizon in that azimuth**, so the land
+  fades into the horizon -- warm towards the sun (the table's Mie glow),
+  cool away, dark at night -- greyed by cover^2 x 0.9 and dimmed by
+  `storm_dim` as the sky light is. Looking DOWN it blends to the horizon
+  averaged over four azimuths: azimuth alone stood a pillar of the sun's
+  glow in the fog at dusk. Near the eye it takes the heightfield GI's share
+  of open sky (a sealed chamber does not glow).
+- **The valley layer** follows the mist's dawn and dusk bumps over a midday
+  floor of 8% (`valley_noon`) and is blown away by wind, (1 - U / 6 m/s)^2
+  (`valley_wind`). Rain thickens every layer as it does the mist.
+- **Measured** (the shot report's `height fog:` line: the layers' own 2%
+  contrast distance, 3.912 / sigma, along a level line; the froxel patches
+  add near the ground): at 20 m above sea 1.8 km at noon, 0.7 km at 07:00,
+  0.86 km in a storm; at 300 m 37 km, 600 m 71 km. The views: spawn's wood
+  closes in within a few hundred metres; from 300 m over the badlands at
+  noon the far summit stands as a silhouette while the coast and lowland
+  sink into the layer; at dawn a sea of fog; the sea-level view of the
+  island's far headland, clear before, is gone into the haze.
+- **Cost**: walking at 1440p 7.05 / 7.04 ms against 6.98 / 6.99 without.
+- **Not done**: the base is sea level everywhere, so a high plateau is
+  clear air (highland, glacier sit at 90-110 m base, relief to 300+) --
+  a regional base from the fog map, blurred over a few km, is the next
+  lever if plateaus see too far; the lightning flash and local lights do
+  not light this fog (the froxel mist carries them); the far terrain rings,
+  far shadow and canopy shell still draw to their old reach, which the fog
+  now hides -- a draw-distance cut would pay for it.
 
-### Canopy shade: crown volumes and a traced sky (ADR-004 L6, step 1)
+### Hardware ray tracing: REMOVED (git tag `rt-last`)
 
-`--rt-sky` (Shift+R) scales the AMBIENT target by a traced sky visibility:
-one cosine-weighted ray a pixel a frame through `gi_transmittance`
-(`gi_trace.hlsli`), which is 0 at any opaque hit and Beer-Lambert through
-the CROWN VOLUMES -- one procedural unit-sphere BLAS, instanced per standing
-tree as an ellipsoid round its crown (mask 0x4, InstanceID `0x400000 |
-model`), with the species' `leaf_density` from archetypes.json as the leaf
-area density (extinction 0.5 x LAD). `--no-crowns` keeps terrain and trunks
-only, for A/B; `--rt-sky-rays <n>` traces more.
+ADR-004 L5/L6 built a DXR 1.1 ray-tracing tier: denoised RT key-light
+shadows (the default for a while), a traced sky visibility through crown
+volumes, DDGI probes, opaque leaf cutouts for the shadow ray, and the
+`--rt-report` / `--gi-report` / `--check-rt` instruments. **It was removed**:
+it cost ~1.2 ms of a 1440p walking frame (8.2 -> 7.0 ms without it) plus
+~300-600 MB of BLAS, TLAS and scratch, and every future dynamic thing --
+built structures, animated creatures, particles -- would have needed its own
+BLAS upkeep, where the cascades shadow anything that is drawn into them.
+Shadows are the cascades with PCSS and the far terrain shadow; diffuse GI is
+the heightfield GI with the canopy map.
 
-- **Crowns are for diffuse rays only.** The key-light shadow (`gi_occluded`,
-  mask 0x3) never sees them, so the alpha-tested cards keep every sunfleck.
-- **A ray skips the crown it starts inside** unless it starts on terrain:
-  charging a leaf for the whole crown behind it drew every crown dark from
-  outside. A ray heading down stands for the ground's bounce and does not
-  see terrain, or every trunk in an open field would lose half its light.
-- `--rt-report` prints the sky visibility with and without crowns and the
-  cost: wood 0.90 -> 0.50, spawn 0.93 -> 0.59, +1.5 ms in a dense wood at
-  full resolution. The ambient target also holds LOCAL light, which this
-  dims too until DDGI separates them.
+Everything is in the tag: `git show rt-last:engine/render/rt_scene.cpp`,
+`git checkout rt-last -- <path>` for a file, or `git log rt-last` for its
+history -- `rt_scene`, `rt_denoise`, `rt_check`, `ddgi`, `leaf_cutout`,
+`gi_trace.hlsli`, `rt_shadow.hlsl`, `ddgi_update.hlsl`, and this file's old
+sections on them. What it taught that still applies without it:
 
-### Canopy shade without RT: the canopy map (ADR-004 L6, step 2)
+- **This GPU (RX 7900 XT, RDNA3) traverses in shader code**: a non-opaque
+  candidate in an inline RayQuery is a branch in the same loop, so "opaque
+  is 2-4x faster" does not hold, and dense geometry costs real traversal.
+- **One sample a pixel a frame is grain TAA cannot remove** (it clips to
+  the 3x3 neighbourhood, which holds 0 and 1); it needs its own temporal
+  filter. Half-resolution traces boiled on swaying trees.
+- **A leak test needs the air too**: the haze and the mist assume sunlit
+  air, so a sealed chamber glowed until their in-scatter near the eye was
+  scaled by the GI's share of open sky at the camera (`cs_hf_camera` now).
+- **Hanika's lifted shadow-ray origin** ("Hacking the Shadow Terminator")
+  cured self-shadow streaks on smooth-normalled coarse facets -- worth
+  remembering for any future screen- or ray-space shadow.
+- **What a probe GI's "off" probe means decides its leak**: falling through
+  to a coarser cascade handed daylight into a sealed room.
 
-On by default (`--no-canopy`, `B` for A/B); the traced sky replaces it
-under `--rt-sky`. `engine/render/canopy.{h,cpp}` splats every standing
-tree's crown ellipsoid (`crown_volume` in `tree_mesh.h`, the same volumes
-the RT scene traces) into a 512 m camera-centred map of 1 m texels on the
+### Canopy shade: the canopy map (ADR-004 L6, step 2)
+
+On by default (`--no-canopy`, `B` for A/B). `engine/render/canopy.{h,cpp}`
+splats every standing tree's crown ellipsoid (`crown_volume` in
+`tree_mesh.h`) into a 512 m camera-centred map of 1 m texels on the
 GPU -- vertical optical depth, tau-weighted crown bottom and top, vertical
 transmittance -- then blurs it a-trous into five wider slices
 (`canopy.hlsl`). `canopy.hlsli`, included by `shadow.hlsli`, reads it in
@@ -1203,7 +2037,7 @@ transmittance -- then blurs it a-trous into five wider slices
 heap [38] (t25), a THIRD range of every lit pipeline's shadow table; its
 corner and reference height ride in `l_canopy` (ShadowConstants, 432 bytes).
 
-- **It is judged against the traced crowns.** `--rt-report` traces 16
+- **It was judged against traced crowns** (while RT existed: `rt-last`). 16
   crowns-only rays a pixel and compares terrain pixels inside 200 m: wood
   0.32 traced / 0.37 map (mean per-pixel error 0.066), spawn 0.51 / 0.48
   (0.077), bare hillside 1.00 / 1.00. One ray a pixel made the "error"
@@ -1224,105 +2058,9 @@ corner and reference height ride in `l_canopy` (ShadowConstants, 432 bytes).
 - At EV100 13 the shaded half of the woodland floor goes from luma 82.6 to
   62.2 (the traced sky: 58.5); crowns seen from above keep their tops.
 
-### DDGI probes (ADR-004 L6, step 3)
+### Heightfield GI (ADR-004 L6, step 5) -- the diffuse GI
 
-Ray-traced probe GI, **OFF by default** since its +2.8 ms walking was judged
-too dear (`--gi`, `I`; `--gi-report` and `--leak-test` switch it on
-themselves). Off, `gi_diffuse` is the heightfield GI (below) with the
-canopy map. It stays as the reference anything cheaper is measured
-against.
-`engine/render/ddgi.{h,cpp}`, `shaders/ddgi_update.hlsl` (the update),
-`ddgi.hlsli` (the reader), `ddgi_common.hlsli` (the layout both share).
-Three camera-centred cascades of 24 x 12 x 24 probes, 2, 8 and 32 m apart,
-addressed by world grid coordinate and stored at it mod the dims, so they
-scroll; a slot whose stored coordinate is not the one it should hold is
-"not yet traced" and is never sampled. 128 rays a probe, a quarter of the
-probes a frame, hysteresis 0.92; 8x8 irradiance and 16x16 depth-moment
-tiles, gutters written by the blend from group memory.
-
-- **Probe rays** go through `gi_trace_probe`: the nearest OPAQUE hit
-  (terrain, bark; cards culled) and the crowns' optical depth before it.
-  A miss is the sky (below the horizon, the lit ground); a hit is lit by
-  the key light (a `gi_transmittance` ray), the first 8 local lights through
-  their shadow atlas, and last frame's probes (every further bounce). A
-  terrain face seen from behind is rock: distance negative, no radiance.
-- **Probes in rock** (more than a quarter of rays backfacing) step through
-  the nearest wall or switch OFF and trace 32 rays; probes with nothing in
-  reach go IDLE (32 rays). 22-57% of a cascade is rock, and at spawn from
-  46 m up all but 53 of cascade 0 are idle.
-- **The leak is decided by what an off probe means.** First version: a
-  point whose cascade-0 neighbours were all off fell through to cascade 1,
-  whose nearest probes stand outside in daylight; the Chebyshev floor (0.05)
-  and the weights' normalisation handed their light back -- 210 nits in a
-  sealed chamber. Now only NOT-YET-TRACED or idle neighbours justify asking
-  a coarser cascade; all-off is "walled in", irradiance 0.
-- **The air leaked too.** The atmosphere's aerial perspective and the
-  mist's sky term assume sunlit, sky-lit air: 3.4 and 10 nits in the
-  chamber with the walls black. `cs_ddgi_camera` measures the probes' share
-  of an open sky's light at the eye (six directions), the CPU reads it back
-  two frames late (`Ddgi::camera_sky`), and post and fog scale their
-  in-scattering by it over the first 64 m, back to full by 256 m. A fade
-  starting at the eye left 6% of the haze at 4 m: 0.2 nits, the residue.
-- **`--leak-test`**: a 4 m sphere dug 10 m under flat ground; it settles
-  1200 frames inside, then measures each config, outside LAST. Sealed and
-  unlit 0.001 nits (the histogram's floor) with or without mist, the
-  chamber's 19 cascade-0 probes all ACTIVE, against 566 on the fallback and
-  2,985 outside; a carried torch's bounce adds 1.08x its direct light,
-  which in a closed chamber means walls of albedo 0.07 -- the meadow
-  material it was dug from. Luminance is read from the meter's histogram
-  (`band_nits`): the meter's own target stops at EV100 -2. It prints, per
-  config, what the probes say at the eye and the chamber's probe states.
-- **Its first pass was an accident, twice over.** (1) `field_normal`
-  ignored the player's edits, so every DUG surface had the undug rock's
-  normal -- "up" ten metres down -- and the chamber's ceiling and walls
-  faced into rock: every probe inside read "in rock", switched off, and
-  the walled-in rule returned black, which is what a sealed chamber should
-  look like. The raster has shaded dug surfaces with those normals since
-  edits existed. A cell that touches an edit now takes its gradient from
-  its own eight (edited) corners. (2) A still's residency loop meshed
-  without telling the RT scene, whose drawn-slot scan only catches changed
-  KEYS; a dig re-meshes the same key, so the BLAS kept the undug rock.
-  `capture()` now calls `note_meshed`. The probe states line is what
-  showed both: "19 off in rock" in a hole dug for the purpose.
-- **Re-entry transient:** stepping out of the chamber and back scrolls its
-  probes out of cascade 0 and swaps the LODs round it; the fresh probes
-  catch light through the half-rebuilt scene and it decays at 0.92 an
-  update -- 10 lux at the eye after 240 frames, under 0.01 after ~1000.
-  Not fixed.
-- **Sky rays were thrown away for the first version.** A miss stored
-  distance 1e27 and an untraced ray 2e27, and the readers skip anything at
-  or past HALF of the latter -- exactly a miss. The probes saw only the
-  ground and its bounce: facing up in open air a third of the sky's light
-  and a twentieth of its blue, and shaded birch trunks read olive (RGB 36,
-  48, 8). `kDdgiUnused` is 1e30 now; the trunk is (35, 53, 29) and the
-  probes' sky colour matches the fallback's facing up (B/G 1.54 v 1.50).
-  `--gi-report` prints the probes' six-way irradiance at the eye beside
-  the fallback's, which is how it was found.
-- **`--gi-report`**: luminance with DDGI against the fallback (bare
-  hillside 1.03, wood 0.72, spawn 0.87), update ms, the eye's six-way
-  irradiance against the fallback's, per-cascade active / off in rock /
-  idle / not yet traced.
-- **The bounce is warm in the badlands and it is physical**: shaded sand
-  takes ~14% of sunlit sand's red (linear), where half a hemisphere of
-  sunlit sand at that albedo predicts ~18%; the probe rays decode albedo as
-  the raster does. The fallback's grey ground bounce never had it.
-- **Trees and grass read the probes per VERTEX** (`g_gi_vertex` in
-  `lighting.hlsli`, set from an interpolant); `gi_diffuse` also leaves
-  `g_gi_all` for `gi_specular`, so a probe-lit cave reflects no sky.
-- **The 1.3x fill on trees and grass is gone where the probes answer**
-  (`gi_fill`): it stood in for bounce between leaves and blades and off the
-  floor, which the probes compute. The fallback keeps it.
-- **Cost, walking** (`--walk 15 --uncapped`): 2.46 -> 5.24 ms. Split with
-  `BIOMES_GI_DBG` (1 samples stale probes and skips the update, 2 updates
-  and never samples): the update ~1.1 ms, sampling ~1.0 ms (terrain per
-  pixel -- removing trees or grass does not change the delta), the RT scene
-  now built every frame ~0.65 ms. Not optimised yet.
-- **Not done:** the mist's sky term per froxel rather than at the camera;
-  logs and stumps are not in the TLAS; the re-entry transient.
-
-### Heightfield GI (ADR-004 L6, step 5) -- the default diffuse GI
-
-On by default (`--no-hfgi`, `Z`); DDGI replaces it where on. The world is
+On by default (`--no-hfgi`, `Z`). The world is
 mostly 2.5D, and the light that matters -- the sky the terrain round a
 point leaves, the light that terrain bounces at it -- comes as often from
 off screen as on. `engine/render/height_gi.{h,cpp}`, `shaders/height_gi.hlsl`
@@ -1348,7 +2086,7 @@ off screen as on. `engine/render/height_gi.{h,cpp}`, `shaders/height_gi.hlsl`
   8, 16 m out) and takes that column's light, faded over 12 m. None: walled
   in, no sky and no bounce. "Below means covered" alone drew every
   overhang's underside black.
-- **The air**: `cs_hf_camera` is the heightfield's `cs_ddgi_camera` -- the
+- **The air**: `cs_hf_camera` (DDGI's `cs_ddgi_camera` before it) -- the
   map's share of an open sky at the eye, read back, scaling the haze and
   the mist near the camera. Without it the sealed chamber's walls were
   black and its air 13.8 nits.
@@ -1357,13 +2095,291 @@ off screen as on. `engine/render/height_gi.{h,cpp}`, `shaders/height_gi.hlsl`
   trunk (83, 93, 69) -> (57, 75, 54) (DDGI 35, 53, 29). `--leak-test`'s
   no-RT config: sealed and unlit **0.001 nits** (the histogram's floor),
   where the bare fallback leaks 566. **Cost +0.05 ms walking** (2.36 ->
-  2.41), against DDGI's +2.8.
+  2.41), against DDGI's +2.8. The DDGI figures above are from `rt-last`.
+  After RT's removal, `--leak-test`: sealed 0.001 nits with and without
+  mist, the bare fallback 424, outside 709.
 - **Not done**: crowns as bouncers (the canopy map dims the sky, nothing
   sends the leaves' green), local lights in the bounce, anything past
   256 m, and true caves seen from inside a big cavern (it sees only the
   nearest opening's light).
 - Heap [48..52] the scene's SRVs (t38..t42, a sixth range of the lit
   tables), [53..55] the update's inputs, [56..61] its UAVs; the heap is 64.
+
+### The near field: light under the top surface
+
+The heightfield GI is 2.5D: anything more than 1.5 m under its 2 m map was
+"covered", and either borrowed light from a way out found by a search or
+went black -- a hard step in every dug pit and tunnel. `engine/render/
+near_field.{h,cpp}`, `shaders/near_field.hlsl`, the reader in `hfgi.hlsli`
+(`nf_sample`, `nf_depth`, `nf_openness`). On by default; `--no-near-field`
+for A/B, `BIOMES_NF_NOREAD=1` updates it but has no shader read it (cost
+A/B). The goal set for it: deep is DARK unless something down there emits.
+
+- **The volume**: 128 x 64 x 128 voxels of 1 m round the camera, the field
+  (`real_terrain_density` at 1 m) plus the player's edits (their absolute
+  value at the 1 m points, scattered from the CPU). TOROIDAL: world voxel w
+  is stored at w mod N, so following the camera refills the 8 m blocks that
+  scrolled in (48 a frame, dug ones first) and moves nothing. A dig refills
+  its blocks and dirties every probe within 12 m. Occupancy (a 1 m ramp of
+  the density, R32 so typed UAV loads are guaranteed) with mips to 16 m,
+  and a per-column map of the REAL top surface at 1 m (`cs_nf_top`).
+- **Probes**: 64 x 32 x 64 at 2 m, 64 rays each -- one per bin of an 8 x 8
+  EQUAL-AREA octahedral map (Clarberg 2008), jittered inside it by a hash
+  of the probe and the update -- marched through the occupancy at 1 m to
+  6 m, where the coarse level takes over (below); the coarse mips only
+  SKIP empty 4 m cells. A ray that rises above the
+  heightfield's top surface, or leaves the volume, carries back the
+  heightfield's sky visibility and bounce in its direction. L1 SH in the
+  heightfield's own convention, blended over updates (DDGI's way) by
+  exp(-interval / memory): 0.35 s (`NearField::Schedule`, the tuning
+  panel's Near field group, `--nf-schedule <fine s> <coarse s> <light s>`);
+  an edit's probes start over. **Every probe under cover is traced every
+  other frame (the LIVE LIST, below)**; the CPU's round robin, 2048 a
+  frame, only places probes and copies the heightfield into the open ones.
+  (Until the live list: 4096 a frame round robin with 1.5 s of memory, and
+  the 8 x 8 x 8 round the camera on a 60 Hz timer. The history notes below
+  are from then.)
+  - **32 rays at 0.85 everywhere made the walls DANCE** where the sky came
+    in through a small opening -- the bottom of a stairwell 10 m down: a
+    few of the 32 rays found it, a different few each frame. Settled at a
+    fixed EV100 3.5 (300 frames, then `--shake`), 39k pixels a frame
+    jumped more than 20 levels; 64 rays and the box's longer memory, 10.
+    The level is unchanged (luma 102 -> 107): that stairwell sees the sky.
+  - **A thread a probe was latency, not work.** The pass cost 0.8 ms at
+    1440p whether it traced 4,608 probes (play) or all 131k, and doubled
+    with the rays: each thread walked its 64 rays in series (up to 96 steps,
+    and a lit hit gathering 8 probes), and the pass lasted as long as the
+    slowest. A GROUP a probe and a THREAD a ray (the SH summed in group
+    memory): **0.818 -> 0.052 ms**, same rays, same image. The timer was
+    meant to win that back and could not: the box at 10 Hz cost the same
+    as every frame. `BIOMES_NF_PLAY=<fps>` runs a still on play's schedule
+    at that frame rate after settling, and `--gpu-profile` prints probes
+    traced a frame -- the two that found it. A probe in rock moves 0.9 m along an axis into
+  air or switches off. Only probes under REAL cover trace -- under the 1 m
+  top map by half a metre, or 1.5 m under the heightfield's (a narrow pit)
+  -- the rest copy the heightfield: open air over a slope sits under the
+  2 m map's texel maximum, and tracing it doubled the walking cost.
+- **A ray that meets rock is lit** (`nf_hit`, step 2): the surface found by
+  three bisections, its normal from the occupancy's gradient, then the sun
+  (one cascade tap half a metre out along the normal -- the volume's wall
+  is a metre-resolution guess at the mesh -- times the clouds' shadow) and
+  the probes round the hit (read from the buffer being written, with the
+  reader's rock-in-between test): every further bounce, a frame at a time.
+  Times a fixed wall albedo (0.26, 0.23, 0.20) over pi. **A fine hit (under
+  6 m) is lit by the local lights too** -- the frame's first 32 with a
+  shadow, each through one tap of its own map, the distance held to 0.5 m
+  (`kNfLightNear`). They came out once: their bounce faded in through the
+  probes' history, and a ray that struck rock beside a flame (the inverse
+  square at a few tens of cm) lit its probe tenfold for a frame. Back in,
+  with the clamp, the short rays, and the FAST LIGHTS: a shadowed light
+  that moved or took its shadow slot within 60 frames (the carried torch
+  always) gives its probes within 10 m a 0.1 s memory
+  (`Schedule::light_memory`, `light_reach`; the live pass tests each probe
+  against up to 8 fast lights), so the bounce follows the torch with no
+  fade-in. The torch walk
+  with the bounce in the probes and no coarse level: the meter's 90th
+  percentile 0.234-0.399 nits, sd 0.023 -- what the fill gave. A light
+  past the 24 shadowed ones is left out (it would bounce through rock).
+- **Three things made a lit tunnel pulse and creep** (the torch walk of
+  `--adapt-test --torch`, its meter's 90th percentile per frame):
+  - **One rotation of the ray set for every probe.** Down a straight
+    tunnel the sunlit ramp at its mouth is a sliver most rays miss; on the
+    frame the shared rotation aimed one up the tunnel, every probe caught
+    100 klx at once and the whole tunnel flared 10x -- 16 pulses in 75 s.
+    Each probe now turns the set by its own hash (`nf_probe_turn`).
+  - **The sun at a FAR hit.** Turned per probe, the same rare rays still
+    lit single probes tenfold (the meter wandered 0.25-1.25 nits; 0.22-0.29
+    with the near field off). The sun at a hit faded out over 4-12 m of
+    ray (`kNfSunNear/Far`); that fade now applies only to a fine ray that
+    finds no coarse level to take. A radiance clamp at the sky's mean did
+    nothing more and cut real bounce; it went.
+  - **Stale probes in the toroidal store**: a block that scrolls in
+    clears its probes in the fill pass, so no neighbour reads a probe from
+    the far side through `nf_hit_irradiance`. The round robin's memory
+    is 1.5 s (3.3 s took half a minute to settle a tunnel walked into).
+- **Measured**: 8 m into `--dig-tunnel` at 11:00 and EV100 11, the walls
+  round the camera 2.1 -> 5.8 luma (the sunlit shaft bouncing in), the
+  floor near the mouth 73 -> 80; sealed and unlit still 0.001 nits, the
+  sealed chamber with a torch 0.046 -> 0.053 (its walls bouncing). A torch
+  down a STRAIGHT tunnel barely changes: it lights every wall seen
+  directly, and 0.26-albedo walls send back ~2% of a lux. Frame-to-frame
+  change in that tunnel view (`--shake 60`, raw frames): 0.23 levels on
+  average against 0.14 with the probes unread.
+- **Cones leaked; rays do not.** The first version traced six 45-degree
+  cones through the occupancy mips. At 8-16 m a cone samples 16 m cells,
+  where a 6 m roof averages to half open: `--leak-test`'s sealed chamber
+  went from 0.001 nits to 18.5. Rays at 1 m put it back to 0.001.
+- **The reader**: `hfgi_sample` blends to the probes where a point is under
+  the REAL top surface (`nf_depth`, from the per-column map) by 0.5-1.5 m,
+  and wherever the heightfield's old covered branch would have run (more
+  than 1.5 m under its map). Eight probes, weighted trilinearly, by facing,
+  and to ZERO where either of two occupancy loads on the way to the probe
+  is rock -- so a tunnel under a metre of roof does not borrow the sunlit
+  probes over it. Deciding cover by the 2 m map instead put ordinary bumpy
+  ground in the probe path: it keeps the HIGHEST point of each texel.
+- **The air**: the mist lit every froxel with the sky's share at the EYE,
+  and the composite lit the haze and the height fog the same way, so a
+  tunnel seen from a sunlit shaft glowed (centre luma 58; 2 without the
+  height fog). Each froxel now records how much ground over it darkens it
+  (`nf_openness`: 1 in the open, the probes' mean sky visibility under the
+  top surface, 1 inside rock, which nobody sees), `cs_fog_integrate`
+  averages that along each view ray, and the composite multiplies its old
+  rule by it. Open air keeps the old rule EXACTLY: lighting it by the
+  heightfield's visibility instead moved 63% of an open meadow's pixels by
+  up to 47 levels, against fog tuned to the old one. With it on, the open
+  spawn view differs from `--no-near-field` on 3 pixels in 921,600.
+- **`--shot ... --dig-tunnel`** digs a shaft 6 m down at the camera and a
+  22 m tunnel along its heading, and stands the camera in the shaft
+  looking down it; `--tunnel-in <m>` stands it that far in, looking back
+  (`--tunnel-inward`: further in); `--tunnel-up` looks up the shaft;
+  `--tunnel-len`, `--tunnel-r`, `--tunnel-depth` its size; `--tunnel-ramp`
+  a ramp in from the surface instead of the shaft. From spawn: `--cam -96
+  32.5 -440 0 -0.55 --dig-tunnel --time 11 --ev100 11`. A dead end 8 m
+  down, 4 m wide, entered by a ramp (`--cam -96 32.5 -440 3.14159 -0.55
+  --dig-tunnel --tunnel-ramp --tunnel-len 55 --tunnel-r 2 --tunnel-depth 8
+  --tunnel-in <m> --tunnel-inward --time 11`), adapted exposure: the mouth
+  EV100 4.6, 10 m in 2.6, from 20 m the meter's floor (-1).
+- **Three leaks a long 4 m tunnel found** (a player's report: "my eyes
+  adjusted and it was very well lit, with noise"):
+  - **The sun at a ray's hit took the cascade by distance.** The near two
+    are fitted to slices of the VIEW; a hit behind or beside the camera
+    fell outside their maps, where the border reads lit -- full sun on the
+    walls of a SEALED tunnel 12 m down, adapted to EV100 0.2-3.4 from run to
+    run. Hits take the third cascade, fitted round the camera: -1.
+  - **A froxel in rock counted as open air** (chosen so haze over hills
+    would not thin). Down a tunnel the last slice before a wall often
+    samples inside it, and lit the fog along the whole ray: bright bands a
+    metre apart (`--texture 0` showed them; the rock texture hid them).
+    Rock now holds no air: no mist, and no part of the ray's openness
+    average. Open ground still 1 pixel in 921,600 off `--no-near-field`.
+  - **The heightfield's old covered branch** (where the near field does
+    not reach) took light from any column within 16 m whose surface lies
+    below the point -- any slope -- and lit that sealed tunnel to EV100 5.
+    More than 4 m under its map it is now enclosed.
+  The reader's probe visibility marches the occupancy every half metre
+  (`nf_clear`) instead of two samples, which could straddle a 1 m roof.
+- **Two levels** (Split Radiance Cascades' idea, `docs/2607.20384v2.pdf`:
+  a coarser level with more directions over the longer interval, merged
+  into the finer; not its hash map, screen-space split or hardware rays).
+  The COARSE level (`cs_nf_coarse`) is one probe per 8 m block (2048),
+  placed on the block's 1 m lattice point that is air, under cover by the
+  fine probes' own rule, with least rock beside it, then nearest the
+  centre (open air takes the heightfield's answer in every bin; all rock,
+  none) -- kept until the block is filled again. 256 rays, four per
+  octahedral bin (the cascades' branching), each in its quarter of the bin
+  jittered by an R2 sequence over the probe's updates, marched from the
+  probe and counted from 6 m to 48 m; a bin keeps (a R, a G, a B, a vis)
+  and a, the share of its rays that got 6 m clear, blended with a 1 s
+  memory (`Schedule::coarse_memory`); the covered ones are on the live
+  list, every frame, the R2 sequence stepping once an update. A fine ray that
+  gets 6 m clear takes ITS bin (`nf_merge`) from the eight coarse probes
+  round its probe -- trilinearly, by a, and only those the fine probe sees
+  (`nf_coarse_seen`, once a probe by eight threads; per ray from its 6 m
+  point it was the fine pass's longest chain) and, where their own 6 m
+  point is air, whose point the ray's sees -- and stops; with none, it
+  marches on as before. Measured:
+  - **Rays pinned to bins, not a rotated Fibonacci set.** With the set
+    turned per update, WHICH coarse bin a ray landed in was a lottery: a
+    sunlit mouth 25 m off caught by one ray or three, and the meter
+    wandered 4x over seconds. **Equal-area bins:** the plain octahedral
+    map's strata run from 0.32 to 1.65 of the mean solid angle, and a
+    sunlit patch in a heavy one jumped the stairwell's mouth on 202 pixels
+    where equal-area gives 19. **Fresh random jitter for the fine rays,
+    not R2**: the round robin returns to a probe every ~32 frames, a stride
+    that walks the sequence slowly across a bin -- updates in a row all
+    miss a sunlit patch, then all catch it: 8,467 pixels.
+  - **The coarse level's direct sun still fades, 6 to 24 m**
+    (`kNfCoarseSunFar`). Unfaded, its 4 rays a bin found a sunlit patch
+    20-40 m down the test tunnel by chance; unlit and 20 m in, the 90th
+    percentile wandered 4x over seconds (sd 70% of the mean). Faded, the
+    patch's light comes through the fine probes beside it. Not clouds:
+    `--no-clouds` gave the identical run. A longer coarse memory (3 s)
+    only stretched the settle after walking in (gaps.md).
+  - **A still iterates both levels four times a frame** (`kSettleIters`)
+    and the coarse level takes the plain mean of a still's updates: the
+    levels bounce off each other, and a still's ~17 frames at a second's
+    memory left the stairwell's side tunnel 10x too dark against play.
+  - Torch walk (`--adapt-test --torch`, 20 m in): 0 frames where the 90th
+    percentile doubles; it holds 0.234-0.318 nits (mean 0.265, sd 0.014;
+    before: 0.217-0.431, sd 0.022). Unlit: EV100 holds the 1.5 floor, p90
+    0.031 nits. Stairwell (`BIOMES_NF_PLAY=60`, `--shake 300 --ev100 3.5`,
+    pixels a frame changing over 20 levels): [11, 19, 6, 1, 5, 0, 4] against
+    [131, 20070, 907, 20, 95, 9, 38] -- the 20k was a round-robin probe at
+    the sunlit mouth taking a 30% step. `--leak-test` sealed 0.001 nits.
+  - `BIOMES_NF_NOCOARSE`, `BIOMES_NF_NOLIGHTS` A/B the two halves;
+    `BIOMES_NF_DBG=1` paints a fine ray that took the coarse level red and
+    one that found none green, `=2` counts (placed, bin open, visible),
+    `=3` never merges (the merge's cost); view with `--texture 0 --tonemap
+    0 --ev100 1`.
+- **Cost** at 1440p, walking: +0.17 ms before the hits were lit, +0.22 /
+  +0.25 with them (8.27 / 8.40 against 8.05 / 8.15); the probe pass is
+  ~0.05 ms in a tunnel since it went to a thread a ray (above). **With two
+  levels** (the torch tunnel, `BIOMES_NF_PLAY=60 --gpu-profile`): 0.115-
+  0.121 ms at 1440p and 4K alike (both levels off 0.074-0.076; coarse pass
+  without merging 0.107 -- the coarse pass ~0.03, latency-bound by its
+  48 m rays, the merge's visibility ~0.015, the lights at hits ~0.005).
+  Walking at 1440p 8.34 ms against 8.35; `--lights-report` +0.06-0.09 ms
+  on every row (the coarse pass, lights or none).
+- **The live list, and the clock jumping.** Fast-forwarding the clock left
+  tunnels lit by daylight for ~10 s after the jump: a 3,000x fall through
+  the round robin's 1.5 s memory, the box's 0.35 s, the coarse level's 1 s,
+  each bouncing off the others. `--shot ... --clock-jump <hours> [s]
+  [ramp s]` is the instrument (`build/time_jump.txt`: the meter's 10th
+  and 90th percentiles in nits, every simulated 1/30 s, after 2 s at the
+  still's hour; with a ramp the clock runs there evenly, as H does).
+  - **Only probes under cover trace**: 1,128 fine and 21 coarse of 131k
+    in the test tunnel. Every probe every frame was 0.45 ms. So in play the
+    CPU's list is classified a THREAD a probe (`cs_nf_classify`: copy, off,
+    or mark to trace -- fresh if dirty), `cs_nf_live` compacts every probe
+    marked to trace into a list on the GPU (and every covered coarse
+    probe), `cs_nf_live_args` writes an indirect dispatch, and
+    `cs_nf_probe_live` / `cs_nf_coarse_live` trace them -- fine probes half
+    the list a frame (`Schedule::live_stride` 2, ~33 ms; stride 1 is
+    0.138 ms against 0.104), coarse every frame (its pass is latency, a
+    handful of groups of 48 m rays, so it runs beside the fine pass with no
+    barrier between: a fine ray takes a bin from this frame or the last).
+    Past 8,192 fine probes a frame the list is walked in longer turns.
+    The counts live in two slots by the plan's parity, so no reset
+    dispatch; `--gpu-profile` prints the lists' lengths and marks each pass.
+  - **A jump of the light starts over.** `Renderer` measures each frame's
+    change (|ln| of the key light's and the sky's ratios, plus the key's
+    turn over 0.05 rad, `NearField::set_light_change`); past 1 (a time skip
+    over ~10 minutes, the key passing from sun to moon) the near field
+    clears its probes and settles in the frame as a still does (both levels
+    iterated four times: one frame at a still's cost, unmeasured), the heightfield GI rebuilds four
+    frames running with the first dropping the old bounce
+    (`HeightGi::reset_bounce`), and the mist drops its history. Shortening
+    every blend by the change instead (exp(-c / 0.1)) made the meter jump
+    4x frame to frame through a fast sunset; with the live list a fast
+    clock is followed anyway. `BIOMES_NF_NORELIGHT` A/Bs it.
+  - **Measured**: the stairwell 14:00 -> 23:00, the 90th percentile within
+    10% of night in **1 frame** (9.4 s with the live list and no reset,
+    over 12 s before either); the pit 04:00 -> 12:00 in 0.3 s; 17:30 -> 20:00
+    over 25 s (H's rate) no frame doubling, at night before the clock
+    stops. The torch walk holds 0.234-0.294 nits (sd 0.010), unlit 0.029
+    (sd 0.003); the stairwell's flicker [15, 19, 9, 2, 9, 1, 4];
+    `--leak-test` 0.001 nits.
+  - **The R2 sequence must step once an update.** It stepped once a lap of
+    the coarse round robin; traced every frame, a coarse probe re-traced
+    the same 256 directions 16 frames running and blended them as new, and
+    the unlit tunnel's meter came in bursts (sd 0.025 against 0.003).
+  - **Cost** (the torch tunnel, `BIOMES_NF_PLAY=60 --gpu-profile`, the
+    near field's marks summed): 0.104 ms at 1440p, 0.106 at 4K -- below
+    the 0.115-0.121 before the live list: fill 0.001, coarse round robin
+    0.007, classify 0.005, lists 0.004, live 0.087. Walking 8.37 ms; the
+    lights report within noise. It was +0.8 ms twice over before two finds: the
+  shallow cover test (above), and **HLSL's `&&` does not short-circuit**:
+  `knf > 0 && nf_sample(...)` ran the eight probes on every terrain pixel
+  and threw the result away. Call anything costly inside an `if`.
+- Heap: [40..42] (t26..t28, the range every lit table kept from DDGI): the
+  probes, the occupancy, the top map; [112..119] the near field's own;
+  [120..122] the mist's openness volumes (t16 in post). The mist root and
+  the heightfield's camera pass declare the range too.
+- **Not done**: see gaps.md -- the walls' own material, emitters as a
+  kind of light, and the volume's reach. How dark a deep tunnel LOOKS is
+  not the near field's: it gives the light (none, sealed), and dark vision
+  (the exposure floor by open sky, slow adaptation, the display's floor)
+  decides what the eye makes of it.
 
 ### Screen-space bounce (ADR-004 L6, an experiment, OFF by default)
 
@@ -1421,11 +2437,19 @@ lit tables), [46] UAV; `--post-debug 3` shows it.
 - The sea writes its colour to the direct target as before and only REMOVES
   ambient under it (ZERO / INV_SRC_ALPHA on target 1), so seabed AO does not
   show through it.
+- **The sea zeroes the direct target's alpha**, the contact-shadow mask
+  (ZERO / ZERO). It writes no depth, so the composite's 0.5 m march runs on
+  the SEABED and multiplies the whole blended colour, reflection and all.
+  Blending its alpha as ONE / INV_SRC_ALPHA left every water pixel at 1:
+  at a low sun the seabed's contact shadows speckled the sea in a band
+  that flickered with the march's jitter (`--sea-shot --time 17.5`).
+  Keeping the seabed's share (1 - a) still left 5x `--no-contact`'s
+  frame-to-frame change in the shallows; zero matches it exactly. RT
+  shadows are also traced from the seabed's depth, but agree with the
+  cascades on open water (0.7% of a sea view differs, all round the
+  island's trees).
 
 ### Shadows
-
-(Without DXR, or with `--no-rt-shadows`. Under RT shadows -- the default
--- only the far two cascades are drawn, for the mist.)
 
 Sun shadows, **four cascades out to 28, 100, 380 m and 1.6 km**, cast by
 the terrain and the trees and received by both through one function,
@@ -1445,7 +2469,12 @@ the terrain and the trees and received by both through one function,
   the near cascades' leaf cards.
 - **Time-sliced** (`cascades_due`): cascade 0 every frame, 1 every second,
   2 and 3 every fourth, interleaved -- two drawn a frame. Each keeps the
-  matrix its map was drawn with. Four cascades every frame at 4096 was +1.4
+  matrix its map was drawn with. **A moving caster past 28 m therefore
+  shadows at 30 or 15 Hz.** Nothing moves out there yet; when creatures,
+  built structures or particles do, the fix is the usual one: keep each
+  cascade's static map as a cached copy and draw the dynamic casters over
+  a copy of it every frame (a copy of a 4096^2 D32 slice is ~0.05 ms), so
+  static cost stays sliced and moving things never lag. Four cascades every frame at 4096 was +1.4
   ms walking; sliced at 4096, +0.7; with the per-cascade sizes, **+0.1**
   (2.41 -> 2.51 ms) for four times the reach.
 - **Filtering (PCSS)**: a 12-tap blocker search, the penumbra from the
@@ -1535,9 +2564,10 @@ threshold as a literal `X%`. Whether a world should read as one continent or
 an archipelago is a feel call made on the contact sheet, not an assertion.
 `tools/validate/README.md` §8 has the measurement. **Land fraction is the
 lever** (`--land-target`, `--land-sweep`, and a slider in `view.exe` reading in
-percent). It is now a **35% mean** — below the percolation threshold, so a
-typical seed is an archipelago of about 7 landmasses with the spawn mass
-holding roughly three quarters of the land, and the worst seeds far less.
+percent). It is now a **32% mean** (v16; 35% before) — below the percolation
+threshold, so a typical seed is an archipelago of about 8 landmasses with the
+spawn mass holding roughly two thirds of the land, and the worst seeds far
+less. `validate --land-sweep` tabulates the neighbouring settings.
 The offset behind it is solved GLOBALLY for the mean and baked as a literal:
 solving per seed would flatten the spread the islandness comes from.
 
@@ -1700,18 +2730,246 @@ shader draws. It is **not** the ADR-001 dialect and invariant 9 does not reach
 it: the sea feeds no hash, no save and no generator decision, so `sin` and
 `cos` are allowed here where they are forbidden four directories away.
 
-Wave height is a runtime value, because storms are a planned mechanic. The
-dial is `sea_state`, 0 to 1, and `--sea-report` says what it buys: **0.20 m
-crest-to-trough calm, 7.51 m at full storm**, with the surface mean staying at
-sea level to 2.4 mm — the one thing worth asserting, because a sea that rose
+Wave height is set by the WEATHER (below), because storms are a planned
+mechanic. The surface mean stays at sea level to 4.5 mm in every case
+`--sea-report` tries -- the one thing worth asserting, because a sea that rose
 with the weather would flood coastlines and no screenshot of a rough sea would
 look wrong.
 
-Controls: `--sea-state <0..1>`, `--sea-shot` (stands the camera off the nearest
-coast, which is the only vantage a 7 m swell reads as a swell from),
-`--water-debug 1..5` (depth, foam, normal, displacement, surviving amplitude;
-with `--tonemap 0` since L1),
-`--no-water`, and `[` `]` `K` in the window.
+Controls: `--sea-shot` (stands the camera off the nearest coast, over 4-12 m of
+water), `--water-debug 1..8` (depth, foam, normal, displacement, surviving
+significant height, SSR source: green screen / red sky, the folding measure J,
+the gusts' ripple strength;
+marked as debug, so shown unexposed), `--no-water`, `--no-ssr`,
+`--no-wave-detail`, and `K` / `F7` / `F4` in the window.
+Weather controls are under the weather section.
+
+**The sea draws AFTER the composite (ADR-004 L7)**, onto the lit scene, in
+`record_water` between `cs_composite` and TAA. It reads copies of the scene
+and depth (heap [79..80]) and writes colour opaquely and its own depth, so TAA
+reprojects the surface and the crack test sees water as drawn. The sea, not
+the composite, now applies the haze and mist over itself (`haze.hlsli`,
+shared with post.hlsl). This makes the older notes about the sea blending into
+the two scene targets, zeroing the contact mask, and breaking the pixel
+detectors historical.
+- **Refraction**: the seabed from the scene copy, shifted by the normal's
+  tilt (`refraction` 0.04), refusing shifts onto things in front of the water,
+  dimmed per channel by `extinction` along the view leg AND the leg down to
+  the seabed, filled by `deep_colour` x the light. `storm_turbidity` makes a
+  rough sea murky. All in archetypes.json's `water` block.
+- **SSR**: a world-space march (28 steps growing 1.35x, to ~3.8 km) against
+  the depth copy, binary refinement, and a hit only if the refined point is AT
+  the surface: rays that cleared a hilltop from the water but ran behind it as
+  the camera sees it gave every headland a slab of reflection. Skipped where
+  Fresnel < 0.06, faded out as the wind rises. Misses take the sky from the
+  composited scene where the reflected direction lands on sky
+  (`sky_reflection`); the sky table alone has no mist and left a blue band
+  under a grey horizon. Reflections leaving below a roughness-dependent
+  horizon take the water's colour (`open`): clamped, they lit every gale back
+  slope with the horizon's beige and sent SSR along the sea into headlands.
+- Shore foam is drifting value-noise lace, thick at the waterline.
+- **Cost** at 2560 x 1440, the sea filling the frame: 0.83 ms light wind
+  (SSR 0.39 of it), ~1.0 ms gale; was 0.25 / 0.38. Walking where the sea is
+  incidental: +0.25 ms (the two full-frame copies and the grid).
+- **Not done**: a faint strip just under the horizon where SSR misses land;
+  no underwater rendering.
+
+### The shoreline: swash and wet ground
+
+The trains die over the shoal, so the sea's edge used to sit at the
+still-water line in every weather, the sand dry to it in a gale as in a calm.
+One function in `water_wave.h` now gives the water running up the beach and
+back -- `ww_swash` -- and three things read it, so they agree on where the
+water is: the sea's sheet (water.hlsl), the wet ground under it (mesh.hlsl)
+and the swimmer (`ww_water_at`, physics_world.cpp).
+
+- **The sheet**: within 1.5 m of water depth (`ww_swash_reach`) the sea's
+  vertices rise by the swash; the terrain in front hides it where the beach
+  is higher. Its height rides the eight longest trains' elevation at the
+  point over their rms, so the uprush comes in sets and varies along the
+  shore, times ~7 m lobes of fixed noise (a single contour drew a
+  straight-edged slab). Reach: Stockdon's gentle-beach run-up, 0.043
+  sqrt(Hs x 100 m), 0.12 to 1.2 m (`Renderer::update_weather`). 0.7 Hs, a
+  steep beach's, ran a 2 m sheet up a meadow coast in a storm.
+- **Never below the bed**: where wet, the sheet is clamped 3 cm over the
+  ground, so storm troughs over shallow water no longer bare the seabed.
+- **The edge is made per pixel from the GROUND** (`edge_fade` in
+  water.hlsl): the ground point behind the pixel comes from the depth copy,
+  the swash is evaluated right there, and the water fades into the scene
+  over its last 8 cm of depth under sea level + swash -- a true contour of
+  the beach. The sheet's geometry reaches 30 cm of depth past the edge,
+  riding 12 cm over the ground, so there is always water drawn for the
+  pixel test to cut; the clip is only a coarse cut (`i.depth + 0.3`).
+  Two attempts drew a staircase, worst looking along the shore: the sheet
+  a few cm over the beach is nearly coplanar with it, so where they cross
+  follows both meshes' triangles (and the vertex-interpolated clip stepped
+  with the grid); then fading by the thickness between the SHEET and the
+  ground only softened the steps, because near the shore the sheet's own
+  height is interpolated across grid cells.
+- **Foam** keys to the last 0.6 m of water, not 2.2: at 2.2 the whole sheet
+  was white as snow; now foam at its leading edge, clear water behind.
+- **Wet ground** (mesh.hlsl, before lighting; the swash rides in the shadow
+  constants, `l_swash_a/b`, `l_swash`): damp from the waterline to the full
+  run-up + 0.2 m, fading over 0.4 m -- albedo x 0.55, roughness to 0.35 --
+  and a film in the 30 cm the water has just left -- roughness 0.06, the
+  scan's normal flattened. At 0.85 of the run-up the damp band ended about
+  where the sheet stood and barely showed. Grass shows it modestly; this
+  session had no sandy beach to judge it on.
+- **Physics**: water is present where the running sheet covers the ground;
+  `--swim 40 --wind 20` PASS, eye under 2.3%, fewer frames wading (the sheet
+  covers the shallows). The `--swim` turn still shows a strip of grass at the
+  bottom edge, as it did before this change; not run down.
+- Cost: none measurable (the terrain branch only runs within ~1.5 m of sea
+  level; walking 7.96 / 7.74 ms with and without water, as before).
+- Not done: the swash in motion has only been judged in stills; no sandy
+  beach checked; no drying time (wetness is the run-up band, not a history).
+
+### The sea's ripples and whitecaps
+
+`engine/render/ocean_detail.{h,cpp}`, `ocean_spectrum.h` (compiled as C++ and
+HLSL, so the CPU sums the spectrum the GPU synthesises), `shaders/ocean_fft.hlsl`.
+F4 / `--no-wave-detail` for A/B.
+
+- **Two 256^2 FFT tiles a frame**, 31 m and 7.7 m (not multiples, so the
+  repeats never line up), carrying 4.5 m down to ~6 cm and splitting at 0.6 m
+  over a 15% overlap whose two bands sum to one. Phillips round the weather's
+  wind (`sea_wind`), 7% kept against it. Each texel's frequency is fixed and
+  the weather only reweights amplitudes, so a veering wind slides no phase.
+  The random field is a hash of the texel: nothing stored. Three complex
+  IFFTs a tile (two real fields packed in each): slope x + i slope z, the
+  choppy displacement's derivatives, then the output (slope x, slope z,
+  J - 1, foam). Rows and columns are one group a line, all eight radix-2
+  stages in group memory. `half` is an HLSL type: not a variable name.
+- **Never geometry, never physics.** The trains (`water_wave.h`) stay the
+  surface the grid, the swimmer and every height query use.
+- **Normalised to Cox-Munk**: the CPU scales the ripples so the trains' mean
+  square slope plus theirs is 0.003 + 0.00512 U, at least 30% of it ripples.
+  Re-summed only when the wind moves 2% or half a degree, only where each
+  band is (~33k spectrum evaluations). Every shot report prints the budget:
+  at 6 m/s, Cox-Munk 0.034, trains 0.015, ripples 0.018.
+- **Distance**: a tile fades as the pixel's footprint (stretched along a
+  grazing view) reaches a quarter to a half of its shortest ripple -- 0.6 m
+  and 6 cm -- and the slope it no longer resolves widens the sun's lobe
+  (Beckmann: exponent ~2 / m^2 - 2, floor ~900). Near the camera every facet
+  is its own sparkle; far off they merge into a glitter track. This replaced
+  a hand-set exponent on the wind (900 to 60, then 250).
+- **Whitecaps where the surface FOLDS**: the trains' Jacobian
+  (`ww_surface_with`'s new out parameter) plus a third of the ripples'. The
+  threshold is MEASURED: `--sea-report` 3b gives the trains' J at Monahan's
+  whitecap share (3.84e-6 U^3.41), 0.63 at 4 m/s to 0.84 at 20, and the shader
+  uses a quadratic through it. A gale frame's lower half measured 10.6% foam
+  against Monahan's 10.5%. At full weight the ripples' J made 25-30%, white
+  speckle all over; without the ripples the old thresholds made none.
+- **Trailing foam** lives in the 31 m tile's alpha, laid where the ripples
+  compress hard (J < 0.85) and decaying over ~2 s IN THE TILE, so it streaks
+  behind the moving compressions; it textures the whitecaps and, past 10 m/s,
+  is laid lightly over the sea. Laid at any compression, it covered the tile.
+- **Reflections**: SSR's ray and the "closed by the next wave" test (`open`)
+  use the trains' normal, not the ripples': with the ripples' tilt in `open`,
+  calm water at a grazing view was pocked with dark spots.
+- **Cost: +0.03 ms** (1440p flight over the sea, 4.62 / 4.59 light wind,
+  4.87 / 4.84 gale); ~3 MB of fields and a 1 MB output.
+- **Gusts on the water (cat's paws)**: the sea samples the same gust field
+  the grass and trees bend in (`wind.hlsli`, `wind_v` / `wind_drift` in the
+  water constants, at p - drift), and scales the ripples by the local wind's
+  Cox-Munk slope over the mean's, with a threshold -- none under 1.2 m/s,
+  full by 3.8 (a softer 0.5-2.5 never let a light air's lulls go glassy).
+  The 7.7 m tile answers in full, the 31 m by 60%; the trains not at all.
+  Where the ripples are below a pixel, their unresolved rms slope still
+  raises the angle Fresnel sees (+0.8 x) and lifts the reflected sky ray
+  (+1.0 x): that is what makes a ruffled patch read dark against glassy water
+  far off, where the glint width alone showed nothing. SSR fades by the
+  local wind, and foam's wind is half local. `--water-debug 8` shows the
+  gusts' ripple strength (grey = the mean). Cost: nothing measurable. Gale
+  foam came down to 8.3% of the frame against Monahan's 10.5%: the gust
+  field is skewed, most of the sea a little under the mean.
+- Once in this session a shot failed at init with "ocean detail pso cs_cols"
+  and the next run hung; every run since, cold and cached, was clean. Not
+  reproduced or explained.
+
+### Weather: the wind, and the sea it raises
+
+`engine/render/weather.{h,cpp}`, tuned by archetypes.json's `weather` block.
+One state that grass, trees, the mist and the sea all read; before it, grass
+and trees blew one fixed way, the mist another, and the waves ran on headings
+no wind chose. Presentation only -- validate and the golden gate passed with
+the block added.
+
+- **A pure function of the seed (`field_id`) and the frame's clock**, the
+  clock the waves and the swimmer use, so saves, replays and stills agree.
+  The storm dial (0..1) is a slow noise (period 8 min); wind = 0.5 + 23.5 x
+  storm^2 m/s; the heading wanders +-100 degrees over 15 min. The wind sea
+  answers the wind averaged over 90 s; the swell (0.25-3 m Hs, ~110 m long,
+  its own heading) the storm averaged over 10 min, so it outlasts a gale.
+  Six hours of four seeds: calm 31%, light 25%, moderate 13%, fresh 19%,
+  strong 6%, gale 6%.
+- **Drift** is the integral of the wind, cached and advanced each call.
+  Anything the air CARRIES (the mist's patches, the gust field) moves by it,
+  never by wind x t, which jumps as soon as the wind changes.
+- **`wind.hlsli`**: gust cells ~90 x 45 m (stretched along the wind) and
+  faster turbulence, sampled at p - drift, averaging 1x the mean speed.
+  Grass bends with speed^2 to lying over (`wind_at` in `foliage.hlsl`).
+  Trees lean downwind (speed^2, 3% of height in a 20 m/s gale), swing about
+  the lean (speed^1.5) and flutter, worked out in WORLD space and turned into
+  the model's frame, sampled at the trunk so a gust crosses a wood tree by
+  tree. Frequencies stay fixed: one that followed the wind would slide its
+  phase by t x the change. The mist drifts at `mist_drift` (0.5) of the wind.
+- **The sea is 32 FIXED trains** (`water_wave.h`): golden-angle headings,
+  log-spaced 157 m to 4.1 m. The weather sets only their AMPLITUDES. A
+  heading or wavelength that changed at runtime would slide the phase by
+  k x |x| x the change, faster than the wave travels 5 km out, so a veering
+  wind hands energy to the trains already pointing its way. Sixteen trains
+  was too few: two carried a gale's peak 85 degrees apart, an egg-crate
+  lattice of crests that the crest foam drew as a grid of squares.
+- **Spectrum**: Pierson-Moskowitz capped by fetch-limited (JONSWAP) growth
+  over `fetch_km` (150), its peak frequency times `peak_shift` (1.4) -- a
+  real gale's 120 m, 1-in-30 peak reads as a slow heave -- cos^2 spread round
+  the wind; the swell a narrow lump, cos^8. Each normalised to its Hs, so
+  the height does not depend on which trains point downwind. Trains under
+  1% of the biggest height and 2% of the steepest slope are zeroed and
+  skipped. Deep-water Hs: 0.26 m at 3.5 m/s, 0.77 at 6, 1.98 at 10, 3.96 at
+  20; a 20 m/s gale with its swell is 7.2 m crest to trough in the report's
+  patch.
+- **Depth tames the waves** (`ww_depth_factor`): each train times
+  tanh(2 k h) -- long swell dies first over a shoal, short chop survives
+  into a lagoon -- then the local Hs is capped at 0.55 x depth
+  (`WW_BREAK_HS`), so the biggest wave is about the depth, where it breaks.
+  The first cap was on the SUM of amplitudes (every crest at once), ~3x what
+  a random sea shows: a coast in a gale went flat. Plain tanh(k h) also took
+  half the swell off coast-side cameras. Speed does NOT vary with depth:
+  w(h) inside `k x - w t` winds the wavefronts into stripes as t grows.
+- **Physics floats on the same sea**: `SeaParams.sea`, depth from the column
+  height at the swimmer (the shader reads it at the rest point; centimetres
+  apart on a beach). `--swim 40 --wind 20`: 0 frames standing in deep water,
+  eye under 2.3% of frames (11% on the old storm).
+- **Cost** (`--flight 10 --settle --flight-from 1638 12 838 --res 2560
+  1440`, the sea filling the frame): the old 4-train sea 0.14 ms, now 0.25 ms
+  in light air and 0.38 ms in a gale. The per-pixel normal takes its
+  breaking scale and Q from the vertex, and the depth term uses a rational
+  tanh (`ww_tanh_pos`): HLSL's tanh at 32 trains three times a pixel was
+  +0.69 ms on its own.
+- **Controls**: `--sea-state <0..1>` fixes the storm dial, `--wind <m/s>`
+  the speed, `--wind-dir <deg>` the heading (0 = +x, 90 = +z), `--swell <m>`
+  the swell's Hs; in the window `[` `]` step the dial, `;` turns the wind
+  45 degrees, `\` goes back to automatic. The title shows wind and Hs.
+  Every `--shot` report has a `weather:` line (and depth and Hs 25-400 m
+  ahead); `--sea-report` tabulates wind, swell, depth and six hours of
+  automatic weather, and asserts the mean, the inversion, growth with depth
+  and no wave taller than 1.1 x its depth.
+- **Trees in the wind.** The sway is `engine/render/tree_sway.h` and the
+  gusts `engine/render/wind.h`, both compiled as C++ AND HLSL (`wind.hlsli`
+  only adapts them) -- so the CPU could lean the RT scene's instances by the
+  formula `trees.hlsl` bends the mesh with, while RT existed (`rt-last`). `small` is a Windows macro (`#define small char`): not a
+  variable name in a header the C++ side includes.
+  - **Impostors** move rigidly by the offset at h^2 = 0.45 (the crown's
+    mass), main and shadow passes alike.
+  - **Species bend**: archetypes.json `shape.bend` (presentation only),
+    scaling lean and swing: birch 1.4, willow 1.3, alder 1.1, maple 1.0,
+    beech 0.9, oak 0.85, pine 0.75, scrub 0.7, fir 0.6, spruce 0.55, snag
+    0.25. In `SpeciesLook` for the GPU, `TreeLook` on the CPU.
+  - Not done: the canopy map (1 m crowns for the sky shade) is static;
+    leaf flutter is raster only (centimetres).
+- **Not done**: no rain, cloud or fetch shelter behind islands.
 
 The water asks the SHARED FIELD FUNCTION how deep it is, so the shoreline is
 the real one at every LOD. That is M1 paying off somewhere other than terrain.

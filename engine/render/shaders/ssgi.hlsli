@@ -10,7 +10,7 @@
 //
 // Included by shadow.hlsli, whose constants carry last frame's matrix and
 // camera; the texture is a fifth range of the lit pipelines' shadow table,
-// heap [45] (t29), sampled through ddgi.hlsli's linear sampler (s3).
+// heap [45] (t29), sampled through the lit pipelines' linear sampler (s3, shadow.hlsli).
 // ---------------------------------------------------------------------------
 #ifndef ENGINE_SSGI_HLSLI
 #define ENGINE_SSGI_HLSLI
@@ -23,7 +23,7 @@ float3 ssgi_irradiance(float3 world) {
     if (c.w <= 1e-4f) return float3(0.0f, 0.0f, 0.0f);
     const float2 uv = float2(c.x / c.w * 0.5f + 0.5f, 0.5f - c.y / c.w * 0.5f);
     if (any(uv < 0.0f) || any(uv > 1.0f)) return float3(0.0f, 0.0f, 0.0f);
-    const float4 s = g_ssgi.SampleLevel(g_ddgi_linear, uv, 0.0f);
+    const float4 s = g_ssgi.SampleLevel(g_gi_linear, uv, 0.0f);
     // Last frame saw something else here -- a nearer surface, or this one
     // from the far side of an edge the bilinear tap straddles.
     const float d = length(world - l_prev_cam.xyz);

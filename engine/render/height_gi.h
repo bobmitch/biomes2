@@ -52,16 +52,25 @@ public:
     // two frames late; `slot` the frame in flight).
     void record_camera(ID3D12GraphicsCommandList* cmd, UINT slot, D3D12_GPU_VIRTUAL_ADDRESS shadow_cb);
     float camera_sky() const { return camera_sky_; }
+    // The eye's share of open sky by geometry alone (sky visibility, no
+    // bounce, no light): 1 in the open, 0 sealed in. Dark vision's floor.
+    float camera_open() const { return camera_open_; }
     // ShadowConstants' l_hf: the map's min corner x, z; w on. Zero until the
     // first rebuild.
     void constants(bool on, float out[4]) const;
     unsigned long long rebuilds() const { return rebuilds_; }
+    // The light jumped (a time skip): its next rebuilds come every frame and
+    // the first drops the last rebuild's bounce, which was the old light's --
+    // each rebuild adds a bounce, so four give the new light four.
+    void reset_bounce() { bounce_reset_ = 4; }
 
 private:
     template <class T> using ComPtr = Microsoft::WRL::ComPtr<T>;
     bool ready_ = false, built_ = false;
     float origin_[2] = {}, centre_[3] = {}, y_top_ = 0.0f, y_range_ = 0.0f, hours_ = -100.0f;
     unsigned long long last_frame_ = 0, rebuilds_ = 0;
+    int bounce_reset_ = 0;                // rebuilds still due by reset_bounce (4: the first, no old bounce)
+    bool drop_bounce_ = false;
     ComPtr<ID3D12Device> dev_;
     ComPtr<ID3D12DescriptorHeap> heap_, rtv_heap_, dsv_heap_;
     ComPtr<ID3D12Resource> albedo_, depth_, height_, rad_, sh_[4], cb_[2];
@@ -71,6 +80,7 @@ private:
     ComPtr<ID3D12Resource> cam_, cam_rb_[2];
     bool cam_pending_[2] = {};
     float camera_sky_ = 1.0f;
+    float camera_open_ = 1.0f;
 };
 
 }  // namespace engine

@@ -95,6 +95,14 @@ bool ScanLibrary::init(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12De
             if (!found) throw std::runtime_error("no material with id " + std::to_string(id));
         }
         rows.push_back(row_of(root.at("seabed")));
+        if (root.has("ground_look")) {
+            const jsonlite::Value& l = root.at("ground_look");
+            if (l.has("variation")) look_.variation = float(l.number("variation"));
+            if (l.has("detail_fade")) for (int k = 0; k < 2; ++k) look_.fade[k] = float(l.array("detail_fade")[k].num);
+            if (l.has("hex")) look_.hex = l.number("hex") > 0.5;
+            if (l.has("far_detail")) look_.far_detail = float(l.number("far_detail"));
+            if (l.has("far_scale")) look_.far_scale = float(l.number("far_scale"));
+        }
     } catch (const std::exception& e) {
         error = std::string("scan library: archetypes.json materials: ") + e.what();
         return false;

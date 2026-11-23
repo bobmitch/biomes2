@@ -20,6 +20,8 @@
 #include "engine/render/shaders/leaf.hlsli"
 #include "engine/render/shaders/scene_out.hlsli"
 #include "engine/render/shaders/local_lights.hlsli"
+#include "engine/render/shaders/flash.hlsli"
+#include "engine/render/shaders/wind.hlsli"
 
 cbuffer FoliageFrame : register(b0) {
     row_major float4x4 view_proj;
@@ -35,6 +37,8 @@ cbuffer FoliageFrame : register(b0) {
     uint   s_grass;     float grass_freq;
     float  near_radius; float debug;
     float  blade_width; float tuft;      // width multiplier; blades a blade instance draws, fanned from one root (1-3)
+    float4 wind_v;                       // weather.h: direction x, z; mean m/s; gustiness
+    float2 wind_drift;  float2 wind_pad; // metres the air has moved
 };
 
 cbuffer DrawConst : register(b3) { uint g_segments; };
@@ -46,6 +50,7 @@ struct Cell {
     uint  look;    // height lo, height hi (x0.01 m), dry, narrow
     uint  color;   // grass rgb8
     uint  dryc;    // dry rgb8
+    uint  bare;    // 4 bits: which 0.5 m quarter the player's edits reach (x lo/hi, z lo/hi)
 };
 
 struct Blade {
@@ -61,6 +66,9 @@ RWStructuredBuffer<Cell>  g_pool     : register(u0);
 StructuredBuffer<int4>    g_slots    : register(t0);   // tile x, z, valid
 StructuredBuffer<uint>    g_bake     : register(t1);   // slots to bake this frame
 StructuredBuffer<float4>  g_ground   : register(t2);   // 4 per biome
+// Per baked tile, 32 x 32 half-metre columns: the highest lattice point the
+// player's edits wrote there (BrickStore::column_top), or -1e30.
+StructuredBuffer<float>   g_edit_top : register(t3);
 RWStructuredBuffer<Blade> g_hi       : register(u1);
 RWStructuredBuffer<Blade> g_lo       : register(u2);
 RWStructuredBuffer<Blade> g_cards    : register(u3);
@@ -74,7 +82,7 @@ static const uint kCaps[4] = {400000u, 400000u, 160000u, 40000u};
 // instance's range holds kTuftMax blades; vs_blade collapses those past `tuft`.
 static const uint kTuftMax = 3u;
 static const uint kIdxFirst[4] = {0u, 81u, 108u, 120u};
-static const uint kIdxCount[4] = {81u, 27u, 12u, 84u};
+static const uint kIdxCount[4] = {81u, 27u, 12u, 144u};
 
 uint pack8(float v) { return uint(saturate(v) * 255.0f + 0.5f); }
 float unpack8(uint v, uint shift) { return float((v >> shift) & 0xFFu) / 255.0f; }
@@ -200,6 +208,18 @@ void cs_bake(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
     const float steep = saturate((0.95f - slope) / 0.35f);
     grass *= steep; flowers *= steep; bushes *= steep;
 
+    // Where the player has dug (or filled) up to within a metre of the
+    // ground, nothing grows: per 0.5 m quarter, so a one-voxel pit bares
+    // a metre square and no more. The ground here is the generated one; the
+    // edit reaching it is what says it is gone.
+    uint bare = 0u;
+    [unroll] for (uint q = 0u; q < 4u; ++q) {
+        const uint hx = t.x * 2u + (q & 1u), hz = t.y * 2u + (q >> 1);
+        if (g_edit_top[g.x * 1024u + hz * 32u + hx] >= y - 1.0f) bare |= 1u << q;
+    }
+    if (bare == 15u) grass = flowers = bushes = 0.0f;
+    c.bare = bare;
+
     c.y = y;
     const int gx = clamp(int(hx * 8192.0f), -32767, 32767), gz = clamp(int(hz * 8192.0f), -32767, 32767);
     c.grad = (uint(gx) & 0xFFFFu) | ((uint(gz) & 0xFFFFu) << 16);
@@ -278,6 +298,7 @@ void cs_emit(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
         for (uint k = 0; k < n; ++k) {
             const uint h = fhash(seed, k + 1u);
             const float ox = funit(h), oz = funit(fhash(h, 3u));
+            if ((c.bare >> ((ox >= 0.5f ? 1u : 0u) | (oz >= 0.5f ? 2u : 0u))) & 1u) continue;
             Blade b;
             b.pos = float3(float(cx) + ox, c.y + gx * (ox - 0.5f) + gz * (oz - 0.5f) - 0.06f, float(cz) + oz);
             const float scale = saturate(want - float(k));
@@ -296,7 +317,8 @@ void cs_emit(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
 
     // Clump cards, from card_near out: one per cell at the cell's grass
     // density, sized to the grass.
-    if (d > card_near - 1.0f && d < card_far + 1.0f && funit(fhash(seed, 101u)) < g_eff * 1.15f) {
+    // A clump card or a bush spans the cell: none where any of it is dug.
+    if (c.bare == 0u && d > card_near - 1.0f && d < card_far + 1.0f && funit(fhash(seed, 101u)) < g_eff * 1.15f) {
         Blade b;
         const uint h = fhash(seed, 103u);
         b.pos = float3(float(cx) + 0.5f, c.y - 0.08f, float(cz) + 0.5f);
@@ -309,11 +331,14 @@ void cs_emit(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
     }
 
     // Bushes: more of them under a canopy, which is where undergrowth is.
-    if (d < 130.0f && funit(fhash(seed, 211u)) < bushes * (1.0f + canopy)) {
+    if (c.bare == 0u && d < 130.0f && funit(fhash(seed, 211u)) < bushes * (1.0f + canopy)) {
         Blade b;
         const uint h = fhash(seed, 213u);
         b.pos = float3(float(cx) + 0.3f + 0.4f * funit(h), c.y - 0.1f, float(cz) + 0.3f + 0.4f * funit(fhash(h, 1u)));
-        b.a = (h & 0xFFu) | (uint(40.0f + 100.0f * funit(fhash(h, 2u))) << 8);
+        // 0.25 to 1.4 m across the radius, most of them small: the old even
+        // spread from 0.4 m put a waist-high ball every few metres.
+        const float us = funit(fhash(h, 2u));
+        b.a = (h & 0xFFu) | (uint(25.0f + 115.0f * us * us) << 8);
         b.color = c.color | (c.look & 0x00FF0000u) << 8;
         b.dryc = c.dryc;
         b.seed = h;
@@ -358,12 +383,19 @@ FolOut with_gi(FolOut o) {
     return o;
 }
 
-// Wind: a gust field drifting across the ground, plus a quick flutter.
+// Wind (weather.h, wind.hlsli): the tip's push as a fraction of the blade's
+// height. A blade bends with the drag, the speed squared, until it is lying
+// over: 0.3 in a light breeze (3 m/s), 0.7 at 6, 1.0 at 10, 1.3 in a gale.
+// The gust cells drifting over the ground are what make a meadow ripple;
+// the quick sway on top grows with the speed. `wind` is the settings'
+// multiplier (1).
 float2 wind_at(float2 p) {
-    const float2 dir = normalize(float2(1.0f, 0.35f));
-    const float gust = vnoise(p * 0.04f - dir * time * 0.6f);
-    const float sway = sin(time * 2.3f + dot(p, float2(0.7f, 0.4f)));
-    return dir * (0.25f + 0.75f * gust * gust) * wind + float2(0.06f, 0.03f) * sway * wind;
+    const float2 v = wind_velocity(p, wind_v, wind_drift, time);
+    const float s2 = dot(v, v);
+    const float bend = 1.4f * s2 / (s2 + 40.0f);
+    const float2 dir = wind_v.xy;
+    const float sway = sin(time * 2.3f + dot(p, float2(0.7f, 0.4f))) * min(0.02f + 0.012f * wind_v.z, 0.2f);
+    return (dir * (bend + sway) + float2(-dir.y, dir.x) * (0.5f * sway)) * wind;
 }
 
 float blade_fade(float d) {
@@ -444,14 +476,41 @@ FolOut vs_blade(uint vid_all : SV_VertexID, uint iid : SV_InstanceID) {
 // and transmitted sun of lighting.hlsli, and the GI interface's diffuse,
 // per vertex, with the fallback's fill for light scattered between blades
 // where the probes did not answer (with_gi; trees.hlsl's shade the same).
+
+// A film of water on a wet leaf or blade (ADR-005 C4): a sheen of the sun
+// and the sky off its surface, on top of the leaf's own light. Leaves have
+// no specular dry -- a crown seen whole is too rough for one -- but a wet one
+// glints. Cheap on purpose: leaves and blades overdraw heavily, and the
+// full GGX lobe and sky lookup cost 0.55 ms walking at 1440p. A normalised
+// Blinn-Phong lobe and the sky's mean radiance carry what a film shows.
+void wet_leaf_sheen(inout float3 dir, inout float3 amb, float3 n, float3 v, float3 world, float sh, float wet) {
+    if (wet <= 0.0f) return;
+    float3 nn = n;
+    if (dot(nn, v) < 0.0f) nn = -nn;   // a card's face towards the eye
+    const float nv = saturate(dot(nn, v));
+    const float k = 1.0f - nv;
+    const float F = 0.04f + 0.96f * (k * k) * (k * k) * k;
+    const float nl = dot(nn, kSunDir);
+    if (nl > 0.0f && sh > 0.0f) {
+        const float nh = saturate(dot(nn, normalize(kSunDir + v)));
+        const float nh2 = nh * nh, nh4 = nh2 * nh2, nh8 = nh4 * nh4, nh16 = nh8 * nh8;
+        dir += kSunLux * (1.35f * nh16 * nh16 * F * nl * sh * 0.35f * wet);
+    }
+    amb += kSkyMean * (F * 0.2f * wet * gi_sky_visibility(world, nn));
+}
+
 SceneOut shade_foliage(float4 clip, float3 albedo_srgb, float3 n, float ao, float3 world, float3 toward_eye,
                        float contact = 0.0f, float ssao = 0.4f) {
-    const float3 albedo = srgb_to_linear(albedo_srgb);
+    // Rain (ADR-005 C4): wet blades a little darker, and glinting.
+    const float wet = l_wet.x;
+    const float3 albedo = srgb_to_linear(albedo_srgb) * lerp(1.0f, 0.82f, wet);
     const float sh = shadow_factor(world, float3(0.0f, 1.0f, 0.0f));
-    return scene_out(leaf_sun_light(albedo, n, toward_eye, 0.5f, 0.7f, sh) * (1.09f * ao),
-                     albedo / kPi * gi_diffuse(world, n, toward_eye) * ao +
-                     local_lights_leaf(albedo, n, toward_eye, 0.5f, 0.7f, world, clip) * ao,
-                     world, cam_pos, far_plane, contact, ssao);
+    float3 dir = leaf_sun_light(albedo, n, toward_eye, 0.5f, 0.7f, sh) * (1.09f * ao);
+    float3 amb = albedo / kPi * gi_diffuse(world, n, toward_eye) * ao +
+                 local_lights_leaf(albedo, n, toward_eye, 0.5f, 0.7f, world, clip) * ao +
+                 flash_leaf(albedo, n, toward_eye, world, 0.5f, 0.7f) * ao;
+    wet_leaf_sheen(dir, amb, n, toward_eye, world, sh, wet * ao);
+    return scene_out(dir, amb, world, cam_pos, far_plane, contact, ssao);
 }
 
 SceneOut ps_blade(FolOut i, bool front : SV_IsFrontFace) {
@@ -529,49 +588,135 @@ SceneOut ps_card(FolOut i) {
     return shade_foliage(i.clip, albedo, normalize(i.nrm), ao, i.world, normalize(cam_pos - i.world));
 }
 
-// A bush: 14 leaf cards round the inside of a squat ellipsoid, verts 0..55.
+// A bush (verts 0..95): up to six STEMS from its base, tapered ribbons
+// facing the eye, and up to eighteen leaf cards set along their upper
+// halves -- clusters on branches, not cards on the inside of a ball, which
+// read as a few textures with nothing solid in them. Four kinds from the
+// bush's hash, each its own stems, spread, proportions and leaf count:
+//   0 round       five stems, mid angles, about as tall as wide
+//   1 upright     four near-vertical stems, a vase half again as tall
+//   2 spreading   six low stems, wide and squat
+//   3 sparse      six stems, half the leaves, smaller: twiggy
+// A tint per bush (most green, some yellower, some bluer, a few red), and
+// one in seven needle-leaved, a juniper. Sizes are skewed small at emission.
+static const uint  kBushStems = 6u, kBushCards = 18u;
+
+struct BushShape { uint kind, stems, cards; float wide, tall, el_lo, el_hi, leaf; };
+
+BushShape bush_shape(uint seed) {
+    BushShape s;
+    s.kind = fhash(seed, 70u) % 4u;
+    if (s.kind == 0u)      { s.stems = 5u; s.cards = 18u; s.wide = 1.0f; s.tall = 0.9f;  s.el_lo = 0.35f; s.el_hi = 0.85f; s.leaf = 0.42f; }
+    else if (s.kind == 1u) { s.stems = 4u; s.cards = 16u; s.wide = 0.6f; s.tall = 1.5f;  s.el_lo = 0.75f; s.el_hi = 0.97f; s.leaf = 0.36f; }
+    else if (s.kind == 2u) { s.stems = 6u; s.cards = 18u; s.wide = 1.3f; s.tall = 0.55f; s.el_lo = 0.15f; s.el_hi = 0.45f; s.leaf = 0.40f; }
+    else                   { s.stems = 6u; s.cards = 9u;  s.wide = 0.9f; s.tall = 0.95f; s.el_lo = 0.30f; s.el_hi = 0.90f; s.leaf = 0.30f; }
+    return s;
+}
+
+// Stem `st`'s tip, relative to the base, before the wind.
+float3 bush_tip(uint seed, uint st, BushShape s, float rad) {
+    const uint h = fhash(seed, 300u + st);
+    const float az = (float(st) + 0.6f * funit(h)) / float(s.stems) * 6.2831853f + funit(fhash(seed, 71u)) * 6.2831853f;
+    const float el = lerp(s.el_lo, s.el_hi, funit(fhash(h, 1u)));
+    const float len = rad * (0.75f + 0.35f * funit(fhash(h, 2u)));
+    const float c = sqrt(saturate(1.0f - el * el));
+    return float3(cos(az) * c * s.wide, el * s.tall * 1.25f, sin(az) * c * s.wide) * len;
+}
+
+FolOut collapsed_bush() {
+    FolOut o = (FolOut)0;
+    o.clip = float4(0.0f, 0.0f, 0.0f, 1.0f);   // a zero-area triangle
+    return o;
+}
+
 FolOut vs_bush(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     const Blade b = g_list[iid];
-    const uint card = vid >> 2, k = vid & 3u;
+    const uint q = vid >> 2, k = vid & 3u;
     const float rad = float((b.a >> 8) & 0xFFu) * 0.01f;
+    const BushShape s = bush_shape(b.seed);
+    const float cu = (k == 1u || k == 2u) ? 1.0f : 0.0f;
+    const float cv = k >= 2u ? 1.0f : 0.0f;
+    const float2 wind = wind_at(b.pos.xz) * 0.08f;
+    const float3 base = b.pos + float3(0.0f, 0.05f, 0.0f);
+    // The bush's own tint.
+    const float tsel = funit(fhash(b.seed, 80u));
+    const float3 tint = tsel < 0.55f ? float3(1.0f, 1.0f, 1.0f)
+                      : tsel < 0.75f ? float3(1.12f, 1.08f, 0.80f)
+                      : tsel < 0.91f ? float3(0.85f, 0.95f, 1.08f)
+                                     : float3(1.25f, 0.72f, 0.58f);
+    const bool needles = funit(fhash(b.seed, 81u)) < 0.14f;
+    FolOut o;
+    if (q < kBushStems) {
+        if (q >= s.stems) return collapsed_bush();
+        // A stem: a ribbon from the base to its tip, turned to face the eye.
+        const float3 tip = bush_tip(b.seed, q, s, rad);
+        const float3 t3 = base + tip + float3(wind.x, 0.0f, wind.y) * saturate(tip.y / max(rad, 0.1f));
+        const float3 along = t3 - base;
+        const float3 mid = base + 0.5f * along;
+        const float3 side = normalize(cross(along, cam_pos - mid));
+        const float w = lerp(0.012f + 0.02f * rad, 0.004f, cv);
+        const float3 p = lerp(base, t3, cv) + side * ((cu - 0.5f) * w);
+        o.clip = mul(float4(p, 1.0f), view_proj);
+        o.world = p;
+        o.nrm = normalize(normalize(cam_pos - mid) + float3(0.0f, 0.4f, 0.0f));
+        o.uv = float2(cu, cv);
+        o.col = float3(0.30f, 0.24f, 0.18f);
+        o.dcol = o.col;
+        o.dry = 0.0f;
+        o.flags = 1u;
+        o.seed = fhash(b.seed, q);
+        return with_gi(o);
+    }
+    const uint card = q - kBushStems;
+    if (card >= s.cards) return collapsed_bush();
     const uint h = fhash(b.seed, card);
-    // A direction over the upper hemisphere, from the card's hash.
-    const float az = funit(h) * 6.2831853f;
-    const float el = 0.15f + 0.85f * funit(fhash(h, 1u));
-    const float3 dir = normalize(float3(cos(az) * (1.0f - el * 0.6f), el, sin(az) * (1.0f - el * 0.6f)));
-    const float3 ctr = b.pos + float3(0.0f, rad * 0.55f, 0.0f) + dir * float3(rad * 0.75f, rad * 0.5f, rad * 0.75f);
-    const float3 nn = normalize(dir + float3(funit(fhash(h, 2u)) - 0.5f, 0.3f, funit(fhash(h, 3u)) - 0.5f));
+    // On the upper half of a stem, a little off it.
+    const uint st = card % s.stems;
+    const float3 tip = bush_tip(b.seed, st, s, rad);
+    const float t = 0.45f + 0.55f * funit(fhash(h, 6u));
+    const float3 dir = normalize(tip + float3(0.0f, 0.001f, 0.0f));
+    const float3 off = (float3(funit(fhash(h, 7u)), funit(fhash(h, 8u)), funit(fhash(h, 9u))) - 0.5f) * (rad * 0.3f);
+    const float3 ctr = base + tip * t + off + float3(wind.x, 0.0f, wind.y) * (t * saturate(tip.y / max(rad, 0.1f)));
+    const float3 nn = normalize(dir + float3(funit(fhash(h, 2u)) - 0.5f, 0.4f, funit(fhash(h, 3u)) - 0.5f));
     float3 u = normalize(cross(nn, abs(nn.y) < 0.9f ? float3(0, 1, 0) : float3(1, 0, 0)));
     const float rot = funit(fhash(h, 4u)) * 6.2831853f;
     u = u * cos(rot) + cross(nn, u) * sin(rot);
     const float3 v = cross(nn, u);
-    const float s = rad * (0.55f + 0.3f * funit(fhash(h, 5u)));
-    const float cu = (k == 1u || k == 2u) ? 1.0f : 0.0f;
-    const float cv = k >= 2u ? 1.0f : 0.0f;
-    const float2 w = wind_at(b.pos.xz) * 0.08f * el;
-    const float3 p = ctr + u * ((cu - 0.5f) * 2.0f * s) + v * ((cv - 0.5f) * 2.0f * s) + float3(w.x, 0.0f, w.y);
-    FolOut o;
+    const float sz = rad * s.leaf * (0.75f + 0.5f * funit(fhash(h, 5u)));
+    const float3 p = ctr + u * ((cu - 0.5f) * 2.0f * sz) + v * ((cv - 0.5f) * 2.0f * sz);
     o.clip = mul(float4(p, 1.0f), view_proj);
     o.world = p;
     o.nrm = normalize(dir + float3(0, 0.3f, 0));
     o.uv = float2(cu, 1.0f - cv);
-    // Bushes a deeper green than the grass round them.
-    o.col = unpack_rgb(b.color) * float3(0.70f, 0.82f, 0.72f);
+    // Bushes a deeper green than the grass round them, in their own tint.
+    o.col = unpack_rgb(b.color) * float3(0.70f, 0.82f, 0.72f) * tint;
     o.dcol = unpack_rgb(b.dryc) * 0.8f;
     o.dry = float(b.color >> 24) / 255.0f * 0.5f;
-    o.flags = 0u;
+    o.flags = needles ? 2u : 0u;
     o.seed = h;
     return with_gi(o);
 }
 
 SceneOut ps_bush(FolOut i) {
-    const float blur = length(fwidth(i.uv));
-    const float a = leaf_coverage(i.uv, 1.0f, funit(i.seed), blur, 0.0f);
-    const float thr = lerp(0.5f, dither(i.clip.xy), saturate(blur * 6.0f));
-    if (a < thr) discard;
-    const float3 albedo = lerp(i.col, i.dcol, i.dry) * (0.85f + 0.3f * funit(fhash(i.seed, 9u)));
-    const float ao = lerp(0.45f, 1.0f, saturate(i.nrm.y));
     if (debug > 0.5f) return scene_flat(float3(0.9f, 0.2f, 0.9f));
     g_gi_vertex = i.gi;
+    if ((i.flags & 1u) != 0u) {
+        // A stem: bark, rounded across, darker at the base where the leaves
+        // shade it.
+        const float across = 1.0f - abs(i.uv.x * 2.0f - 1.0f);
+        const float3 albedo = i.col * (0.75f + 0.3f * across);
+        return shade_foliage(i.clip, albedo, normalize(i.nrm), lerp(0.45f, 0.85f, i.uv.y), i.world,
+                             normalize(cam_pos - i.world));
+    }
+    // Leaves: sharp, then solid clusters as the card shrinks (leaf.hlsli), as
+    // the trees' cards are -- no screen-fixed dither for TAA to lose.
+    const float blur = length(fwidth(i.uv));
+    const float kind = (i.flags & 2u) != 0u ? 2.0f : 1.0f;
+    const float kk = saturate(blur * 6.0f);
+    float a = kk < 1.0f ? leaf_coverage(i.uv, kind, funit(i.seed), blur, 0.0f) : 0.0f;
+    if (kk > 0.0f) a = lerp(a, leaf_cluster(i.uv, kind, funit(i.seed), 0.0f), kk);
+    if (a < 0.5f) discard;
+    const float3 albedo = lerp(i.col, i.dcol, i.dry) * (0.85f + 0.3f * funit(fhash(i.seed, 9u)));
+    const float ao = lerp(0.45f, 1.0f, saturate(i.nrm.y));
     return shade_foliage(i.clip, albedo, normalize(i.nrm), ao, i.world, normalize(cam_pos - i.world));
 }

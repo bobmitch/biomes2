@@ -123,6 +123,7 @@ struct BiomeProfile {
     float gain;
     float ridge_blend;
     float flatness;
+    float detail_amp;    // metres of the shared micro-relief (layer4_detail)
     // layer 6
     float overhang_strength;
     float cave_density;
@@ -136,6 +137,30 @@ WG_FN float layer4_profile(float x, float z, float freq, BiomeProfile p, uint se
     const float t = wg_saturate(n * 0.5f + 0.5f);
     const float shaped = flatness_curve(t, p.flatness);
     return p.base_elevation + p.amplitude * (shaped * 2.0f - 1.0f);
+}
+
+// Layer 4's micro-relief: one field for every biome, which each scales by its
+// own detail_amp before the heights are blended. Faded by voxel like every
+// other octave, so LOD levels agree.
+WG_FN float layer4_detail(float x, float z, float period, int octaves, float gain, uint seed, float voxel) {
+    const float f = 1.0f / period;
+    return fbm_lod(x * f, z * f, octaves, 2.0f, gain, seed, period, voxel);
+}
+
+// --- layer 5b: flat sites ---------------------------------------------------
+// A site pulls the ground to `level` over its pad and eases back to the
+// terrain across its shoulder. Sites never overlap (world.cpp places one in
+// the middle of each candidate cell), so a point is inside at most one.
+WG_FN float flat_apply(float h, float x, float z, float cx, float cz,
+                       float radius, float shoulder, float level) {
+    const float dx = x - cx;
+    const float dz = z - cz;
+    const float d2 = dx * dx + dz * dz;
+    const float outer = radius + shoulder;
+    if (d2 >= outer * outer) return h;
+    float t = 1.0f;
+    if (d2 > radius * radius) t = 1.0f - wg_smoothstep(radius, outer, sqrt(d2));
+    return h + (level - h) * t;
 }
 
 // A cell's blend weight, from its distance dk, the nearest cell's d0 and the

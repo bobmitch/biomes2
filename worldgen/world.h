@@ -37,7 +37,9 @@ enum FeatureId : uint32_t {
     FEATURE_TREES     = 10u,   // which cells hold a tree, and its rolls
     FEATURE_TREE_PATCH = 11u,  // the patch / clearing noise
     FEATURE_ROCKS     = 12u,   // which cells hold a rock, and its rolls
-    FEATURE_ROCK_PATCH = 13u   // the rock patch noise
+    FEATURE_ROCK_PATCH = 13u,  // the rock patch noise
+    FEATURE_DETAIL    = 14u,   // layer 4's shared micro-relief
+    FEATURE_FLATS     = 15u    // layer 5b: which cells hold a flat site, and its rolls
 };
 
 inline uint64_t hash64(uint64_t x) {
@@ -84,10 +86,11 @@ struct WorldParams {
     float sea_level         = 0.0f;
     // Stand-in only: shifts the continent mask to hit the 55% land target.
     // In the real generator this is sea level, which is a world constant.
-    // Solved globally for a 35% MEAN land fraction, then baked. Seeds run
-    // about 31-41% around it, and that spread is where the islandness is:
-    // the archipelagos are its low tail, not a separate mode.
-    float land_offset       = -0.0248f;
+    // Solved globally for a 32% MEAN land fraction, then baked (v16; 35% and
+    // -0.0248 before). Seeds run about 28-36% around it, and that spread is
+    // where the islandness is: the archipelagos are its low tail, not a
+    // separate mode. validate --land-sweep / --land-target re-solve it.
+    float land_offset       = -0.0540f;
 
     // layer 1
     float danger_w          = 0.60f;      // the feel parameter; see tools/validate/README.md
@@ -267,6 +270,7 @@ struct SeedWorld {
     uint32_t s_overhang = 0, s_cave = 0, s_entrance = 0;
     uint32_t s_trees = 0, s_tree_patch = 0;
     uint32_t s_rocks = 0, s_rock_patch = 0;
+    uint32_t s_detail = 0, s_flats = 0;
     float    land_fraction = 0.0f;
 
     // --- layer 5 ---
@@ -284,6 +288,19 @@ struct SeedWorld {
     int   river_paths_to_ocean = 0;
     int   river_paths_total = 0;
     int   river_ascending = 0;   // segments that climb on the filled surface
+    // --- layer 5b ---
+    // Flat sites: level pads, binned on the river grid's geometry (rgrid_n,
+    // rgrid_cell) in a grid of their own. terrain_height applies them after
+    // the river carve; nothing upstream of build_flats sees them.
+    struct FlatSite {
+        float x, z;
+        float radius, shoulder;   // pad and the eased ring round it, metres
+        float level;              // the pad's height
+        uint32_t id;              // flat_id(i, j): the site's identity
+        int   biome;              // dominant biome where it stands
+    };
+    std::vector<FlatSite> flats;
+    std::vector<std::vector<int> > fgrid;
     // --- layer 7 ---
     // Shafts from the surface into the cave system, as 3D polylines with a
     // radius at each vertex, binned in XZ the way the rivers are. A trunk is
@@ -346,6 +363,20 @@ float terrain_height(const SeedWorld& w, const WorldParams& wp,
 
 void build_rivers(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table);
 
+// Layer 5b. After the rivers (a site keeps clear of every channel) and before
+// the entrances. Tests the ground with terrain_height while w.flats is still
+// empty, so a site never sees another.
+void build_flats(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table);
+
+// The flat site whose pad or shoulder holds (x, z), or -1. `margin` widens
+// the test past the shoulder (trees and rocks keep clear by tree_clear).
+int flat_site_at(const SeedWorld& w, float x, float z, float margin);
+
+// A site's identity, a pure function of its candidate cell.
+inline uint32_t flat_id(int i, int j) {
+    return (static_cast<uint32_t>(i) & 0xFFFFu) | ((static_cast<uint32_t>(j) & 0xFFFFu) << 16);
+}
+
 // Signed distance to the nearest entrance shaft: negative inside one. Large
 // positive when the world has none near the sample.
 float nearest_entrance(const SeedWorld& w, const WorldParams& wp,
@@ -406,6 +437,7 @@ void trees_in_cells(const SeedWorld& w, const WorldParams& wp, const ArchetypeTa
 enum TreeReject {
     TREE_KEPT = 0, TREE_OUTSIDE, TREE_NO_LAND, TREE_CLEARING, TREE_ROLL,
     TREE_SHORE, TREE_SLOPE, TREE_RIVER, TREE_ALTITUDE, TREE_FIT_ROLL, TREE_SURFACE,
+    TREE_FLAT,
     TREE_REJECT_COUNT
 };
 
@@ -438,7 +470,7 @@ inline uint32_t rock_id(int kind, int i, int j) {
 
 enum RockReject {
     ROCK_KEPT = 0, ROCK_OUTSIDE, ROCK_NO_LAND, ROCK_CLEARING, ROCK_ROLL, ROCK_SHORE,
-    ROCK_SLOPE, ROCK_RIVER, ROCK_SURFACE, ROCK_TREE, ROCK_OUTCROP,
+    ROCK_SLOPE, ROCK_RIVER, ROCK_SURFACE, ROCK_TREE, ROCK_OUTCROP, ROCK_FLAT,
     ROCK_REJECT_COUNT
 };
 
@@ -458,5 +490,22 @@ float terrain_density(const SeedWorld& w, const WorldParams& wp,
 // One seed, from scatter through quota assignment to drainage.
 SeedWorld build_world(uint64_t world_seed, const WorldParams& wp,
                       const ArchetypeTable& table, const AssignParams& ap);
+
+// --- the player's start ------------------------------------------------------
+// The point nearest the world's centre that stands well inside the CALMEST
+// biome (lowest danger_preferred -- nothing here knows its name): its blend
+// weight at least kSpawnCore there and a majority on a ring round it, dry,
+// gentle ground on that ring too, clear of rivers and of tree trunks. A pure
+// function of the seed. Downstream of the golden hash -- it moves nothing --
+// but it uses only + - * / and sqrt anyway, so every OS starts in one place.
+// If no point qualifies, the land point where the calmest biome weighs most.
+struct SpawnPoint {
+    float x = 0.0f, z = 0.0f;
+    float ground = 0.0f;     // terrain height there
+    float weight = 0.0f;     // the calmest biome's blend weight there
+    int   biome = -1;        // the calmest biome's index
+    bool  strict = false;    // true when every test passed; false is the fallback
+};
+SpawnPoint find_spawn(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table);
 
 }  // namespace worldgen

@@ -31,7 +31,7 @@
 namespace engine {
 
 // One row per biome (and one for the seabed): matches ScanMaterial in
-// mesh.hlsl, 64 bytes.
+// scan.hlsli, 80 bytes.
 struct ScanMaterialGpu {
     float ground_layer, rock_layer, ground_inv_tile, rock_inv_tile;
     float ground_tint[3], ground_rough;   // authored / scan mean; authored roughness
@@ -39,7 +39,18 @@ struct ScanMaterialGpu {
     float ground_scan_rough, rock_scan_rough;   // the scans' own mean roughness
     float ground_depth, rock_depth;             // parallax depth, metres (scans.json depth_m)
 };
-static_assert(sizeof(ScanMaterialGpu) == 64, "ScanMaterialGpu must match mesh.hlsl");
+static_assert(sizeof(ScanMaterialGpu) == 64, "ScanMaterialGpu must match scan.hlsli");
+
+// How bare ground looks (archetypes.json `ground_look`, presentation only;
+// live in the tuning panel's Terrain group). Against the scans' tiling: a
+// 2.5 m scan repeated over a clearing read as a grid from ~10 m out.
+struct GroundLook {
+    float variation = 1.0f;      // macro variation's strength, 0 off
+    float fade[2] = {350.0f, 700.0f};   // the scan fades to its own mean over this, metres
+    bool  hex = true;            // the ground scan through a hex lattice (scan.hlsli)
+    float far_detail = 1.2f;     // the scan at far_scale x its tile, over the near one, 0 off
+    float far_scale = 5.3f;
+};
 
 class ScanLibrary {
 public:
@@ -59,8 +70,10 @@ public:
                 float tint[3], float& depth_m) const;
     bool ready() const { return layers_ > 0; }
     // Each biome's authored rock albedo, linear, rgb per biome (the seabed
-    // last): what a ray hitting a rock of that biome sees (rt_scene.h).
+    // last): what the heightfield GI's top-down pass sees of a rock.
     const std::vector<float>& rock_albedo() const { return rock_albedo_; }
+    // archetypes.json's ground_look, read at init (defaults when absent).
+    const GroundLook& ground_look() const { return look_; }
     UINT layers() const { return layers_; }
     // What init found, for startup.txt: sets loaded, missing, MB uploaded.
     const std::string& note() const { return note_; }
@@ -72,6 +85,7 @@ private:
     struct Info { int layer; float mean[3]; float tile; float depth; };
     std::map<std::string, Info> info_;
     std::vector<float> rock_albedo_;
+    GroundLook look_;
     ComPtr<ID3D12Resource> albedo_, nra_, table_;
 };
 

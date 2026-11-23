@@ -27,6 +27,12 @@ struct BiomeArchetype {
     float    gain           = 0.5f;
     float    ridge_blend    = 0.0f;
     float    flatness       = 1.0f;
+    // Metres of the shared micro-relief (DetailTable) this biome carries:
+    // hummocks, swales and low banks below the profile's finest octave.
+    float    detail_amp     = 0.0f;
+    // Chance a flat-site candidate cell (FlatTable) in this biome holds a
+    // site, before the terrain tests. 0 = none.
+    float    flat_chance    = 0.0f;
 
     // --- volumetric (layer 6) ---
     float    overhang_strength = 0.0f;
@@ -89,6 +95,31 @@ struct RockClass {
     float slope_hi  = 0.0f;
 };
 
+// Layer 4's micro-relief: ONE noise field shared by every biome, scaled by
+// each biome's detail_amp. Scaling a shared field and blending the results is
+// blending heights, not noise parameters, so it is safe across a border.
+struct DetailTable {
+    float period  = 72.0f;   // metres, the coarsest octave
+    int   octaves = 3;
+    float gain    = 0.5f;
+};
+
+// Layer 5b, flat sites: rare level ground, a pure function of a candidate
+// cell like a tree, placed where the land is already gentle and pulled level
+// to the mean of its own pad, with an eased shoulder.
+struct FlatTable {
+    float cell         = 320.0f;  // candidate spacing, metres
+    float radius_min   = 14.0f;   // level pad radius, metres
+    float radius_max   = 36.0f;
+    float shoulder     = 0.6f;    // shoulder width as a share of the radius ...
+    float shoulder_min = 10.0f;   // ... never under this, metres
+    float max_grade    = 0.08f;   // rise over run the ground may already have across it
+    float river_clear  = 15.0f;   // metres between the shoulder and a channel's edge
+    float shore        = 2.0f;    // metres above sea level the pad needs
+    float tree_clear   = 3.0f;    // metres past the pad no tree or rock stands
+    bool  present      = false;
+};
+
 struct RockTable {
     RockClass boulder, outcrop;
     float patch_freq    = 0.006f;  // cycles per metre of the rock patch noise
@@ -103,6 +134,8 @@ struct ArchetypeTable {
     float sea_level = 0.0f;
     TreeTable trees;
     RockTable rocks;
+    DetailTable detail;
+    FlatTable flats;
 
     size_t size() const { return biomes.size(); }
     const BiomeArchetype& operator[](size_t i) const { return biomes[i]; }

@@ -10,7 +10,9 @@
 // ---------------------------------------------------------------------------
 
 #include "engine/render/shaders/shadow.hlsli"
+#include "engine/render/shaders/wet.hlsli"
 #include "engine/render/shaders/scene_out.hlsli"
+#include "engine/render/shaders/flash.hlsli"
 #include "engine/render/shaders/local_lights.hlsli"
 #include "engine/render/shaders/scan.hlsli"
 
@@ -109,6 +111,9 @@ SceneOut ps_rock(VSOut i) {
         ns = normalize(s.n);
         ao = s.ao;
     }
+    // Rain on rock (ADR-005 C4): a sealed surface, so a glossy film more than
+    // a darkening.
+    wet_surface(albedo, rough, ns, n, 0.3f, wet_at(i.world, n));
     const float lam = dot(n, kSunDir);
     // No sun where the GEOMETRIC surface faces away from it, and a fade over
     // the last six degrees before: the shading normal is the scan's, and on
@@ -119,6 +124,7 @@ SceneOut ps_rock(VSOut i) {
     // unshadowed under a dark wood (fixed after the scans landed).
     const float sh = lam > 0.0f ? shadow_factor(i.world, n) * psh * saturate(lam * 10.0f) : 0.0f;
     const Surface s = make_surface(albedo, rough, ns, v);
-    return scene_out(sun_light(s, sh), ambient_light(s, i.world) * ao + local_lights(s, i.world, i.clip),
+    return scene_out(sun_light(s, sh), ambient_light(s, i.world) * ao + local_lights(s, i.world, i.clip) +
+                     flash_light(s, i.world),
                      i.world, cam_pos, far_plane);
 }

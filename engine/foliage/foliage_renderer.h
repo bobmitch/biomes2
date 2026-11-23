@@ -24,6 +24,7 @@ namespace engine {
 
 using Microsoft::WRL::ComPtr;
 class WorldGpu;
+class BrickStore;
 
 struct FoliageSettings {
     float blade_range = 60.0f;   // blades out to here
@@ -31,7 +32,11 @@ struct FoliageSettings {
     float card_far = 150.0f;     // cards out to here
     float max_blades = 96.0f;    // blades per m^2 at grass 1, inside a patch
     float near_radius = 10.0f;   // full density inside this
-    float wind = 1.0f;
+    float wind = 1.0f;           // a multiplier on the weather's push
+    // The weather (weather.h), set by the renderer every frame: direction x,
+    // z; mean speed m/s; gustiness. And the metres the air has moved.
+    float wind_v[4] = {0.94f, 0.33f, 4.0f, 0.4f};
+    float wind_drift[2] = {0.0f, 0.0f};
     float debug = 0.0f;          // 1 tints by kind
     float blade_width = 1.4f;    // a multiplier on every blade's width (--grass-width)
     float tuft = 3.0f;           // blades per placed blade, fanned from one root, 1-3 (--grass-tuft)
@@ -59,6 +64,13 @@ public:
     void record(ID3D12GraphicsCommandList* cmd, UINT frame, const FoliageFrameInputs& in,
                 const FoliageSettings& s);
     bool ready() const { return ready_; }
+
+    // The player's edits: no ground cover grows where they reach the
+    // surface. `invalidate_box` re-bakes the resident tiles under a world
+    // box (a dig), next update.
+    void set_edits(const BrickStore* e) { edits_ = e; }
+    void invalidate_box(const float lo[3], const float hi[3]);
+    void invalidate_all();
 
     // Diagnostics.
     size_t tiles_resident() const { return tiles_.size(); }
@@ -89,7 +101,10 @@ private:
     ComPtr<ID3D12CommandSignature> cmd_sig_;
 
     ComPtr<ID3D12Resource> pool_, lists_[4], counters_, args_, ib_, ground_;
-    ComPtr<ID3D12Resource> slots_up_[2], bake_up_[2], cb_[2];
+    ComPtr<ID3D12Resource> slots_up_[2], bake_up_[2], cb_[2], edit_up_[2];
+    void* edit_cpu_[2] = {};
+    const BrickStore* edits_ = nullptr;
+    std::vector<TileKey> rebake_;
     void* slots_cpu_[2] = {};
     void* bake_cpu_[2] = {};
     void* cb_cpu_[2] = {};

@@ -20,7 +20,8 @@
 //                  irradiance from the upper hemisphere and the ground's
 //                  bounce from the lower one, which is the shape of the old
 //                  `albedo * 0.22 + (0.10, 0.13, 0.18) * sky` made honest.
-//                  DDGI (L6) replaces the bodies, never the calls.
+//                  A better GI replaces the bodies, never the calls (the
+//                  heightfield GI does now; DDGI did until rt-last).
 //
 // Ambient occlusion is NOT applied here. The post chain multiplies the
 // ambient target by GTAO (scene_out.hlsli), which is the Low tier's "sky
@@ -91,11 +92,11 @@ float gi_luma(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
 float gi_fill(float stand_in) { return lerp(stand_in, 1.0f, g_gi_cover); }
 
 // Irradiance (lux) arriving at a surface with this normal, from everything
-// but the sun's direct beam. With DDGI (L6) the probes answer wherever they
-// cover the point -- sky, bounce, local light, all of it, and none in a
-// sealed cave. Elsewhere, and on the tier without RT, two uniform
-// hemispheres: sky above (what the canopy leaves) and ground below,
-// integrated against the cosine lobe, which is exact rather than a fit.
+// but the sun's direct beam: two uniform hemispheres -- sky above (what the
+// canopy leaves) and ground below, integrated against the cosine lobe, which
+// is exact rather than a fit -- replaced by the heightfield GI wherever its
+// map covers the point. (DDGI's ray-traced probes answered first until
+// hardware RT was removed: git tag rt-last.)
 float3 gi_diffuse(float3 world, float3 n, float3 view) {
     if (g_gi_vertex.w >= 0.0f) {
         g_gi_sky = 1.0f;
@@ -103,19 +104,7 @@ float3 gi_diffuse(float3 world, float3 n, float3 view) {
         return g_gi_vertex.xyz;
     }
     const float up = 0.5f + 0.5f * n.y;
-    float cover = 0.0f;
-    float3 E = float3(0.0f, 0.0f, 0.0f);
-#ifdef ENGINE_DDGI_HLSLI
-    E = ddgi_irradiance(world, n, view, cover);
-#endif
-    const float3 open = kPi * (kSkyMean * up + kGroundRadiance * (1.0f - up));
-    const float ratio = saturate(gi_luma(E) / max(gi_luma(open), 1e-4f));
-    g_gi_cover = cover;
-    if (cover >= 1.0f) {
-        g_gi_sky = 1.0f;
-        g_gi_all = ratio;
-        return E;
-    }
+    g_gi_cover = 0.0f;
     const float sv = gi_canopy(world);
     float3 fb = kPi * (kSkyMean * (up * sv) + kGroundRadiance * (1.0f - up));
     const float3 fb_hemis = fb;   // the two hemispheres, before the heightfield
@@ -135,12 +124,12 @@ float3 gi_diffuse(float3 world, float3 n, float3 view) {
     if (l_prev_cam.w > 1.5f) return ssgi_irradiance(world) + 1e-3f;   // BIOMES_SSGI_DBG: the bounce alone
     fb += ssgi_irradiance(world);
 #endif
-    g_gi_sky = lerp(sv, 1.0f, cover);
+    g_gi_sky = sv;
     // The specular follows the diffuse: what the heightfield took from the
     // two hemispheres (a valley floor, a cave called covered) it takes from
     // the reflection too.
-    g_gi_all = lerp(saturate(gi_luma(fb) / max(gi_luma(fb_hemis), 1e-4f)), ratio, cover);
-    return lerp(fb, E, cover);
+    g_gi_all = saturate(gi_luma(fb) / max(gi_luma(fb_hemis), 1e-4f));
+    return fb;
 }
 
 // Radiance (nits) arriving along the mirror direction, prefiltered by
@@ -156,8 +145,8 @@ float3 gi_specular(float3 world, float3 n, float3 view, float roughness) {
     return lerp(sharp, broad, roughness * roughness) * all;
 }
 
-// How much of the sky a point sees: 0 in a sealed cave. With DDGI, what the
-// probes found relative to an open sky; otherwise what the canopy leaves.
+// How much of the sky a point sees: 0 in a sealed cave. What gi_diffuse
+// found relative to the two hemispheres, else what the canopy leaves.
 float gi_sky_visibility(float3 world, float3 n) {
     if (g_gi_all >= 0.0f) return g_gi_sky * g_gi_all;
     return gi_canopy(world);

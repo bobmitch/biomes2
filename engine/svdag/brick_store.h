@@ -110,14 +110,30 @@ public:
 
     size_t edited_voxels() const;
 
+    // The player's value at lattice point (vx, vy, vz) -- world position
+    // v x kEditVoxel -- if one is stored. The CPU's view of what the mesher's
+    // edited_density reads.
+    bool edited_at(int vx, int vy, int vz, float& out_d) const;
+
+    // The highest edited lattice point whose reach covers half-voxel column
+    // (sx, sz) -- the 0.5 m square [sx, sx + 1) x [sz, sz + 1) x kEditVoxel
+    // -- if any. What grass and trees ask: has the ground here been touched,
+    // and how high up. Derived (not saved), rebuilt on load.
+    bool column_top(int sx, int sz, float& out_top) const;
+    // Bumped by every edit and every load: "has anything changed since".
+    uint64_t generation() const { return generation_; }
+
     // Bricks whose contents changed since the last upload.
     void take_dirty(std::vector<BrickKey>& out);
     const Brick* find(const BrickKey& k) const;
 
 private:
     Brick& touch(const BrickKey& k, bool& created);
+    void mark_column(int vx, int vy, int vz);
 
     std::unordered_map<BrickKey, Brick, BrickKeyHash> bricks_;
+    std::unordered_map<uint64_t, float> column_top_;
+    uint64_t generation_ = 0;
     std::vector<BrickKey> dirty_;
 };
 

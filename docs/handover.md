@@ -68,7 +68,7 @@ of having them.
 | Shadows | `engine --flight 10 [--no-shadows]` | spawn 1.66 vs 0.78 ms; densest forest (`--flight-from -704 60 -448`) 2.66 vs 0.97 ms |
 | Felling | `engine --fell --fell-save`, then `--fell-verify` | walk stopped 0.55 m from the axis (bark + capsule 0.54), 9 of 9 swings, log tipped 72 degrees and rested in 9.3 s; reloaded 0.0000 m from rest, tree not standing |
 | Blend seams | same | 0 seeds over 5 cm; worst 0.014 m base, 0.036 m 3D, over 398,211 crossings (v8: steps up to 178 m) |
-| Land / islandness | same | 35.2% mean, 7.2 landmasses/seed, spawn mass 73.9% |
+| Land / islandness | same | 32.1% mean, 8.1 landmasses/seed, spawn mass 66.9% (v16; v15 35.2%, 7.2, 73.9%) |
 | Volumetrics | same | caves off: 0.00% cave air, 2.3% of land columns overhang (v10 with caves: 1.72% and 10.6% -- most of what the overhang metric counted was cave air near the surface) |
 | CPU vs GPU field | `engine --probe-field` | worst 0.000006 over densities spanning 18 m |
 | Frame cost | `engine --flight 10` | 0.37 ms a frame, 2,684 fps, 1.1 M triangles, 0 overflows. Every earlier figure (74–77 fps) was CPU-bound on recomputing `column_band`; see CLAUDE.md |

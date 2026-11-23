@@ -3,6 +3,16 @@
 **Status:** accepted for the GI backbone (DDGI on hardware ray tracing,
 behind two explicit interfaces); the rest proposed
 **Date:** 2026-11-14
+
+**Superseded in part, 2026-11-21: hardware ray tracing is REMOVED.** L5's RT
+shadows and denoiser and L6's traced sky, DDGI probes and leaf cutouts were
+built, measured and then taken out: ~1.2 ms of a 1440p walking frame and
+several hundred MB of acceleration structures, with BLAS upkeep that every
+planned dynamic object (built structures, animated creatures, particles)
+would have added to. The interfaces this ADR set up stand -- `gi_diffuse`,
+`gi_specular`, `gi_sky_visibility` -- answered now by the heightfield GI and
+the canopy map; shadows are the cascades (PCSS) and the far terrain shadow.
+The code is in git tag `rt-last`.
 **Extends:** [ADR-003](adr-003-graphics-api.md) (D3D12). Touches nothing upstream of the golden hash.
 
 ## Context

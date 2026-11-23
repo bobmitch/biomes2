@@ -29,6 +29,91 @@ SamplerState                   g_scan_samp : register(s5);   // anisotropic, wra
 // back faces so a scan is not reversed on them (Golus, Normal Mapping for a
 // Triplanar Shader). A plane under 1% weight is not sampled.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Hex-tiling (Mikkelsen, "Practical Real-Time Hex-Tiling", JCGT 11(2), 2022).
+// A scan repeated on one square lattice shows its blotches as a grid from
+// ~10 m out. Here a hexagonal lattice over the uv gives every hex its own
+// random offset into the scan and its own rotation; each pixel takes the
+// three hexes round it, blended by barycentric weight raised to a power and
+// biased by luminance, which keeps the scan's contrast where a plain blend
+// greys it out. The normal map's xy is turned back by each hex's rotation.
+// Three fetches where there was one; ground only (scan_surface).
+// ---------------------------------------------------------------------------
+static const float kHexScale = 1.0f;       // hexes along a tile: a hex is ~0.35 tile across its flats
+static const float kHexContrast = 0.6f;    // Mikkelsen's g_fallOffContrast
+static const float kHexExp = 7.0f;         // ... g_exp
+
+float2 hex_hash2(int2 v) {
+    uint h = uint(v.x) * 0x8da6b343u ^ uint(v.y) * 0xd8163841u;
+    h = (h ^ (h >> 13)) * 0xcb1ab31fu;
+    h ^= h >> 16;
+    uint g = h * 0x9e3779b9u;
+    g ^= g >> 15;
+    return float2(float(h & 0xFFFFu), float(g & 0xFFFFu)) / 65535.0f;
+}
+
+// The triangle of the hex lattice a point is in: its three corners and the
+// barycentric weights (Mikkelsen's TriangleGrid).
+void hex_grid(float2 st, out float3 w, out int2 v1, out int2 v2, out int2 v3) {
+    st *= 3.46410162f;   // 2 sqrt 3
+    const float2 sk = float2(st.x, -0.57735027f * st.x + 1.15470054f * st.y);
+    const int2 base = int2(floor(sk));
+    float3 t = float3(frac(sk), 0.0f);
+    t.z = 1.0f - t.x - t.y;
+    const float s = step(0.0f, -t.z);
+    const float s2 = 2.0f * s - 1.0f;
+    w = float3(-t.z * s2, s - t.y * s2, s - t.x * s2);
+    const int si = int(s);
+    v1 = base + int2(si, si);
+    v2 = base + int2(si, 1 - si);
+    v3 = base + int2(1 - si, si);
+}
+
+float2 hex_centre(int2 v) {
+    // The inverse of the skew, back in st units.
+    const float2 f = float2(v);
+    return float2(f.x, 0.5f * f.x + 0.86602540f * f.y) / 3.46410162f;
+}
+
+// The scan at `uv` through the hex lattice: A (albedo, height) and, when
+// asked, B with its normal xy turned back into the uv frame.
+void hex_sample(float layer, float2 uv, float2 gx, float2 gy, bool want_b, out float4 a, out float4 b) {
+    float3 w;
+    int2 v[3];
+    hex_grid(uv * kHexScale, w, v[0], v[1], v[2]);
+    // The blend raises each corner's weight to the 7th power, so over most
+    // of a hex one corner carries nearly all of it: a corner under 1% of the
+    // heaviest is not fetched at all. Most pixels take one sample, not three.
+    const float wp[3] = {pow(max(w.x, 0.0f), kHexExp), pow(max(w.y, 0.0f), kHexExp), pow(max(w.z, 0.0f), kHexExp)};
+    const float wcut = 0.01f * max(wp[0], max(wp[1], wp[2]));
+    a = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    b = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float wsum = 0.0f;
+    [unroll] for (int k = 0; k < 3; ++k) {
+        if (wp[k] >= wcut) {
+            const float2 h = hex_hash2(v[k]);
+            // A rotation from the hash as a direction, no trigonometry.
+            const float2 d = normalize(float2(h.x - 0.5f, h.y - 0.5f) + float2(1e-4f, 0.0f));
+            const float2x2 R = float2x2(d.x, -d.y, d.y, d.x);
+            const float2 c = hex_centre(v[k]) / kHexScale;
+            const float2 u = mul(R, uv - c) + c + h * 7.31f;   // the hash again for the offset, off its period
+            const float4 sa = g_scan_a.SampleGrad(g_scan_samp, float3(u, layer), mul(R, gx), mul(R, gy));
+            float4 sb = float4(0.5f, 0.5f, 0.5f, 1.0f);
+            if (want_b) {
+                sb = g_scan_b.SampleGrad(g_scan_samp, float3(u, layer), mul(R, gx), mul(R, gy));
+                // The texture is turned by R^-1 in uv, so is its normal.
+                sb.xy = mul(transpose(R), sb.xy * 2.0f - 1.0f) * 0.5f + 0.5f;
+            }
+            const float W = wp[k] * lerp(1.0f, dot(sa.rgb, float3(0.2126f, 0.7152f, 0.0722f)), kHexContrast);
+            a += W * sa;
+            b += W * sb;
+            wsum += W;
+        }
+    }
+    a /= max(wsum, 1e-6f);
+    b /= max(wsum, 1e-6f);
+}
+
 struct ScanSample {
     float3 albedo;   // linear, before the tint
     float  height;
@@ -37,9 +122,15 @@ struct ScanSample {
     float  ao;
 };
 
-ScanSample scan_triplanar(float layer, float inv_tile, float3 p, float3 n, float3 bw, float3 dpx, float3 dpy) {
+// `hex`: the plane the normal faces most through the hex lattice
+// (hex_sample); the others straight -- their weight is small where the
+// ground is level enough to show a grid, and hex-tiling every plane of every
+// candidate was +1.1 ms of a 1440p frame.
+ScanSample scan_triplanar(float layer, float inv_tile, float3 p, float3 n, float3 bw, float3 dpx, float3 dpy,
+                          bool hex = false) {
     ScanSample o = (ScanSample)0;
     const float3 sg = float3(n.x < 0.0f ? -1.0f : 1.0f, n.y < 0.0f ? -1.0f : 1.0f, n.z < 0.0f ? -1.0f : 1.0f);
+    const int kmax = (bw.y >= bw.x && bw.y >= bw.z) ? 1 : (bw.x >= bw.z ? 0 : 2);
     float3 nsum = 0.0f;
     [unroll] for (int k = 0; k < 3; ++k) {
         const float w = bw[k];
@@ -56,8 +147,13 @@ ScanSample scan_triplanar(float layer, float inv_tile, float3 p, float3 n, float
         gy *= inv_tile;
         // Explicit gradients: the parallax shift is discontinuous, and its
         // derivatives would pick wild mips along every step it takes.
-        const float4 a = g_scan_a.SampleGrad(g_scan_samp, float3(uv, layer), gx, gy);
-        const float4 b = g_scan_b.SampleGrad(g_scan_samp, float3(uv, layer), gx, gy);
+        float4 a, b;
+        if (hex && k == kmax) {
+            hex_sample(layer, uv, gx, gy, true, a, b);
+        } else {
+            a = g_scan_a.SampleGrad(g_scan_samp, float3(uv, layer), gx, gy);
+            b = g_scan_b.SampleGrad(g_scan_samp, float3(uv, layer), gx, gy);
+        }
         float2 t = b.xy * 2.0f - 1.0f;
         t.x *= flip;
         const float tz = sqrt(saturate(1.0f - dot(t, t)));
@@ -73,6 +169,31 @@ ScanSample scan_triplanar(float layer, float inv_tile, float3 p, float3 n, float
     }
     o.n = nsum;
     return o;
+}
+
+// The scan at a much LARGER scale (its tile x `scale`), hex-tiled, in the
+// plane the normal faces most, as a colour ratio to the scan's own mean
+// (its 1 x 1 mip): what the ground's own texture does over tens of metres --
+// clumps, bare patches, colour shifts -- where the scan at its own tile has
+// gone to its mean. Multiplied over the near scan by the caller.
+float3 scan_far_ratio(float layer, float inv_tile, float scale, float3 p, float3 n, float3 bw, float3 dpx, float3 dpy) {
+    float2 uv, gx, gy;
+    float flip;
+    if (bw.y >= bw.x && bw.y >= bw.z) { uv = p.xz; gx = dpx.xz; gy = dpy.xz; flip = n.y < 0.0f ? -1.0f : 1.0f; }
+    else if (bw.x >= bw.z) { uv = p.zy; gx = dpx.zy; gy = dpy.zy; flip = n.x < 0.0f ? -1.0f : 1.0f; }
+    else { uv = p.xy; gx = dpx.xy; gy = dpy.xy; flip = n.z < 0.0f ? 1.0f : -1.0f; }
+    uv.x *= flip;
+    gx.x *= flip;
+    gy.x *= flip;
+    const float k = inv_tile / scale;
+    float4 a, b;
+    // Offset from the near scan's lattice so the two scales never line up.
+    // Two mips coarser than the footprint asks (gradients x4): this layer is
+    // structure over metres, the near scan carries the grain -- and the fine
+    // mips of a scan magnified 5x were most of its 0.3 ms at 1440p.
+    hex_sample(layer, uv * k + float2(0.37f, 0.71f), gx * (4.0f * k), gy * (4.0f * k), false, a, b);
+    const float3 mean = g_scan_a.SampleLevel(g_scan_samp, float3(0.5f, 0.5f, layer), 16.0f).rgb;
+    return clamp(a.rgb / max(mean, 1e-3f), 0.3f, 2.5f);
 }
 
 // Parallax in the triplanar plane the normal faces most (pom.hlsli): the

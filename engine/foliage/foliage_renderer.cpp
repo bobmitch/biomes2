@@ -3,6 +3,7 @@
 #endif
 #include "engine/foliage/foliage_renderer.h"
 #include "engine/field/world_gpu.h"
+#include "engine/svdag/brick_store.h"
 #include "engine/render/shader_compile.h"
 #include "worldgen/assign/json_lite.h"
 
@@ -18,7 +19,8 @@ namespace {
 const char* kShader = "engine/render/shaders/foliage.hlsl";
 const UINT kPool = 768;              // tile slots
 const UINT kTileCells = 256;         // 16 x 16 cells of 1 m
-const UINT kCellBytes = 24;
+const UINT kCellBytes = 28;
+const UINT kEditTops = 1024;         // 32 x 32 half-metre columns a tile
 const UINT kBladeBytes = 32;
 const UINT kCaps[4] = {400000u, 400000u, 160000u, 40000u};
 const UINT kBakePerFrame = 24;
@@ -39,8 +41,10 @@ struct FoliageFrame {
     UINT  s_grass;      float grass_freq;
     float near_radius;  float debug;
     float blade_width;  float tuft;
+    float wind_v[4];
+    float wind_drift[2]; float wind_pad[2];
 };
-static_assert(sizeof(FoliageFrame) == 272, "FoliageFrame must match foliage.hlsl");
+static_assert(sizeof(FoliageFrame) == 304, "FoliageFrame must match foliage.hlsl");
 
 std::string hr_text(const char* what, HRESULT hr) {
     char buf[256];
@@ -149,8 +153,8 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
     // --- root signatures ---
     {
         // Compute: frame CB, world CB, the ten world buffers (u11..u20, as the
-        // mesher and the sea bind them), then this pass's own. 44 DWORDs.
-        D3D12_ROOT_PARAMETER p[22] = {};
+        // mesher and the sea bind them), then this pass's own. 46 DWORDs.
+        D3D12_ROOT_PARAMETER p[23] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 1;
         for (int k = 0; k < 10; ++k) {
@@ -165,9 +169,10 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
             p[16 + k].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
             p[16 + k].Descriptor.ShaderRegister = 1 + k;
         }
-        for (int k = 0; k < 22; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        p[22].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[22].Descriptor.ShaderRegister = 3;   // edit tops
+        for (int k = 0; k < 23; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 22;
+        rsd.NumParameters = 23;
         rsd.pParameters = p;
         ComPtr<ID3DBlob> sig, err;
         HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
@@ -196,7 +201,8 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         sr[2].NumDescriptors = 1;
         sr[2].BaseShaderRegister = 25;
         sr[2].OffsetInDescriptorsFromTableStart = 38;
-        // ADR-004 L6: the DDGI probes at [40..42] (t26..t28).
+        // [40..42] (t26..t28): DDGI's probes until hardware RT was removed
+        // (rt-last); the range stays declared, nothing reads it.
         sr[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr[3].NumDescriptors = 3;
         sr[3].BaseShaderRegister = 26;
@@ -235,7 +241,7 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         cmp.MaxLOD = D3D12_FLOAT32_MAX;
         cmp.ShaderRegister = 1;
         cmp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        // s3: DDGI's linear sampler (ddgi.hlsli), visible to the vertex
+        // s3: the lit pipelines' linear sampler (shadow.hlsli g_gi_linear), visible to the vertex
         // shaders too -- trees and grass read the probes per vertex.
         D3D12_STATIC_SAMPLER_DESC lin = {};
         lin.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -309,10 +315,12 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
         pd.SampleMask = UINT_MAX;
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        // The renderer's two HDR targets: direct and ambient (scene_out.hlsli).
-        pd.NumRenderTargets = 2;
+        // The renderer's three scene targets: direct, ambient and the puddle
+        // mask (scene_out.hlsli), which a blade over a puddle clears.
+        pd.NumRenderTargets = 3;
         pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         pd.RTVFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        pd.RTVFormats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
         pd.SampleDesc.Count = 1;
         const HRESULT hr = device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&out));
@@ -367,12 +375,12 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         const uint32_t t[6] = {b, b + 1, b + 2, b, b + 2, b + 3};
         idx.insert(idx.end(), t, t + 6);
     }
-    for (uint32_t c = 0; c < 14; ++c) {   // 84, at 120
+    for (uint32_t c = 0; c < 24; ++c) {   // 144, at 120: six stems and eighteen leaf cards
         const uint32_t b = c * 4;
         const uint32_t t[6] = {b, b + 1, b + 2, b, b + 2, b + 3};
         idx.insert(idx.end(), t, t + 6);
     }
-    if (idx.size() != 204) { error = "foliage index layout disagrees with foliage.hlsl"; return false; }
+    if (idx.size() != 264) { error = "foliage index layout disagrees with foliage.hlsl"; return false; }
     if (!make_buffer(device_, idx.size() * 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
                      D3D12_RESOURCE_STATE_GENERIC_READ, ib_, error, "foliage indices")) return false;
     {
@@ -397,6 +405,9 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         if (!make_buffer(device_, UINT64(kPool) * 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
                          D3D12_RESOURCE_STATE_GENERIC_READ, bake_up_[f], error, "foliage bake list")) return false;
         bake_up_[f]->Map(0, nullptr, &bake_cpu_[f]);
+        if (!make_buffer(device_, UINT64(kPool) * kEditTops * 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                         D3D12_RESOURCE_STATE_GENERIC_READ, edit_up_[f], error, "foliage edit tops")) return false;
+        edit_up_[f]->Map(0, nullptr, &edit_cpu_[f]);
         if (!make_buffer(device_, 512, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
                          D3D12_RESOURCE_STATE_GENERIC_READ, cb_[f], error, "foliage cb")) return false;
         cb_[f]->Map(0, nullptr, &cb_cpu_[f]);
@@ -443,9 +454,16 @@ void FoliageRenderer::update(float x, float z, const FoliageSettings& s, bool se
         queue_.clear();
         for (size_t i = 0; i < want.size(); ++i) queue_.push_back(want[i].second);
     }
-    // Hand out slots to this frame's bakes.
+    // Hand out slots to this frame's bakes: first the resident tiles an
+    // edit touched, again into their own slots.
     bake_now_.clear();
-    const size_t budget = settle ? kPool : kBakePerFrame;
+    for (size_t i = 0; i < rebake_.size(); ++i) {
+        std::unordered_map<TileKey, uint32_t, TileKeyHash>::const_iterator it = tiles_.find(rebake_[i]);
+        if (it != tiles_.end() && std::find(bake_now_.begin(), bake_now_.end(), it->second) == bake_now_.end())
+            bake_now_.push_back(it->second);
+    }
+    rebake_.clear();
+    const size_t budget = (settle ? kPool : kBakePerFrame) + bake_now_.size();
     while (!queue_.empty() && bake_now_.size() < budget && !free_.empty()) {
         const TileKey k = queue_.front();
         queue_.pop_front();
@@ -472,6 +490,20 @@ void FoliageRenderer::record(ID3D12GraphicsCommandList* cmd, UINT frame, const F
             st[k * 4 + 3] = 0;
         }
         if (!bake_now_.empty()) std::memcpy(bake_cpu_[f], bake_now_.data(), bake_now_.size() * 4);
+        // The edits over each tile being baked, as the bake reads them.
+        float* et = static_cast<float*>(edit_cpu_[f]);
+        for (size_t b = 0; b < bake_now_.size(); ++b) {
+            float* o = et + b * kEditTops;
+            const TileKey k = slot_tile_[bake_now_[b]];
+            for (UINT i = 0; i < kEditTops; ++i) o[i] = -1.0e30f;
+            if (!edits_ || edits_->brick_count() == 0) continue;
+            const int sx0 = k.x * int(kTileM) * 2, sz0 = k.z * int(kTileM) * 2;
+            for (int hz = 0; hz < 32; ++hz)
+                for (int hx = 0; hx < 32; ++hx) {
+                    float top;
+                    if (edits_->column_top(sx0 + hx, sz0 + hz, top)) o[hz * 32 + hx] = top;
+                }
+        }
     }
     FoliageFrame fr = {};
     std::memcpy(fr.view_proj, in.view_proj, sizeof fr.view_proj);
@@ -495,6 +527,9 @@ void FoliageRenderer::record(ID3D12GraphicsCommandList* cmd, UINT frame, const F
     fr.tree_patch_edge = tree_patch_edge_;
     fr.sea_level = sea_level_;
     fr.wind = s.wind;
+    for (int k = 0; k < 4; ++k) fr.wind_v[k] = s.wind_v[k];
+    fr.wind_drift[0] = s.wind_drift[0];
+    fr.wind_drift[1] = s.wind_drift[1];
     fr.far_plane = in.far_plane;
     fr.s_grass = s_grass_;
     fr.grass_freq = 1.0f / 45.0f;
@@ -516,6 +551,7 @@ void FoliageRenderer::record(ID3D12GraphicsCommandList* cmd, UINT frame, const F
     cmd->SetComputeRootShaderResourceView(13, slots_up_[f]->GetGPUVirtualAddress());
     cmd->SetComputeRootShaderResourceView(14, bake_up_[f]->GetGPUVirtualAddress());
     cmd->SetComputeRootShaderResourceView(15, ground_->GetGPUVirtualAddress());
+    cmd->SetComputeRootShaderResourceView(22, edit_up_[f]->GetGPUVirtualAddress());
     for (int l = 0; l < 4; ++l) cmd->SetComputeRootUnorderedAccessView(16 + l, lists_[l]->GetGPUVirtualAddress());
     cmd->SetComputeRootUnorderedAccessView(20, counters_->GetGPUVirtualAddress());
     cmd->SetComputeRootUnorderedAccessView(21, args_->GetGPUVirtualAddress());
@@ -588,6 +624,26 @@ bool FoliageRenderer::read_counts(ID3D12CommandQueue* queue, uint32_t out[5], st
     for (int k = 0; k < 5; ++k) out[k] = p[k];
     readback_->Unmap(0, nullptr);
     return true;
+}
+
+}  // namespace engine
+
+namespace engine {
+
+void FoliageRenderer::invalidate_all() {
+    for (std::unordered_map<TileKey, uint32_t, TileKeyHash>::const_iterator it = tiles_.begin(); it != tiles_.end(); ++it)
+        rebake_.push_back(it->first);
+}
+
+void FoliageRenderer::invalidate_box(const float lo[3], const float hi[3]) {
+    if (!ready_) return;
+    const int i0 = int(std::floor(lo[0] / kTileM)), i1 = int(std::floor(hi[0] / kTileM));
+    const int j0 = int(std::floor(lo[2] / kTileM)), j1 = int(std::floor(hi[2] / kTileM));
+    for (int j = j0; j <= j1; ++j)
+        for (int i = i0; i <= i1; ++i) {
+            TileKey k; k.x = i; k.z = j;
+            if (tiles_.count(k)) rebake_.push_back(k);
+        }
 }
 
 }  // namespace engine

@@ -6,7 +6,7 @@
 // trees stand. mesh.hlsl's vertex shader lifts -- in every pass that draws
 // the terrain, so the cascades, the far shadow and the heightfield's top-down
 // map all see it -- and its pixel shader shades. Needs the shadow constants
-// (shadow.hlsli) and the linear sampler (ddgi.hlsli) first.
+// (shadow.hlsli) and its linear sampler g_gi_linear first.
 // ---------------------------------------------------------------------------
 
 Texture2D<float4> g_forest_a : register(t47);   // cover, canopy height, conifer share
@@ -42,8 +42,8 @@ Forest forest_at(float3 world) {
     if (f.w <= 0.0f) return f;
     const float2 uv = (world.xz - l_forest.xy) / l_forest.z;
     if (any(uv < 0.0f) || any(uv > 1.0f)) { f.w = 0.0f; return f; }
-    const float4 a = g_forest_a.SampleLevel(g_ddgi_linear, uv, 0.0f);
-    const float4 b = g_forest_b.SampleLevel(g_ddgi_linear, uv, 0.0f);
+    const float4 a = g_forest_a.SampleLevel(g_gi_linear, uv, 0.0f);
+    const float4 b = g_forest_b.SampleLevel(g_gi_linear, uv, 0.0f);
     // Cover through a contrast curve: a wood's edge is a few metres wide and
     // the map's texels are twenty, so bilinear cover blurred every edge and
     // clump the real trees draw crisply.

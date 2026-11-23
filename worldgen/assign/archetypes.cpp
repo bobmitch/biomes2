@@ -160,6 +160,42 @@ ArchetypeTable load_archetypes(const std::string& path) {
         read_class(rr.obj.at("outcrop"), rt.outcrop, "outcrop");
     }
 
+    // Layer 4's micro-relief and layer 5b's flat sites. Both optional: a table
+    // without them has neither.
+    if (root.has("detail")) {
+        const jsonlite::Value& d = root.obj.at("detail");
+        t.detail.period  = static_cast<float>(d.number("period"));
+        t.detail.octaves = static_cast<int>(d.number("octaves"));
+        t.detail.gain    = static_cast<float>(d.number("gain"));
+        if (!(t.detail.period > 0.0f && t.detail.octaves >= 1 && t.detail.octaves <= 8 &&
+              t.detail.gain > 0.0f && t.detail.gain < 1.0f))
+            throw std::runtime_error("archetypes: detail needs period > 0, octaves 1..8, 0 < gain < 1");
+    }
+    if (root.has("flats")) {
+        const jsonlite::Value& f = root.obj.at("flats");
+        FlatTable& ft = t.flats;
+        ft.present = true;
+        const jsonlite::Array& rr = f.array("radius");
+        if (rr.size() != 2) throw std::runtime_error("archetypes: flats.radius needs 2 entries");
+        ft.cell         = static_cast<float>(f.number("cell"));
+        ft.radius_min   = static_cast<float>(rr[0].num);
+        ft.radius_max   = static_cast<float>(rr[1].num);
+        ft.shoulder     = static_cast<float>(f.number("shoulder"));
+        ft.shoulder_min = static_cast<float>(f.number("shoulder_min"));
+        ft.max_grade    = static_cast<float>(f.number("max_grade"));
+        ft.river_clear  = static_cast<float>(f.number("river_clear"));
+        ft.shore        = static_cast<float>(f.number("shore"));
+        ft.tree_clear   = static_cast<float>(f.number("tree_clear"));
+        // A site sits in the middle 56% of its cell (world.cpp), so two can
+        // never touch while the outer edge stays under 0.22 cell.
+        const float outer = ft.radius_max + (ft.radius_max * ft.shoulder > ft.shoulder_min
+                                             ? ft.radius_max * ft.shoulder : ft.shoulder_min);
+        if (!(ft.radius_min > 0.0f && ft.radius_min <= ft.radius_max && ft.shoulder >= 0.0f &&
+              ft.cell > 0.0f && outer + ft.tree_clear < 0.22f * ft.cell && ft.max_grade > 0.0f))
+            throw std::runtime_error("archetypes: flats needs 0 < radius_min <= radius_max and "
+                                     "radius + shoulder + tree_clear under 0.22 cell");
+    }
+
     const jsonlite::Array& list = root.array("biomes");
     t.biomes.reserve(list.size());
 
@@ -185,6 +221,10 @@ ArchetypeTable load_archetypes(const std::string& path) {
         b.gain           = static_cast<float>(e.number("gain"));
         b.ridge_blend    = static_cast<float>(e.number("ridge_blend"));
         b.flatness       = static_cast<float>(e.number("flatness"));
+        b.detail_amp     = e.has("detail") ? static_cast<float>(e.number("detail")) : 0.0f;
+        b.flat_chance    = e.has("flats") ? static_cast<float>(e.number("flats")) : 0.0f;
+        if (b.detail_amp < 0.0f || b.flat_chance < 0.0f || b.flat_chance > 1.0f)
+            throw std::runtime_error("archetypes: " + b.name + " needs detail >= 0 and flats in [0, 1]");
 
         b.overhang_strength = static_cast<float>(e.number("overhang_strength"));
         b.cave_density      = static_cast<float>(e.number("cave_density"));

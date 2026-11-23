@@ -9,9 +9,12 @@
 // and their paths are relative, the same convention validate.exe uses for
 // archetypes.json and the golden hashes.
 //
-//   WASD / QE   fly, shift to sprint
-//   mouse       look (click to capture, Esc to release)
-//   Tab         walk (a capsule under physics) / fly
+//   WASD / QE   move; fly, shift to go faster. Walking: a jog, Shift
+//               sprints, Caps Lock (toggled) walks
+//   mouse       look (click to capture, Esc to release); walking, it
+//               orbits the third-person camera round the character
+//   wheel       walking: camera distance, in to first person; flying: speed
+//   Tab         walk (the character, a capsule under physics) / fly
 //   Space       jump; in the sea, swim up -- and out over a ledge
 //   Ctrl        in the sea, dive
 //   [ ]         sea state, calm to storm
@@ -21,25 +24,35 @@
 //   F2          write a capture to build/shot.bmp
 //   click       (once captured) chop the tree in front of you; enough
 //               swings fell it, and the log falls under physics
+//   right click (once captured) dig where the screen centre meets the
+//               ground; held, keep digging
+//   , .         dig radius, 0.5 m (one voxel) to 8 m; Shift: exposure
 //   - =         tree draw distance, 100 to 2000 m in 50 m steps
 //   F6 / F9     save / load: dig edits and felled trees, under build/
+//   F8          snapshot: camera, time, weather, edits and a still, under
+//               build/snapshots/<time>/; --snapshot <that dir> stands you there
 //   L           sun shadows on / off
 //   G           ground cover (grass, flowers, bushes) on / off
 //   Y O J       TAA, ambient occlusion, contact shadows on / off
+//   Esc         pause menu (resume, options, controls, quit) -- game/scripts
+//   F1 or `     the tuning panel: time, weather, fog, exposure, live
 // ---------------------------------------------------------------------------
 #include "engine/render/renderer.h"
 #include "engine/render/water_wave.h"
+#include "engine/render/weather.h"
 #include "engine/render/shader_compile.h"
 #include "engine/render/sky.h"
 #include "engine/camera.h"
 #include "engine/physics/physics_world.h"
 #include "engine/trees/felling.h"
+#include "engine/ui/ui.h"
 
 #include <windows.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -49,10 +62,30 @@ engine::Renderer  g_renderer;
 engine::Camera    g_camera;
 engine::PhysicsWorld g_physics;
 engine::TreeFelling  g_felling;
+// Where the player starts: worldgen::find_spawn, the most central point well
+// inside the calmest biome. Every mode that starts "at spawn" starts here.
+worldgen::SpawnPoint g_spawn;
 bool  g_walk = false;
 bool  g_want_chop = false;
 bool  g_want_save = false, g_want_load = false;
+// F8: a snapshot -- everything needed to stand exactly here again
+// (write_snapshot; --snapshot <dir> reads it back).
+bool  g_want_snapshot = false;
+std::string g_snapshot_dir;          // --snapshot: the folder being reproduced
+int   g_snap_walk_frames = -1;       // frames until the snapshot's character is placed
+float g_snap_feet[3] = {0, 0, 0};
+float g_snap_cam_dist = -1.0f;
 char  g_tree_msg[96] = "";
+// Digging (right mouse): a sphere carved where the screen centre meets the
+// ground. The smallest removes ONE 0.5 m edit voxel; , and . step the size.
+// Held, it digs again every kDigRepeat seconds.
+const float kDigRadii[] = {0.5f, 0.75f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f};
+const int   kDigSizes = int(sizeof(kDigRadii) / sizeof(kDigRadii[0]));
+const float kDigReach = 80.0f;
+const float kDigRepeat = 0.2f;
+int   g_dig_size = 0;
+bool  g_want_dig = false, g_dig_held = false;
+float g_dig_timer = 0.0f;
 // The capsule's feet, read back from Jolt each frame. Kept here so the camera
 // and the raymarch's capsule agree with what physics actually did, rather than
 // with what was asked for.
@@ -74,6 +107,149 @@ size_t g_mesh_max_verts = 0, g_mesh_max_idx = 0;
 const float kCapsuleRadius = 0.35f;
 const float kCapsuleHalf = 0.80f;
 const float kEyeAboveFeet = 1.60f;
+
+// --- The player in walk mode: a character and a third-person camera -------
+//
+// The camera orbits a point over the feet at the camera's own yaw and pitch
+// (the mouse), g_cam_dist behind it; the wheel sets the distance, and in
+// close enough it becomes the old first-person eye with the character
+// hidden. Movement is relative to the camera; the character turns to face
+// where it is going. A ray through physics (terrain, trunks, rocks) and the
+// terrain height pull the camera in so it never sits inside a hill.
+engine::CharacterAnimator g_anim;
+engine::AnimLibrary g_anim_lib;   // the Universal Animation Library, retargeted
+// On foot: a jog by default, Shift sprints, Caps Lock (toggled) walks --
+// each near the speed its clip covers (5.4, 8.3 and 1.0 m/s), so the
+// stride a clip shows is the stride physics moves.
+const float kJogSpeed = 5.0f, kSprintSpeed = 8.0f, kWalkSpeed = 1.4f;
+float g_cam_dist = 4.5f;        // wanted, metres; 0 is first person
+float g_cam_dist_now = 4.5f;    // after collision, eased back out
+float g_char_yaw = 0.0f;        // the character's facing, Camera's convention
+float g_char_speed = 0.0f;      // horizontal, m/s, from what physics did
+float g_prev_feet[3] = {0.0f, 0.0f, 0.0f};
+bool  g_have_prev_feet = false;
+std::vector<float> g_bones;
+const float kCamDistMin = 1.2f, kCamDistMax = 18.0f;
+const float kFirstPersonBelow = 0.9f;   // zooming in past this goes to the eye
+const float kCamPivot = 1.55f;          // over the feet: the shoulders
+
+bool first_person() { return g_cam_dist < kFirstPersonBelow; }
+
+// The wheel: in walk mode the camera's distance, 15% a notch, through first
+// person at the near end; in flight, the flying speed.
+void zoom(float notches) {
+    if (!g_walk) {
+        g_camera.speed = (std::max)(2.0f, (std::min)(g_camera.speed * std::pow(1.25f, notches), 2000.0f));
+        return;
+    }
+    if (first_person()) {
+        if (notches < 0.0f) g_cam_dist = g_cam_dist_now = kCamDistMin;
+        return;
+    }
+    g_cam_dist *= std::pow(0.85f, notches);
+    if (g_cam_dist < kCamDistMin) g_cam_dist = 0.0f;
+    if (g_cam_dist > kCamDistMax) g_cam_dist = kCamDistMax;
+}
+
+// After physics has moved the capsule: the character's speed, facing and
+// pose. (vx, vz) is the velocity asked for, which decides the facing.
+void update_character(float dt, float t, float vx, float vz) {
+    if (!g_anim.ready()) return;
+    float speed = 0.0f;
+    if (g_have_prev_feet && dt > 1e-5f) {
+        const float dx = g_feet[0] - g_prev_feet[0], dz = g_feet[2] - g_prev_feet[2];
+        speed = std::sqrt(dx * dx + dz * dz) / dt;
+        if (speed > 30.0f) speed = 0.0f;   // a teleport, not a stride
+    }
+    const float vy = (g_have_prev_feet && dt > 1e-5f) ? (g_feet[1] - g_prev_feet[1]) / dt : 0.0f;
+    for (int k = 0; k < 3; ++k) g_prev_feet[k] = g_feet[k];
+    g_have_prev_feet = true;
+    g_char_speed += (speed - g_char_speed) * (1.0f - std::exp(-12.0f * dt));
+    if (first_person()) {
+        g_char_yaw = g_camera.yaw;
+    } else if (vx * vx + vz * vz > 0.01f) {
+        // Turn towards the way we are going, the short way round, quickly.
+        const float want = std::atan2(vx, vz);
+        float d = want - g_char_yaw;
+        d -= 6.2831853f * std::floor((d + 3.14159265f) / 6.2831853f);
+        const float step = 12.0f * dt;
+        g_char_yaw += d > step ? step : (d < -step ? -step : d);
+    }
+    engine::LocomotionInput in;
+    in.dt = dt;
+    in.speed = g_char_speed;
+    in.grounded = g_physics.character_supported();
+    in.swimming = g_physics.medium() == engine::Medium::Swimming;
+    in.vertical = vy;
+    in.time = t;
+    in.torch = g_renderer.carried_torch();
+    g_anim.update(in);
+}
+
+// Hand the renderer this frame's pose (or nothing), and the torch's hand.
+void publish_character() {
+    const bool show = g_walk && g_anim.ready() && !first_person();
+    if (show) g_anim.skin(g_feet, g_char_yaw, g_bones);
+    g_renderer.character().set_pose(g_bones, show);
+    static int hand = -2;
+    if (hand == -2) hand = g_anim.ready() ? g_renderer.character().model().find("hand_r") : -1;
+    float p[3];
+    if (show && g_anim.joint_world(hand, g_feet, g_char_yaw, p)) {
+        // A little ahead of and above the fist, where a flame would be.
+        p[0] += 0.12f * std::sin(g_char_yaw);
+        p[1] += 0.25f;
+        p[2] += 0.12f * std::cos(g_char_yaw);
+        g_renderer.set_torch_anchor(p);
+    } else {
+        g_renderer.set_torch_anchor(nullptr);
+    }
+}
+
+// The walk-mode camera, after the mouse has turned it: the eye in first
+// person, else behind the pivot, pulled in by anything in between.
+void place_walk_camera(float dt) {
+    if (first_person()) {
+        g_camera.x = g_feet[0];
+        g_camera.y = g_feet[1] + kEyeAboveFeet;
+        g_camera.z = g_feet[2];
+        g_cam_dist_now = 0.0f;
+        return;
+    }
+    float fwd[3], right[3], up[3];
+    g_camera.basis(fwd, right, up);
+    const float pivot[3] = {g_feet[0], g_feet[1] + kCamPivot, g_feet[2]};
+    const float back[3] = {-fwd[0], -fwd[1], -fwd[2]};
+    const float margin = 0.3f;
+    float allowed = g_cam_dist;
+    int prop = 0;
+    const float hit = g_physics.probe_ray(pivot, back, g_cam_dist + margin, prop);
+    if (hit >= 0.0f) allowed = (std::max)(0.0f, hit - margin);
+    // The heightfield too: physics holds only what has streamed near the
+    // player, and the ray can slip between two chunks' shapes.
+    const engine::WorldGpu& wg = g_renderer.world();
+    for (int i = 0; i < 12 && allowed > 0.2f; ++i) {
+        const float x = pivot[0] + back[0] * allowed, z = pivot[2] + back[2] * allowed;
+        if (pivot[1] + back[1] * allowed >= wg.height(x, z) + 0.35f) break;
+        allowed *= 0.85f;
+    }
+    // In at once, out gently: a trunk passing between must not make the
+    // camera pump.
+    if (allowed < g_cam_dist_now || dt <= 0.0f) g_cam_dist_now = allowed;
+    else g_cam_dist_now += (allowed - g_cam_dist_now) * (1.0f - std::exp(-5.0f * dt));
+    g_camera.x = pivot[0] + back[0] * g_cam_dist_now;
+    g_camera.y = pivot[1] + back[1] * g_cam_dist_now;
+    g_camera.z = pivot[2] + back[2] * g_cam_dist_now;
+}
+
+// Where a swing of the axe comes from: the eye in first person, the head
+// otherwise -- the camera is metres behind, out of reach of any trunk.
+void chop_origin(float eye[3]) {
+    if (g_walk && !first_person()) {
+        eye[0] = g_feet[0]; eye[1] = g_feet[1] + kEyeAboveFeet; eye[2] = g_feet[2];
+    } else {
+        eye[0] = g_camera.x; eye[1] = g_camera.y; eye[2] = g_camera.z;
+    }
+}
 
 // Layer 9 in a report: what is resident and drawn, the largest outcrop, and
 // the nearest outcrop and boulder over 2 m to (x, z), for a --cam. With
@@ -181,7 +357,12 @@ void sync_sea(float t) {
     engine::SeaParams s;
     s.on = g_renderer.water();
     s.level = g_renderer.world().params().sea_level;
+    // The weather at this frame's clock, so the sea is the one about to be
+    // drawn even before record_scene asks for it.
+    g_renderer.update_weather(t);
     s.state = g_renderer.sea_state();
+    s.sea = g_renderer.sea();
+    s.swash = g_renderer.swash();
     s.time = t;
     g_physics.set_sea(s);
 }
@@ -203,10 +384,23 @@ void step_window_physics(float dt, float t, float vx, float vz, bool jump, float
     g_physics.character_position(g_feet);
 }
 bool g_captured = false;
+// The UI layer (engine/ui, game/): absent in every headless mode. Paused
+// stops the game clock, physics and the camera; the frame still draws, so the
+// tuning panel's changes show behind the menu.
+engine::ui::Ui   g_ui;
+engine::ui::Host g_host;
+bool g_paused = false;
+// The display as the options screen sees it. Borderless renders at
+// g_display.width x height and DXGI stretches it to the monitor; windowed
+// renders at the client size.
+engine::ui::DisplayState g_display;
 // The window's client size, and so every mode's render size: --res W H
 // (1280 x 720 by default), so a cost can be measured at the resolution it
 // will be played at.
 float g_res_w = 1280.0f, g_res_h = 720.0f;
+// --dig-tunnel's geometry, for --adapt-test's walk in: the entrance (x, z),
+// the heading, the floor's height and the ground's at the entrance.
+struct TestTunnel { bool dug = false; float x0 = 0, z0 = 0, fx = 0, fz = 1, floor_y = 0, h0 = 0; } g_tunnel;
 bool g_want_shot = false;
 // Time of day running on its own (H): an hour every ten seconds.
 bool g_time_lapse = false;
@@ -223,15 +417,32 @@ void set_capture(HWND hwnd, bool on) {
 }
 
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_ui.ready() && g_ui.on_message(hwnd, msg, wp, lp, g_captured)) return 0;
     switch (msg) {
         case WM_SIZE:
-            if (wp != SIZE_MINIMIZED) g_renderer.resize(LOWORD(lp), HIWORD(lp));
+            if (wp != SIZE_MINIMIZED) {
+                if (g_display.borderless) g_renderer.resize(UINT(g_display.width), UINT(g_display.height));
+                else g_renderer.resize(LOWORD(lp), HIWORD(lp));
+            }
+            return 0;
+        case WM_MOUSEWHEEL:
+            // Walking: the camera's distance from the character. Flying:
+            // the speed.
+            zoom(float(GET_WHEEL_DELTA_WPARAM(wp)) / float(WHEEL_DELTA));
             return 0;
         case WM_LBUTTONDOWN:
             // The first click captures the mouse; once captured, a click is
             // a swing of the axe.
             if (g_captured) g_want_chop = true;
             else set_capture(hwnd, true);
+            return 0;
+        case WM_RBUTTONDOWN:
+            // Dig where the screen centre meets the ground; held, keep digging.
+            if (g_captured) { g_want_dig = true; g_dig_held = true; g_dig_timer = 0.0f; }
+            else set_capture(hwnd, true);
+            return 0;
+        case WM_RBUTTONUP:
+            g_dig_held = false;
             return 0;
         case WM_KEYDOWN:
             if (wp == VK_ESCAPE) {
@@ -242,15 +453,45 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == VK_OEM_4 || wp == VK_OEM_6) {
                 // [ and ]: calm to storm without leaving the water. Seeing the
                 // surface change under one camera is the only way to judge
-                // whether the sea state actually reads as weather.
+                // whether the weather actually reads as weather. Fixes the
+                // dial; \ hands it back to the automatic weather. The sea
+                // answers over weather.sea_lag_s, as it would to a real wind.
                 const float d = (wp == VK_OEM_6) ? 0.1f : -0.1f;
                 g_renderer.set_sea_state(g_renderer.sea_state() + d);
+                return 0;
+            }
+            if (wp == VK_OEM_5) {
+                g_renderer.weather().set_auto();
+                return 0;
+            }
+            if (wp == VK_OEM_1) {
+                // ;: turn the wind 45 degrees.
+                const engine::WeatherState& w = g_renderer.weather_state();
+                float h = std::atan2(w.wind_dir[1], w.wind_dir[0]) + 0.78539816f;
+                if (h < 0.0f) h += 6.2831853f;
+                g_renderer.weather().set_heading(h);
+                return 0;
+            }
+            if (wp == VK_F3) {
+                // The volumetric clouds (ADR-005), for A/B; with Shift, the rain (C3).
+                if (GetKeyState(VK_SHIFT) & 0x8000) g_renderer.set_rain_on(!g_renderer.rain_on());
+                else g_renderer.set_clouds(!g_renderer.clouds());
+                return 0;
+            }
+            if (wp == VK_F4) {
+                // The sea's ripples (FFT detail), for A/B.
+                g_renderer.set_wave_detail(!g_renderer.wave_detail());
+                return 0;
+            }
+            if (wp == VK_F7) {
+                // Screen-space reflections on the sea, for A/B.
+                g_renderer.set_ssr(!g_renderer.ssr());
                 return 0;
             }
             if (wp == 'K') {
                 // Cycle the water debug views.
                 float m = g_renderer.water_debug() + 1.0f;
-                if (m > 4.5f) m = 0.0f;
+                if (m > 8.5f) m = 0.0f;
                 g_renderer.set_water_debug(m);
                 return 0;
             }
@@ -275,6 +516,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     // Drop in where the camera is, so the first frames are a
                     // short fall rather than a long one.
                     g_physics.place_character(g_camera.x, g_camera.y, g_camera.z);
+                    g_char_yaw = g_camera.yaw;
+                    g_have_prev_feet = false;
                 }
                 return 0;
             }
@@ -288,13 +531,6 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (wp == 'L') { g_renderer.set_shadows(!g_renderer.shadows()); return 0; }
-            // The traced shadow's denoiser (rt_denoise.h), for A/B under R.
-            // Shift+F8: terrain traced sparsely (one pixel per 2x2 a frame) or every pixel.
-            if (wp == VK_F8) {
-                if (GetKeyState(VK_SHIFT) & 0x8000) g_renderer.set_rt_sparse_terrain(!g_renderer.rt_sparse_terrain());
-                else g_renderer.set_rt_denoise(!g_renderer.rt_denoise());
-                return 0;
-            }
             if (wp == 'G') { g_renderer.set_foliage(!g_renderer.foliage_on()); return 0; }
             if (wp == 'Y') { g_renderer.set_taa(!g_renderer.taa()); return 0; }
             if (wp == 'O') { g_renderer.set_ao(!g_renderer.ao()); return 0; }
@@ -320,24 +556,23 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 engine::LocalLight l = engine::make_campfire();
                 l.pos[0] = g_camera.x + (hl > 1e-3f ? f[0] / hl : 0.0f) * 4.0f;
                 l.pos[2] = g_camera.z + (hl > 1e-3f ? f[2] / hl : 1.0f) * 4.0f;
-                l.pos[1] = g_renderer.world().height(l.pos[0], l.pos[2]) + 0.5f;
+                // On the EDITED ground, found down from eye height: the
+                // generated height left a fire dropped into a pit floating
+                // where the surface had been, and one in a tunnel on the
+                // ground above it. Eye height inside rock (ahead is a rising
+                // hill): from over the generated surface instead.
+                const float eye = g_walk ? g_feet[1] + 1.6f : g_camera.y;
+                const float gen = g_renderer.world().height(l.pos[0], l.pos[2]);
+                const float from = g_renderer.edited_density(l.pos[0], eye, l.pos[2]) > 0.0f ? gen + 1.0f : eye;
+                l.pos[1] = g_renderer.ground_below(l.pos[0], l.pos[2], from, true) + 0.5f;
                 g_renderer.add_light(l);
                 return 0;
             }
             if (wp == 'C') { g_renderer.clear_lights(); return 0; }
             // The mist (ADR-004 L4), for A/B.
             if (wp == 'N') { g_renderer.set_fog(!g_renderer.fog()); return 0; }
-            // Ray-traced key-light shadows in place of the cascades (L5).
-            // Shift+R: the traced sky visibility, canopy shade (L6).
-            if (wp == 'R') {
-                if (GetKeyState(VK_SHIFT) & 0x8000) g_renderer.set_rt_sky(!g_renderer.rt_sky());
-                else g_renderer.set_rt_shadows(!g_renderer.rt_shadows());
-                return 0;
-            }
-            // The canopy map's shade, the no-RT path (L6), for A/B.
+            // The canopy map's shade (L6), for A/B.
             if (wp == 'B') { g_renderer.set_canopy(!g_renderer.canopy()); return 0; }
-            // DDGI, the RT tier's GI (L6), for A/B against the fallback.
-            if (wp == 'I') { g_renderer.set_gi(!g_renderer.gi()); return 0; }
             // The screen-space bounce (L6), for A/B.
             if (wp == 'X') { g_renderer.set_ssgi(!g_renderer.ssgi()); return 0; }
             // The heightfield GI (L6), for A/B.
@@ -345,10 +580,18 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == 'P') { g_renderer.set_pom(!g_renderer.pom()); return 0; }
             if (wp == 'H') { g_time_lapse = !g_time_lapse; return 0; }
             if (wp == VK_OEM_COMMA || wp == VK_OEM_PERIOD) {
-                g_renderer.set_ev_comp(g_renderer.ev_comp() + (wp == VK_OEM_PERIOD ? 0.5f : -0.5f));
+                // , . the dig's size; with Shift, exposure by half a stop.
+                if (GetKeyState(VK_SHIFT) & 0x8000) {
+                    g_renderer.set_ev_comp(g_renderer.ev_comp() + (wp == VK_OEM_PERIOD ? 0.5f : -0.5f));
+                } else {
+                    g_dig_size += (wp == VK_OEM_PERIOD) ? 1 : -1;
+                    g_dig_size = g_dig_size < 0 ? 0 : (g_dig_size >= kDigSizes ? kDigSizes - 1 : g_dig_size);
+                    std::snprintf(g_tree_msg, sizeof g_tree_msg, "dig radius %.2f m", kDigRadii[g_dig_size]);
+                }
                 return 0;
             }
             if (wp == VK_F6) { g_want_save = true; return 0; }
+            if (wp == VK_F8) { g_want_snapshot = true; return 0; }
             if (wp == VK_F9) { g_want_load = true; return 0; }
             if (wp == VK_F5) {
                 std::string err;
@@ -413,108 +656,642 @@ void fill_view(const engine::Camera& cam, float w, float h, float t,
     v.cap_half = kCapsuleHalf;
 }
 
+// F8: a folder that stands someone else exactly here. snapshot.txt's "args:"
+// line is command-line flags (camera, time, fixed weather, exposure, torch,
+// walking), which --snapshot <dir> appends to the command line; edits.bin
+// and trees.bin are F6's saves; shot.bmp and shot.bmp.txt are this view as
+// a still, its exposure report included (the meter, the histogram), so what
+// the screen showed can be compared with what a rerun shows. Returns the
+// folder, or "" if it could not be written.
+std::string write_snapshot(const engine::ViewConstants& view) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char name[64];
+    std::snprintf(name, sizeof name, "%04d%02d%02d-%02d%02d%02d", st.wYear, st.wMonth, st.wDay, st.wHour,
+                  st.wMinute, st.wSecond);
+    CreateDirectoryA("build/snapshots", nullptr);
+    const std::string dir = std::string("build/snapshots/") + name;
+    if (!CreateDirectoryA(dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return "";
+    std::string err;
+    g_renderer.save_edits((dir + "/edits.bin").c_str(), err);
+    g_felling.save((dir + "/trees.bin").c_str(), g_renderer.world().field_id(), err);
+    FILE* f = std::fopen((dir + "/snapshot.txt").c_str(), "w");
+    if (!f) return "";
+    const engine::WeatherState& ws = g_renderer.weather_state();
+    float heading = std::atan2(ws.wind_dir[1], ws.wind_dir[0]) * 57.29578f;
+    if (heading < 0.0f) heading += 360.0f;
+    std::fprintf(f, "args: --cam %.3f %.3f %.3f %.5f %.5f --time %.4f --sea-state %.4f --wind %.3f --wind-dir %.2f "
+                    "--swell %.3f --ev-comp %.2f",
+                 g_camera.x, g_camera.y, g_camera.z, g_camera.yaw, g_camera.pitch, g_renderer.time_of_day(),
+                 g_renderer.sea_state(), ws.wind_speed, heading, ws.swell_hs, g_renderer.ev_comp());
+    if (g_renderer.rain_override() >= 0.0f) std::fprintf(f, " --rain %.3f", g_renderer.rain_override());
+    // The ground's wetness is the weather's recent history, not its state
+    // now: fixing the storm dial alone left a soaked tunnel dry on replay,
+    // and dry soil is twice as bright.
+    {
+        float wet_now = 0.0f, puddle_now = 0.0f;
+        g_renderer.wetness(wet_now, puddle_now);
+        std::fprintf(f, " --wet %.3f", wet_now);
+    }
+    if (g_renderer.carried_torch()) std::fprintf(f, " --torch");
+    // Campfires (V), each where it stands.
+    for (const engine::LocalLight& l : g_renderer.lights())
+        std::fprintf(f, " --fire %.3f %.3f %.3f", l.pos[0], l.pos[1], l.pos[2]);
+    if (g_walk) std::fprintf(f, " --snap-walk %.3f %.3f %.3f %.3f", g_feet[0], g_feet[1], g_feet[2], g_cam_dist);
+    std::fprintf(f, "\n");
+    std::fprintf(f, "# Reproduce: engine.exe --snapshot %s   (window, standing here)\n", dir.c_str());
+    std::fprintf(f, "#            engine.exe --snapshot %s --shot build/repro.bmp   (this view as a still)\n",
+                 dir.c_str());
+    std::fprintf(f, "# world: field id %08x; walking: %s; feet (%.2f, %.2f, %.2f); edits: %zu voxels in %zu bricks\n",
+                 g_renderer.world().field_id(), g_walk ? "yes" : "no", g_feet[0], g_feet[1], g_feet[2],
+                 g_renderer.edits().edited_voxels(), g_renderer.edits().brick_count());
+    std::fprintf(f, "# near field: %s, %s; heightfield GI %s\n", g_renderer.near_field_on() ? "on" : "off",
+                 g_renderer.near_field().ready() ? "ready" : "not ready", g_renderer.hfgi() ? "on" : "off");
+    std::fprintf(f, "# campfires: %zu; not kept: logs' poses beyond trees.bin, the clock's own weather\n",
+                 g_renderer.lights().size());
+    std::fclose(f);
+    g_renderer.capture(view, (dir + "/shot.bmp").c_str(), err);
+    // What the meter made of it: the still adapts instantly, so this is the
+    // fully adapted eye -- the number to compare a rerun against.
+    const engine::Renderer::ExposureReport& ex = g_renderer.last_exposure();
+    if (ex.valid) {
+        if (FILE* fa = std::fopen((dir + "/snapshot.txt").c_str(), "a")) {
+            std::fprintf(fa, "# exposure (adapted): EV100 %.2f, metered mean %.4g nits, band %.4g..%.4g nits\n",
+                         ex.ev100, ex.metered, ex.lo_nits, ex.hi_nits);
+            std::fclose(fa);
+        }
+    }
+    return dir;
+}
+
+// --- The script host: what game/scripts may read and set ---------------------
+//
+// Every knob is a Tunable (engine/ui/script_api.h): a name, a range, a getter
+// and a setter. The "Graphics" group is the options screen and is saved to
+// build/settings.lua by the script; every other group is the tuning panel,
+// for auditioning values live, and is NOT saved -- the authored values stay
+// in archetypes.json, where the panel's findings belong once settled.
+
+std::vector<std::pair<int, int> > display_modes(HWND hwnd) {
+    MONITORINFOEXA mi = {};
+    mi.cbSize = sizeof mi;
+    GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    std::vector<std::pair<int, int> > out;
+    DEVMODEA dm = {};
+    dm.dmSize = sizeof dm;
+    for (DWORD i = 0; EnumDisplaySettingsA(mi.szDevice, i, &dm); ++i)
+        if (dm.dmPelsWidth >= 800 && dm.dmPelsHeight >= 600)
+            out.push_back(std::make_pair(int(dm.dmPelsWidth), int(dm.dmPelsHeight)));
+    std::sort(out.begin(), out.end(), [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+        return a.first != b.first ? a.first > b.first : a.second > b.second;
+    });
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+engine::ui::DisplayState current_display(HWND hwnd) {
+    engine::ui::DisplayState d = g_display;
+    d.vsync = g_renderer.vsync();
+    if (!d.borderless) {
+        RECT cr;
+        GetClientRect(hwnd, &cr);
+        d.width = int(cr.right - cr.left);
+        d.height = int(cr.bottom - cr.top);
+    }
+    return d;
+}
+
+// Windowed: a framed window with that client size, centred on its monitor.
+// Borderless: a popup over the whole monitor, the swapchain at the asked
+// size and stretched by DXGI -- so a lower resolution costs what it should
+// while the window stays full screen. No exclusive mode: flip-model
+// borderless presents as fast, and alt-tab never loses the device.
+void apply_display(HWND hwnd, engine::ui::DisplayState d) {
+    g_renderer.set_vsync(d.vsync);
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof mi;
+    GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    d.width = (std::max)(640, (std::min)(d.width, 7680));
+    d.height = (std::max)(360, (std::min)(d.height, 4320));
+    g_display = d;
+    if (d.borderless) {
+        const RECT& m = mi.rcMonitor;
+        SetWindowLongPtrA(hwnd, GWL_STYLE, LONG_PTR(WS_POPUP | WS_VISIBLE));
+        SetWindowPos(hwnd, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        g_renderer.resize(UINT(d.width), UINT(d.height));
+    } else {
+        const DWORD style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+        SetWindowLongPtrA(hwnd, GWL_STYLE, LONG_PTR(style));
+        RECT rc = {0, 0, LONG(d.width), LONG(d.height)};
+        AdjustWindowRect(&rc, style, FALSE);
+        const RECT& wa = mi.rcWork;
+        const int ww = rc.right - rc.left, wh = rc.bottom - rc.top;
+        const int x = wa.left + (std::max)(0, int(wa.right - wa.left - ww) / 2);
+        const int y = wa.top + (std::max)(0, int(wa.bottom - wa.top - wh) / 2);
+        SetWindowPos(hwnd, nullptr, x, y, ww, wh, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER);
+        RECT cr;
+        GetClientRect(hwnd, &cr);
+        g_renderer.resize(UINT(cr.right - cr.left), UINT(cr.bottom - cr.top));
+    }
+}
+
+void register_tunables() {
+    using engine::ui::Tunable;
+    using engine::ui::TunableKind;
+    std::vector<Tunable>& T = g_host.tunables;
+    auto range = [&](const std::string& id, const char* group, const std::string& label, float mn, float mx,
+                     float step, const char* unit, std::function<float()> get, std::function<void(float)> set) {
+        Tunable t;
+        t.id = id; t.group = group; t.label = label;
+        t.kind = TunableKind::Range;
+        t.min = mn; t.max = mx; t.step = step; t.unit = unit;
+        t.get = std::move(get); t.set = std::move(set);
+        T.push_back(t);
+    };
+    auto toggle = [&](const char* id, const char* group, const char* label,
+                      std::function<bool()> get, std::function<void(bool)> set) {
+        Tunable t;
+        t.id = id; t.group = group; t.label = label;
+        t.kind = TunableKind::Toggle;
+        t.min = 0.0f; t.max = 1.0f; t.step = 1.0f;
+        t.get = [get]() { return get() ? 1.0f : 0.0f; };
+        t.set = [set](float v) { set(v > 0.5f); };
+        T.push_back(t);
+    };
+    auto choice = [&](const char* id, const char* group, const char* label, std::vector<std::string> names,
+                      std::function<float()> get, std::function<void(float)> set) {
+        Tunable t;
+        t.id = id; t.group = group; t.label = label;
+        t.kind = TunableKind::Choice;
+        t.min = 0.0f; t.max = float(names.size() - 1); t.step = 1.0f;
+        t.choices = std::move(names);
+        t.get = std::move(get); t.set = std::move(set);
+        T.push_back(t);
+    };
+    // Static, so the getters and setters below name it rather than capture a
+    // reference to a local that dies with this function.
+    static engine::Renderer& R = g_renderer;
+
+    // Graphics: the options screen, saved.
+    const char* G = "Graphics";
+    toggle("shadows", G, "Sun shadows", [&] { return R.shadows(); }, [&](bool b) { R.set_shadows(b); });
+    toggle("light_shadows", G, "Torch and fire shadows", [&] { return R.light_shadows(); },
+           [&](bool b) { R.set_light_shadows(b); });
+    toggle("ao", G, "Ambient occlusion", [&] { return R.ao(); }, [&](bool b) { R.set_ao(b); });
+    toggle("contact", G, "Contact shadows", [&] { return R.contact(); }, [&](bool b) { R.set_contact(b); });
+    toggle("taa", G, "Temporal anti-aliasing", [&] { return R.taa(); }, [&](bool b) { R.set_taa(b); });
+    toggle("pom", G, "Parallax occlusion", [&] { return R.pom(); }, [&](bool b) { R.set_pom(b); });
+    toggle("hfgi", G, "Terrain bounce light", [&] { return R.hfgi(); }, [&](bool b) { R.set_hfgi(b); });
+    toggle("canopy", G, "Canopy shade", [&] { return R.canopy(); }, [&](bool b) { R.set_canopy(b); });
+    toggle("foliage", G, "Grass and flowers", [&] { return R.foliage_on(); }, [&](bool b) { R.set_foliage(b); });
+    toggle("trees", G, "Trees", [&] { return R.trees_on(); }, [&](bool b) { R.set_trees(b); });
+    // The player's Brightness: a display gamma (dark vision's last step).
+    range("brightness", G, "Brightness", 0.6f, 1.8f, 0.05f, "", [&] { return R.dark_vision().brightness; },
+          [&](float v) { R.dark_vision().brightness = v; });
+    range("tree_distance", G, "Tree draw distance", 100.0f, 2000.0f, 50.0f, "m",
+          [&] { return R.tree_settings().max_dist; }, [&](float v) { R.tree_settings().max_dist = v; });
+    choice("texture", G, "Surface texture", {"Flat", "Scans", "Grid", "Scans + grid"},
+           [&] { return R.texture_mode(); }, [&](float v) { R.set_texture_mode(std::floor(v + 0.5f)); });
+    // The scans' anisotropic filtering: 1, 2, 4, 8, 16 as choices 0..4.
+    choice("aniso", G, "Texture filtering", {"Trilinear", "Anisotropic 2x", "Anisotropic 4x", "Anisotropic 8x",
+                                             "Anisotropic 16x"},
+           [&] { return std::floor(std::log2(R.scan_aniso()) + 0.5f); },
+           [&](float v) { R.set_scan_aniso(std::exp2(std::floor(v + 0.5f))); });
+
+    // Time.
+    range("time", "Time", "Time of day", 0.0f, 24.0f, 0.05f, "h",
+          [&] { return R.time_of_day(); }, [&](float v) { R.set_time_of_day(v); });
+    toggle("time_lapse", "Time", "Run the clock (1 h / 10 s)", [] { return g_time_lapse; },
+           [](bool b) { g_time_lapse = b; });
+
+    // Weather. Setting the storm or the wind fixes the dial; "automatic"
+    // hands it back to the seed's weather.
+    const char* W = "Weather";
+    toggle("weather_auto", W, "Automatic weather", [&] { return R.weather().automatic(); },
+           [&](bool b) { if (b) R.weather().set_auto(); else R.set_sea_state(R.sea_state()); });
+    range("storm", W, "Storm", 0.0f, 1.0f, 0.01f, "", [&] { return R.sea_state(); },
+          [&](float v) { R.set_sea_state(v); });
+    range("wind", W, "Wind speed", 0.0f, 30.0f, 0.5f, "m/s", [&] { return R.weather_state().wind_speed; },
+          [&](float v) { R.weather().set_wind(v); });
+    range("wind_dir", W, "Wind heading", 0.0f, 359.0f, 1.0f, "deg",
+          [&] {
+              const engine::WeatherState& w = R.weather_state();
+              float h = std::atan2(w.wind_dir[1], w.wind_dir[0]) * 57.29578f;
+              return h < 0.0f ? h + 360.0f : h;
+          },
+          [&](float v) { R.weather().set_heading(v * 0.01745329f); });
+    range("swell", W, "Swell height", 0.0f, 4.0f, 0.05f, "m", [&] { return R.weather_state().swell_hs; },
+          [&](float v) { R.weather().set_swell(v); });
+    toggle("rain_auto", W, "Rain follows the storm", [&] { return R.rain_override() < 0.0f; },
+           [&](bool b) { R.set_rain(b ? -1.0f : R.rain_intensity()); });
+    range("rain", W, "Rain", 0.0f, 1.0f, 0.01f, "", [&] { return R.rain_intensity(); },
+          [&](float v) { R.set_rain(v); });
+    toggle("wet_auto", W, "Wetness follows the rain", [&] { return R.wet_override() < 0.0f; },
+           [&](bool b) {
+               float wet = 0.0f, puddle = 0.0f;
+               R.wetness(wet, puddle);
+               R.set_wet(b ? -1.0f : wet);
+           });
+    range("wet", W, "Wetness", 0.0f, 1.0f, 0.01f, "",
+          [&] {
+              float wet = 0.0f, puddle = 0.0f;
+              R.wetness(wet, puddle);
+              return wet;
+          },
+          [&](float v) { R.set_wet(v); });
+    toggle("clouds", W, "Clouds", [&] { return R.clouds(); }, [&](bool b) { R.set_clouds(b); });
+    toggle("rain_drawn", W, "Rain drawn", [&] { return R.rain_on(); }, [&](bool b) { R.set_rain_on(b); });
+    toggle("lightning", W, "Lightning", [&] { return R.lightning_on(); }, [&](bool b) { R.set_lightning(b); });
+
+    // Fog. The height layers as their sea-level VISIBILITY (the 2% contrast
+    // distance, 3.912 / sigma) and their thickness (the e-folding height);
+    // the shader still takes sigma.
+    // Bare ground past the near field (scan_library.h GroundLook): the
+    // authored values are archetypes.json's ground_look.
+    const char* GL = "Terrain";
+    engine::GroundLook& gl = R.ground_look();
+    range("ground_variation", GL, "Ground: macro variation", 0.0f, 2.0f, 0.05f, "x",
+          [&gl] { return gl.variation; }, [&gl](float v) { gl.variation = v; });
+    range("ground_fade_from", GL, "Ground: scan fades from", 0.0f, 400.0f, 5.0f, "m",
+          [&gl] { return gl.fade[0]; }, [&gl](float v) { gl.fade[0] = v; });
+    range("ground_fade_to", GL, "Ground: scan is its mean by", 10.0f, 1000.0f, 5.0f, "m",
+          [&gl] { return gl.fade[1]; }, [&gl](float v) { gl.fade[1] = v; });
+    toggle("ground_hex", GL, "Ground: hex-tiling", [&gl] { return gl.hex; }, [&gl](bool b) { gl.hex = b; });
+    range("ground_far_detail", GL, "Ground: far detail", 0.0f, 1.5f, 0.05f, "x",
+          [&gl] { return gl.far_detail; }, [&gl](float v) { gl.far_detail = v; });
+    range("ground_far_scale", GL, "Ground: far detail scale", 2.0f, 20.0f, 0.1f, "x tile",
+          [&gl] { return gl.far_scale; }, [&gl](float v) { gl.far_scale = v; });
+
+    const char* F = "Fog";
+    toggle("mist", F, "Mist (near, patchy)", [&] { return R.fog(); }, [&](bool b) { R.set_fog(b); });
+    range("mist_density", F, "Mist density", 0.0f, 5.0f, 0.05f, "x", [&] { return R.fog_density(); },
+          [&](float v) { R.set_fog_density(v); });
+    range("mist_top", F, "Mist thins above", 0.0f, 400.0f, 5.0f, "m",
+          [&] { return R.fog_settings().mist_top[0]; }, [&](float v) { R.fog_settings().mist_top[0] = v; });
+    toggle("height_fog", F, "Height fog (exploration)", [&] { return R.height_fog(); },
+           [&](bool b) { R.set_height_fog(b); });
+    range("height_fog_scale", F, "Height fog density", 0.0f, 5.0f, 0.05f, "x",
+          [&] { return R.height_fog_scale(); }, [&](float v) { R.set_height_fog_scale(v); });
+    auto layer = [&](const char* id, const char* label, float* lp, float vmin, float vmax, float vstep,
+                     float hmax, float hstep) {
+        range(std::string(id) + "_vis", F, std::string(label) + ": visibility at sea level", vmin, vmax, vstep,
+              "m", [lp] { return lp[0] > 0.0f ? 3.912f / lp[0] : 1e6f; },
+              [lp](float v) { lp[0] = 3.912f / (v > 1.0f ? v : 1.0f); });
+        range(std::string(id) + "_height", F, std::string(label) + ": thickness", 5.0f, hmax, hstep, "m",
+              [lp] { return lp[1]; }, [lp](float v) { lp[1] = v; });
+    };
+    engine::FogSettings& fs = R.fog_settings();
+    layer("ground", "Ground layer", fs.ground, 100.0f, 20000.0f, 50.0f, 500.0f, 5.0f);
+    layer("valley", "Valley layer (dawn peak)", fs.valley, 50.0f, 5000.0f, 10.0f, 300.0f, 5.0f);
+    layer("deep", "Deep layer", fs.deep, 2000.0f, 200000.0f, 500.0f, 5000.0f, 50.0f);
+    range("valley_noon", F, "Valley layer left at noon", 0.0f, 1.0f, 0.01f, "",
+          [&] { return R.fog_settings().valley_noon; }, [&](float v) { R.fog_settings().valley_noon = v; });
+    range("valley_wind", F, "Wind that clears the valleys", 1.0f, 20.0f, 0.5f, "m/s",
+          [&] { return R.fog_settings().valley_wind; }, [&](float v) { R.fog_settings().valley_wind = v; });
+
+    // Exposure.
+    // The near field's probes (near_field.h Schedule): how often the box round
+    // the camera is traced, and how long probes remember, in Hz and seconds.
+    {
+        const char* NF = "Near field";
+        static engine::NearField::Schedule& S = R.near_field_schedule();
+        range("nf_near_memory", NF, "Probes' memory", 0.05f, 3.0f, 0.05f, "s",
+              [] { return S.near_memory; }, [](float v) { S.near_memory = v; });
+        range("nf_coarse_memory", NF, "Coarse level's memory", 0.1f, 5.0f, 0.1f, "s",
+              [] { return S.coarse_memory; }, [](float v) { S.coarse_memory = v; });
+        range("nf_light_memory", NF, "By a moving light", 0.02f, 1.0f, 0.02f, "s",
+              [] { return S.light_memory; }, [](float v) { S.light_memory = v; });
+    }
+    const char* E = "Exposure";
+    range("ev_comp", E, "Exposure compensation", -4.0f, 4.0f, 0.25f, "EV", [&] { return R.ev_comp(); },
+          [&](float v) { R.set_ev_comp(v); });
+    choice("tonemap", E, "Tonemap", {"Raw", "AgX", "ACES"}, [&] { return float(R.tonemap()); },
+           [&](float v) { R.set_tonemap(unsigned(v + 0.5f)); });
+    range("agx_saturation", E, "AgX saturation", 0.5f, 2.0f, 0.05f, "", [&] { return R.agx_saturation(); },
+          [&](float v) { R.set_agx_saturation(v); });
+    range("agx_power", E, "AgX power (contrast)", 0.5f, 2.5f, 0.05f, "", [&] { return R.agx_power(); },
+          [&](float v) { R.set_agx_power(v); });
+    // Dark vision (renderer.h DarkVision): the eye's floor by its sky, how it
+    // adapts, and the display's dark floor.
+    {
+        engine::Renderer::DarkVision& dv = R.dark_vision();
+        range("ev_floor_open", E, "Darkest the eye adapts to, open sky", -3.0f, 4.0f, 0.25f, "EV100",
+              [&dv] { return dv.floor_open; }, [&dv](float v) { dv.floor_open = v; });
+        range("ev_floor_under", E, "Darkest the eye adapts to, underground", -3.0f, 6.0f, 0.25f, "EV100",
+              [&dv] { return dv.floor_under; }, [&dv](float v) { dv.floor_under = v; });
+        range("ev_floor_lit", E, "Darkest the eye adapts to, a light in view", -4.0f, 4.0f, 0.25f, "EV100",
+              [&dv] { return dv.floor_lit; }, [&dv](float v) { dv.floor_lit = v; });
+        range("lit_key", E, "A light in the dark: its lit part over grey", 0.0f, 4.0f, 0.25f, "stops",
+              [&dv] { return dv.lit_key; }, [&dv](float v) { dv.lit_key = v; });
+        range("adapt_dark", E, "Into the dark", 0.1f, 10.0f, 0.1f, "s",
+              [&dv] { return dv.dark; }, [&dv](float v) { dv.dark = v; });
+        range("adapt_light", E, "Into the light", 0.1f, 5.0f, 0.05f, "s",
+              [&dv] { return dv.light; }, [&dv](float v) { dv.light = v; });
+        toggle("dark_display", E, "Dark vision display floor", [&dv] { return dv.on; }, [&dv](bool b) { dv.on = b; });
+        range("dark_lift", E, "Dark floor lift", 0.0f, 0.06f, 0.0025f, "",
+              [&dv] { return dv.lift; }, [&dv](float v) { dv.lift = v; });
+        range("dark_threshold", E, "Colour fades below", 0.01f, 3.0f, 0.01f, "nits",
+              [&dv] { return dv.threshold; }, [&dv](float v) { dv.threshold = v; });
+    }
+
+    // Digging (right mouse; , . step it). The HUD reads this too.
+    {
+        std::vector<std::string> names;
+        for (int i = 0; i < kDigSizes; ++i) {
+            char b[32];
+            std::snprintf(b, sizeof b, "%.2f m", kDigRadii[i]);
+            names.push_back(b);
+        }
+        choice("dig_radius", "Dig", "Dig radius", names, [] { return float(g_dig_size); },
+               [](float v) {
+                   const int i = int(v + 0.5f);
+                   g_dig_size = i < 0 ? 0 : (i >= kDigSizes ? kDigSizes - 1 : i);
+               });
+    }
+
+    // Lights.
+    toggle("torch", "Lights", "Carry a torch", [&] { return R.carried_torch(); },
+           [&](bool b) { R.set_carried_torch(b); });
+
+    // Trees: the depth prepass, live, for A/B (--no-tree-prepass).
+    toggle("tree_prepass", "Trees", "Depth prepass", [&] { return R.tree_prepass(); },
+           [&](bool b) { R.set_tree_prepass(b); });
+    // Terrain: its depth prepass, live, for A/B (--no-terrain-prepass).
+    toggle("terrain_prepass", "Terrain", "Depth prepass", [&] { return R.terrain_prepass(); },
+           [&](bool b) { R.set_terrain_prepass(b); });
+}
+
+// Brings the UI up over the window loop. Failure leaves the engine as it was
+// before the UI existed (Esc releases the mouse, then quits); the reason is
+// in build/ui_log.txt.
+void setup_ui(HWND hwnd) {
+    register_tunables();
+    g_host.quit = [] { PostQuitMessage(0); };
+    g_host.set_paused = [](bool p) { g_paused = p; };
+    g_host.paused = [] { return g_paused; };
+    g_host.capture_mouse = [hwnd](bool on) { set_capture(hwnd, on); };
+    g_host.display = [hwnd] { return current_display(hwnd); };
+    g_host.display_modes = [hwnd] { return display_modes(hwnd); };
+    g_host.apply_display = [hwnd](const engine::ui::DisplayState& d) { apply_display(hwnd, d); };
+    std::string err;
+    if (!g_ui.init(hwnd, g_renderer.device(), g_renderer.width(), g_renderer.height(), &g_host, err)) {
+        if (FILE* ef = std::fopen("build/engine_error.txt", "w")) {
+            std::fprintf(ef, "ui init failed (running without it):\n%s\n", err.c_str());
+            std::fclose(ef);
+        }
+        return;
+    }
+    g_renderer.set_overlay([](ID3D12GraphicsCommandList* cmd, D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT w, UINT h) {
+        g_ui.draw(cmd, rtv, w, h);
+    });
+}
+
 }  // namespace
 
-// --sea-report: what the sea state actually produces, measured on the C++ side
-// of the SAME function the shader draws. Storms are a planned mechanic, so the
-// thing that matters is not that waves exist but that the dial maps onto a
-// usable range of weather -- and the formula in water_wave.h is not evidence
-// of that, only the numbers it produces are.
+// --sea-report: what the weather's sea actually produces, measured on the C++
+// side of the SAME function the shader draws. The thing that matters is not
+// that waves exist but that the wind maps onto a usable range of weather, and
+// that depth tames them -- and the spectrum in weather.cpp is not evidence of
+// either, only the numbers it produces are.
 //
 // The assertion worth making is the one you would never catch by looking: the
-// MEAN surface height must stay at sea level whatever the sea state. A Gerstner
+// MEAN surface height must stay at sea level whatever the weather. A Gerstner
 // sum has zero mean by construction, so a non-zero mean here means an amplitude
 // or a steepness term has acquired a bias -- the sea would silently rise or
 // fall with the weather, flooding or draining coastlines, and no screenshot of
 // a rough sea would look wrong.
-static int run_sea_report(const char* path) {
-    FILE* f = std::fopen(path, "w");
-    if (!f) return 1;
+namespace {
+struct SeaStats { double hi, lo, mean, slope, miss, naive; };
 
-    std::fprintf(f, "The sea surface, measured from engine/render/water_wave.h\n");
-    std::fprintf(f, "-- the same text the shader compiles.\n\n");
-    std::fprintf(f, "%-6s %10s %10s %10s %10s %9s\n",
-                 "state", "crest-m", "trough-m", "height-m", "max-slope", "mean-m");
-
+SeaStats measure_sea(const WwSea& sea, float depth, bool invert) {
     const int N = 160;          // sample grid a side
     const float span = 420.0f;  // metres, several of the longest wavelength
-    double worst_mean = 0.0;
-    bool ok = true;
-    double inv_miss[11] = {0}, inv_naive[11] = {0};
-
-    for (int s = 0; s <= 10; s += 2) {
-        const float state = float(s) / 10.0f;
-        double lo = 1e30, hi = -1e30, sum = 0.0, slope = 0.0;
-        int n = 0;
-        // Two times, because a single snapshot of a travelling wave can miss
-        // the crest entirely and report a calm sea.
-        for (int ti = 0; ti < 2; ++ti) {
-            const float t = ti == 0 ? 0.0f : 7.3f;
-            for (int j = 0; j < N; ++j) {
-                for (int i = 0; i < N; ++i) {
-                    const float x = -span * 0.5f + span * float(i) / float(N - 1);
-                    const float z = -span * 0.5f + span * float(j) / float(N - 1);
-                    ww_float3 nrm;
-                    const ww_float3 p = ww_surface(x, z, t, state, 1.0f, 0.0f, nrm);
-                    if (p.y < lo) lo = p.y;
-                    if (p.y > hi) hi = p.y;
-                    sum += p.y;
-                    ++n;
-                    // ny is cos of the angle from vertical; smaller means steeper.
-                    const double sl = nrm.y > 1e-6f ? (1.0 / nrm.y) : 1e6;
-                    if (sl > slope) slope = sl;
-
-                    // The waterline physics asks for: the surface ABOVE
-                    // (x, z), not the water that started there. Every
-                    // fourth sample is plenty to find the worst case.
-                    if ((i & 3) == 0 && (j & 3) == 0) {
-                        const ww_float2 r = ww_rest_point(x, z, t, state, 0.0f);
-                        ww_float3 n2;
-                        const ww_float3 q = ww_surface(r.x, r.y, t, state, 1.0f, 0.0f, n2);
-                        const double mx = double(q.x) - x, mz = double(q.z) - z;
-                        const double miss = std::sqrt(mx * mx + mz * mz);
-                        if (miss > inv_miss[s]) inv_miss[s] = miss;
-                        const double naive = std::fabs(double(p.y) - double(q.y));
-                        if (naive > inv_naive[s]) inv_naive[s] = naive;
-                    }
+    SeaStats r = {-1e30, 1e30, 0.0, 0.0, 0.0, 0.0};
+    double sum = 0.0;
+    int n = 0;
+    // Two times, because a single snapshot of a travelling wave can miss
+    // the crest entirely and report a calm sea.
+    for (int ti = 0; ti < 2; ++ti) {
+        const float t = ti == 0 ? 0.0f : 7.3f;
+        for (int j = 0; j < N; ++j) {
+            for (int i = 0; i < N; ++i) {
+                const float x = -span * 0.5f + span * float(i) / float(N - 1);
+                const float z = -span * 0.5f + span * float(j) / float(N - 1);
+                ww_float3 nrm;
+                const ww_float3 p = ww_surface(x, z, t, sea, depth, 1.0f, 0.0f, nrm);
+                if (p.y < r.lo) r.lo = p.y;
+                if (p.y > r.hi) r.hi = p.y;
+                sum += p.y;
+                ++n;
+                // ny is cos of the angle from vertical; smaller means steeper.
+                const double sl = nrm.y > 1e-6f ? (1.0 / nrm.y) : 1e6;
+                if (sl > r.slope) r.slope = sl;
+                // The waterline physics asks for: the surface ABOVE (x, z),
+                // not the water that started there. Every fourth sample is
+                // plenty to find the worst case.
+                if (invert && (i & 3) == 0 && (j & 3) == 0) {
+                    const ww_float2 rp = ww_rest_point(x, z, t, sea, depth, 0.0f);
+                    ww_float3 n2;
+                    const ww_float3 q = ww_surface(rp.x, rp.y, t, sea, depth, 1.0f, 0.0f, n2);
+                    const double mx = double(q.x) - x, mz = double(q.z) - z;
+                    const double miss = std::sqrt(mx * mx + mz * mz);
+                    if (miss > r.miss) r.miss = miss;
+                    const double naive = std::fabs(double(p.y) - double(q.y));
+                    if (naive > r.naive) r.naive = naive;
                 }
             }
         }
-        const double mean = n ? sum / n : 0.0;
-        const double amean = mean < 0.0 ? -mean : mean;
-        if (amean > worst_mean) worst_mean = amean;
-        if (amean > 0.05) ok = false;
-
-        std::fprintf(f, "%-6.1f %10.2f %10.2f %10.2f %10.2f %9.4f\n",
-                     state, hi, lo, hi - lo, slope, mean);
     }
+    r.mean = n ? sum / n : 0.0;
+    return r;
+}
+}  // namespace
+
+static int run_sea_report(const char* path) {
+    FILE* f = std::fopen(path, "w");
+    if (!f) return 1;
+    engine::Weather weather;
+    std::string err;
+    if (!weather.load("worldgen/data/archetypes.json", err)) {
+        std::fprintf(f, "%s\n", err.c_str());
+        std::fclose(f);
+        return 1;
+    }
+    weather.set_seed(1);
+    weather.set_heading(0.6f);
+
+    std::fprintf(f, "The sea surface, measured from engine/render/water_wave.h -- the same\n");
+    std::fprintf(f, "text the shader compiles -- raised by engine/render/weather.cpp.\n");
+    std::fprintf(f, "Heights are crest to trough over a 420 m patch at two times.\n\n");
+
+    bool ok = true;
+    double worst_mean = 0.0;
+    auto check_mean = [&](const SeaStats& st) {
+        const double am = std::fabs(st.mean);
+        if (am > worst_mean) worst_mean = am;
+        if (am > 0.05) ok = false;
+    };
+
+    // 1. The wind sea alone, deep water, steady wind (the sea fully answered).
+    std::fprintf(f, "1. wind sea alone (no swell), deep water:\n");
+    std::fprintf(f, "%-7s %8s %8s %9s %9s %9s %9s %9s\n", "wind", "storm", "Hs-m", "crest-m",
+                 "trough-m", "height-m", "max-slope", "mean-m");
+    const float winds[] = {0.5f, 2.0f, 3.5f, 6.0f, 10.0f, 15.0f, 20.0f, 24.0f};
+    double inv_miss = 0.0;
+    for (float u : winds) {
+        weather.set_wind(u);
+        weather.set_swell(0.0f);
+        const engine::WeatherState w = weather.at(1000.0);
+        const WwSea sea = weather.sea(w);
+        const SeaStats st = measure_sea(sea, 1e4f, true);
+        check_mean(st);
+        if (st.miss > inv_miss) inv_miss = st.miss;
+        double m0 = 0.0;
+        for (int i = 0; i < WW_WAVES; ++i) m0 += 0.5 * double(sea.amp[i]) * sea.amp[i];
+        std::fprintf(f, "%-7.1f %8.2f %8.2f %9.2f %9.2f %9.2f %9.2f %9.4f   (naive waterline error %.3f m)\n",
+                     u, w.storm, 4.0 * std::sqrt(m0), st.hi, st.lo, st.hi - st.lo, st.slope, st.mean, st.naive);
+    }
+
+    // 2. The swell alone.
+    std::fprintf(f, "\n2. swell alone (a calm wind), deep water:\n");
+    std::fprintf(f, "%-7s %9s %9s\n", "Hs-m", "height-m", "max-slope");
+    const float swells[] = {0.25f, 1.0f, 2.5f};
+    for (float hs : swells) {
+        weather.set_wind(0.5f);
+        weather.set_swell(hs);
+        const SeaStats st = measure_sea(weather.sea(weather.at(1000.0)), 1e4f, false);
+        check_mean(st);
+        std::fprintf(f, "%-7.2f %9.2f %9.2f\n", hs, st.hi - st.lo, st.slope);
+    }
+
+    // 3. Depth, at a near gale with its swell: the waves die towards the
+    // shore, the long ones first, and nothing stands much taller than the
+    // water is deep. The cap is on the significant height (WW_BREAK_HS x
+    // depth); the biggest single wave of a random sea runs ~1.6-1.9 times
+    // that, so the check is the tallest wave in the patch against 1.1 x
+    // depth -- a wave that size is breaking, which is the point.
+    std::fprintf(f, "\n3. depth, at 15 m/s wind with a 2 m swell:\n");
+    std::fprintf(f, "%-8s %9s %9s %10s\n", "depth-m", "height-m", "limit-m", "verdict");
+    weather.set_wind(15.0f);
+    weather.set_swell(2.0f);
+    const WwSea gale = weather.sea(weather.at(1000.0));
+    const float depths[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f, 64.0f, 1e4f};
+    double prev = 0.0;
+    bool grows = true, held = true;
+    for (float d : depths) {
+        const SeaStats st = measure_sea(gale, d, d < 100.0f);
+        check_mean(st);
+        if (st.miss > inv_miss) inv_miss = st.miss;
+        const double h = st.hi - st.lo;
+        const double limit = 1.1 * d;
+        const bool deep = d > 1000.0f;
+        const bool in = deep || h <= limit + 0.01;
+        if (!in) held = false;
+        if (h + 0.01 < prev) grows = false;
+        prev = h;
+        std::fprintf(f, "%-8.2f %9.2f %9.2f %10s\n", deep ? 9999.0f : d, h,
+                     deep ? 0.0 : limit, deep ? "deep" : (in ? "ok" : "TOO TALL"));
+    }
+    std::fprintf(f, "waves grow with depth up to deep water: %s\n", grows ? "PASS" : "FAIL");
+    std::fprintf(f, "no wave taller than its water can hold: %s\n", held ? "PASS" : "FAIL");
+    if (!grows || !held) ok = false;
+
+    // 3b. Whitecaps: the trains' folding measure (ww_surface_with's Jacobian,
+    // 1 on still water, 0 where a crest folds) against the share of the sea
+    // that is whitecap at each wind, Monahan's fit W = 3.84e-6 U^3.41. The
+    // J at that quantile is the threshold water.hlsl's foam is fitted to.
+    std::fprintf(f, "\n3b. whitecaps: the trains' Jacobian J at the Monahan coverage, deep water, steady wind:\n");
+    std::fprintf(f, "%-7s %10s %8s %8s %8s %12s\n", "wind", "Monahan-%", "J 1%", "J 5%", "J 20%", "J@Monahan");
+    const float cap_winds[] = {4.0f, 6.0f, 8.0f, 10.0f, 12.0f, 15.0f, 18.0f, 20.0f, 24.0f};
+    for (float u : cap_winds) {
+        weather.set_wind(u);
+        weather.set_swell(0.0f);
+        const WwSea sea = weather.sea(weather.at(1000.0));
+        const ww_float3 loc = ww_local(sea, 1e4f, 1.0f, 0.0f);
+        std::vector<float> js;
+        js.reserve(160 * 160 * 2);
+        for (int ti = 0; ti < 2; ++ti) {
+            const float t = ti == 0 ? 0.0f : 7.3f;
+            for (int j = 0; j < 160; ++j) {
+                for (int i = 0; i < 160; ++i) {
+                    const float x = -210.0f + 420.0f * float(i) / 159.0f;
+                    const float z = -210.0f + 420.0f * float(j) / 159.0f;
+                    ww_float3 nrm;
+                    float jac = 1.0f;
+                    ww_surface_with(x, z, t, sea, 1e4f, 1.0f, 0.0f, loc.x, loc.y, nrm, jac);
+                    js.push_back(jac);
+                }
+            }
+        }
+        std::sort(js.begin(), js.end());
+        auto q = [&](double share) { return js[size_t((share < 0.999 ? share : 0.999) * double(js.size() - 1))]; };
+        const double w0 = 3.84e-6 * std::pow(double(u), 3.41), w = w0 < 0.3 ? w0 : 0.3;
+        std::fprintf(f, "%-7.1f %10.2f %8.3f %8.3f %8.3f %12.3f\n", u, 100.0 * w, q(0.01), q(0.05), q(0.20), q(w));
+    }
+
+    // 4. The automatic weather over six hours of four seeds: how often each wind.
+    std::fprintf(f, "\n4. automatic weather, seeds 1-4, six hours each sampled every 10 s:\n");
+    weather.set_auto();
+    int bins[6] = {0, 0, 0, 0, 0, 0};
+    const char* names[6] = {"calm <2", "light 2-5", "moderate 5-8", "fresh 8-14", "strong 14-18", "gale 18+"};
+    double worst_swell = 0.0;
+    const int per_seed = 2160, samples = 4 * per_seed;
+    for (int k = 0; k < samples; ++k) {
+        if (k % per_seed == 0) weather.set_seed(uint32_t(1 + k / per_seed));
+        const engine::WeatherState w = weather.at(double(k % per_seed) * 10.0);
+        const float u = w.wind_speed;
+        bins[u < 2 ? 0 : u < 5 ? 1 : u < 8 ? 2 : u < 14 ? 3 : u < 18 ? 4 : 5]++;
+        if (w.swell_hs > worst_swell) worst_swell = w.swell_hs;
+    }
+    for (int b = 0; b < 6; ++b) std::fprintf(f, "  %-13s %5.1f%%\n", names[b], 100.0 * bins[b] / samples);
+    std::fprintf(f, "  biggest swell %.2f m\n", worst_swell);
 
     std::fprintf(f, "\nmean surface height must stay at sea level: worst |mean| %.4f m -> %s\n",
-                 worst_mean, ok ? "PASS" : "FAIL (the sea rises with the weather)");
-
-    // The swimmer's waterline. ww_height_at inverts the Gerstner throw so it
-    // returns the surface directly above a point; "naive" is what you would
-    // get by skipping that and reading the water that STARTED there.
-    std::fprintf(f, "\nwaterline inversion (%d Newton steps), what physics floats on:\n",
-                 WW_INVERT_STEPS);
-    std::fprintf(f, "%-6s %16s %22s\n", "state", "miss-m (horiz)", "naive-error-m (vert)");
-    bool inv_ok = true;
-    for (int s = 0; s <= 10; s += 2) {
-        std::fprintf(f, "%-6.1f %16.6f %22.3f\n", float(s) / 10.0f, inv_miss[s], inv_naive[s]);
-        if (inv_miss[s] > 0.001) inv_ok = false;
-    }
-    std::fprintf(f, "inversion lands within 1 mm of the asked point: %s\n",
-                 inv_ok ? "PASS" : "FAIL (raise WW_INVERT_STEPS)");
+                 worst_mean, worst_mean <= 0.05 ? "PASS" : "FAIL (the sea rises with the weather)");
+    const bool inv_ok = inv_miss <= 0.001;
+    std::fprintf(f, "waterline inversion (%d Newton steps) lands within 1 mm of the asked point: "
+                    "worst %.6f m -> %s\n", WW_INVERT_STEPS, inv_miss, inv_ok ? "PASS" : "FAIL (raise WW_INVERT_STEPS)");
     if (!inv_ok) ok = false;
     std::fprintf(f, "\nmax-slope is 1/n.y, so 1.00 is flat and the Gerstner limit is\n");
-    std::fprintf(f, "where crests come to a point. Steepness rises with the sea\n");
-    std::fprintf(f, "state on purpose -- sharpening crests is most of what makes a\n");
+    std::fprintf(f, "where crests come to a point. Steepness rises with the storm\n");
+    std::fprintf(f, "on purpose -- sharpening crests is most of what makes a\n");
     std::fprintf(f, "storm read as one rather than as calm water scaled up.\n");
     std::fclose(f);
     return ok ? 0 : 1;
 }
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
+    // --snapshot <dir> (F8 writes them): the snapshot's own flags -- camera,
+    // time, weather, exposure, torch -- appended to this command line, so
+    // every mode reads them as if typed, and anything typed first wins.
+    static std::string full_cmdline;
+    full_cmdline = cmdline ? cmdline : "";
+    {
+        const size_t at = full_cmdline.find("--snapshot ");
+        if (at != std::string::npos) {
+            size_t p = full_cmdline.find_first_not_of(" \t", at + 11);
+            size_t e;
+            if (p != std::string::npos && full_cmdline[p] == '"') {
+                e = full_cmdline.find('"', p + 1);
+                ++p;
+            } else {
+                e = full_cmdline.find_first_of(" \t", p);
+            }
+            g_snapshot_dir = full_cmdline.substr(p, e == std::string::npos ? std::string::npos : e - p);
+            if (FILE* f = std::fopen((g_snapshot_dir + "/snapshot.txt").c_str(), "r")) {
+                char line[2048];
+                while (std::fgets(line, sizeof line, f)) {
+                    if (std::strncmp(line, "args:", 5) != 0) continue;
+                    std::string a = line + 5;
+                    while (!a.empty() && (a.back() == '\n' || a.back() == '\r')) a.pop_back();
+                    full_cmdline += " " + a;
+                }
+                std::fclose(f);
+            }
+        }
+    }
+    cmdline = &full_cmdline[0];
     // --sky-report (ADR-004 L2): the atmosphere model against published
     // clear-sky references. CPU only -- no device, no window, no world.
     if (std::string(cmdline ? cmdline : "").find("--sky-report") != std::string::npos) {
@@ -530,7 +1307,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     // the finished world rather than eight chunks of it.
     std::string shot_path;
     bool start_overlay = false, debug_layer = false;
-    float sea_state = 0.25f;
+    // The weather (weather.h) is automatic unless one of these fixes it:
+    // --sea-state the storm dial 0..1, --wind a speed in m/s, --wind-dir a
+    // heading in degrees (the way the air moves, from +x towards +z),
+    // --swell a significant height in metres.
+    float sea_state = -1.0f, wind_mps = -1.0f, wind_dir_deg = -1000.0f, swell_hs = -1.0f;
     float water_debug = 0.0f;
     bool  no_water = false;
     double flight_seconds = 0.0;
@@ -563,7 +1344,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (cl.find("--dig-save") != std::string::npos) mode_dig_save = true;
         else if (cl.find("--dig-verify") != std::string::npos) mode_dig_verify = true;
         else if (cl.find("--dig-stress") != std::string::npos) mode_dig_stress = true;
-        else if (cl.find("--dig") != std::string::npos) dig_seconds = 20.0;
+        else {
+            // --dig alone: --dig-row and --dig-settle contain it too.
+            for (size_t at = cl.find("--dig"); at != std::string::npos; at = cl.find("--dig", at + 5)) {
+                const char nx = at + 5 < cl.size() ? cl[at + 5] : ' ';
+                if (nx == ' ' || nx == '\t' || nx == '"') { dig_seconds = 20.0; break; }
+            }
+        }
         const size_t wk = cl.find("--walk");
         if (wk != std::string::npos) {
             walk_seconds = 8.0;
@@ -595,6 +1382,26 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             size_t p = cl.find_first_not_of(" \t", ss + 11);
             if (p != std::string::npos) sea_state = float(std::atof(cl.c_str() + p));
         }
+        auto flag_num = [&](const char* name, float& out) {
+            const size_t at = cl.find(name);
+            if (at == std::string::npos) return;
+            const size_t q = cl.find_first_not_of(" \t", at + std::string(name).size());
+            if (q != std::string::npos) out = float(std::atof(cl.c_str() + q));
+        };
+        flag_num("--wind-dir", wind_dir_deg);
+        {
+            // "--wind" alone, not the prefix of --wind-dir.
+            size_t at = 0;
+            while ((at = cl.find("--wind", at)) != std::string::npos) {
+                if (cl.compare(at, 10, "--wind-dir") != 0) {
+                    const size_t q = cl.find_first_not_of(" \t", at + 6);
+                    if (q != std::string::npos) wind_mps = float(std::atof(cl.c_str() + q));
+                    break;
+                }
+                at += 6;
+            }
+        }
+        flag_num("--swell", swell_hs);
         no_water = cl.find("--no-water") != std::string::npos;
         const size_t wd = cl.find("--water-debug");
         if (wd != std::string::npos) {
@@ -696,6 +1503,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                               rc.right - rc.left, rc.bottom - rc.top,
                               nullptr, nullptr, inst, nullptr);
     if (!hwnd) return 1;
+    g_display.width = int(g_res_w);
+    g_display.height = int(g_res_h);
+    g_display.borderless = res_given;
+    g_display.forced = res_given;
 
     // Every batch mode, not just --shot. The narrow version of this check
     // covered --shot only and --dig-save hung on a message box the very next
@@ -712,19 +1523,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                              hl.find("--normal-check") != std::string::npos ||
                              hl.find("--blend-report") != std::string::npos;
     const bool fell_mode = hl.find("--fell") != std::string::npos;
+    const bool dig_tree_mode = hl.find("--dig-settle") != std::string::npos;
     const bool lights_mode = hl.find("--lights-report") != std::string::npos;
-    const bool rt_report_mode = hl.find("--rt-report") != std::string::npos;
-    const bool rt_check_mode = hl.find("--check-rt") != std::string::npos;
     const bool leak_mode = hl.find("--leak-test") != std::string::npos;
-    const bool gi_report_mode = hl.find("--gi-report") != std::string::npos;
-    const bool headless = report_mode || fell_mode || lights_mode || rt_report_mode || rt_check_mode || leak_mode ||
-                          gi_report_mode ||
+    const bool headless = report_mode || fell_mode || dig_tree_mode || lights_mode || leak_mode ||
                           !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
                           dig_seconds > 0.0 || mode_dig_save || mode_dig_verify ||
                           mode_dig_stress || sea_shot ||
-                          std::string(cmdline ? cmdline : "").find("--tab-test") != std::string::npos;
+                          std::string(cmdline ? cmdline : "").find("--tab-test") != std::string::npos ||
+                          std::string(cmdline ? cmdline : "").find("--pose-sheet") != std::string::npos;
 
     std::string error;
     if (!g_physics.init(error)) {
@@ -737,8 +1546,40 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         }
         return 1;
     }
+    {
+        // --character male|female: which packed character (tools/models).
+        const std::string cl = cmdline ? cmdline : "";
+        const size_t ch = cl.find("--character ");
+        if (ch != std::string::npos) {
+            std::string name = cl.substr(ch + 12);
+            name = name.substr(0, name.find(' '));
+            for (char c : name)
+                if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) name.clear();
+            if (!name.empty()) g_renderer.set_character_pack("assets/models/packed/" + name + ".chr");
+        }
+    }
     const double init_t0 = engine::startup_now_ms();
     const bool init_ok = g_renderer.init(hwnd, error, debug_layer);
+    // Dark vision's rays (the ground under the eye, whether a light is in
+    // clear view of it): through the physics world -- terrain near the
+    // player, edits included, trunks, rocks.
+    g_renderer.set_ray_query([](const float from[3], const float dir[3], float len) {
+        int prop = 0;
+        return g_physics.probe_ray(from, dir, len, prop);
+    });
+    if (init_ok && g_renderer.character().ready()) {
+        // The clips, retargeted onto this character; without them the
+        // procedural gait.
+        std::string aerr;
+        const double ta = engine::startup_now_ms();
+        const bool clips = g_anim_lib.load("assets/models/packed/ual.anim", g_renderer.character().model(), aerr);
+        if (FILE* sf = std::fopen("build/startup.txt", "a")) {
+            std::fprintf(sf, "%9.0f ms  animation clips -- %s\n", engine::startup_now_ms() - ta,
+                         clips ? g_anim_lib.note.c_str() : aerr.c_str());
+            std::fclose(sf);
+        }
+        g_anim.bind(&g_renderer.character().model(), clips ? &g_anim_lib : nullptr);
+    }
     {
         // Where startup went. The 15-20 s before the first frame was always
         // described as "shader compilation plus the world build" and never
@@ -772,19 +1613,104 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 1;
     }
     g_felling.init(&g_renderer, &g_physics);
-    if (rt_check_mode) {
-        // ADR-004 L0: does hardware ray tracing work end to end here?
-        std::remove("build/rt_check.txt");
-        const bool ok = engine::run_rt_check(g_renderer.device(), g_renderer.queue(), g_renderer.caps(),
-                                             "build/rt_check.txt");
-        g_renderer.shutdown();
-        g_physics.shutdown();
-        return ok ? 0 : 1;
+    {
+        const double ts = engine::startup_now_ms();
+        const engine::WorldGpu& wg = g_renderer.world();
+        g_spawn = worldgen::find_spawn(wg.world(), wg.params(), wg.table());
+        // The window opens over the start, 40 m up, looking along +z at it.
+        g_camera.x = g_spawn.x;
+        g_camera.z = g_spawn.z - 60.0f;
+        g_camera.y = g_spawn.ground + 40.0f;
+        if (FILE* sf = std::fopen("build/startup.txt", "a")) {
+            std::fprintf(sf, "%9.0f ms  spawn at (%.0f, %.1f, %.0f), %.0f m from the centre, "
+                             "calmest biome %d at weight %.2f%s\n",
+                         engine::startup_now_ms() - ts, g_spawn.x, g_spawn.ground, g_spawn.z,
+                         std::sqrt(g_spawn.x * g_spawn.x + g_spawn.z * g_spawn.z),
+                         g_spawn.biome, g_spawn.weight,
+                         g_spawn.strict ? "" : " (FALLBACK: no point passed every test)");
+            // Layer 5b: how many level sites the seed has, and the nearest.
+            const std::vector<worldgen::SeedWorld::FlatSite>& fl = wg.world().flats;
+            size_t best = fl.size();
+            float bd2 = 3.4e38f;
+            for (size_t i = 0; i < fl.size(); ++i) {
+                const float dx = fl[i].x - g_spawn.x, dz = fl[i].z - g_spawn.z;
+                if (dx * dx + dz * dz < bd2) { bd2 = dx * dx + dz * dz; best = i; }
+            }
+            if (best < fl.size()) {
+                std::fprintf(sf, "           flat sites: %zu; nearest to spawn at (%.0f, %.1f, %.0f), "
+                                 "radius %.0f m, shoulder %.0f m, %.0f m away\n",
+                             fl.size(), fl[best].x, fl[best].level, fl[best].z,
+                             fl[best].radius, fl[best].shoulder, std::sqrt(bd2));
+            } else {
+                std::fprintf(sf, "           flat sites: none\n");
+            }
+            std::fclose(sf);
+        }
+    }
+    // A snapshot: its camera (the window opens there; --shot re-applies it),
+    // its edits and felled trees, and -- in the window -- the character back
+    // at its feet once the ground round them has streamed in.
+    if (have_cam) {
+        g_camera.x = cam_arg[0]; g_camera.y = cam_arg[1]; g_camera.z = cam_arg[2];
+        g_camera.yaw = cam_arg[3]; g_camera.pitch = cam_arg[4];
+    }
+    if (!g_snapshot_dir.empty()) {
+        std::string err;
+        bool mismatch = false;
+        g_renderer.load_edits((g_snapshot_dir + "/edits.bin").c_str(), err, mismatch);
+        g_felling.load((g_snapshot_dir + "/trees.bin").c_str(), g_renderer.world().field_id(), err, mismatch);
+        const std::string cl = cmdline;
+        const size_t sw = cl.find("--snap-walk ");
+        if (sw != std::string::npos &&
+            std::sscanf(cl.c_str() + sw + 12, "%f %f %f %f", &g_snap_feet[0], &g_snap_feet[1], &g_snap_feet[2],
+                        &g_snap_cam_dist) == 4)
+            g_snap_walk_frames = 90;
+        if (mismatch) {
+            if (FILE* sf = std::fopen("build/startup.txt", "a")) {
+                std::fprintf(sf, "           snapshot %s was made in ANOTHER world (seed or generator version)\n",
+                             g_snapshot_dir.c_str());
+                std::fclose(sf);
+            }
+        }
     }
     if (start_overlay) g_renderer.set_mode(engine::Mode::Wireframe);
-    g_renderer.set_sea_state(sea_state);
+    if (sea_state >= 0.0f) g_renderer.set_sea_state(sea_state);
+    if (wind_mps >= 0.0f) g_renderer.weather().set_wind(wind_mps);
+    if (wind_dir_deg > -999.0f) {
+        float rad = wind_dir_deg * 0.017453293f;
+        while (rad < 0.0f) rad += 6.2831853f;
+        g_renderer.weather().set_heading(rad);
+    }
+    if (swell_hs >= 0.0f) g_renderer.weather().set_swell(swell_hs);
     g_renderer.set_water_debug(water_debug);
     if (no_water) g_renderer.set_water(false);
+    if (cmdline && std::string(cmdline).find("--no-ssr") != std::string::npos) g_renderer.set_ssr(false);
+    if (cmdline && std::string(cmdline).find("--no-wave-detail") != std::string::npos) g_renderer.set_wave_detail(false);
+    if (cmdline && std::string(cmdline).find("--no-clouds") != std::string::npos) g_renderer.set_clouds(false);
+    if (cmdline && std::string(cmdline).find("--no-rain") != std::string::npos) g_renderer.set_rain_on(false);
+    if (cmdline && std::string(cmdline).find("--no-lightning") != std::string::npos) g_renderer.set_lightning(false);
+    if (cmdline && std::string(cmdline).find("--no-height-fog") != std::string::npos) g_renderer.set_height_fog(false);
+    if (cmdline) {
+        const std::string c4 = cmdline;
+        const size_t hk = c4.find("--height-fog ");
+        if (hk != std::string::npos) g_renderer.set_height_fog_scale(float(std::atof(c4.c_str() + hk + 13)));
+    }
+    if (cmdline) {
+        const std::string c3 = cmdline;
+        const size_t rn = c3.find("--rain ");
+        if (rn != std::string::npos) g_renderer.set_rain(float(std::atof(c3.c_str() + rn + 7)));
+        // --lightning <dist m> <bearing deg>: a ground strike for a still, the
+        // bearing from the camera's forward, positive to the right.
+        const size_t lt = c3.find("--lightning ");
+        if (lt != std::string::npos) {
+            float d = 2000.0f, b = 0.0f;
+            int in_cloud = 0;
+            std::sscanf(c3.c_str() + lt + 12, "%f %f %d", &d, &b, &in_cloud);
+            g_renderer.lightning().force(d, b * 0.017453293f, in_cloud != 0);
+        }
+        const size_t wt = c3.find("--wet ");
+        if (wt != std::string::npos) g_renderer.set_wet(float(std::atof(c3.c_str() + wt + 6)));
+    }
     if (no_lod_hold) g_renderer.set_lod_hold(false);
     {
         const std::string c2 = cmdline ? cmdline : "";
@@ -806,6 +1732,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const size_t tg = c2.find("--tree-debug");
         if (tg != std::string::npos) g_renderer.tree_settings().debug = float(std::atof(c2.c_str() + tg + 12));
         if (c2.find("--no-trees") != std::string::npos) g_renderer.set_trees(false);
+        if (c2.find("--no-tree-prepass") != std::string::npos) g_renderer.set_tree_prepass(false);
+        if (c2.find("--no-terrain-prepass") != std::string::npos) g_renderer.set_terrain_prepass(false);
         if (c2.find("--no-shadows") != std::string::npos) g_renderer.set_shadows(false);
         if (c2.find("--no-foliage") != std::string::npos) g_renderer.set_foliage(false);
         if (c2.find("--no-taa") != std::string::npos) g_renderer.set_taa(false);
@@ -819,33 +1747,78 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (c2.find("--no-light-shadows") != std::string::npos) g_renderer.set_light_shadows(false);
         // The mist (ADR-004 L4): off, or thicker or thinner than authored.
         if (c2.find("--no-fog") != std::string::npos) g_renderer.set_fog(false);
-        // The ray-tracing scene (ADR-004 L5).
-        // RT shadows are on by default where DXR 1.1 is; --no-rt-shadows for
-        // the cascades (PCSS). --rt-shadows is kept, and changes nothing.
-        if (c2.find("--no-rt-shadows") != std::string::npos) g_renderer.set_rt_shadows(false);
-        else if (c2.find("--rt-shadows") != std::string::npos) g_renderer.set_rt_shadows(true);
-        if (c2.find("--no-rt-denoise") != std::string::npos) g_renderer.set_rt_denoise(false);
-        if (c2.find("--rt-sparse-terrain") != std::string::npos) g_renderer.set_rt_sparse_terrain(true);
-        if (c2.find("--rt-sky") != std::string::npos) g_renderer.set_rt_sky(true);
-        {
-            const size_t k = c2.find("--rt-sky-rays ");
-            if (k != std::string::npos) g_renderer.set_rt_sky_rays(std::atoi(c2.c_str() + k + 14));
-        }
         if (c2.find("--no-canopy") != std::string::npos) g_renderer.set_canopy(false);
-        // --gi: the DDGI reference (off by default). Matched as a whole word:
-        // --gi-report and --no-gi contain it.
-        if ((" " + c2 + " ").find(" --gi ") != std::string::npos) g_renderer.set_gi(true);
-        if (c2.find("--no-gi") != std::string::npos) g_renderer.set_gi(false);
         if ((" " + c2 + " ").find(" --ssgi ") != std::string::npos) g_renderer.set_ssgi(true);
         if (c2.find("--no-ssgi") != std::string::npos) g_renderer.set_ssgi(false);
         if (c2.find("--no-hfgi") != std::string::npos) g_renderer.set_hfgi(false);
+        if (c2.find("--no-near-field") != std::string::npos) g_renderer.set_near_field(false);
+        // --fire x y z (any number): a campfire there -- what a snapshot
+        // writes for each one dropped with V.
+        for (size_t fp = c2.find("--fire "); fp != std::string::npos; fp = c2.find("--fire ", fp + 7)) {
+            engine::LocalLight l = engine::make_campfire();
+            if (std::sscanf(c2.c_str() + fp + 7, "%f %f %f", &l.pos[0], &l.pos[1], &l.pos[2]) == 3)
+                g_renderer.add_light(l);
+        }
+        // --fire-ground x z (any number): a campfire on the edited ground
+        // under (x, z) -- the floor of a pit, for a test.
+        for (size_t fp = c2.find("--fire-ground "); fp != std::string::npos; fp = c2.find("--fire-ground ", fp + 14)) {
+            engine::LocalLight l = engine::make_campfire();
+            if (std::sscanf(c2.c_str() + fp + 14, "%f %f", &l.pos[0], &l.pos[2]) == 2) {
+                const float gen = g_renderer.world().height(l.pos[0], l.pos[2]);
+                l.pos[1] = g_renderer.ground_below(l.pos[0], l.pos[2], gen + 1.0f, true) + 0.5f;
+                g_renderer.add_light(l);
+            }
+        }
+        // --nf-schedule <fine s> <coarse s> <light s>: the probes' memories.
+        {
+            const size_t ns = c2.find("--nf-schedule ");
+            engine::NearField::Schedule& s = g_renderer.near_field_schedule();
+            if (ns != std::string::npos)
+                std::sscanf(c2.c_str() + ns + 14, "%f %f %f", &s.near_memory, &s.coarse_memory, &s.light_memory);
+        }
+        // Dark vision for A/B: --ev-floor <open> <under> (EV100), the display
+        // floor off, the player's brightness.
+        {
+            engine::Renderer::DarkVision& dv = g_renderer.dark_vision();
+            const size_t ef = c2.find("--ev-floor ");
+            if (ef != std::string::npos) std::sscanf(c2.c_str() + ef + 11, "%f %f", &dv.floor_open, &dv.floor_under);
+            if (c2.find("--no-dark-display") != std::string::npos) dv.on = false;
+            const size_t br = c2.find("--brightness ");
+            if (br != std::string::npos) dv.brightness = float(std::atof(c2.c_str() + br + 13));
+        }
         if (c2.find("--no-far-shadow") != std::string::npos) g_renderer.set_far_shadow(false);
         if (c2.find("--no-pom") != std::string::npos) g_renderer.set_pom(false);
+        {
+            // The scans' anisotropic filtering (1 trilinear, 2, 4, 8, 16).
+            const size_t an = c2.find("--aniso ");
+            if (an != std::string::npos) g_renderer.set_scan_aniso(float(std::atof(c2.c_str() + an + 8)));
+        }
         if (c2.find("--no-rocks") != std::string::npos) g_renderer.set_rocks(false);
+        // Bare ground (GroundLook): --no-ground-look is the scans as they
+        // were; the others set one part. Not "--ground-...": --ground is
+        // taken (the camera at eye height), and a find() for it matches.
+        {
+            engine::GroundLook& gl = g_renderer.ground_look();
+            if (c2.find("--no-ground-look") != std::string::npos) {
+                gl.variation = 0.0f;
+                gl.fade[0] = 1e6f;
+                gl.fade[1] = 2e6f;
+                gl.hex = false;
+                gl.far_detail = 0.0f;
+            }
+            if (c2.find("--no-hex") != std::string::npos) gl.hex = false;
+            const size_t fd = c2.find("--far-detail ");
+            if (fd != std::string::npos) gl.far_detail = float(std::atof(c2.c_str() + fd + 13));
+            const size_t gv = c2.find("--macro-var ");
+            if (gv != std::string::npos) gl.variation = float(std::atof(c2.c_str() + gv + 12));
+            const size_t gf = c2.find("--detail-fade ");
+            if (gf != std::string::npos) {
+                char* e = nullptr;
+                gl.fade[0] = std::strtof(c2.c_str() + gf + 14, &e);
+                gl.fade[1] = std::strtof(e, nullptr);
+            }
+        }
         if (c2.find("--no-forest-shell") != std::string::npos) g_renderer.set_forest_shell(false);
-        if (c2.find("--no-crowns") != std::string::npos)
-            g_renderer.set_rt_sky_mask(engine::RtScene::kMaskTerrain | engine::RtScene::kMaskTrees);
-        if (c2.find("--rt-report") != std::string::npos) { g_renderer.set_rt_active(true); g_renderer.set_rt_checks(true); }
         const size_t fdn = c2.find("--fog-density");
         if (fdn != std::string::npos) g_renderer.set_fog_density(float(std::atof(c2.c_str() + fdn + 13)));
         // Time of day (ADR-004 L2), hours: --time 6.5 is half past six.
@@ -937,7 +1910,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // --sea-shot has already placed the camera on a coast; do not stamp
         // the fixed vantage over it.
         if (!sea_shot) {
-            g_camera.x = 10.0f; g_camera.y = 46.0f; g_camera.z = -70.0f;
+            // The fixed vantage, relative to the start: 70 m behind it
+            // and 22 m up, looking at it.
+            g_camera.x = g_spawn.x + 10.0f; g_camera.z = g_spawn.z - 70.0f;
+            g_camera.y = g_renderer.world().height(g_camera.x, g_camera.z) + 22.0f;
             g_camera.yaw = 0.15f; g_camera.pitch = -0.42f;
             if (shot_altitude > 0.0) {
                 g_camera.y = float(shot_altitude);
@@ -959,7 +1935,284 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         engine::ViewConstants v = {};
         fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
 
+        // --ui "<lua>": bring the UI up, run the code against it (say,
+        // menu.open()) and draw it into the still -- the one way to check a
+        // document without a person at the window. Without it a shot holds
+        // no UI at all.
+        {
+            const std::string cl = cmdline ? cmdline : "";
+            const size_t ui = cl.find("--ui ");
+            if (ui != std::string::npos) {
+                std::string code;
+                size_t p = cl.find_first_not_of(" 	", ui + 5);
+                if (p != std::string::npos && cl[p] == '"') {
+                    const size_t e = cl.find('"', p + 1);
+                    code = cl.substr(p + 1, e == std::string::npos ? std::string::npos : e - p - 1);
+                } else if (p != std::string::npos) {
+                    code = cl.substr(p, cl.find_first_of(" 	", p) - p);
+                }
+                g_display.forced = true;   // the still's size is the command line's
+                setup_ui(hwnd);
+                if (g_ui.ready()) {
+                    g_ui.run(code);
+                    for (int k = 0; k < 4; ++k) g_ui.update(0.25f);   // past the panel's refresh
+                    g_renderer.set_capture_overlay(true);
+                }
+            }
+        }
+
+        // --dig-row: before the still, one aimed dig of every size, left to
+        // right across the view at 60% of its height (smallest on the left),
+        // through the same Renderer::dig_aimed the right mouse uses.
+        // <shot>.dig.txt says where each landed and what it wrote.
+        if (std::string(cmdline ? cmdline : "").find("--dig-row") != std::string::npos) {
+            const std::string dp = shot_path + ".dig.txt";
+            FILE* df = std::fopen(dp.c_str(), "w");
+            float fwd[3], right[3], up[3];
+            g_camera.basis(fwd, right, up);
+            const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
+            if (df) std::fprintf(df, "aimed digs from (%.2f, %.2f, %.2f) yaw %.3f pitch %.3f\n",
+                                 eye[0], eye[1], eye[2], g_camera.yaw, g_camera.pitch);
+            for (int i = 0; i < kDigSizes; ++i) {
+                const float px = g_res_w * (0.08f + 0.84f * float(i) / float(kDigSizes - 1));
+                const float py = g_res_h * 0.6f;
+                const float nx = (px / g_res_w) * 2.0f - 1.0f, ny = 1.0f - (py / g_res_h) * 2.0f;
+                float d[3];
+                for (int k = 0; k < 3; ++k)
+                    d[k] = fwd[k] + right[k] * nx * v.tan_half_fov * v.aspect + up[k] * ny * v.tan_half_fov;
+                const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                for (int k = 0; k < 3; ++k) d[k] /= dl;
+                const engine::Renderer::AimedDig r = g_renderer.dig_aimed(eye, d, kDigReach, kDigRadii[i]);
+                // What the ray sees now: a dig must have moved the surface
+                // back along it, by about the radius.
+                float after[3], dist_after = -1.0f;
+                g_renderer.aim_terrain(eye, d, kDigReach, after, dist_after);
+                if (df) {
+                    if (!r.hit) std::fprintf(df, "r %.2f m: pixel (%.0f, %.0f) no ground within %.0f m\n",
+                                             kDigRadii[i], px, py, kDigReach);
+                    else std::fprintf(df, "r %.2f m: pixel (%.0f, %.0f) hit at %.2f m (%.2f, %.2f, %.2f), "
+                                          "centre (%.2f, %.2f, %.2f), %zu voxels, %.2f ms; "
+                                          "the ray now meets ground at %.2f m (+%.2f)\n",
+                                      kDigRadii[i], px, py, r.dist, r.hit_pos[0], r.hit_pos[1], r.hit_pos[2],
+                                      r.centre[0], r.centre[1], r.centre[2], r.voxels, r.ms,
+                                      dist_after, dist_after - r.dist);
+                }
+            }
+            if (df) std::fclose(df);
+        }
+
+        // --dig-tunnel: a shaft 6 m down at the camera's x, z (2.5 m radius),
+        // then a tunnel 22 m along the camera's heading from its floor (1.4 m
+        // radius), and the camera moved into the shaft, at eye height off its
+        // floor, looking down the tunnel. The scene for light under the
+        // ground: sky down the shaft, dark along the tunnel. With --tunnel-up
+        // it looks up the shaft instead.
+        //
+        // --tunnel-len <m> and --tunnel-r <m> its length (22) and radius
+        // (1.4); --tunnel-ramp a ramp in from the surface instead of the
+        // shaft (walking in from outside: the mouth's light is the open
+        // horizon, not a well); --tunnel-inward looks further in, not back;
+        // --tunnel-depth <m> how far under the ground its floor is (6).
+        if (std::string(cmdline ? cmdline : "").find("--dig-tunnel") != std::string::npos) {
+            const std::string tcl = cmdline;
+            auto tnum = [&](const char* name, float def) {
+                const size_t a = tcl.find(name);
+                return a == std::string::npos ? def : float(std::atof(tcl.c_str() + a + std::strlen(name)));
+            };
+            const float len = tnum("--tunnel-len ", 22.0f), rad = tnum("--tunnel-r ", 1.4f);
+            const bool ramp = tcl.find("--tunnel-ramp") != std::string::npos;
+            const float x0 = g_camera.x, z0 = g_camera.z;
+            const float h0 = g_renderer.world().height(x0, z0);
+            const float fx = std::sin(g_camera.yaw), fz = std::cos(g_camera.yaw);
+            const float floor_y = h0 - tnum("--tunnel-depth ", 6.0f);
+            g_tunnel.dug = true;
+            g_tunnel.x0 = x0; g_tunnel.z0 = z0; g_tunnel.fx = fx; g_tunnel.fz = fz;
+            g_tunnel.floor_y = floor_y; g_tunnel.h0 = h0;
+            if (ramp) {
+                // 20 m down from the surface, its floor meeting the tunnel's.
+                const float slope = (h0 - floor_y) / 20.0f;
+                for (int k = -24; k <= 0; ++k)
+                    g_renderer.dig(x0 + fx * float(k), floor_y + rad * 0.65f - slope * float(k), z0 + fz * float(k),
+                                   rad, -4.0f, 1);
+            } else {
+                for (int k = 0; k <= 4; ++k) g_renderer.dig(x0, h0 - 1.5f * float(k), z0, 2.5f, -4.0f, 1);
+            }
+            for (int k = 0; k <= int(len); ++k)
+                g_renderer.dig(x0 + fx * float(k), floor_y + rad * 0.65f, z0 + fz * float(k), rad, -4.0f, 1);
+            g_camera.x = x0 - fx * 1.0f;
+            g_camera.z = z0 - fz * 1.0f;
+            g_camera.y = floor_y + 1.6f;
+            g_camera.pitch = std::string(cmdline).find("--tunnel-up") != std::string::npos ? 1.2f : -0.05f;
+            // --tunnel-in <m>: stand that far down the tunnel, looking back
+            // at its mouth and the lit shaft.
+            const size_t ti = std::string(cmdline).find("--tunnel-in ");
+            if (ti != std::string::npos) {
+                const float m = float(std::atof(cmdline + ti + 12));
+                g_camera.x = x0 + fx * m;
+                g_camera.z = z0 + fz * m;
+                g_camera.y = floor_y + 1.4f;
+                if (tcl.find("--tunnel-inward") == std::string::npos) g_camera.yaw += 3.14159265f;
+                g_camera.pitch = 0.0f;
+            }
+            fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
+            if (FILE* tf = std::fopen((shot_path + ".tunnel.txt").c_str(), "w")) {
+                std::fprintf(tf, "%s at (%.1f, %.1f, %.1f), 6 m deep; tunnel heading (%.2f, %.2f), %.0f m, radius %.1f m; "
+                                 "camera (%.2f, %.2f, %.2f) yaw %.3f pitch %.3f\n",
+                             ramp ? "ramp" : "shaft", x0, h0, z0, fx, fz, len, rad, g_camera.x, g_camera.y, g_camera.z,
+                             g_camera.yaw, g_camera.pitch);
+                std::fclose(tf);
+            }
+        }
+
+        // --dig-burst <n>: a player hammering one spot with small digs --
+        // n aimed digs at radii 0.5, 0.75, 1 and 1.5 m in turn, scattered
+        // over +-90 px round 60% down the middle of the view by a fixed
+        // sequence, so a still of what repeated small edits leave is
+        // repeatable. Pair with --mesh-debug 1 to see the skirt curtain.
+        {
+            const std::string cl = cmdline ? cmdline : "";
+            const size_t at = cl.find("--dig-burst ");
+            if (at != std::string::npos) {
+                const int n = std::atoi(cl.c_str() + at + 12);
+                float fwd[3], right[3], up[3];
+                g_camera.basis(fwd, right, up);
+                const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
+                const float radii[4] = {0.5f, 0.75f, 1.0f, 1.5f};
+                uint32_t h = 0x2545F491u;
+                int hits = 0;
+                for (int i = 0; i < n; ++i) {
+                    h = h * 1664525u + 1013904223u;
+                    const float jx = (float(h >> 8) / 16777216.0f - 0.5f) * 180.0f;
+                    h = h * 1664525u + 1013904223u;
+                    const float jy = (float(h >> 8) / 16777216.0f - 0.5f) * 180.0f;
+                    const float px = 0.5f * g_res_w + jx, py = 0.6f * g_res_h + jy;
+                    const float nx = (px / g_res_w) * 2.0f - 1.0f, ny = 1.0f - (py / g_res_h) * 2.0f;
+                    float d[3];
+                    for (int k = 0; k < 3; ++k)
+                        d[k] = fwd[k] + right[k] * nx * v.tan_half_fov * v.aspect + up[k] * ny * v.tan_half_fov;
+                    const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                    for (int k = 0; k < 3; ++k) d[k] /= dl;
+                    if (g_renderer.dig_aimed(eye, d, kDigReach, radii[i & 3]).dug) ++hits;
+                }
+                if (FILE* bf = std::fopen((shot_path + ".dig.txt").c_str(), "a")) {
+                    std::fprintf(bf, "burst: %d of %d small digs landed, %zu edited voxels in all\n", hits, n,
+                                 g_renderer.edits().edited_voxels());
+                    std::fclose(bf);
+                }
+            }
+        }
+
         bool ok = g_renderer.capture(v, shot_path.c_str(), error);
+        // --adapt-test (with --dig-tunnel): the eye's adaptation, timed. From
+        // 10 m outside the tunnel's entrance in daylight (3 s), down it and
+        // 20 m in at walking pace, holding there for 75 s, then back out --
+        // every frame a simulated 1/30 s, so the curve does not depend on how
+        // fast this renders. build/adapt_test.txt: time, where, the meter's
+        // target and the adapted EV100, every 0.1 s.
+        if (ok && g_tunnel.dug && std::string(cmdline).find("--adapt-test") != std::string::npos) {
+            const float step = 1.0f / 30.0f;
+            g_renderer.set_post_dt_override(step);
+            FILE* af = std::fopen("build/adapt_test.txt", "w");
+            if (af) std::fprintf(af, "t_s  phase  metres_in  target_EV100  adapted_EV100  light_presence  p10_nits  p90_nits\n");
+            const TestTunnel& tt = g_tunnel;
+            // Where the camera is, metres along the tunnel's axis from its
+            // entrance (negative: back up the ramp and out on the surface).
+            auto place = [&](float m) {
+                g_camera.x = tt.x0 + tt.fx * m;
+                g_camera.z = tt.z0 + tt.fz * m;
+                const float ground = g_renderer.world().height(g_camera.x, g_camera.z);
+                const float in_tunnel = tt.floor_y + 1.4f;
+                // On the ramp the floor rises 1/20 of the depth a metre.
+                const float ramp = tt.floor_y + 1.4f + (tt.h0 - tt.floor_y) * (-m / 20.0f);
+                g_camera.y = m >= 0.0f ? in_tunnel : (m > -20.0f ? ramp : ground + 1.6f);
+                g_camera.yaw = std::atan2(tt.fx, tt.fz);
+                g_camera.pitch = -0.05f;
+            };
+            float t = 0.0f;
+            int frame = 0;
+            auto run = [&](const char* phase, float seconds, float from, float to) {
+                const int n = int(seconds / step + 0.5f);
+                for (int i = 0; i < n; ++i) {
+                    const float m = from + (to - from) * (float(i + 1) / float(n));
+                    place(m);
+                    t += step;
+                    fill_view(g_camera, g_res_w, g_res_h, t, v);
+                    g_renderer.step_offscreen(v);
+                    const float* ex = g_renderer.live_exposure();
+                    if (af)
+                        std::fprintf(af, "%6.2f  %-5s  %6.1f  %6.2f  %6.2f  %4.2f  %8.4f %8.4f\n", t, phase, m,
+                                     ex[3] + 3.0f, ex[2], g_renderer.light_presence(), ex[4], ex[5]);
+                    ++frame;
+                }
+            };
+            run("out", 3.0f, -30.0f, -30.0f);     // on the surface, adapted to the day
+            run("in", 6.0f, -30.0f, 20.0f);       // down the ramp and in, ~8 m/s
+            run("hold", 75.0f, 20.0f, 20.0f);     // standing 20 m in
+            run("back", 6.0f, 20.0f, -30.0f);     // out again
+            run("out", 4.0f, -30.0f, -30.0f);
+            if (af) std::fclose(af);
+            g_renderer.set_post_dt_override(-1.0f);
+        }
+
+        // --clock-jump <hours> [seconds] [ramp]: how fast the light under the
+        // ground follows the clock. After the still, 2 s at its hour, then the
+        // clock jumps to <hours> -- or with [ramp] seconds, runs there
+        // evenly over them, as H does -- and holds for [seconds] (10) after
+        // it. Every frame a
+        // simulated 1/30 s, the camera still. build/time_jump.txt: time, hour,
+        // the meter's target and adapted EV100, its 10th and 90th percentiles
+        // in nits (exposure-independent), every frame.
+        {
+            const std::string cl = cmdline ? cmdline : "";
+            const size_t tj = cl.find("--clock-jump ");
+            if (ok && tj != std::string::npos) {
+                float to = 23.0f, secs = 10.0f, ramp = 0.0f;
+                std::sscanf(cl.c_str() + tj + 13, "%f %f %f", &to, &secs, &ramp);
+                if (secs <= 0.0f || secs > 300.0f) secs = 10.0f;
+                const float step = 1.0f / 30.0f;
+                g_renderer.set_post_dt_override(step);
+                FILE* jf = std::fopen("build/time_jump.txt", "w");
+                if (jf) std::fprintf(jf, "t_s  hour  target_EV100  adapted_EV100  p10_nits  p90_nits\n");
+                float t = 0.0f;
+                auto run = [&](float seconds) {
+                    const int n = int(seconds / step + 0.5f);
+                    for (int i = 0; i < n; ++i) {
+                        t += step;
+                        fill_view(g_camera, g_res_w, g_res_h, t, v);
+                        g_renderer.step_offscreen(v);
+                        const float* ex = g_renderer.live_exposure();
+                        if (jf)
+                            std::fprintf(jf, "%6.3f  %5.2f  %6.2f  %6.2f  %9.5f %9.5f\n", t, g_renderer.time_of_day(),
+                                         ex[3] + 3.0f, ex[2], ex[4], ex[5]);
+                    }
+                };
+                run(2.0f);
+                if (ramp > 0.0f) {
+                    // Forward through midnight if need be, as the clock runs.
+                    const float from = g_renderer.time_of_day();
+                    const float span = std::fmod(to - from + 24.0f, 24.0f);
+                    const int n = int(ramp / step + 0.5f);
+                    for (int i = 0; i < n; ++i) {
+                        g_renderer.set_time_of_day(from + span * float(i + 1) / float(n));
+                        run(step);
+                    }
+                }
+                g_renderer.set_time_of_day(to);
+                run(secs);
+                if (jf) std::fclose(jf);
+                g_renderer.set_post_dt_override(-1.0f);
+            }
+        }
+
+        // --write-snapshot: the still's scene as an F8 snapshot (the window's
+        // key, headless), its folder named in build/last_snapshot.txt.
+        if (ok && std::string(cmdline).find("--write-snapshot") != std::string::npos) {
+            const std::string dir = write_snapshot(v);
+            if (FILE* lf = std::fopen("build/last_snapshot.txt", "w")) {
+                std::fprintf(lf, "%s\n", dir.c_str());
+                std::fclose(lf);
+            }
+        }
         {
             // --shake <frames>: a still camera through a session's worth of
             // frames with the clock running, then eight consecutive raw
@@ -997,6 +2250,190 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 }
                 g_renderer.set_capture_raw(false);
                 if (sl) std::fclose(sl);
+            }
+        }
+        {
+            // --gpu-profile [frames]: where a still's GPU time goes, pass by
+            // pass, and how much the tree pass overdraws. Writes
+            // <shot>.gpu.txt and <shot>.overdraw.bmp. The camera stays still
+            // and the clock runs, as in --shake.
+            const std::string cl = cmdline ? cmdline : "";
+            const size_t gp = cl.find("--gpu-profile");
+            if (ok && gp != std::string::npos) {
+                int n = 120;
+                {
+                    const size_t q = cl.find_first_not_of(" \t", gp + 13);
+                    if (q != std::string::npos && cl[q] != '-') n = std::atoi(cl.c_str() + q);
+                    if (n < 8) n = 120;
+                }
+                engine::GpuProfiler& prof = g_renderer.profiler();
+                float t = 0.0f;
+                auto run = [&](int frames) {
+                    for (int i = 0; i < frames; ++i) {
+                        t += 1.0f / 60.0f;
+                        fill_view(g_camera, g_res_w, g_res_h, t, v);
+                        g_renderer.step_offscreen(v);
+                    }
+                };
+                run(30);   // settle the streamers, the history, the exposure
+                // The frame as it runs: first and last marks only.
+                g_renderer.set_profiling(true);
+                prof.set_detail(false);
+                prof.reset(2);
+                LARGE_INTEGER w0, w1, wf;
+                QueryPerformanceFrequency(&wf);
+                QueryPerformanceCounter(&w0);
+                run(n);
+                g_renderer.flush();
+                QueryPerformanceCounter(&w1);
+                const double wall_ms = double(w1.QuadPart - w0.QuadPart) * 1000.0 / double(wf.QuadPart) / n;
+                prof.harvest_all();
+                const unsigned whole_frames = prof.frames();
+                const double whole_ms = whole_frames ? prof.total_ms() / whole_frames : 0.0;
+                // Pass by pass, serialised.
+                prof.set_detail(true);
+                prof.reset(2);
+                const unsigned long long nf_probes0 = g_renderer.near_field().probes_traced();
+                run(n);
+                const double nf_probes_frame = double(g_renderer.near_field().probes_traced() - nf_probes0) / n;
+                g_renderer.flush();
+                prof.harvest_all();
+                g_renderer.set_profiling(false);
+                const unsigned pf = prof.frames() ? prof.frames() : 1u;
+                const double W = g_res_w, H = g_res_h;
+                const std::string gpath = shot_path + ".gpu.txt";
+                FILE* gf = std::fopen(gpath.c_str(), "w");
+                if (gf) {
+                    std::fprintf(gf, "gpu profile: %.0f x %.0f, camera (%.1f, %.1f, %.1f) yaw %.2f pitch %.2f, %d frames each\n",
+                                 W, H, g_camera.x, g_camera.y, g_camera.z, g_camera.yaw, g_camera.pitch, n);
+                    std::fprintf(gf, "frame, as it runs (first to last mark, passes overlapping): %.3f ms over %u frames\n",
+                                 whole_ms, whole_frames);
+                    std::fprintf(gf, "frame, wall clock (CPU and GPU, a still's frame waits for the GPU): %.3f ms\n",
+                                 wall_ms);
+                    std::fprintf(gf, "frame, every pass serialised by a barrier:                  %.3f ms over %u frames\n\n",
+                                 prof.total_ms() / pf, prof.frames());
+                    std::fprintf(gf, "near field: %.0f probes listed by the CPU a frame%s; live, traced every frame: %u fine, %u coarse\n\n",
+                                 nf_probes_frame, std::getenv("BIOMES_NF_PLAY") ? " (BIOMES_NF_PLAY: play's schedule)" : "",
+                                 g_renderer.near_field().live_fine(), g_renderer.near_field().live_coarse());
+                    std::fprintf(gf, "%-58s %9s %9s %7s\n", "pass (named by the mark that ends it)", "ms/frame", "max ms", "frames");
+                    double sum = 0.0;
+                    const std::vector<std::pair<std::string, engine::GpuProfiler::Segment> > segs = prof.ordered_segments();
+                    for (size_t i = 0; i < segs.size(); ++i) {
+                        const double ms = segs[i].second.ms / pf;
+                        sum += ms;
+                        std::fprintf(gf, "%-58s %9.3f %9.3f %7u\n", segs[i].first.c_str(), ms, segs[i].second.ms_max,
+                                     segs[i].second.frames);
+                    }
+                    // Groups, for the headline.
+                    double g_trees = 0.0, g_shadow_trees = 0.0, g_shadow_terrain = 0.0, g_foliage = 0.0, g_terrain = 0.0;
+                    for (size_t i = 0; i < segs.size(); ++i) {
+                        const std::string& nm = segs[i].first;
+                        const double ms = segs[i].second.ms / pf;
+                        if (nm.compare(0, 6, "trees ") == 0) g_trees += ms;
+                        if (nm.compare(0, 8, "shadow c") == 0 && nm.find("trees") != std::string::npos) g_shadow_trees += ms;
+                        if (nm.compare(0, 8, "shadow c") == 0 && nm.find("terrain") != std::string::npos) g_shadow_terrain += ms;
+                        if (nm == "foliage") g_foliage += ms;
+                        if (nm == "terrain") g_terrain += ms;
+                    }
+                    std::fprintf(gf, "\nsum of passes %.3f ms. Groups: trees (camera) %.3f ms; tree shadow casters %.3f ms; "
+                                     "terrain + rocks shadow casters %.3f ms; foliage %.3f ms; terrain %.3f ms\n",
+                                 sum, g_trees, g_shadow_trees, g_shadow_terrain, g_foliage, g_terrain);
+                    std::fprintf(gf, "\npipeline statistics, per frame it ran (PS invocations: the overdraw PAID, after early depth)\n");
+                    std::fprintf(gf, "%-28s %12s %12s %12s %14s %10s %7s\n", "draws", "VS inv", "prims in", "prims raster",
+                                 "PS invocations", "per pixel", "frames");
+                    const std::vector<std::pair<std::string, engine::GpuProfiler::Stat> > sts = prof.ordered_stats();
+                    for (size_t i = 0; i < sts.size(); ++i) {
+                        const engine::GpuProfiler::Stat& st2 = sts[i].second;
+                        const double f = st2.frames ? double(st2.frames) : 1.0;
+                        std::fprintf(gf, "%-28s %12.0f %12.0f %12.0f %14.0f %10.3f %7u\n", sts[i].first.c_str(), st2.vs / f,
+                                     st2.ia_prims / f, st2.c_prims / f, st2.ps / f, st2.ps / f / (W * H), st2.frames);
+                    }
+                }
+                // One frame through the counting shaders.
+                std::vector<uint32_t> od;
+                std::string oerr;
+                if (g_renderer.tree_overdraw_begin(oerr)) {
+                    run(1);
+                    g_renderer.tree_overdraw_read(od, oerr);
+                }
+                const size_t px = size_t(W) * size_t(H);
+                if (gf && od.size() == px * 2) {
+                    double inv = 0, surv = 0, leaf = 0, imp = 0;
+                    size_t touched = 0, covered = 0;
+                    unsigned max_inv = 0, max_surv = 0;
+                    size_t hist[7] = {0, 0, 0, 0, 0, 0, 0};   // survived: 1, 2, 3-4, 5-8, 9-16, 17-32, 33+
+                    std::vector<unsigned char> bgr(px * 3, 0);
+                    for (size_t i = 0; i < px; ++i) {
+                        const unsigned a = od[i * 2] & 0xFFFFu, b = od[i * 2] >> 16;
+                        const unsigned c = od[i * 2 + 1] & 0xFFFFu, d = od[i * 2 + 1] >> 16;
+                        inv += a; surv += b; leaf += c; imp += d;
+                        if (a) ++touched;
+                        if (b) ++covered;
+                        max_inv = (std::max)(max_inv, a);
+                        max_surv = (std::max)(max_surv, b);
+                        if (b) {
+                            const int k = b <= 1 ? 0 : b <= 2 ? 1 : b <= 4 ? 2 : b <= 8 ? 3 : b <= 16 ? 4 : b <= 32 ? 5 : 6;
+                            ++hist[k];
+                        }
+                        // Heat: the rasterised layers, black 0, blue 1, green 4,
+                        // yellow 8, red 16, white 32+.
+                        const float l = a == 0 ? 0.0f : std::log2(float(a)) / 5.0f;
+                        float r = 0, g = 0, bl = 0;
+                        if (a) {
+                            if (l < 0.4f) { bl = 1.0f - l / 0.4f; g = l / 0.4f; }
+                            else if (l < 0.6f) { g = 1.0f; r = (l - 0.4f) / 0.2f; }
+                            else if (l < 0.8f) { r = 1.0f; g = 1.0f - (l - 0.6f) / 0.2f; }
+                            else { r = 1.0f; g = bl = (std::min)(1.0f, (l - 0.8f) / 0.2f); }
+                            r = 0.15f + 0.85f * r; g = 0.15f + 0.85f * g; bl = 0.15f + 0.85f * bl;
+                        }
+                        const size_t x = i % size_t(W), y = i / size_t(W);
+                        const size_t o = ((size_t(H) - 1 - y) * size_t(W) + x) * 3;   // BMP rows run bottom-up
+                        bgr[o + 0] = (unsigned char)(bl * 255.0f);
+                        bgr[o + 1] = (unsigned char)(g * 255.0f);
+                        bgr[o + 2] = (unsigned char)(r * 255.0f);
+                    }
+                    const double cov = covered ? double(covered) : 1.0;
+                    std::fprintf(gf, "\ntree overdraw, camera pass, one frame (counting shaders: late depth, so every "
+                                     "rasterised fragment runs)\n");
+                    std::fprintf(gf, "  fragments rasterised %.0f (%.2f per screen pixel, %.2f per touched pixel, max %u); "
+                                     "touched %.1f%% of the screen\n",
+                                 inv, inv / double(px), touched ? inv / double(touched) : 0.0, max_inv,
+                                 100.0 * double(touched) / double(px));
+                    std::fprintf(gf, "  survived coverage + dither %.0f (%.1f%% of rasterised): leaf cards %.0f, impostors %.0f, "
+                                     "bark %.0f\n", surv, inv > 0 ? 100.0 * surv / inv : 0.0, leaf, imp, surv - leaf - imp);
+                    std::fprintf(gf, "  covered pixels %.1f%% of the screen; survivors per covered pixel %.2f (max %u) -- "
+                                     "a depth prepass would shade ~1\n",
+                                 100.0 * double(covered) / double(px), surv / cov, max_surv);
+                    std::fprintf(gf, "  survivors per covered pixel: 1: %.1f%%, 2: %.1f%%, 3-4: %.1f%%, 5-8: %.1f%%, 9-16: %.1f%%, "
+                                     "17-32: %.1f%%, 33+: %.1f%%\n",
+                                 100.0 * hist[0] / cov, 100.0 * hist[1] / cov, 100.0 * hist[2] / cov, 100.0 * hist[3] / cov,
+                                 100.0 * hist[4] / cov, 100.0 * hist[5] / cov, 100.0 * hist[6] / cov);
+                    const std::string hp = shot_path + ".overdraw.bmp";
+                    FILE* bf = std::fopen(hp.c_str(), "wb");
+                    if (bf) {
+                        const int w = int(W), h = int(H);
+                        const int row = (w * 3 + 3) & ~3;
+                        const unsigned size = 54u + unsigned(row) * unsigned(h);
+                        unsigned char hd[54] = {'B', 'M'};
+                        auto put32 = [&](int at, unsigned val) {
+                            for (int k = 0; k < 4; ++k) hd[at + k] = (unsigned char)(val >> (8 * k));
+                        };
+                        put32(2, size); put32(10, 54); put32(14, 40); put32(18, unsigned(w)); put32(22, unsigned(h));
+                        hd[26] = 1; hd[28] = 24;
+                        std::fwrite(hd, 1, 54, bf);
+                        const unsigned char pad[3] = {0, 0, 0};
+                        for (int y = 0; y < h; ++y) {
+                            std::fwrite(&bgr[size_t(y) * size_t(w) * 3], 1, size_t(w) * 3, bf);
+                            std::fwrite(pad, 1, size_t(row - w * 3), bf);
+                        }
+                        std::fclose(bf);
+                        std::fprintf(gf, "  heat map of rasterised layers: %s (black 0, blue 1, green 4, yellow 8, red 16, "
+                                         "white 32+)\n", hp.c_str());
+                    }
+                } else if (gf) {
+                    std::fprintf(gf, "\ntree overdraw: not measured (%s)\n", oerr.empty() ? "no trees" : oerr.c_str());
+                }
+                if (gf) std::fclose(gf);
             }
         }
         const engine::FrameStats st = g_renderer.stats();
@@ -1194,6 +2631,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (pf) std::fclose(pf);
         }
 
+        if (g_ui.ready()) {
+            g_renderer.flush();
+            g_renderer.set_overlay(nullptr);
+            g_ui.shutdown();
+        }
         g_renderer.shutdown();
         g_physics.shutdown();
 
@@ -1225,20 +2667,81 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 std::fprintf(f, "sky: %02d:%02d, sun %.1f deg up; key light the %s, %.4g lux; sky on level ground %.4g lux\n",
                              int(sf.hours), int((sf.hours - float(int(sf.hours))) * 60.0f), sf.sun_elevation_deg,
                              sf.key_is_moon ? "moon" : "sun", kl, sm);
+                {
+                    // The weather (weather.h) and the sea under the camera.
+                    const engine::WeatherState& w = g_renderer.weather_state();
+                    const WwSea& sea = g_renderer.sea();
+                    double m0 = 0.0;
+                    for (int i = 0; i < WW_WAVES; ++i) m0 += 0.5 * double(sea.amp[i]) * sea.amp[i];
+                    const float sl = g_renderer.world().params().sea_level;
+                    const float depth = sl - g_renderer.world().height(g_camera.x, g_camera.z);
+                    std::fprintf(f, "weather: %s, storm %.2f, wind %.1f m/s towards (%.2f, %.2f), gusts %.2f; "
+                                    "sea developed for %.1f m/s, swell Hs %.2f m towards (%.2f, %.2f); "
+                                    "deep-water Hs %.2f m; camera (%.1f, %.1f, %.1f) over %.1f m of water, significant height there %.2f m\n",
+                                 g_renderer.weather().automatic() ? "automatic" : "fixed", w.storm, w.wind_speed,
+                                 w.wind_dir[0], w.wind_dir[1], w.gust, w.sea_wind, w.swell_hs, w.swell_dir[0],
+                                 w.swell_dir[1], 4.0 * std::sqrt(m0), g_camera.x, g_camera.y, g_camera.z, depth,
+                                 depth > 0.0f ? ww_significant_height_lod(sea, depth, 0.0f) : 0.0f);
+                    {
+                        const engine::Strike& st = g_renderer.strike();
+                        if (st.active)
+                            std::fprintf(f, "  lightning: %s strike %.0f m away at (%.0f, %.0f), %.0f ms in, %.3g cd now, "
+                                            "channel %.2f; thunder %.1f s after the flash\n",
+                                         st.ground ? "ground" : "in-cloud", st.distance, st.ground_pt[0], st.ground_pt[2],
+                                         st.age * 1000.0f, st.candela, st.channel, st.distance / 343.0f);
+                        else
+                            std::fprintf(f, "  lightning: none this frame\n");
+                    }
+                    {
+                        // The exploration fog's visibility (haze.hlsli), from
+                        // its own layers alone (the froxel mist's patches add
+                        // to it near the ground): the 2% contrast distance,
+                        // 3.912 / sigma, along a level line at a few heights.
+                        const float sl = g_renderer.world().params().sea_level;
+                        auto vis = [&](float y) {
+                            const float s = g_renderer.height_fog_sigma(y);
+                            return s > 0.0f ? 3.912f / s : 0.0f;
+                        };
+                        std::fprintf(f, "  height fog: valley %.2f; level visibility at the eye (%.0f m) %.0f m, at 20 m "
+                                        "%.0f m, at 300 m %.0f m, at 600 m %.0f m\n",
+                                     g_renderer.height_fog_valley(), g_camera.y - sl, vis(g_camera.y), vis(sl + 20.0f),
+                                     vis(sl + 300.0f), vis(sl + 600.0f));
+                    }
+                    float wet_now = 0.0f, puddle_now = 0.0f;
+                    g_renderer.wetness(wet_now, puddle_now);
+                    std::fprintf(f, "  rain: %.2f (%s), cloud cover %.2f; ground wetness %.2f, puddles %.2f\n",
+                                 g_renderer.rain_intensity(),
+                                 !g_renderer.rain_on() ? "off" : "from the clouds unless --rain",
+                                 g_renderer.cloud_layer().coverage(), wet_now, puddle_now);
+                    {
+                        const engine::OceanDetail& od = g_renderer.ocean();
+                        std::fprintf(f, "  sea slope (mean square, both axes): Cox-Munk %.4f; trains %.4f, ripples %.4f "
+                                        "(31 m tile %.4f, 7.7 m tile %.4f)%s\n",
+                                     od_cox_munk(w.sea_wind > 1.0f ? w.sea_wind : 1.0f),
+                                     od.gerstner_variance(), od.variance(0) + od.variance(1), od.variance(0), od.variance(1),
+                                     g_renderer.wave_detail() ? "" : " -- ripples OFF");
+                    }
+                    // Along the view, flat: what the water ahead can carry.
+                    const float fx = std::sin(g_camera.yaw), fz = std::cos(g_camera.yaw);
+                    std::fprintf(f, "  ahead (depth m / Hs m):");
+                    const float ahead[5] = {25.0f, 50.0f, 100.0f, 200.0f, 400.0f};
+                    for (float a : ahead) {
+                        const float px = g_camera.x + fx * a, pz = g_camera.z + fz * a;
+                        const float d = sl - g_renderer.world().height(px, pz);
+                        std::fprintf(f, " %.0f m: %.1f / %.2f;", a, d,
+                                     d > 0.0f ? ww_significant_height_lod(sea, d, 0.0f) : 0.0f);
+                    }
+                    std::fprintf(f, "\n");
+                }
                 const engine::Renderer::PostTimes& pt = g_renderer.post_times();
                 std::fprintf(f, "gpu: atmosphere %.3f ms, mist inject %.3f ms, mist integrate %.3f ms, "
                                 "post chain in all %.3f ms (smoothed over the still's frames)\n",
                              pt.atmosphere, pt.mist_inject, pt.mist_integrate, pt.post_total);
-                if (g_renderer.gi_active())
-                    std::fprintf(f, "gpu: DDGI probe update %.3f ms (3 cascades, a quarter of 20736 probes a frame, %.1f MB)\n",
-                                 g_renderer.gi_ms(), g_renderer.gi_bytes() / 1048576.0);
-                else
-                    std::fprintf(f, "gi: DDGI off (%s)\n", g_renderer.gi() ? "no ray tracing" : "the default; --gi turns it on");
-                if (g_renderer.rt_shadows() || g_renderer.rt_sky()) {
-                    const engine::Renderer::RtStats& rs = g_renderer.rt_stats();
-                    std::fprintf(f, "gpu: ray tracing -- BLAS + TLAS build %.3f ms, trace (key light%s) %.3f ms\n",
-                                 rs.build_ms, g_renderer.rt_sky() ? " + sky" : "", rs.trace_ms);
-                }
+                const engine::Renderer::CloudShadowReport& csr = g_renderer.last_cloud_shadow();
+                if (csr.valid)
+                    std::fprintf(f, "cloud shadow: %.1f%% of its 12 x 12 km sunlit (beam T > 0.5), mean T %.3f; "
+                                    "percentiles 10/25/50/75/90: %.3f %.3f %.3f %.3f %.3f\n",
+                                 csr.sunlit * 100.0f, csr.mean_t, csr.pct[0], csr.pct[1], csr.pct[2], csr.pct[3], csr.pct[4]);
                 const engine::Renderer::SkyCheck& sk = g_renderer.last_sky_check();
                 if (sk.valid)
                     std::fprintf(f, "sky table GPU vs CPU: %d texels, mean %.3f%%, worst %.3f%% at (%.0f, %.0f)\n",
@@ -1255,7 +2758,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                  er.ev100, std::exp2(er.adapted_log2), std::exp2(er.target_log2), er.exposure,
                                  g_renderer.ev_comp(),
                                  g_renderer.tonemap() == 1u ? "AgX" : g_renderer.tonemap() == 2u ? "ACES" : "raw");
-                    std::fprintf(f, "exposure: %.0f pixels metered; 10th percentile %.0f nits, 90th %.0f nits "
+                    std::fprintf(f, "dark vision: light presence %.2f (%.3g lux at the eye from visible local lights)\n",
+                                 g_renderer.light_presence(), g_renderer.light_lux_at_eye());
+                    std::fprintf(f, "exposure: %.0f pixels metered; 10th percentile %.3g nits, 90th %.3g nits "
                                     "(%.1f stops apart)\n",
                                  er.metered, er.lo_nits, er.hi_nits,
                                  er.lo_nits > 0.0f ? std::log2(er.hi_nits / er.lo_nits) : 0.0f);
@@ -1467,7 +2972,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // A chunk straddling the surface near the origin, where the centre
         // floor guarantees land.
         const float surface = 0.20f * 140.0f;
-        const float origin[3] = {-8.0f, surface - 8.0f, -8.0f};
+        float origin[3] = {-8.0f, surface - 8.0f, -8.0f};
+        // --probe-at x z: the chunk centred on the ground there instead.
+        {
+            const std::string pc = cmdline ? cmdline : "";
+            const size_t pa = pc.find("--probe-at");
+            float px = 0.0f, pz = 0.0f;
+            if (pa != std::string::npos && std::sscanf(pc.c_str() + pa + 10, "%f %f", &px, &pz) == 2) {
+                const float gy = g_renderer.world().height(px, pz);
+                origin[0] = px - 8.0f; origin[1] = gy - 8.0f; origin[2] = pz - 8.0f;
+            }
+        }
         std::string e;
         g_renderer.probe_field(origin, 0.5f, "build/field_probe.txt", e);
         if (debug_layer) g_renderer.drain_debug_messages("build/d3d12_validation.txt");
@@ -2358,108 +3873,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
-    // The meter's histogram as a luminance: the mean of its 10-90% band in
-    // log2, as the meter weighs it, but without its EV100 -2 floor.
-    auto band_nits = [](const engine::Renderer::ExposureReport& ex) -> double {
-        if (!ex.valid || ex.bins.empty()) return -1.0;
-        double total = 0.0;
-        for (unsigned b : ex.bins) total += b;
-        const double step = (ex.log_max - ex.log_min) / double(ex.bins.size());
-        double seen = 0.0, acc = 0.0, w = 0.0;
-        for (size_t b = 0; b < ex.bins.size(); ++b) {
-            const double lo = seen / total, hi = (seen + ex.bins[b]) / total;
-            seen += ex.bins[b];
-            const double in = (std::min)(hi, 0.9) - (std::max)(lo, 0.1);
-            if (in <= 0.0) continue;
-            acc += in * (ex.log_min + (double(b) + 0.5) * step);
-            w += in;
-        }
-        return w > 0.0 ? std::exp2(acc / w) : -1.0;
-    };
-
-    if (gi_report_mode) {
-        // --gi-report (ADR-004 L6): DDGI at three views -- what the probes
-        // cost, how many stand in rock, and the picture's luminance against
-        // the no-RT fallback. Where the sky is open the two should nearly
-        // agree (the probes add the terrain's bounce, and see the horizon the
-        // fallback assumes); under trees the probes should be darker.
-        std::remove("build/gi_report.txt");
-        FILE* f = std::fopen("build/gi_report.txt", "w");
-        if (!f) return 1;
-        const engine::WorldGpu& wg = g_renderer.world();
-        struct View { const char* name; float x, y, z, yaw, pitch, hours; bool ground; };
-        const View views[] = {
-            {"spawn at 14:00, from 46 m", 10.0f, 46.0f, -70.0f, 0.15f, -0.42f, 14.0f, false},
-            {"a wood at 09:00, at eye height", -30.0f, 0.0f, -60.0f, 4.71f, 0.05f, 9.0f, true},
-            {"the badlands hillside at 17:00", 2420.0f, 118.0f, 3390.0f, 0.6f, -0.25f, 17.0f, false},
-        };
-        std::fprintf(f, "gi report (ADR-004 L6): DDGI, 3 cascades of 24x12x24 probes at 2/8/32 m, 128 rays, a quarter a frame\n\n");
-        // DDGI is off by default; the report is about it, so it is on here.
-        const bool gi_was = true;
-        for (const View& vw : views) {
-            g_camera.x = vw.x; g_camera.z = vw.z;
-            g_camera.y = vw.ground ? wg.height(vw.x, vw.z) + 1.7f : vw.y;
-            g_camera.yaw = vw.yaw; g_camera.pitch = vw.pitch;
-            g_renderer.set_time_of_day(vw.hours);
-            engine::ViewConstants v = {};
-            fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
-            std::string err;
-            double lum[2] = {0.0, 0.0};
-            float ms = 0.0f;
-            engine::Ddgi::Counts counts;
-            engine::Ddgi::CameraIrradiance cam_irr = {};
-            for (int pass = 0; pass < 2; ++pass) {
-                g_renderer.set_gi(pass == 0 && gi_was);
-                g_renderer.capture(v, "build/gi_report.bmp", err);
-                for (int i = 0; i < 240; ++i) g_renderer.step_offscreen(v);
-                char path[64];
-                std::snprintf(path, sizeof path, "build/gi_report_%d_%s.bmp", int(&vw - views), pass == 0 ? "ddgi" : "fallback");
-                g_renderer.capture(v, path, err);
-                lum[pass] = band_nits(g_renderer.last_exposure());
-                if (pass == 0) {
-                    ms = g_renderer.gi_ms();
-                    g_renderer.gi_counts(counts, err);
-                    cam_irr = g_renderer.gi_camera_irradiance();
-                }
-            }
-            std::fprintf(f, "%s -- (%.0f, %.1f, %.0f)\n", vw.name, g_camera.x, g_camera.y, g_camera.z);
-            std::fprintf(f, "  luminance (meter's 10-90%% band): DDGI %.4g nits, fallback %.4g nits, ratio %.3f\n",
-                         lum[0], lum[1], lum[1] > 0.0 ? lum[0] / lum[1] : 0.0);
-            std::fprintf(f, "  probe update %.3f ms a frame (GPU)\n", ms);
-            // At the eye, per side: the probes' irradiance and the fallback's,
-            // in lux, and the probes' blue over green against the fallback's --
-            // where the bounce's colour shows.
-            {
-                const char* side[6] = {"+x", "-x", "up", "down", "+z", "-z"};
-                for (int k = 0; k < 6; ++k) {
-                    const float* E = cam_irr.E[k];
-                    const float* O = cam_irr.open[k];
-                    std::fprintf(f, "  at the eye, facing %-4s probes (%7.0f, %7.0f, %7.0f) cover %.2f   fallback (%7.0f, %7.0f, %7.0f)"
-                                    "   B/G %.2f vs %.2f\n",
-                                 side[k], E[0], E[1], E[2], E[3], O[0], O[1], O[2],
-                                 E[1] > 0.0f ? E[2] / E[1] : 0.0f, O[1] > 0.0f ? O[2] / O[1] : 0.0f);
-                }
-            }
-            for (int c = 0; c < engine::Ddgi::kCascades; ++c)
-                std::fprintf(f, "  cascade %d (%2.0f m): %5d active, %5d off in rock, %5d idle in open air, %5d not yet traced\n",
-                             c, engine::Ddgi::kSpacing[c], counts.active[c], counts.inactive[c], counts.idle[c],
-                             counts.pending[c]);
-            std::fprintf(f, "\n");
-        }
-        g_renderer.set_gi(gi_was);
-        std::fclose(f);
-        g_renderer.shutdown();
-        g_physics.shutdown();
-        return 0;
-    }
-
     if (leak_mode) {
-        // --leak-test (ADR-004 L6): the failure every probe GI is judged by.
+        // --leak-test (ADR-004 L6): the failure every GI is judged by.
         // A sphere of air dug 10 m under flat ground -- sealed, its roof six
         // metres of rock -- and the camera in it: with no light inside, its
         // luminance must be ~0, and a torch must fill it. Measured as the
-        // exposure meter's mean (nits, 10-90% band) after the probes have
-        // had 240 frames, each config against the same chamber.
+        // exposure meter's mean (nits, 10-90% band) after 240 frames, each
+        // config against the same chamber.
         std::remove("build/leak_report.txt");
         FILE* f = std::fopen("build/leak_report.txt", "w");
         if (!f) return 1;
@@ -2496,34 +3916,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         std::fprintf(f, "leak test (ADR-004 L6): a sphere of air r %.1f m, centre %.1f m under flat ground at (%.0f, %.1f, %.0f); "
                         "roof %.1f m of rock\n",
                      kR, kDepth, cx, cy, cz, kDepth - kR);
-        std::fprintf(f, "DDGI %s\n\n", g_renderer.gi_active() || g_renderer.gi() ? "available" : "unavailable");
-        // `bounce` false: the probes do not see local lights, so the torch is
-        // its direct light alone; against `bounce` true, that is the fill.
-        // `hf`: the heightfield GI, the no-RT path; with neither it nor DDGI
-        // the bare two-hemisphere fallback is what leaked 566 nits.
-        struct Cfg { const char* name; bool inside, gi, torch, fog, bounce, hf; };
-        // Outside LAST: stepping out and back scrolls the chamber's probes out
-        // of cascade 0 and swaps the chunks round it to other LODs, and the
-        // fresh probes catch light through the half-rebuilt scene that then
-        // decays at 0.92 an update -- a re-entry transient, measured apart.
+        std::fprintf(f, "\n");
+        // `hf`: the heightfield GI; without it the bare two-hemisphere
+        // fallback is what leaked 566 nits. (DDGI's probe configurations went
+        // with hardware RT: git tag rt-last.)
+        struct Cfg { const char* name; bool inside, torch, fog, hf; };
         const Cfg cfgs[] = {
-            {"sealed, DDGI", true, true, false, true, true, true},
-            {"sealed, DDGI, no mist", true, true, false, false, true, true},
-            {"sealed, no RT: heightfield GI", true, false, false, true, true, true},
-            {"sealed, bare fallback (--no-gi --no-hfgi)", true, false, false, true, true, false},
-            {"sealed, DDGI, torch, no mist", true, true, true, false, true, true},
-            {"sealed, DDGI, torch, no mist, probes blind to it", true, true, true, false, false, true},
-            {"sealed, heightfield GI, torch", true, false, true, true, true, true},
-            {"outside, standing on the ground above", false, true, false, true, true, true},
+            {"sealed, heightfield GI", true, false, true, true},
+            {"sealed, heightfield GI, no mist", true, false, false, true},
+            {"sealed, bare fallback (--no-hfgi)", true, false, true, false},
+            {"sealed, heightfield GI, torch", true, true, true, true},
+            {"outside, standing on the ground above", false, false, true, true},
         };
-        const bool gi_was = true;   // DDGI is off by default; this test is about it
-        g_renderer.set_gi(true);
-        double dark_gi = -1.0, dark_clear = -1.0, torch_gi = -1.0, torch_direct = -1.0, fallback = -1.0, heightfield = -1.0;
-        // Settle inside first. The chamber is re-meshed and its BLAS rebuilt
-        // over the first frames, and probes that saw daylight through the
-        // half-built chamber decay at 0.92 an update: the first config
-        // measured right after entering read 10 lux at the eye, the later
-        // ones under 1. A long settle once, then each config its own frames.
+        double dark = -1.0, dark_clear = -1.0, fallback = -1.0, torch = -1.0;
+        // Settle inside first: the chamber is re-meshed over the first frames.
         {
             g_camera.x = cx; g_camera.y = cy; g_camera.z = cz;
             g_camera.yaw = 0.0f; g_camera.pitch = -0.35f;
@@ -2531,13 +3937,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
             std::string err;
             g_renderer.capture(v, "build/leak.bmp", err);
-            for (int i = 0; i < 1200; ++i) g_renderer.step_offscreen(v);
+            for (int i = 0; i < 300; ++i) g_renderer.step_offscreen(v);
         }
         for (const Cfg& c : cfgs) {
-            g_renderer.set_gi(c.gi && gi_was);
             g_renderer.set_carried_torch(c.torch);
             g_renderer.set_fog(c.fog);
-            g_renderer.set_gi_local_lights(c.bounce);
             g_renderer.set_hfgi(c.hf);
             if (c.inside) {
                 g_camera.x = cx; g_camera.y = cy; g_camera.z = cz;
@@ -2549,8 +3953,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             engine::ViewConstants v = {};
             fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
             std::string err;
-            // The first capture streams and meshes the chamber and builds its
-            // BLAS; then the probes get 240 frames; then the measured still.
             g_renderer.capture(v, "build/leak.bmp", err);
             for (int i = 0; i < leak_frames; ++i) g_renderer.step_offscreen(v);
             char path[64];
@@ -2578,182 +3980,19 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             }
             std::fprintf(f, "  %-40s %s mean %.4g nits (EV100 %.2f) -> %s\n", c.name, ok ? "" : "CAPTURE FAILED", nits,
                          ex.ev100, path);
-            if (c.gi) {
-                // What the probes say reaches the eye: the mist and the haze
-                // take their share of open sky from this.
-                const engine::Ddgi::CameraIrradiance& ci = g_renderer.gi_camera_irradiance();
-                std::fprintf(f, "      at the eye: sky share %.5f; probes up (%.3g, %.3g, %.3g) down (%.3g, %.3g, %.3g) lux, "
-                                "cover %.2f\n",
-                             g_renderer.gi_camera_sky(), ci.E[2][0], ci.E[2][1], ci.E[2][2], ci.E[3][0], ci.E[3][1],
-                             ci.E[3][2], ci.E[2][3]);
-                if (c.inside) {
-                    // The chamber's own probes: cascade 0's grid points inside
-                    // the sphere, less half a spacing so none sits in its wall.
-                    engine::Ddgi::Counts in_ch;
-                    const float centre[3] = {cx, cy, cz};
-                    g_renderer.gi_counts(in_ch, err, centre, kR - 1.0f);
-                    std::fprintf(f, "      the chamber's cascade-0 probes: %d active, %d off in rock, %d idle, %d not yet traced\n",
-                                 in_ch.active[0], in_ch.inactive[0], in_ch.idle[0], in_ch.pending[0]);
-                }
-            }
-            if (c.inside && c.gi && !c.torch && c.fog) dark_gi = nits;
-            if (c.inside && c.gi && !c.torch && !c.fog) dark_clear = nits;
-            if (c.inside && c.gi && c.torch && c.bounce) torch_gi = nits;
-            if (c.inside && c.gi && c.torch && !c.bounce) torch_direct = nits;
-            if (c.inside && !c.gi && !c.torch && !c.hf) fallback = nits;
-            if (c.inside && !c.gi && !c.torch && c.hf) heightfield = nits;
+            if (c.inside && !c.torch && c.fog && c.hf) dark = nits;
+            if (c.inside && !c.torch && !c.fog && c.hf) dark_clear = nits;
+            if (c.inside && !c.torch && !c.hf) fallback = nits;
+            if (c.inside && c.torch) torch = nits;
         }
-        g_renderer.set_gi(gi_was);
         g_renderer.set_carried_torch(false);
         g_renderer.set_fog(true);
-        g_renderer.set_gi_local_lights(true);
         g_renderer.set_hfgi(true);
         // A full moon puts ~0.01 nits on a meadow; sealed and unlit must be
-        // well under that. The torch's own light is (torch - dark); the
-        // probes' share of it is what they add over the direct light.
-        const double t_all = torch_gi - dark_clear, t_dir = torch_direct - dark_clear;
-        std::fprintf(f, "\nverdict: sealed and unlit, DDGI %.3g nits with mist, %.3g without (%s); without RT, the "
-                        "heightfield GI %.3g (%s) -- under 0.01, a moonlit meadow; the bare fallback leaks %.4g\n",
-                     dark_gi, dark_clear, dark_gi >= 0.0 && dark_gi < 0.01 ? "PASS" : "LEAKS", heightfield,
-                     heightfield >= 0.0 && heightfield < 0.01 ? "PASS" : "LEAKS", fallback);
-        // In a closed chamber every bounce returns albedo r of the light, so
-        // the total is 1/(1 - r) of the direct: the factor implies the walls'
-        // albedo, which is the material the chamber was dug from.
-        const double fill = t_dir > 0.0 ? t_all / t_dir : 0.0;
-        std::fprintf(f, "         the torch: %.3g nits direct, %.3g with the probes' bounce -- %.2fx, which a closed chamber "
-                        "gives walls of albedo %.2f (%s)\n",
-                     t_dir, t_all, fill, fill > 0.0 ? 1.0 - 1.0 / fill : 0.0, fill > 1.02 ? "FILLS" : "DOES NOT FILL");
-        std::fclose(f);
-        g_renderer.shutdown();
-        g_physics.shutdown();
-        return 0;
-    }
-
-    if (rt_report_mode) {
-        // --rt-report (ADR-004 L5): the ray-tracing scene, measured at three
-        // views once its BLAS backlog has drained -- what it holds and costs,
-        // whether its terrain is the terrain that was drawn (a primary ray
-        // against the depth buffer), and how its key-light shadow agrees with
-        // the cascades'.
-        g_renderer.set_vsync(false);
-        const engine::WorldGpu& wg = g_renderer.world();
-        std::remove("build/rt_report.txt");
-        FILE* f = std::fopen("build/rt_report.txt", "w");
-        if (!f) return 1;
-        if (!g_renderer.rt_available()) {
-            std::fprintf(f, "ray tracing unavailable on this device (needs DXR 1.1 and DXC)\n");
-            std::fclose(f);
-            g_renderer.shutdown();
-            g_physics.shutdown();
-            return 0;
-        }
-        float clock = 0.0f;
-        auto frame = [&]() -> bool {
-            MSG m = {};
-            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
-            RECT cr;
-            GetClientRect(hwnd, &cr);
-            const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
-            if (w < 1.0f || h < 1.0f) return false;
-            clock += 1.0f / 60.0f;
-            engine::ViewConstants v = {};
-            fill_view(g_camera, w, h, clock, v);
-            g_renderer.render(v);
-            return true;
-        };
-        struct View { const char* name; float x, y, z, yaw, pitch, hours; bool ground; };
-        const View views[] = {
-            {"a wood at dawn, facing the sun", -30.0f, 0.0f, -60.0f, 4.71f, 0.05f, 7.0f, true},
-            {"spawn at 14:00", 10.0f, 46.0f, -70.0f, 0.15f, -0.42f, 14.0f, false},
-            {"the rough hillside at 17:00", 2420.0f, 118.0f, 3390.0f, 0.6f, -0.25f, 17.0f, false},
-        };
-        std::fprintf(f, "rt report (ADR-004 L5): DXR 1.1 inline RayQuery, BLAS per LOD 0-3 chunk and per tree model\n\n");
-        for (const View& vw : views) {
-            g_camera.x = vw.x; g_camera.z = vw.z;
-            g_camera.y = vw.ground ? wg.height(vw.x, vw.z) + 1.7f : vw.y;
-            g_camera.yaw = vw.yaw; g_camera.pitch = vw.pitch;
-            g_renderer.set_time_of_day(vw.hours);
-            int fill = 0;
-            unsigned max_built = 0;
-            for (; fill < 1500; ++fill) {
-                if (!frame()) break;
-                const engine::RtScene::Stats& rs = g_renderer.rt_scene_stats();
-                if (rs.built_this_frame > max_built) max_built = rs.built_this_frame;
-                if (fill > 60 && g_renderer.stats().pending == 0 && g_renderer.tree_field().settled() &&
-                    rs.pending == 0 && rs.drawn_without_blas == 0) break;
-            }
-            for (int i = 0; i < 120; ++i) frame();
-            const engine::RtScene::Stats& rs = g_renderer.rt_scene_stats();
-            const engine::Renderer::RtStats& st = g_renderer.rt_stats();
-            const double cmp = double(st.lit_lit) + st.shadow_shadow + st.rt_only + st.csm_only;
-            const double prim = double(st.primary_agree) + st.primary_nearer + st.primary_farther;
-            std::fprintf(f, "%s -- (%.0f, %.1f, %.0f)\n", vw.name, g_camera.x, g_camera.y, g_camera.z);
-            std::fprintf(f, "  settled in %d frames, at most %u BLAS built in one\n", fill, max_built);
-            // A hung GPU reads back as zeros everywhere -- counts, stats, timers
-            // -- which first looked like a BLAS queue bug. Say so up front.
-            std::fprintf(f, "  device: %s\n", g_renderer.device()->GetDeviceRemovedReason() == S_OK
-                                                  ? "alive" : "REMOVED -- every number below is void");
-            std::fprintf(f, "  queue so far: %llu noted, %llu built, %llu empty, %llu dropped as remeshed, %llu as moved\n",
-                         (unsigned long long)rs.noted, (unsigned long long)rs.built_total, (unsigned long long)rs.empty,
-                         (unsigned long long)rs.dropped_remeshed, (unsigned long long)rs.dropped_moved);
-            std::fprintf(f, "  BLAS: %u terrain, %u tree models; %.1f MB, TLAS %.1f MB (two), scratch %.1f MB\n",
-                         rs.terrain_blas, rs.tree_blas, rs.blas_bytes / 1048576.0, rs.tlas_bytes / 1048576.0,
-                         rs.scratch_bytes / 1048576.0);
-            std::fprintf(f, "  TLAS: %u chunk instances, %u trees, %u crowns, %u rocks; %u drawn LOD 0-3 chunks without a BLAS; %u pending\n",
-                         rs.instances_terrain, rs.instances_trees, rs.instances_crowns, rs.instances_rocks,
-                         rs.drawn_without_blas, rs.pending);
-            std::fprintf(f, "  GPU: BLAS + TLAS build %.3f ms a frame (steady), shadow trace and checks %.3f ms\n",
-                         st.build_ms, st.trace_ms);
-            if (prim > 0)
-                std::fprintf(f, "  primary ray vs depth (terrain): agree %.2f%%, RT nearer %.3f%%, RT farther or missed %.2f%%; "
-                                "normal error %.2f deg where they agree within 40 m\n",
-                             100.0 * st.primary_agree / prim, 100.0 * st.primary_nearer / prim,
-                             100.0 * st.primary_farther / prim, st.normal_err_deg);
-            if (cmp > 0)
-                std::fprintf(f, "  key-light shadow vs cascades (%.0f lit-facing pixels inside 468 m): agree %.2f%% "
-                                "(lit %.2f%%, shadowed %.2f%%); RT shadowed only %.2f%%, cascades shadowed only %.2f%%\n\n",
-                             cmp, 100.0 * (st.lit_lit + st.shadow_shadow) / cmp, 100.0 * st.lit_lit / cmp,
-                             100.0 * st.shadow_shadow / cmp, 100.0 * st.rt_only / cmp, 100.0 * st.csm_only / cmp);
-
-            // The sky (L6): mean visibility over the surface pixels, with the
-            // crowns, with terrain and trunks only, and the trace's cost each
-            // way -- off is the L5 trace alone. One ray a pixel a frame.
-            struct SkyCfg { const char* name; bool on; unsigned mask; };
-            const SkyCfg cfgs[] = {
-                {"off (key light only)", false, 0x7u},
-                {"terrain + trunks", true, 0x3u},
-                {"terrain + trunks + crowns", true, 0x7u},
-                {"crowns only", true, 0x4u},
-            };
-            for (const SkyCfg& c : cfgs) {
-                // The map is compared per pixel, so the traced side needs
-                // enough rays to be an answer rather than a sample.
-                g_renderer.set_rt_sky_rays(c.mask == 0x4u ? 16 : 1);
-                g_renderer.set_rt_sky_mask(c.mask);
-                g_renderer.set_rt_sky(c.on);
-                for (int i = 0; i < 240; ++i) frame();
-                const engine::Renderer::RtStats& s2 = g_renderer.rt_stats();
-                const engine::RtScene::Stats& r2 = g_renderer.rt_scene_stats();
-                if (c.on)
-                    std::fprintf(f, "  sky %-26s visibility %.3f inside 468 m (%u px), %.3f inside 60 m (%u px); "
-                                    "trace %.3f ms, build %.3f ms, %u crowns\n",
-                                 c.name, s2.sky_mean, s2.sky_pixels, s2.sky_near_mean, s2.sky_near_pixels,
-                                 s2.trace_ms, s2.build_ms, r2.instances_crowns);
-                else
-                    std::fprintf(f, "  sky %-26s trace %.3f ms, build %.3f ms\n", c.name, s2.trace_ms, s2.build_ms);
-                // The canopy map (L6's no-RT path) is judged against crowns
-                // alone: terrain horizons and trunks are not what it models.
-                if (c.on && c.mask == 0x4u)
-                    std::fprintf(f, "  canopy map vs traced crowns (16 rays), %u terrain px inside 200 m: traced %.3f, map %.3f, mean |difference| %.3f; "
-                                    "%u trees in the map\n",
-                                 s2.canopy_pixels, s2.canopy_rt_mean, s2.canopy_map_mean, s2.canopy_mae,
-                                 g_renderer.canopy_trees());
-            }
-            g_renderer.set_rt_sky(false);
-            g_renderer.set_rt_sky_rays(1);
-            g_renderer.set_rt_sky_mask(0x7u);
-            std::fprintf(f, "\n");
-        }
+        // well under that.
+        std::fprintf(f, "\nverdict: sealed and unlit, the heightfield GI %.3g nits with mist, %.3g without (%s) -- under "
+                        "0.01, a moonlit meadow; the bare fallback leaks %.4g; a carried torch %.3g\n",
+                     dark, dark_clear, dark >= 0.0 && dark < 0.01 && dark_clear < 0.01 ? "PASS" : "LEAKS", fallback, torch);
         std::fclose(f);
         g_renderer.shutdown();
         g_physics.shutdown();
@@ -2769,8 +4008,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (cl.find("--time") == std::string::npos) g_renderer.set_time_of_day(23.0f);
         g_renderer.set_vsync(false);
         const engine::WorldGpu& wg = g_renderer.world();
-        g_camera.x = 0.0f; g_camera.z = 0.0f;
-        g_camera.y = wg.height(0.0f, 0.0f) + 1.7f;
+        g_camera.x = g_spawn.x; g_camera.z = g_spawn.z;
+        g_camera.y = wg.height(g_camera.x, g_camera.z) + 1.7f;
         g_camera.yaw = 0.15f; g_camera.pitch = -0.12f;
         std::remove("build/lights_report.txt");
         // A running clock: flames flicker and the carried torch wanders, so
@@ -2859,6 +4098,247 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (dig_tree_mode) {
+        // --dig-settle: a tree, then a boulder, dug out from under. Picks a fellable tree near
+        // spawn, carves a 3 m sphere a metre under its base, then with the
+        // clock running:
+        //   1. watches it drop -- straight down, under gravity, to the new
+        //      ground under its trunk (Renderer::ground_below), upright;
+        //   2. probes its trunk collider half a metre over the NEW base,
+        //      where the old capsule (built at the old base) would be absent;
+        //   3. stands beside it at the bottom of the hole and chops it down.
+        // A still of it in the hole first: build/dig_tree.bmp. Then a boulder
+        // near spawn: a hole under its whole footprint, the drop, and a ray
+        // down its axis that must hit its collider at its NEW top
+        // (build/dig_rock.bmp).
+        const engine::WorldGpu& wg = g_renderer.world();
+        g_renderer.set_vsync(true);
+        g_walk = true;
+        std::remove("build/dig_settle.txt");
+        LARGE_INTEGER tf, tp;
+        QueryPerformanceFrequency(&tf);
+        auto frame = [&](float tt) -> bool {
+            sync_physics_terrain();
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
+            if (w < 1.0f || h < 1.0f) return false;
+            engine::ViewConstants v = {};
+            fill_view(g_camera, w, h, tt, v);
+            g_renderer.render(v);
+            return true;
+        };
+        auto standing_y = [&](uint32_t id, float& y) -> bool {
+            const std::vector<worldgen::TreeInstance>& st = g_renderer.tree_field().standing();
+            for (size_t i = 0; i < st.size(); ++i) if (st[i].id == id) { y = st[i].y; return true; }
+            return false;
+        };
+        g_camera.x = g_spawn.x; g_camera.z = g_spawn.z;
+        g_camera.y = wg.height(g_camera.x, g_camera.z) + 2.0f;
+        for (int i = 0; i < 600 && !g_renderer.tree_field().settled(); ++i) { frame(0.0f); Sleep(5); }
+        for (int i = 0; i < 5; ++i) frame(0.0f);
+
+        FILE* f = std::fopen("build/dig_settle.txt", "w");
+        if (!f) return 1;
+        const std::vector<worldgen::TreeInstance> st = g_renderer.tree_field().standing();
+        const worldgen::TreeInstance* pick = nullptr;
+        float best = 1e30f;
+        for (size_t i = 0; i < st.size(); ++i) {
+            float b[3], ht, tr;
+            int hits;
+            if (!g_felling.tree_info(st[i].id, b, ht, tr, hits) || tr < 0.12f || ht < 8.0f) continue;
+            const float dx = st[i].x - g_spawn.x, dz = st[i].z - g_spawn.z;
+            if (dx * dx + dz * dz < best) { best = dx * dx + dz * dz; pick = &st[i]; }
+        }
+        if (!pick) {
+            std::fprintf(f, "VOID RUN: no fellable tree near spawn (%zu standing)\n", st.size());
+            std::fclose(f);
+            return 1;
+        }
+        const worldgen::TreeInstance tree = *pick;
+        float b0[3], height, trunk_r;
+        int need = 0;
+        g_felling.tree_info(tree.id, b0, height, trunk_r, need);
+        std::fprintf(f, "tree %08x, %.1f m tall, trunk radius %.2f m, base (%.2f, %.2f, %.2f)\n",
+                     tree.id, height, trunk_r, tree.x, tree.y, tree.z);
+
+        const float y0 = tree.y;
+        g_renderer.dig(tree.x, y0 - 1.0f, tree.z, 3.0f, -4.0f, 1);
+        // How long the hole takes to reach the screen: frames until every
+        // chunk the dig threw away has its remesh drawn (Streamer's edit
+        // swap: no cross-fade; it was the remesh plus 16 faded frames).
+        int swap_frames = -1;
+        {
+            const size_t dug = g_renderer.stats().chunks_invalidated;
+            for (int i = 1; i <= 60; ++i) {
+                frame(0.0f);
+                if (g_renderer.streamer().edit_swaps_pending() == 0) { swap_frames = i; break; }
+            }
+            std::fprintf(f, "remesh: %zu chunks thrown away, all redrawn after %d frame(s), "
+                            "swapped without a fade\n", dug, swap_frames);
+        }
+        const float expect = g_renderer.ground_below(tree.x, tree.z, y0);
+        std::fprintf(f, "dug a 3 m sphere 1 m under the base; ground under the trunk now %.2f (%.2f m down)\n",
+                     expect, y0 - expect);
+
+        // 1. The drop, on the real clock.
+        float t = 0.0f, y_prev = y0, y = y0, max_step = 0.0f, landed_at = -1.0f;
+        bool rose = false;
+        QueryPerformanceCounter(&tp);
+        unsigned long long frames = 0;
+        while (t < 4.0f) {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            float dt = float(double(now.QuadPart - tp.QuadPart) / double(tf.QuadPart));
+            tp = now;
+            if (dt > 0.1f) dt = 0.1f;
+            t += dt;
+            g_felling.update(tree.x + 6.0f, tree.z);
+            frame(t);
+            ++frames;
+            if (!standing_y(tree.id, y)) break;
+            if (y > y_prev + 1e-4f) rose = true;
+            if (y_prev - y > max_step) max_step = y_prev - y;
+            if (landed_at < 0.0f && std::fabs(y - expect) < 0.01f) landed_at = t;
+            y_prev = y;
+        }
+        const float fall = y0 - expect;
+        std::fprintf(f, "drop: %.2f m in %.2f s over %llu frames (free fall from rest: %.2f s); "
+                        "now at %.3f, %.3f off the ground; largest step %.2f m; moved up: %s\n",
+                     y0 - y, landed_at, frames, std::sqrt(2.0f * fall / 9.81f), y, y - expect, max_step,
+                     rose ? "YES" : "no");
+
+        // The still, from the rim, looking down at the base.
+        {
+            engine::Camera c = g_camera;
+            c.x = tree.x + 7.0f; c.z = tree.z - 7.0f;
+            c.y = wg.height(c.x, c.z) + 5.0f;
+            const float dx = tree.x - c.x, dz = tree.z - c.z, dy = (y + 1.5f) - c.y;
+            c.yaw = std::atan2(dx, dz);
+            c.pitch = std::atan2(dy, std::sqrt(dx * dx + dz * dz));
+            engine::ViewConstants cv = {};
+            fill_view(c, g_res_w, g_res_h, t, cv);
+            std::string e3;
+            g_renderer.capture(cv, "build/dig_tree.bmp", e3);
+        }
+
+        // 2. The trunk collider at the new base.
+        for (int i = 0; i < 3; ++i) { g_felling.update(tree.x + 1.0f, tree.z); frame(t); }
+        int prop = 0;
+        const float from[3] = {tree.x + 1.5f, y + 0.5f, tree.z};
+        const float dir[3] = {-1.0f, 0.0f, 0.0f};
+        const float hit = g_physics.probe_ray(from, dir, 3.0f, prop);
+        std::fprintf(f, "collider: a ray 0.5 m over the new base hits %s at %.2f m (bark at %.2f)\n",
+                     hit < 0.0f ? "NOTHING" : (prop ? "a prop" : "terrain"), hit, 1.5f - trunk_r);
+
+        // 3. Chop it from the bottom of the hole.
+        const float eye[3] = {tree.x + trunk_r + 1.0f, y + kEyeAboveFeet, tree.z};
+        int swings = 0, r = 0;
+        while (swings < 40 && r != 2) {
+            r = g_felling.chop(eye, dir, t, nullptr, nullptr, nullptr);
+            ++swings;
+            t += 0.2f;
+            frame(t);
+            if (r == 0) break;
+        }
+        float lp[3] = {0, 0, 0}, lr[4];
+        bool active = false;
+        const bool have_log = g_felling.log_pose(tree.id, lp, lr, active);
+        std::fprintf(f, "chop: %s after %d swings (needs %d); log starts at y %.2f (new base %.2f)\n",
+                     r == 2 ? "FELLED" : (r == 0 ? "NOTHING IN REACH" : "still standing"), swings, need,
+                     have_log ? lp[1] : 0.0f, y);
+
+        const bool tree_pass = landed_at >= 0.0f && landed_at < 3.0f && !rose && std::fabs(y - expect) < 0.02f &&
+                               fall > 1.0f && hit >= 0.0f && prop && r == 2;
+        std::fprintf(f, "tree: %s\n\n", tree_pass ? "pass" : "FAIL");
+
+        // A boulder: the nearest to spawn over 1.5 m across, clear of the tree.
+        bool rock_pass = false;
+        {
+            for (int i = 0; i < 600 && !g_renderer.rock_field().settled(); ++i) { frame(t); Sleep(5); }
+            const worldgen::RockInstance* bp = nullptr;
+            float bd = 1e30f;
+            for (const worldgen::RockInstance& rk : g_renderer.rock_field().rocks()) {
+                if (rk.kind != 0 || rk.size < 1.5f) continue;
+                const float tx = rk.x - tree.x, tz = rk.z - tree.z;
+                if (tx * tx + tz * tz < 15.0f * 15.0f) continue;
+                const float dx = rk.x - g_spawn.x, dz = rk.z - g_spawn.z;
+                if (dx * dx + dz * dz < bd) { bd = dx * dx + dz * dz; bp = &rk; }
+            }
+            if (!bp) {
+                std::fprintf(f, "rock: VOID, no boulder over 1.5 m resident near spawn\n");
+            } else {
+                const worldgen::RockInstance rock = *bp;
+                const engine::RockModel& rm = g_renderer.rocks().model(engine::rock_model(rock.kind, rock.variant));
+                std::fprintf(f, "boulder %08x, %.2f m across, origin y %.2f, ground %.2f, %.0f m from spawn\n",
+                             rock.id, rock.size, rock.y, rock.ground, std::sqrt(bd));
+                const float R = 0.6f * rock.size + 1.5f;
+                g_renderer.dig(rock.x, rock.ground - 0.5f, rock.z, R, -4.0f, 1);
+                auto rock_y = [&](float& ry) -> bool {
+                    for (const worldgen::RockInstance& rk : g_renderer.rock_field().rocks())
+                        if (rk.id == rock.id) { ry = rk.y; return true; }
+                    return false;
+                };
+                float ry = rock.y, rprev = rock.y, rlanded = -1.0f, last_move = 0.0f;
+                bool rrose = false;
+                const float t_start = t;
+                QueryPerformanceCounter(&tp);
+                while (t - t_start < 4.0f) {
+                    LARGE_INTEGER now;
+                    QueryPerformanceCounter(&now);
+                    float dt = float(double(now.QuadPart - tp.QuadPart) / double(tf.QuadPart));
+                    tp = now;
+                    if (dt > 0.1f) dt = 0.1f;
+                    t += dt;
+                    g_felling.update(rock.x, rock.z);
+                    frame(t);
+                    if (!rock_y(ry)) break;
+                    if (ry > rprev + 1e-4f) rrose = true;
+                    if (ry < rprev - 1e-4f) last_move = t - t_start;
+                    rprev = ry;
+                }
+                rlanded = last_move;
+                const float rdrop = rock.y - ry;
+                std::fprintf(f, "dug a %.1f m sphere 0.5 m under its middle: dropped %.2f m, still after %.2f s "
+                                "(free fall: %.2f s); moved up: %s\n",
+                             R, rdrop, rlanded, std::sqrt(2.0f * (rdrop > 0.0f ? rdrop : 0.0f) / 9.81f),
+                             rrose ? "YES" : "no");
+                {
+                    engine::Camera c = g_camera;
+                    c.x = rock.x + 3.0f + 0.5f * rock.size; c.z = rock.z - 3.0f - 0.5f * rock.size;
+                    c.y = wg.height(c.x, c.z) + 6.0f + rock.size;
+                    const float dx = rock.x - c.x, dz = rock.z - c.z, dy = ry - c.y;
+                    c.yaw = std::atan2(dx, dz);
+                    c.pitch = std::atan2(dy, std::sqrt(dx * dx + dz * dz));
+                    engine::ViewConstants cv = {};
+                    fill_view(c, g_res_w, g_res_h, t, cv);
+                    std::string e3;
+                    g_renderer.capture(cv, "build/dig_rock.bmp", e3);
+                }
+                for (int i = 0; i < 3; ++i) { g_felling.update(rock.x, rock.z); frame(t); }
+                const float top = ry + rm.height * rock.size;
+                const float rf[3] = {rock.x, top + 30.0f, rock.z};
+                const float down[3] = {0.0f, -1.0f, 0.0f};
+                int rprop = 0;
+                const float rh = g_physics.probe_ray(rf, down, 80.0f, rprop);
+                const float hy = rh < 0.0f ? 0.0f : rf[1] - rh;
+                std::fprintf(f, "collider: a ray down its axis hits %s at y %.2f; its new top %.2f\n",
+                             rh < 0.0f ? "NOTHING" : (rprop ? "a prop" : "terrain"), hy, top);
+                rock_pass = rdrop > 0.5f && !rrose && rlanded < 3.0f && rh >= 0.0f && rprop &&
+                            std::fabs(hy - top) < 0.5f + 0.15f * rock.size;
+                std::fprintf(f, "rock: %s\n", rock_pass ? "pass" : "FAIL");
+            }
+        }
+        const bool pass = tree_pass && rock_pass;
+        std::fprintf(f, "\n%s\n", pass ? "PASS" : "FAIL");
+        std::fclose(f);
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return pass ? 0 : 1;
+    }
+
     if (fell_mode) {
         // --fell: the whole life of one tree, measured. Picks a real tree
         // near spawn, stands the character 1.6 m off its trunk, and:
@@ -2900,8 +4380,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         };
 
         // Let the tree field fill round spawn before choosing.
-        g_camera.x = 0.0f; g_camera.z = 0.0f;
-        g_camera.y = wg.height(0.0f, 0.0f) + 2.0f;
+        g_camera.x = g_spawn.x; g_camera.z = g_spawn.z;
+        g_camera.y = wg.height(g_camera.x, g_camera.z) + 2.0f;
         for (int i = 0; i < 600 && !g_renderer.tree_field().settled(); ++i) { frame(0.0f); Sleep(5); }
         for (int i = 0; i < 5; ++i) frame(0.0f);
 
@@ -3165,8 +4645,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const engine::WorldGpu& wg = g_renderer.world();
         double fly_ms_sum = 0.0;
         unsigned long long fly_frames = 0;
-        g_camera.x = 0.0f; g_camera.z = 0.0f;
-        g_camera.y = wg.height(0.0f, 0.0f) + 40.0f;
+        g_camera.x = g_spawn.x; g_camera.z = g_spawn.z;
+        g_camera.y = wg.height(g_camera.x, g_camera.z) + 40.0f;
         g_camera.yaw = 1.0f; g_camera.pitch = -0.3f;
 
         LARGE_INTEGER tf, t0, tp;
@@ -3253,13 +4733,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // of.
         const engine::WorldGpu& wg = g_renderer.world();
         const float sea = wg.params().sea_level;
+        g_renderer.update_weather(0.0);
         const float state = g_renderer.sea_state();
+        // The weather's sea. Under --sea-state the dial is fixed and the sea
+        // with it (only the swell's heading wanders, slowly).
+        const WwSea& wsea = g_renderer.sea();
+        auto surf_at = [&](float x, float z, float t) {
+            return ww_water_at(x, z, t, wsea, g_renderer.swash(), sea - wg.height(x, z));
+        };
         // "Deep" is deep enough that no trough at this sea state can put the
         // floating feet on the bottom: float depth, plus the full amplitude
         // the trough can fall, plus a metre. Below this, touching the seabed
         // while swimming is legitimate and is not counted.
         const float deep = engine::PhysicsWorld::kFloatDepth +
-                           ww_total_amplitude(state) + 1.0f;
+                           ww_total_amplitude(wsea) + 1.0f;
 
         // A beach: the nearest coast to the origin along any of 72 spokes
         // where the land side is low enough to walk down (under 6 m, 20 m
@@ -3356,6 +4843,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             const float px = g_feet[0], pz = g_feet[2];
             g_physics.update(float(dt), sy * spd, cy * spd, false);
             g_physics.character_position(g_feet);
+            // The character swims too (it is drawn only in the second still).
+            update_character(float(dt), float(total), sy * spd, cy * spd);
 
             g_camera.x = g_feet[0];
             g_camera.y = g_feet[1] + kEyeAboveFeet;
@@ -3406,7 +4895,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 // of nothing.
                 const double eye_y = double(g_feet[1]) + kEyeAboveFeet;
                 const double surf = double(sea) +
-                    ww_height_at(g_feet[0], g_feet[2], float(total), state);
+                    surf_at(g_feet[0], g_feet[2], float(total));
                 const double clear = eye_y - surf;
                 if (clear < eye_min) eye_min = clear;
                 if (clear > eye_max) eye_max = clear;
@@ -3431,8 +4920,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             // whatever was happening, and twice photographed a camera 7 cm
             // under the surface that the report then had to explain.
             const double eye_local = double(g_camera.y) - (double(sea) +
-                ww_height_at(g_camera.x, g_camera.z, float(total), state));
-            const bool trough_sea = ww_total_amplitude(state) > 1.5f;
+                surf_at(g_camera.x, g_camera.z, float(total)));
+            const bool trough_sea = ww_total_amplitude(wsea) > 1.5f;
             const bool vantage = md == engine::Medium::Swimming && eye_local > 0.2 &&
                                  (!trough_sea || double(g_camera.y) < double(sea) - 1.0);
             if (back && !shot_taken && (vantage || total >= swim_seconds * 0.8)) {
@@ -3443,8 +4932,23 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 std::string err;
                 g_renderer.capture(cv, "build/swim.bmp", err);
                 shot_eye_local = double(g_camera.y) - (double(sea) +
-                    ww_height_at(g_camera.x, g_camera.z, float(total), state));
+                    surf_at(g_camera.x, g_camera.z, float(total)));
                 shot_eye_sea = double(g_camera.y) - double(sea);
+                // And the same moment in third person: the swimmer, through
+                // the window's camera, 4.5 m back and a little above.
+                {
+                    const engine::Camera keep = g_camera;
+                    g_walk = true;
+                    g_cam_dist = g_cam_dist_now = 4.5f;
+                    g_camera.pitch = -0.3f;
+                    place_walk_camera(0.0f);
+                    publish_character();
+                    engine::ViewConstants tv = {};
+                    fill_view(g_camera, g_res_w, g_res_h, float(total), tv);
+                    g_renderer.capture(tv, "build/swim_char.bmp", err);
+                    g_renderer.character().set_pose(g_bones, false);
+                    g_camera = keep;
+                }
                 shot_cam = g_camera;
                 shot_time = float(total);
             }
@@ -3475,7 +4979,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(f, "distance swum: %.1f m\n", swum);
             std::fprintf(f, "\n'deep' is a column over %.2f m: float depth %.2f + the sea's "
                             "full amplitude %.2f + 1 m\n",
-                         deep, engine::PhysicsWorld::kFloatDepth, ww_total_amplitude(state));
+                         deep, engine::PhysicsWorld::kFloatDepth, ww_total_amplitude(wsea));
             std::fprintf(f, "frames in deep water: %llu\n", deep_frames);
             std::fprintf(f, "  of which standing on the seabed: %llu -> %s\n",
                          deep_standing,
@@ -3517,6 +5021,96 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (std::string(cmdline ? cmdline : "").find("--pose-sheet") != std::string::npos) {
+        // --pose-sheet: the character in fixed poses from fixed cameras, to
+        // judge the procedural animation without playing. Stands it at spawn,
+        // lets the world and the capsule settle, then for each pose drives
+        // the animator to it and writes build/pose_<name>.bmp, and a line
+        // per pose to build/pose_sheet.txt.
+        g_walk = true;
+        g_cam_dist = g_cam_dist_now = 4.5f;
+        const float sx = 0.0f, sz = 0.0f;
+        g_physics.place_character(sx, Spawn::above(sx, sz), sz);
+        g_physics.character_position(g_feet);
+        for (int i = 0; i < 240; ++i) {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+            step_window_physics(1.0f / 60.0f, float(i) / 60.0f, 0.0f, 0.0f, false, 0.0f);
+            g_camera.x = g_feet[0] - 4.0f; g_camera.y = g_feet[1] + 1.6f; g_camera.z = g_feet[2];
+            engine::ViewConstants v = {};
+            fill_view(g_camera, g_res_w, g_res_h, float(i) / 60.0f, v);
+            g_renderer.render(v);
+        }
+        // speed: m/s; air / swim: the medium; action: seconds into the axe's
+        // swing, -1 none.
+        struct Pose { const char* name; float speed; bool air, swim, torch; float action; float phase;
+                      float cam_yaw; float cam_pitch; float dist; float pivot; };
+        // Camera yaw: the character faces +z (yaw 0); -pi/2 looks along -x,
+        // which is from the character's left side; pi looks back at its front.
+        const float side = -1.5707963f, front = 3.1415927f, behind = 0.35f;
+        const Pose poses[] = {
+            {"idle_front", 0.0f, false, false, false, -1.0f, 0.0f, front, -0.05f, 3.2f, 1.0f},
+            {"idle_side", 0.0f, false, false, false, -1.0f, 0.0f, side, -0.05f, 3.2f, 1.0f},
+            {"walk_0", 1.4f, false, false, false, -1.0f, 0.0f, side, -0.05f, 3.2f, 1.0f},
+            {"walk_50", 1.4f, false, false, false, -1.0f, 0.5f, side, -0.05f, 3.2f, 1.0f},
+            {"jog_0", 5.0f, false, false, false, -1.0f, 0.0f, side, -0.05f, 3.4f, 1.0f},
+            {"jog_25", 5.0f, false, false, false, -1.0f, 0.25f, side, -0.05f, 3.4f, 1.0f},
+            {"sprint_0", 8.0f, false, false, false, -1.0f, 0.0f, side, -0.05f, 3.4f, 1.0f},
+            {"sprint_25", 8.0f, false, false, false, -1.0f, 0.25f, side, -0.05f, 3.4f, 1.0f},
+            {"jog_front", 5.0f, false, false, false, -1.0f, 0.1f, front, -0.05f, 3.4f, 1.0f},
+            {"jump", 0.0f, true, false, false, -1.0f, 0.0f, side, -0.05f, 3.4f, 1.0f},
+            {"swim_idle", 0.0f, false, true, false, -1.0f, 0.0f, side, -0.05f, 3.4f, 1.0f},
+            {"swim_fwd", 2.0f, false, true, false, -1.0f, 0.3f, side, 0.1f, 3.4f, 1.0f},
+            {"torch_idle", 0.0f, false, false, true, -1.0f, 0.0f, front, -0.05f, 3.2f, 1.0f},
+            {"torch_jog", 5.0f, false, false, true, -1.0f, 0.3f, side, -0.05f, 3.4f, 1.0f},
+            {"chop", 0.0f, false, false, false, 0.55f, 0.0f, front, -0.05f, 3.2f, 1.0f},
+            {"third_person", 5.0f, false, false, false, -1.0f, 0.6f, behind, -0.2f, 4.5f, kCamPivot},
+        };
+        FILE* rf = std::fopen("build/pose_sheet.txt", "w");
+        if (rf) std::fprintf(rf, "%s\n%s\nfeet at (%.2f, %.2f, %.2f)\n", g_renderer.character().note().c_str(),
+                             g_anim.clips() ? g_anim_lib.note.c_str() : "no clips: the procedural gait",
+                             g_feet[0], g_feet[1], g_feet[2]);
+        for (const Pose& p : poses) {
+            engine::LocomotionInput in;
+            in.dt = 0.05f;
+            in.speed = p.speed;
+            in.grounded = !p.air && !p.swim;
+            in.swimming = p.swim;
+            in.torch = p.torch;
+            for (int i = 0; i < 60; ++i) {
+                in.time = float(i) * in.dt;
+                g_anim.set_phase(p.phase);
+                g_anim.update(in);
+            }
+            g_anim.set_phase(p.phase);
+            g_anim.set_action_time(p.action);
+            in.dt = 0.0f;
+            g_anim.update(in);
+            g_char_yaw = 0.0f;
+            publish_character();
+            engine::Camera c = g_camera;
+            c.yaw = p.cam_yaw;
+            c.pitch = p.cam_pitch;
+            float f[3], r[3], u[3];
+            c.basis(f, r, u);
+            c.x = g_feet[0] - f[0] * p.dist;
+            c.y = g_feet[1] + p.pivot - f[1] * p.dist;
+            c.z = g_feet[2] - f[2] * p.dist;
+            engine::ViewConstants v = {};
+            fill_view(c, g_res_w, g_res_h, 0.0f, v);
+            std::string err;
+            const std::string path = std::string("build/pose_") + p.name + ".bmp";
+            g_renderer.capture(v, path.c_str(), err);
+            if (rf) std::fprintf(rf, "%-13s speed %.1f %s phase %.2f: run %.2f air %.2f drop %.3f m%s%s\n", p.name,
+                                 p.speed, p.swim ? "swim  " : (p.air ? "air   " : "ground"), g_anim.phase(), g_anim.run_blend(),
+                                 g_anim.air_blend(), g_anim.foot_drop(), err.empty() ? "" : " -- ", err.c_str());
+        }
+        if (rf) std::fclose(rf);
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return 0;
+    }
+
     if (walk_seconds > 0.0) {
         // --uncapped measures frame cost at ground level, where the grass is:
         // a flight passes too high for blades to be emitted at all.
@@ -3524,9 +5118,19 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         g_renderer.set_vsync(!walk_uncapped);
         std::vector<double> walk_ms;
         g_walk = true;
-        g_physics.place_character(0.0f, Spawn::above(0.0f, 0.0f), 0.0f);
+        g_physics.place_character(g_spawn.x, Spawn::above(g_spawn.x, g_spawn.z), g_spawn.z);
         g_physics.character_position(g_feet);
-        g_camera.pitch = -0.12f;
+        g_camera.pitch = -0.2f;
+        // --cam-dist <m>: the third-person camera's distance; 0 is the old
+        // first-person eye, with no character drawn.
+        {
+            const std::string wcl = cmdline ? cmdline : "";
+            const size_t cd = wcl.find("--cam-dist");
+            if (cd != std::string::npos) g_cam_dist = float(std::atof(wcl.c_str() + cd + 10));
+            g_cam_dist_now = g_cam_dist;
+        }
+        g_char_yaw = 0.0f;
+        g_have_prev_feet = false;
 
         LARGE_INTEGER wfreq, wstart, wprev;
         QueryPerformanceFrequency(&wfreq);
@@ -3569,10 +5173,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_physics.character_position(g_feet);
             travelled += std::sqrt((g_feet[0] - px) * (g_feet[0] - px) +
                                    (g_feet[2] - pz) * (g_feet[2] - pz));
-
-            g_camera.x = g_feet[0];
-            g_camera.y = g_feet[1] + kEyeAboveFeet;
-            g_camera.z = g_feet[2];
+            // The player as the window has it: the character posed from what
+            // physics did, the third-person camera behind it.
+            update_character(float(dt), float(total), sy * sp, cy * sp);
+            place_walk_camera(float(dt));
+            publish_character();
 
             RECT cr;
             GetClientRect(hwnd, &cr);
@@ -3657,7 +5262,23 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                              sm[size_t(sm.size() * 0.99)]);
             }
             write_rock_report(f, g_feet[0], g_feet[2], true);
+            {
+                const engine::NearField& nf = g_renderer.near_field();
+                std::fprintf(f, "near field: %s; %llu plans, %llu of them filled blocks (%llu blocks), %llu probes traced\n",
+                             g_renderer.near_field_on() ? (nf.ready() ? "on, ready" : "on, NOT ready") : "off",
+                             nf.plans(), nf.fill_frames(), nf.blocks_filled(), nf.probes_traced());
+            }
+            std::fprintf(f, "lightning: %u strikes (%u to the ground), %llu frames lit, seed %u, clock %.1f s at the end\n",
+                         g_renderer.strikes_seen(), g_renderer.ground_strikes_seen(), g_renderer.flash_frames(),
+                         g_renderer.lightning().seed(), double(g_renderer.weather_time()));
             std::fprintf(f, "frames %llu, travelled %.0f m\n", frames, travelled);
+            std::fprintf(f, "character: %s; camera %.1f m behind (wanted %.1f)%s; speed %.2f m/s, gait phase %.2f, "
+                            "run %.2f, planted-foot drop %.3f m\n",
+                         (g_renderer.character().note() + "; " +
+                          (g_anim.clips() ? g_anim_lib.note : std::string("procedural gait"))).c_str(),
+                         g_cam_dist_now, g_cam_dist,
+                         first_person() ? ", first person" : "", g_char_speed, g_anim.phase(), g_anim.run_blend(),
+                         g_anim.foot_drop());
             std::fprintf(f, "canopy map: %s, %llu builds, %u trees in the last\n",
                          g_renderer.canopy() ? "on" : "off", g_renderer.canopy_builds(), g_renderer.canopy_trees());
             // Jolt cannot tell "in the air" from "that chunk has not arrived":
@@ -3696,24 +5317,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fclose(f);
         }
 
-        // Where the walk ended up. The capsule itself is no longer in the
-        // picture: it was drawn by the raymarch's capsule SDF, and M1 retired
-        // the raymarch along with the trivial field it was the last caller of.
-        // What the shot still shows is the ground the walk finished on.
+        // Where the walk ended up, through the third-person camera as it was
+        // on the last frame: the character mid-stride, and the ground.
         {
-            engine::Camera c = g_camera;
-            const float sy = std::sin(g_camera.yaw), cy = std::cos(g_camera.yaw);
-            c.x = g_feet[0] - sy * 7.0f;
-            c.z = g_feet[2] - cy * 7.0f;
-            // Lifted clear of whatever is at the camera's own position: seven
-            // metres behind the character is often inside a hillside, and the
-            // first attempt at this shot was a screen of solid rock.
-            const float behind = g_renderer.world().height(c.x, c.z);
-            c.y = g_feet[1] + 3.2f;
-            if (c.y < behind + 2.5f) c.y = behind + 2.5f;
-            c.pitch = -0.33f;
             engine::ViewConstants v = {};
-            fill_view(c, g_res_w, g_res_h, 0.0f, v);
+            fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
             g_renderer.set_mode(engine::Mode::Mesh);
             std::string err;
             g_renderer.capture(v, "build/b4_walk.bmp", err);
@@ -3732,7 +5340,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // at 60 Hz the camera covers a metre a frame and streaming has real
         // work to do, while uncapped it covers a fraction of a millimetre.
         g_renderer.set_vsync(flight_vsync);
-        g_camera.x = 0.0f; g_camera.y = 34.0f; g_camera.z = 0.0f;
+        g_camera.x = g_spawn.x; g_camera.z = g_spawn.z;
+        g_camera.y = g_spawn.ground + 10.0f;
         // --flight-from x y z: start somewhere else -- rough ground is where
         // the slot pool ran dry, and the origin is gentle.
         {
@@ -3969,6 +5578,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     int    fps_frames = 0;
     float  t = 0.0f;
 
+    setup_ui(hwnd);
+
     MSG msg = {};
     while (msg.message != WM_QUIT) {
         if (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -3984,6 +5595,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         double dt = elapsed - last;
         last = elapsed;
         if (dt > 0.1) dt = 0.1;   // a breakpoint must not teleport the camera
+        // The UI runs on the wall clock; the game's clock stops while paused.
+        const double wall_dt = dt;
+        if (g_paused) dt = 0.0;
         t += static_cast<float>(dt);
 
         RECT cr;
@@ -3992,7 +5606,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const float h = static_cast<float>(cr.bottom - cr.top);
         if (w < 1.0f || h < 1.0f) continue;
 
-        if (g_walk) {
+        if (g_paused) {
+            // Still hand physics what streamed in: the events are this
+            // frame's only (see step_window_physics).
+            sync_physics_terrain();
+        } else if (g_walk) {
             // The capsule moves; the camera rides it at eye height. Streaming
             // follows the camera, so this is also what keeps chunks loading
             // around the character rather than around a detached viewpoint.
@@ -4008,7 +5626,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             // (+cos, -sin) -- screen LEFT -- so A and D were swapped in walk
             // mode while fly mode, which uses basis(), had them right.
             const float sy = std::sin(g_camera.yaw), cy = std::cos(g_camera.yaw);
-            const float sp = 6.0f;
+            // A jog; Shift sprints, Caps Lock (toggled) walks. A diagonal is
+            // no faster than straight ahead.
+            float sp = kJogSpeed;
+            if (GetKeyState(VK_CAPITAL) & 1) sp = kWalkSpeed;
+            if (GetAsyncKeyState(VK_SHIFT) & 0x8000) sp = kSprintSpeed;
+            const float ml = std::sqrt(mx * mx + mz * mz);
+            if (ml > 1.0f) { mx /= ml; mz /= ml; }
             const float vx = (sy * mz - cy * mx) * sp;
             const float vz = (cy * mz + sy * mx) * sp;
             const bool jump = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
@@ -4016,9 +5640,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             // the water is the key you would already be pressing.
             const float swim = (GetAsyncKeyState(VK_CONTROL) & 0x8000) ? -1.0f : 0.0f;
             step_window_physics(float(dt), t, vx, vz, jump, swim);
-            g_camera.x = g_feet[0];
-            g_camera.y = g_feet[1] + kEyeAboveFeet;
-            g_camera.z = g_feet[2];
+            update_character(float(dt), t, vx, vz);
         } else {
             step_window_physics(float(dt), t, 0.0f, 0.0f, false, 0.0f);
         }
@@ -4043,6 +5665,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             }
             if (!g_walk) g_camera.update(static_cast<float>(dt));
         }
+        // The camera follows the character after the mouse has turned it, so
+        // the orbit never lags the look by a frame.
+        if (g_walk && !g_paused) place_walk_camera(float(dt));
+        publish_character();
 
         // Trees: colliders round the player, logs posed by physics; then any
         // swing, save or load the window asked for this frame.
@@ -4051,13 +5677,50 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_want_chop = false;
             float fwd[3], right[3], up[3];
             g_camera.basis(fwd, right, up);
-            const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
+            float eye[3];
+            chop_origin(eye);
+            // The swing: the character turns to where the camera looks and
+            // its upper body plays the axe over whatever the legs are doing.
+            if (g_walk) {
+                g_char_yaw = g_camera.yaw;
+                g_anim.trigger_action();
+            }
             uint32_t id = 0;
             int hits = 0, need = 0;
             const int r = g_felling.chop(eye, fwd, t, &id, &hits, &need);
             if (r == 0) std::snprintf(g_tree_msg, sizeof g_tree_msg, "nothing in reach");
             else if (r == 1) std::snprintf(g_tree_msg, sizeof g_tree_msg, "chop %d/%d", hits, need);
             else std::snprintf(g_tree_msg, sizeof g_tree_msg, "TIMBER (%zu felled)", g_felling.felled());
+        }
+        if (g_dig_held && g_captured && !g_paused) {
+            g_dig_timer += float(dt);
+            if (g_dig_timer >= kDigRepeat) { g_dig_timer = 0.0f; g_want_dig = true; }
+        }
+        if (g_want_dig) {
+            g_want_dig = false;
+            float fwd[3], right[3], up[3];
+            g_camera.basis(fwd, right, up);
+            const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
+            const engine::Renderer::AimedDig d =
+                g_renderer.dig_aimed(eye, fwd, kDigReach, kDigRadii[g_dig_size]);
+            if (!d.hit) std::snprintf(g_tree_msg, sizeof g_tree_msg, "dig: no ground within %.0f m", kDigReach);
+            else std::snprintf(g_tree_msg, sizeof g_tree_msg, "dug r %.2f m at %.1f m, %zu voxels, %.1f ms",
+                               kDigRadii[g_dig_size], d.dist, d.voxels, d.ms);
+        }
+        if (g_snap_walk_frames >= 0 && --g_snap_walk_frames < 0) {
+            g_walk = true;
+            g_physics.place_character(g_snap_feet[0], g_snap_feet[1] + 0.2f, g_snap_feet[2]);
+            g_char_yaw = g_camera.yaw;
+            g_have_prev_feet = false;
+            if (g_snap_cam_dist >= 0.0f) g_cam_dist = g_snap_cam_dist;
+        }
+        if (g_want_snapshot) {
+            g_want_snapshot = false;
+            engine::ViewConstants sv = {};
+            fill_view(g_camera, w, h, t, sv);
+            const std::string dir = write_snapshot(sv);
+            std::snprintf(g_tree_msg, sizeof g_tree_msg, dir.empty() ? "snapshot FAILED" : "snapshot %s",
+                          dir.c_str());
         }
         if (g_want_save || g_want_load) {
             std::string err;
@@ -4074,6 +5737,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_want_save = g_want_load = false;
         }
 
+        g_ui.update(float(wall_dt));
+
         engine::ViewConstants view = {};
         fill_view(g_camera, w, h, t, view);
         g_renderer.render(view);
@@ -4085,24 +5750,26 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         }
 
         if (g_time_lapse) g_renderer.set_time_of_day(g_renderer.time_of_day() + float(dt) * 0.1f);
-        const double frame_ms = dt * 1000.0;
+        const double frame_ms = wall_dt * 1000.0;
         if (frame_ms > worst_frame_ms) worst_frame_ms = frame_ms;
-        fps_accum += dt;
+        fps_accum += wall_dt;
         ++fps_frames;
         if (fps_accum >= 0.5) {
             const engine::FrameStats st = g_renderer.stats();
-            char title[400];
+            char title[512];
             const float tod = g_renderer.time_of_day();
             std::snprintf(title, sizeof(title),
-                          "biomes2 engine - %02d:%02d%s [PgUp/PgDn H] - %s [M] %s [T] - trees %.0f m [-=] %s - %.0f fps (worst %.1f ms) - "
+                          "biomes2 engine - %02d:%02d%s [PgUp/PgDn H] - wind %.1f m/s, sea Hs %.1f m%s [[ ] \\ ;] - %s [M] %s [T] - trees %.0f m [-=] - dig r %.2f m [RMB , .] %s - %.0f fps (worst %.1f ms) - "
                           "%zu chunks, %u tris - %u meshed/frame in %.3f ms - "
                           "%zu pending, %zu slots free%s%s",
                           int(tod), int((tod - float(int(tod))) * 60.0f), g_time_lapse ? " running" : "",
+                          g_renderer.weather_state().wind_speed, ww_significant_height(g_renderer.sea()),
+                          g_renderer.weather().automatic() ? "" : " fixed",
                           g_renderer.mode() == engine::Mode::Mesh ? "shaded" : "wireframe",
                           g_renderer.texture_mode() < 0.5f ? "flat"
                           : g_renderer.texture_mode() < 1.5f ? "detail"
                           : g_renderer.texture_mode() < 2.5f ? "grid" : "detail+grid",
-                          g_renderer.tree_settings().max_dist, g_tree_msg,
+                          g_renderer.tree_settings().max_dist, kDigRadii[g_dig_size], g_tree_msg,
                           fps_frames / fps_accum, worst_frame_ms,
                           st.resident, st.indices / 3,
                           st.meshed_this_frame, st.mesh_ms,
@@ -4119,7 +5786,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         }
     }
 
+    g_renderer.flush();
+    g_renderer.set_overlay(nullptr);
+    g_ui.shutdown();
     g_renderer.shutdown();
-        g_physics.shutdown();
+    g_physics.shutdown();
     return 0;
 }

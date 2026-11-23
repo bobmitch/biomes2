@@ -408,8 +408,40 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
     } else {
         nrm = field_normal(world);
     }
-    const bool border = id.x == 0u || id.x == kCells - 1u ||
-                        id.z == 0u || id.z == kCells - 1u;
+    bool border = id.x == 0u || id.x == kCells - 1u ||
+                  id.z == 0u || id.z == kCells - 1u;
+
+    // Where the skirt goes (see below): into the rock along -normal, leaning
+    // out across the chunk face.
+    float3 skirt_pos = world;
+    if (border) {
+        float3 outward = float3(0.0f, 0.0f, 0.0f);
+        if (id.x == 0u) outward.x = -1.0f; else if (id.x == kCells - 1u) outward.x = 1.0f;
+        if (id.z == 0u) outward.z = -1.0f; else if (id.z == kCells - 1u) outward.z = 1.0f;
+        float3 tang = outward - nrm * dot(outward, nrm);
+        tang.y = min(tang.y, 0.0f);
+        const float  tl = length(tang);
+        const float3 lean = tl > 0.05f ? tang / tl : float3(0.0f, 0.0f, 0.0f);
+        const float3 dir = lean * 0.5f - nrm;
+        skirt_pos = world + dir * (voxel * skirt);
+        // Where the player has dug, the rock a skirt hangs into can be a lip
+        // a voxel thick. Undercut, its normal points DOWN and the skirt
+        // climbs straight out into the air; thin, the skirt goes through it
+        // into the hole beyond. Either way the curtain is in view: the
+        // stretched-bark fins and spikes over and in repeatedly dug pits
+        // (--dig-burst 60 with --mesh-debug 1: 1427 curtain pixels). An
+        // edited border cell keeps its skirt only if it goes down, and its
+        // middle and end are not in dug-out air. A LOD seam over dug ground
+        // can then show a sliver; coarse levels point-sample the edits and
+        // disagree with LOD 0 there anyway.
+        if (edited) {
+            float ed;
+            const float3 mid = world + dir * (0.5f * voxel * skirt);
+            if (dir.y > -0.25f ||
+                (edited_density(mid, ed) && ed <= 0.0f) ||
+                (edited_density(skirt_pos, ed) && ed <= 0.0f)) border = false;
+        }
+    }
     const uint need = border ? 2u : 1u;
 
     uint local_slot;
@@ -448,15 +480,9 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
         // at most one COARSE voxel, and both sides lean, so one is enough.
         // A/B on the hillside: undrawn 49 -> 0, visible curtain 2666 -> 3330
         // pixels, and the frame otherwise differs only in distant slivers.
-        float3 outward = float3(0.0f, 0.0f, 0.0f);
-        if (id.x == 0u) outward.x = -1.0f; else if (id.x == kCells - 1u) outward.x = 1.0f;
-        if (id.z == 0u) outward.z = -1.0f; else if (id.z == kCells - 1u) outward.z = 1.0f;
-        float3 tang = outward - nrm * dot(outward, nrm);
-        tang.y = min(tang.y, 0.0f);
-        const float  tl = length(tang);
-        const float3 lean = tl > 0.05f ? tang / tl : float3(0.0f, 0.0f, 0.0f);
+        // (The position is worked out above, before the slot is allocated.)
         Vertex s;
-        s.pos = world + (lean * 0.5f - nrm) * (voxel * skirt);
+        s.pos = skirt_pos;
         s.nrm = nrm * 0.5f;
         skirt_slot = local_slot + 1u;
         g_vertices[vbase + skirt_slot] = s;

@@ -462,9 +462,16 @@ void PhysicsWorld::update(float dt, float vx, float vz, bool jump, float swim) {
         if (sea_.on && column_height_) {
             // water.hlsl's clip(depth + 0.02): drawn wherever the base column
             // is below sea level, give or take its two centimetres.
-            sea_here_ = column_height_(fx, fz) < sea_.level + 0.02f;
+            const float ground = column_height_(fx, fz);
+            const float depth = sea_.level - ground;
+            // The swash runs the water up the beach (water_wave.h), so the sea
+            // is here wherever the running sheet covers the ground, as drawn.
+            const float swash = ww_swash(fx, fz, sea_.time, sea_.swash) * ww_swash_reach(depth);
+            sea_here_ = depth + swash > -0.02f;
             if (sea_here_) {
-                water_y_ = sea_.level + ww_height_at(fx, fz, sea_.time, sea_.state);
+                // The depth the shader reads at the rest point, read here at
+                // the asked point (water_wave.h, ww_rest_point).
+                water_y_ = sea_.level + ww_water_at(fx, fz, sea_.time, sea_.sea, sea_.swash, depth);
                 float sub = water_y_ - fy;
                 const float body = 2.0f * (half_height_ + radius_);
                 submerged_ = sub < 0.0f ? 0.0f : (sub > body ? body : sub);

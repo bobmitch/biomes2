@@ -3,6 +3,7 @@
 #endif
 #include "engine/render/far_shadow.h"
 #include "engine/render/shader_compile.h"
+#include "engine/render/shader_heaps.h"
 
 #include <cmath>
 #include <cstring>
@@ -192,8 +193,7 @@ void FarShadow::record(ID3D12GraphicsCommandList* cmd, UINT frame) {
     };
     tr(depth_.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, kRead);
     tr(vis_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
-    cmd->SetDescriptorHeaps(1, heaps);
+    bind_shader_heaps(cmd);
     const D3D12_GPU_DESCRIPTOR_HANDLE base = heap_->GetGPUDescriptorHandleForHeapStart();
     cmd->SetComputeRootSignature(root_.Get());
     cmd->SetComputeRootConstantBufferView(0, cb_[f]->GetGPUVirtualAddress());
