@@ -78,6 +78,9 @@ struct Layer0Params {
     float regime_mean;     // mask offset where the regime is average
     float regime_amp;      // mask offset per std of the regime
     int   regime_on;       // 0: the regime is never evaluated (and reads 0)
+    float shelf_depth;     // metres the shelf levels at under sea level
+    float shelf_width;     // mask units below sea level the shelf spans; 0 is off
+    float shelf_regime;    // how much the regime widens the shelf, per std
     uint  seed;
     uint  seed_fine;
     uint  seed_regime;
@@ -115,6 +118,28 @@ WG_FN Layer0Noise layer0_noise(float x, float z, Layer0Params p, float voxel) {
 WG_FN float layer0_mask(float x, float z, float r, Layer0Params p, float voxel) {
     const Layer0Noise o = layer0_noise(x, z, p, voxel);
     return layer0_shape(o.n + p.land_offset, r, p.centre_floor, p.edge_drop);
+}
+
+// The shelf's width where the regime reads `regime`. Never below a tenth of
+// the set width, so a shelf that is on stays continuous at the coast.
+WG_FN float layer0_shelf_width(Layer0Params p, float regime) {
+    if (p.shelf_width <= 0.0f) return 0.0f;
+    const float w = p.shelf_width * (1.0f - p.shelf_regime * regime);
+    const float lo = 0.1f * p.shelf_width;
+    return w > lo ? w : lo;
+}
+
+// Metres of water over the seabed `u` mask units below sea level, with a
+// shelf. Rational (invariant 9): a quick rise to `depth` (half of it a tenth
+// of the way out), then the old slope `scale` coming in as t^4 / (1 + t^4),
+// t = u / width. Flat near the coast, the old gradient far out, deeper than
+// the old seabed by `depth` there. Positive for every u > 0, so the shelf
+// never reaches sea level: it creates no land and moves no coastline.
+WG_FN float shelf_depth_at(float u, float scale, float depth, float width) {
+    const float t = u / width;
+    const float t2 = t * t;
+    const float t4 = t2 * t2;
+    return depth * t / (t + 0.1f) + scale * u * t4 / (1.0f + t4);
 }
 
 // Layer 1 -- the danger field, defined on normalised AREA (r squared), never
@@ -306,6 +331,16 @@ WG_FN float layer4_blend(float h0, float w0, float h1, float w1, float h2, float
 WG_FN float layer4_height(float continent, float continent_scale, float blended, float sea_level) {
     const float land = wg_smoothstep(sea_level, sea_level + 0.12f, continent);
     return continent * continent_scale + blended * land;
+}
+
+// layer4_height with layer 0's shelf under the sea. shelf_width 0 is exactly
+// layer4_height. Below sea level the biome relief is already faded to zero,
+// so the seabed is the mask's mapping alone and the shelf replaces it there.
+WG_FN float layer4_height_shelf(float continent, float continent_scale, float blended, float sea_level, float shelf_depth, float shelf_width) {
+    if (shelf_width > 0.0f && continent < sea_level) {
+        return sea_level * continent_scale - shelf_depth_at(sea_level - continent, continent_scale, shelf_depth, shelf_width);
+    }
+    return layer4_height(continent, continent_scale, blended, sea_level);
 }
 
 // --- layer 5: rivers --------------------------------------------------------

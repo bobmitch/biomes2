@@ -72,9 +72,14 @@ cbuffer WorldConstants : register(b1) {
     float w_regime_amp;
 
     int   w_regime_on;
+    float w_shelf_depth;
+    float w_shelf_width;
+    float w_shelf_regime;
+
     uint  w_s_fine;
     uint  w_s_regime;
     float w_l0_pad0;
+    float w_l0_pad1;
 };
 
 // The CPU's SeedWorld::l0, rebuilt from the constants.
@@ -94,6 +99,9 @@ Layer0Params real_layer0() {
     p.regime_mean = w_regime_mean;
     p.regime_amp = w_regime_amp;
     p.regime_on = w_regime_on;
+    p.shelf_depth = w_shelf_depth;
+    p.shelf_width = w_shelf_width;
+    p.shelf_regime = w_shelf_regime;
     p.seed = w_s_cont;
     p.seed_fine = w_s_fine;
     p.seed_regime = w_s_regime;
@@ -217,6 +225,7 @@ float real_terrain_base(float x, float z, float r, float voxel) {
     const Layer0Params l0 = real_layer0();
     const Layer0Noise l0n = layer0_noise(x, z, l0, voxel);
     const float continent = layer0_shape(l0n.n + l0.land_offset, r, l0.centre_floor, l0.edge_drop);
+    const float shelf_w = layer0_shelf_width(l0, l0n.regime);
 
     // The boundary warp is what makes cell edges read as coastlines.
     const float wx = x + w_warp_amp * fbm(x * w_warp_freq, z * w_warp_freq, 2, 2.0f, 0.5f, w_s_wx);
@@ -224,7 +233,7 @@ float real_terrain_base(float x, float z, float r, float voxel) {
 
     int4 idx; float4 dist; float d5;
     const int found = cell_nearest4(wx, wz, idx, dist, d5);
-    if (found == 0) return layer4_height(continent, w_continent_scale, 0.0f, w_sea_level);
+    if (found == 0) return layer4_height_shelf(continent, w_continent_scale, 0.0f, w_sea_level, l0.shelf_depth, shelf_w);
 
     // The micro-relief once; each biome scales it (world.cpp's terrain_base).
     const float dn = layer4_detail(x, z, w_detail_period, w_detail_octaves, w_detail_gain,
@@ -253,7 +262,7 @@ float real_terrain_base(float x, float z, float r, float voxel) {
     }
 
     const float blended = layer4_blend(h[0], wt[0], h[1], wt[1], h[2], wt[2], h[3], wt[3], wall);
-    return layer4_height(continent, w_continent_scale, blended, w_sea_level);
+    return layer4_height_shelf(continent, w_continent_scale, blended, w_sea_level, l0.shelf_depth, shelf_w);
 }
 
 // Distance to the nearest river, with that channel's shape.

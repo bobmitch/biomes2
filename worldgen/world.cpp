@@ -151,7 +151,17 @@ float terrain_base(const SeedWorld& w, const WorldParams& wp,
     }
 
     const float blended = layer4_blend(h[0], wt[0], h[1], wt[1], h[2], wt[2], h[3], wt[3], wall);
-    return layer4_height(cont, wp.continent_scale, blended, wp.sea_level);
+    return layer4_height_shelf(cont, wp.continent_scale, blended, wp.sea_level,
+                               w.l0.shelf_depth, layer0_shelf_width(w.l0, l0n.regime));
+}
+
+float still_water_depth(const SeedWorld& w, const WorldParams& wp, float x, float z, float r) {
+    const Layer0Noise l0n = layer0_noise(x, z, w.l0, 0.0f);
+    const float cont = layer0_shape(l0n.n + w.l0.land_offset, r, w.l0.centre_floor, w.l0.edge_drop);
+    if (cont > wp.sea_level) return 0.0f;
+    const float bed = layer4_height_shelf(cont, wp.continent_scale, 0.0f, wp.sea_level,
+                                          w.l0.shelf_depth, layer0_shelf_width(w.l0, l0n.regime));
+    return wp.sea_level * wp.continent_scale - bed;
 }
 
 // --- layer 0 prototype: per-seed parameters and the land knee ----------------
@@ -183,9 +193,13 @@ Layer0Params make_layer0(const WorldParams& wp, uint64_t world_seed) {
         p.regime_mean = wp.regime_mean_lo + (wp.regime_mean_hi - wp.regime_mean_lo) * um;
         p.regime_amp = wp.regime_amp_lo + (wp.regime_amp_hi - wp.regime_amp_lo) * ua;
     }
+    p.shelf_depth = wp.shelf_depth;
+    p.shelf_width = wp.shelf_width;
+    p.shelf_regime = wp.shelf_regime;
     // The regime is evaluated only if something reads it; off, the mask is
     // today's bit for bit.
-    p.regime_on = (p.regime_mean != 0.0f || p.regime_amp != 0.0f || p.fine_regime != 0.0f) ? 1 : 0;
+    p.regime_on = (p.regime_mean != 0.0f || p.regime_amp != 0.0f || p.fine_regime != 0.0f ||
+                   (p.shelf_width > 0.0f && p.shelf_regime != 0.0f)) ? 1 : 0;
     p.seed = feature_seed(world_seed, FEATURE_CONTINENT);
     p.seed_fine = feature_seed(world_seed, FEATURE_CONTINENT_FINE);
     p.seed_regime = feature_seed(world_seed, FEATURE_REGIME);

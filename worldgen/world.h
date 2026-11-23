@@ -102,7 +102,7 @@ struct WorldParams {
     // --- layer 0 PROTOTYPE: land as a lottery with fences ------------------
     // docs/worldgen-design.md, "Layer 0, proposed". Every default below is
     // today's world: the regime off (amplitude, mean and fine weight 0), no
-    // per-seed draws, no knee. layer0_noise evaluates
+    // per-seed draws, no shelf (width 0), no knee. layer0_noise evaluates
     // nothing new while they are, so the golden hashes do not move.
     float fine_freq         = 1.0f / 1500.0f;   // the fine continent noise, islets
     int   fine_octaves      = 4;
@@ -118,6 +118,11 @@ struct WorldParams {
     float regime_size_lo    = 2500.0f, regime_size_hi = 8000.0f;   // metres
     float regime_mean_lo    = -0.05f,  regime_mean_hi = 0.05f;
     float regime_amp_lo     = 0.0f,    regime_amp_hi  = 0.15f;
+    // The shelf: seabed nearly flat at shelf_depth for about shelf_width mask
+    // units below sea level, then the old slope. Width 0 is off.
+    float shelf_depth       = 0.5f;   // metres
+    float shelf_width       = 0.0f;   // mask units
+    float shelf_regime      = 0.0f;   // width change per std of regime (low regime, wider)
     // The land knee: a seed whose raw land fraction L is over knee_k has its
     // offset lowered until land is k + (c-k)(L-k)/((L-k)+(c-k)).
     bool  knee              = false;
@@ -535,6 +540,11 @@ void rocks_in_cells(const SeedWorld& w, const WorldParams& wp, const ArchetypeTa
 float terrain_density(const SeedWorld& w, const WorldParams& wp,
                       const ArchetypeTable& table, float x, float y, float z,
                       float voxel = 0.0f);
+
+// Metres of still water over the seabed at (x, z), from layer 0 and the shelf
+// alone; 0 on land. Rivers and lakes are not in it. The readings use it for
+// what can be waded.
+float still_water_depth(const SeedWorld& w, const WorldParams& wp, float x, float z, float r);
 
 // One seed, from scatter through quota assignment to drainage.
 SeedWorld build_world(uint64_t world_seed, const WorldParams& wp,

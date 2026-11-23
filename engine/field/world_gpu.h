@@ -90,9 +90,14 @@ struct WorldConstants {
     float    regime_amp;
 
     int      regime_on;
+    float    shelf_depth;
+    float    shelf_width;
+    float    shelf_regime;
+
     unsigned s_fine;
     unsigned s_regime;
     float    l0_pad0;
+    float    l0_pad1;
 };
 
 class WorldGpu {

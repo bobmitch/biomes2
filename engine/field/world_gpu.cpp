@@ -144,6 +144,9 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
                 else if (k == "regime_mean") p.regime_mean = v;
                 else if (k == "regime_amp") p.regime_amp = v;
                 else if (k == "regime_draw") p.regime_draw = v != 0.0f;
+                else if (k == "shelf_depth") p.shelf_depth = v;
+                else if (k == "shelf_width") p.shelf_width = v;
+                else if (k == "shelf_regime") p.shelf_regime = v;
                 else if (k == "knee") p.knee = v != 0.0f;
             }
             at = end + 1;
@@ -364,6 +367,9 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
         constants_.regime_mean = l0.regime_mean;
         constants_.regime_amp = l0.regime_amp;
         constants_.regime_on = l0.regime_on;
+        constants_.shelf_depth = l0.shelf_depth;
+        constants_.shelf_width = l0.shelf_width;
+        constants_.shelf_regime = l0.shelf_regime;
         constants_.s_fine = l0.seed_fine;
         constants_.s_regime = l0.seed_regime;
     }
