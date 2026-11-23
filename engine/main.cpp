@@ -2980,10 +2980,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     }
 
     if (std::string(cmdline ? cmdline : "").find("--probe-field") != std::string::npos) {
-        // A chunk straddling the surface near the origin, where the centre
-        // floor guarantees land.
-        const float surface = 0.20f * 140.0f;
-        float origin[3] = {-8.0f, surface - 8.0f, -8.0f};
+        // A chunk straddling the surface at the spawn. It was the origin while
+        // the centre floor guaranteed land there; since v18 the origin can be
+        // sea (on seed 0 the default chunk came back all air).
+        float origin[3] = {g_spawn.x - 8.0f, g_spawn.ground - 8.0f, g_spawn.z - 8.0f};
         // --probe-at x z: the chunk centred on the ground there instead.
         {
             const std::string pc = cmdline ? cmdline : "";
