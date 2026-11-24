@@ -2483,9 +2483,25 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   0.32 -> 0.19 ms, chamber 0.69 -> 0.38. Rejected, measured: coarse rays
   stopping at 24 m (`BIOMES_NF_COARSE_REACH`) cost the same and darken
   the dug tunnel 20 m in by a third; coarse probes every other frame
-  (`BIOMES_NF_COARSE_STRIDE`) saves 0.02 ms. In OPEN cave air the coarse
-  level's ~0.19 ms is mostly the fine probes' merge (a visibility march
-  per ray to up to eight coarse probes), not the coarse rays.
+  (`BIOMES_NF_COARSE_STRIDE`) saves 0.02 ms.
+- **The merge's per-ray test is for OPEN coarse probes only.** In open
+  cave air the coarse level's cost was the fine probes' merge, not the
+  coarse rays: per ray, a march from its 6 m point to each coarse probe's
+  6 m point along the same direction, up to 14 m to up to eight probes.
+  With that test removed (an A/B) the near field went 0.44 -> 0.23 ms in a
+  cave mouth, the coarse level then costing nothing, and every still
+  matched within run-to-run noise -- the dug ramp tunnel included. The
+  failure the test was built for is an OPEN coarse probe (meta 1: the
+  heightfield's daylight in every bin) over a tunnel's mouth lending a
+  ray down the tunnel the sunlit hillside, so only open ones are tested
+  now. Cave mouth 0.44 -> 0.25 ms, trench floor 0.46 -> 0.26, cave 0.49 ->
+  0.28; dug tunnels unchanged (their mouth's probes are open). Stills and
+  `--shake` raw frames match within noise in the shaft-and-tunnel, ramp
+  tunnel 10 and 20 m in, cave mouth and cave; the torch walk's 90th
+  percentile 0.234 / 0.235 nits, sd 0.0100 both. Two things tried that
+  did nothing, so nobody tries them again: nested ifs in place of the
+  `&&` chain (the compiler already skipped), and a march that jumps empty
+  4 m cells (beside a surface they are never empty).
 - Heap: [40..42] (t26..t28, the range every lit table kept from DDGI): the
   probes, the occupancy, the top map; [112..121] the near field's own
   (its visibility volume's SRV and UAV the last two); [122..124] the

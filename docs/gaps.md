@@ -83,12 +83,9 @@ Last gathered: 2026-11-21, after the exploration fog.
   Probes in sealed air with no light near no longer trace (`nf_gated`:
   1.17 -> 0.11 ms in the chamber), but OPEN cave air -- a sinkhole floor,
   a cave with any way out -- still traces every covered probe (the trench
-  floor 6,484 live, 0.44 ms). Of that, ~0.19 ms is the coarse level, and
-  the A/B says most of it is the fine probes' MERGE -- per ray, a
-  visibility march to up to eight coarse probes -- not the coarse rays
-  (24 m rays and a stride of 2 saved nothing). Cheaper merge visibility
-  (once per probe and coarse probe, as `nf_coarse_seen` already does for
-  the probe itself) and priority by distance from the camera are next.
+  floor 6,484 live, 0.44 ms). The merge's per-ray test now runs for open
+  coarse probes only, which took that to 0.26 ms; what is left is the fine
+  probes' own rays. Priority by distance from the camera is next.
   [Near field; Sky access]
 - **The sky-access flood runs in `plan`, on the main thread** (sky_access.h):
   a cave world's first still spends 0.2-0.8 s on it, and a 15 s walk did

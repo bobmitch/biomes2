@@ -568,8 +568,18 @@ bool nf_merge(float3 o, float3 d, uint bin, out float vis, out float3 rad, out f
         // it too: a probe up over a tunnel's mouth sees the hillside along
         // a ray that runs down the tunnel. Where it starts in rock (a probe
         // by the wall, a ray at an angle) the bin's other rays speak for it.
+        // Only an OPEN coarse probe (meta.x 1) is tested: its bins are the
+        // heightfield's daylight in every direction, the sunlit hillside
+        // that failure took. A covered one traced its own rays underground.
+        // Nested ifs: HLSL's && does not short-circuit.
         const float3 s = pc + d * kNfSplit;
-        if (nf_inside(s) && nf_occ_point(s) < 0.5f && !nf_clear_to(e, s)) continue;
+        if (meta.x < 1.5f) {
+            if (nf_inside(s)) {
+                if (nf_occ_point(s) < 0.5f) {
+                    if (!nf_clear_to(e, s)) continue;
+                }
+            }
+        }
         dbg.z += 1.0f;
         acc += w * u_coarse[b4];
         wsum += w * a;
