@@ -2447,6 +2447,23 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   still is the ungated one's to 1 level in 255. Sinkholes and the shipping
   world are unchanged (no sealed air). Walking the cave world 6.72 ->
   6.38 ms against the shipping world's 6.15.
+- **The coarse level, A/B'd in caves** (`BIOMES_NF_NOCOARSE`; play's
+  schedule, fixed exposure, stills and `--shake 300` raw frames). It
+  carries daylight from past 6 m and is worth it there: a dug ramp
+  tunnel 10 m in is 40% darker without it (luma 9.4 -> 5.4) with a
+  1,494-pixel flicker frame, for 0.02 ms; under a sinkhole's overhang the
+  ceiling loses the sunlit floor's bounce (up to 51 levels). In SEALED air
+  it did nothing -- a torch in the 42 m chamber and in the 4 m tunnel
+  drew the same stills with it off, for 0.36 and 0.16 ms -- so coarse
+  probes in sealed air are gated with lights or without, and a sealed fine
+  probe takes no coarse bins (`merge`): finding which coarse probes it
+  sees cost more than its rays marching on themselves. Torch-lit tunnel
+  0.32 -> 0.19 ms, chamber 0.69 -> 0.38. Rejected, measured: coarse rays
+  stopping at 24 m (`BIOMES_NF_COARSE_REACH`) cost the same and darken
+  the dug tunnel 20 m in by a third; coarse probes every other frame
+  (`BIOMES_NF_COARSE_STRIDE`) saves 0.02 ms. In OPEN cave air the coarse
+  level's ~0.19 ms is mostly the fine probes' merge (a visibility march
+  per ray to up to eight coarse probes), not the coarse rays.
 - Heap: [40..42] (t26..t28, the range every lit table kept from DDGI): the
   probes, the occupancy, the top map; [112..119] the near field's own;
   [120..122] the mist's openness volumes (t16 in post). The mist root and

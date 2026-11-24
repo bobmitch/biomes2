@@ -60,7 +60,7 @@ cbuffer NfConstants : register(b0) {
     // The live pass (play): every probe under cover traced every frame.
     // Blends for one frame (fine, a fast light's, coarse); then the fast
     // lights (x, y, z, reach^2).
-    float4 nf_live;                     // keep fine, keep by a fast light, keep coarse, -
+    float4 nf_live;                     // keep fine, keep by a fast light, keep coarse, the coarse rays' reach (m; 0: 48)
     uint4  nf_live2;                    // fast lights, plans so far, the fine and coarse strides (frames)
     float4 nf_fast[8];
 };
@@ -516,12 +516,12 @@ bool nf_merge(float3 o, float3 d, uint bin, out float vis, out float3 rad, out f
 // faded with distance. Otherwise the coarse level's ray: `a` is 0 where it
 // meets rock before kNfSplit -- its interval starts in rock, and it has
 // nothing to say -- and its hits are lit by the sun in full, no lights.
-void nf_march(float3 o, float3 d, uint bin, bool fine, out float a, out float vis, out float3 rad) {
+void nf_march(float3 o, float3 d, uint bin, bool fine, bool merge, out float a, out float vis, out float3 rad) {
     a = 1.0f;
     vis = 0.0f;
     rad = float3(0.0f, 0.0f, 0.0f);
     float t = 0.3f, t_air = 0.0f;
-    bool tried = !fine;
+    bool tried = !fine || !merge;
     uint outcome = 0u;   // 0 ran out (dark), 1 got out, 2 met rock
     float2 uv_out = 0.0f;
     bool on_out = false;
@@ -574,7 +574,7 @@ void nf_march(float3 o, float3 d, uint bin, bool fine, out float a, out float vi
         // extra mip reads made the coarse pass slower, 0.038 -> 0.046 ms.)
         const float coarse = g_nf_occ.SampleLevel(g_nf_wrap, uvw, 2.0f);
         t += coarse <= 0.0f ? 2.0f : 0.5f;
-        if (t > 48.0f) break;
+        if (t > (fine || nf_live.w <= 0.0f ? 48.0f : nf_live.w)) break;
     }
     if (outcome == 1u) {
         nf_escape(on_out, uv_out, d, vis, rad);
@@ -643,7 +643,6 @@ bool nf_gated(float3 c, float reach) {
     return true;
 }
 static const float kNfGateFine = kNfSplit + 2.0f;   // a hit's reach, and the probes round it
-static const float kNfGateCoarse = 48.0f;           // the coarse rays' reach (their hits read the fine probes)
 
 void nf_write_dark(uint o4) {
     [unroll] for (int z = 0; z < 4; ++z) u_probes[o4 + uint(z)] = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -711,6 +710,12 @@ void nf_probe_body(uint li, uint k, bool from_live) {
     float3 off = float3(0.0f, 0.0f, 0.0f);
     if (live) mode = nf_probe_mode(c, uv, off);
     if (mode == 3u && nf_gated(c + off, kNfGateFine)) mode = 4u;   // held dark, not traced
+    // A probe in sealed air traced for a light near it takes no coarse bins:
+    // the coarse probes there are gated (cs_nf_live), and finding which it
+    // sees cost more than its rays marching on themselves -- the torch in the
+    // 4 m tunnel 0.29 ms against 0.16 with the coarse level off, the same
+    // still. Uniform over the group, as mode is.
+    const bool merge = !(mode == 3u && nf_gate != 0u && nf_sealed_at(c + off));
     const bool settle = nf_settle != 0xFFFFFFFFu;
     const bool fresh = from_live ? (u_aux[pi] & kNfModeFresh) != 0u : (entry & 0x80000000u) != 0u;
 
@@ -724,7 +729,7 @@ void nf_probe_body(uint li, uint k, bool from_live) {
     // three, and a tunnel's meter wandered 4x over seconds.
     if (k == 0u) gs_nf_cvis = 0u;
     GroupMemoryBarrierWithGroupSync();
-    if (mode == 3u && k < 8u && nf_coarse_seen(c + off, k)) InterlockedOr(gs_nf_cvis, 1u << k);
+    if (mode == 3u && merge && k < 8u && nf_coarse_seen(c + off, k)) InterlockedOr(gs_nf_cvis, 1u << k);
     GroupMemoryBarrierWithGroupSync();
     float4 sv = 0.0f, sr = 0.0f, sg = 0.0f, sb = 0.0f;
     if (mode == 3u) {
@@ -739,7 +744,7 @@ void nf_probe_body(uint li, uint k, bool from_live) {
         const float dw = 4.0f * 3.14159265f / float(kNfRays);
         float a, vis;
         float3 rad;
-        nf_march(c + off, d, k, true, a, vis, rad);
+        nf_march(c + off, d, k, true, merge, a, vis, rad);
         const float4 basis = float4(kHfY00, kHfY1 * d) * dw;
         sv = vis * basis;
         sr = rad.r * basis;
@@ -980,7 +985,7 @@ void nf_coarse_body(uint gi_in, uint k, bool from_live) {
     float a = 1.0f, vis = 0.0f;
     float3 rad = float3(0.0f, 0.0f, 0.0f);
     if (mode == 2u) {
-        nf_march(pc, d, bin, false, a, vis, rad);
+        nf_march(pc, d, bin, false, false, a, vis, rad);
     } else {
         float2 uv;
         float top;
@@ -1057,7 +1062,12 @@ void cs_nf_live(uint3 id : SV_DispatchThreadID) {
             const int3 s = int3(ci % uint(kNfCoarseDims.x), (ci / uint(kNfCoarseDims.x)) % uint(kNfCoarseDims.y),
                                 ci / uint(kNfCoarseDims.x * kNfCoarseDims.y));
             const int3 ob = nf_origin.xyz / 8;
-            gated = nf_gated(float3((ob + nf_wrap(s - ob, kNfCoarseDims)) * 8 + 4) + meta.yzw, kNfGateCoarse);
+            // A coarse probe in sealed air is gated with lights or without:
+            // its hits see no local light, and the fine probes round a light
+            // carry its bounce. A/B with the coarse level off: a torch in the
+            // sealed 42 m chamber and in the 4 m tunnel under spawn drew the
+            // same still to 1 level in 255, for 0.36 and 0.16 ms of coarse.
+            gated = nf_gate != 0u && nf_sealed_at(float3((ob + nf_wrap(s - ob, kNfCoarseDims)) * 8 + 4) + meta.yzw);
         }
         if (m > 1.5f && m < 2.5f && !gated) {   // placed under cover, and not gated
             InterlockedAdd(u_aux[nf_count_slot() + 1u], 1u, slot);

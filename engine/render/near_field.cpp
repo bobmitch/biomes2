@@ -621,7 +621,9 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
     c.live[0] = keep_live_;
     c.live[1] = keep_live_light_;
     c.live[2] = keep_live_coarse_;
-    c.live[3] = 0.0f;
+    // BIOMES_NF_COARSE_REACH=<m>: the coarse rays stop there, not at 48 m (A/B).
+    static const char* reach_env = std::getenv("BIOMES_NF_COARSE_REACH");
+    c.live[3] = reach_env ? float(std::atof(reach_env)) : 0.0f;
     {
         const size_t nfast = (std::min)(fast_.size() / 4, size_t(8));
         c.live2[0] = uint32_t(nfast);
@@ -633,7 +635,9 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
     }
     c.live2[1] = uint32_t(plans_);
     c.live2[2] = uint32_t((std::max)(sched_.live_stride, 1));
-    c.live2[3] = uint32_t((std::max)(sched_.coarse_stride, 1));
+    // BIOMES_NF_COARSE_STRIDE=<frames>: the coarse live pass in turns (A/B).
+    static const char* cstride_env = std::getenv("BIOMES_NF_COARSE_STRIDE");
+    c.live2[3] = uint32_t((std::max)(cstride_env ? std::atoi(cstride_env) : sched_.coarse_stride, 1));
     static const char* dbg_env = std::getenv("BIOMES_NF_DBG");
     c.dbg = dbg_env ? uint32_t(std::atoi(dbg_env)) : 0u;
     // BIOMES_NF_NOGATE: probes in sealed air trace even with no light near
