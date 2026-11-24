@@ -2687,9 +2687,11 @@ int main(int argc, char** argv) {
         line("cave entrances", s.entrance_failures == 0, d);
         std::snprintf(d, sizeof(d), "%.0f ns/sample, scalar CPU reference; design budget is "
                       "20 ns serial-equivalent for the full field on the shipping path", ns);
-        // 600 since v18 (400 before): the regime and the fine continent noise
-        // are two more fbm stacks per sample, 189 -> ~450 ns. Same headroom.
-        line("throughput", ns <= 600.0, d);
+        // 1600 since v18 (400 before): the regime and the fine continent noise
+        // are two more fbm stacks per sample. Measured 189 -> 441 ns on the
+        // dev machine but 207 -> 787 on CI's Windows runner (98 -> 418 on
+        // Linux), so the guard keeps v17's ~2x over CI's Windows figure.
+        line("throughput", ns <= 1600.0, d);
         if (!had_golden) {
             std::snprintf(d, sizeof(d), "no %s -- run with --bless to pin this world",
                           kGoldenPath);
@@ -2723,7 +2725,7 @@ int main(int argc, char** argv) {
                          // It printed FAIL and never failed the run: the
                          // entrance check was missing from this conjunction.
                          s.entrance_failures == 0 &&
-                         ns <= 600.0 && golden_ok && sheet_ok;
+                         ns <= 1600.0 && golden_ok && sheet_ok;
         std::printf("\n%s\n", all ? "ALL CHECKS PASSED" : "FAILED");
         return all ? 0 : 1;
     }
