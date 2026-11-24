@@ -98,6 +98,13 @@ StructuredBuffer<uint>   g_coarse_list : register(t5);  // coarse probe (block) 
 // a pad) and 16 words, a bit per 1 m voxel (x + 8 y + 64 z) of air the
 // CPU's flood found no path from to the open sky.
 StructuredBuffer<uint>   g_marks      : register(t6);
+// The probe visibility volume (hfgi.hlsli nf_sample): per 1 m voxel v, a bit
+// per probe P = floor(v / 2) + d, d in {-1, 0, 1}^3, bit (dx+1) + 3 (dy+1) +
+// 9 (dz+1), set when a reader there sees that probe. Every 2 m cell a reader
+// within half a metre of v can fall in has its eight probes among those 27.
+// And the blocks to compute it for (8 m units).
+RWTexture3D<uint>        u_vis        : register(u21);
+StructuredBuffer<int4>   g_vis_blocks : register(t7);
 RWTexture3D<float>       u_density    : register(u0);
 RWTexture3D<float>       u_occ[5]     : register(u1);   // mips 0..4 (u1..u5)
 RWStructuredBuffer<float4> u_probes   : register(u6);
@@ -193,6 +200,77 @@ void cs_nf_mark(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
     float d = nf_unseal(u_density[s]);
     if (bit && d < 0.0f) d -= kNfSealBias;
     u_density[s] = d;
+}
+
+// The visibility volume. The reader marched from its point to each of its
+// eight probes every half metre (nf_clear) -- up to ~50 occupancy loads a
+// pixel, which was the whole of its cost: 0.66 ms of a 3.2 ms terrain pass
+// at 1440p on a screen of cave wall. The same march, once per voxel and
+// probe, here, for the blocks filled this frame and the blocks round them
+// (a march reaches ~3.5 m, a probe's placement 0.9 m).
+//
+// From the voxel's point, not the pixel's: a reader 0.4 m off the surface
+// rounds to a voxel in rock as often as not, so a voxel in rock may climb
+// up to a metre out of it before the line must stay clear. The probe stands
+// where nf_probe_mode puts it: its point, or 0.9 m out of rock along an
+// axis; nowhere (no bit) if it is switched off.
+bool nf_vis_place(int3 P, out float3 pc) {
+    const float3 c = float3(P * 2 + 1);
+    pc = c;
+    if (u_occ[0][nf_wrap(P * 2 + 1, kNfDims)] <= 0.5f) return true;
+    static const float3 kTry[6] = {float3(0, 0.9f, 0), float3(0.9f, 0, 0), float3(-0.9f, 0, 0),
+                                   float3(0, 0, 0.9f), float3(0, 0, -0.9f), float3(0, -0.9f, 0)};
+    [loop] for (int q = 0; q < 6; ++q) {
+        if (u_occ[0][nf_wrap(int3(floor(c + kTry[q] + 0.5f)), kNfDims)] < 0.5f) { pc = c + kTry[q]; return true; }
+    }
+    return false;
+}
+
+bool nf_vis_clear(float3 a, float3 b, bool a_rock) {
+    const float3 v = b - a;
+    const float len = length(v);
+    const int n = max(int(ceil(len * 2.0f)), 1);
+    bool climbing = a_rock;
+    [loop] for (int i = 1; i <= n; ++i) {
+        const float s = float(i) / float(n + 1);
+        const bool rock = u_occ[0][nf_wrap(int3(floor(a + v * s + 0.5f)), kNfDims)] > 0.5f;
+        if (!rock) { climbing = false; continue; }
+        if (climbing && len * s <= 1.0f) continue;
+        return false;
+    }
+    return !climbing || len <= 1.0f;
+}
+
+[numthreads(8, 8, 8)]
+void cs_nf_vis(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
+    const int3 w = g_vis_blocks[g.x].xyz * 8 + int3(t);
+    const float3 a = float3(w);
+    const bool a_rock = u_occ[0][nf_wrap(w, kNfDims)] > 0.5f;
+    // Voxels no reader rounds to: rock with rock all round it (a reader is
+    // in air, 0.4 m off a surface), and air 3 m over its column's top
+    // surface (readers there take the heightfield). Most of a block that
+    // scrolls in is one or the other; walking in the open paid ~0.05 ms a
+    // frame for marching them.
+    if (a_rock) {
+        bool buried = true;
+        [loop] for (uint n = 0u; n < 27u && buried; ++n) {
+            const int3 d = int3(int(n % 3u), int((n / 3u) % 3u), int(n / 9u)) - 1;
+            if (u_occ[0][nf_wrap(w + d, kNfDims)] <= 0.5f) buried = false;
+        }
+        if (buried) { u_vis[nf_wrap(w, kNfDims)] = 0u; return; }
+    } else if (float(w.y) > u_top[nf_wrap(int3(w.x, 0, w.z), kNfDims).xz] + 3.0f) {
+        u_vis[nf_wrap(w, kNfDims)] = 0x7FFFFFFu;
+        return;
+    }
+    const int3 pc0 = w >> 1;   // arithmetic: floor(w / 2)
+    uint mask = 0u;
+    [loop] for (uint b = 0u; b < 27u; ++b) {
+        const int3 d = int3(int(b % 3u), int((b / 3u) % 3u), int(b / 9u)) - 1;
+        float3 pc;
+        if (!nf_vis_place(pc0 + d, pc)) continue;
+        if (nf_vis_clear(a, pc, a_rock)) mask |= 1u << b;
+    }
+    u_vis[nf_wrap(w, kNfDims)] = mask;
 }
 
 [numthreads(8, 8, 8)]

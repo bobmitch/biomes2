@@ -63,7 +63,10 @@ public:
     static const UINT kFirst = 112;
     static const UINT kSrvDensity = kFirst, kUavDensity = kFirst + 1, kUavOcc = kFirst + 2;
     static const UINT kUavTop = kUavOcc + kMips;
-    static const UINT kHeapEnd = kUavTop + 1;
+    // The probe visibility volume (cs_nf_vis): read by every table that
+    // reads the probes (t30), written here.
+    static const UINT kSrvVis = kUavTop + 1, kUavVis = kUavTop + 2;
+    static const UINT kHeapEnd = kUavTop + 3;
     // Per-frame budgets: blocks filled from the field, probes listed.
     static const int kBlocksPerFrame = 48;
     static const int kProbesPerFrame = 2048;   // the round robin: placing and copying
@@ -205,6 +208,11 @@ private:
     std::vector<uint32_t> held_mask_;
     uint64_t sky_gen_ = 0;
     std::vector<uint32_t> marks_;
+    // The visibility volume's blocks this frame (4 ints each): the filled
+    // ones and their held neighbours.
+    std::vector<int32_t> vis_blocks_;
+    std::vector<uint32_t> vis_stamp_;
+    uint32_t vis_plan_ = 0;
     bool cam_sealed_ = false;            // the camera stands in sealed air (constants: l_nf.w 2)
     std::vector<float> edit_list_;       // 4 floats an entry
     std::vector<uint32_t> probe_list_;
@@ -213,12 +221,14 @@ private:
 
     ComPtr<ID3D12Device> dev_;
     ComPtr<ID3D12DescriptorHeap> heap_;
-    ComPtr<ID3D12Resource> density_, occ_, probes_, top_, coarse_, aux_, args_, live_rb_[2];
+    ComPtr<ID3D12Resource> density_, occ_, probes_, top_, coarse_, aux_, args_, live_rb_[2], vis_;
+    bool vis_is_srv_ = false;
     ComPtr<ID3D12CommandSignature> dispatch_sig_;
     bool live_rb_pending_[2] = {false, false};
     bool top_is_srv_ = false;
-    ComPtr<ID3D12Resource> cb_[2], blocks_up_[2], edits_up_[2], probes_up_[2], coarse_up_[2], marks_up_[2];
+    ComPtr<ID3D12Resource> cb_[2], blocks_up_[2], edits_up_[2], probes_up_[2], coarse_up_[2], marks_up_[2], vis_up_[2];
     void* marks_cpu_[2] = {};
+    void* vis_cpu_[2] = {};
     void* cb_cpu_[2] = {};
     void* blocks_cpu_[2] = {};
     void* edits_cpu_[2] = {};
@@ -227,7 +237,7 @@ private:
     bool occ_is_srv_ = false, probes_is_srv_ = false;
     ComPtr<ID3D12RootSignature> root_;
     ComPtr<ID3D12PipelineState> fill_pso_, edits_pso_, occ_pso_, mip_pso_, probe_pso_, top_pso_, coarse_pso_,
-        probe_live_pso_, coarse_live_pso_, classify_pso_, live_pso_, live_args_pso_, clear_pso_, mark_pso_;
+        probe_live_pso_, coarse_live_pso_, classify_pso_, live_pso_, live_args_pso_, clear_pso_, mark_pso_, vis_pso_;
 };
 
 }  // namespace engine

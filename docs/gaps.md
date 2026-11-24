@@ -43,11 +43,12 @@ Last gathered: 2026-11-21, after the exploration fog.
   the eye is light-adapted. A real eye's rods take over only once it is
   dark-adapted. [Dark vision]
 
-- **The near field's per-pixel reader costs ~1 ms at 4K on a screen of
-  tunnel wall** (terrain 5.85 -> 4.83 ms with `BIOMES_NF_NOREAD`): eight
-  probes a pixel, each checked for rock in between by a 0.5 m march
-  (`nf_clear`). Cheaper visibility (a precomputed per-probe mask, or the
-  march at half rate) would win most of it back. [Near field]
+- **The near field's per-pixel reader is no longer a cost worth chasing**:
+  since the visibility volume took its march out, the terrain pass with
+  the reader is BELOW `BIOMES_NF_NOREAD`'s on every view measured (chamber
+  2.65 against 2.71 ms, dug tunnel 1.47 against 1.54) -- the heightfield's
+  covered fallback it replaces costs more. Left: eight probes' meta and
+  SH, 40 loads a pixel. [Near field]
 - **Three campfires in a pit at 4K cost ~1.6 ms**: terrain +0.9, grass +0.7
   (every lit pixel walks its cluster, each light with its shadow cube).
   Grass is the bigger share for its overdraw. [Local lights]

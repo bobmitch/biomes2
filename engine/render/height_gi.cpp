@@ -2,6 +2,7 @@
 #define NOMINMAX
 #endif
 #include "engine/render/height_gi.h"
+#include "engine/render/near_field.h"   // NearField::kSrvVis
 #include "engine/render/shader_compile.h"
 #include "engine/render/shader_heaps.h"
 
@@ -120,7 +121,10 @@ bool HeightGi::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::strin
     // Root: the update's constants, the frame's shadow constants (the light,
     // the sky, the canopy), the SRVs it reads, the UAVs it writes.
     {
-        D3D12_DESCRIPTOR_RANGE sr[4] = {};
+        D3D12_DESCRIPTOR_RANGE sr[5] = {};
+        // The near field's probe visibility volume (t30).
+        sr[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; sr[4].NumDescriptors = 1; sr[4].BaseShaderRegister = 30;
+        sr[4].OffsetInDescriptorsFromTableStart = NearField::kSrvVis;
         sr[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; sr[0].NumDescriptors = 3; sr[0].BaseShaderRegister = 0;
         sr[0].OffsetInDescriptorsFromTableStart = kSrvTop;
         sr[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; sr[1].NumDescriptors = 5; sr[1].BaseShaderRegister = 38;
@@ -138,7 +142,7 @@ bool HeightGi::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, std::strin
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[2].DescriptorTable.NumDescriptorRanges = 4; p[2].DescriptorTable.pDescriptorRanges = sr;
+        p[2].DescriptorTable.NumDescriptorRanges = 5; p[2].DescriptorTable.pDescriptorRanges = sr;
         p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p[3].DescriptorTable.NumDescriptorRanges = 1; p[3].DescriptorTable.pDescriptorRanges = &ur;
         p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; p[4].Descriptor.ShaderRegister = 6;   // the camera's share

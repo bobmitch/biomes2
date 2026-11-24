@@ -30,6 +30,9 @@ Texture2D<float2> g_hf_height : register(t42);   // the top surface's height, it
 StructuredBuffer<float4> g_nf_probes : register(t26);
 Texture3D<float>         g_nf_occ    : register(t27);
 Texture2D<float>         g_nf_top    : register(t28);   // per 1 m column, the topmost rock's surface
+// Which probes a reader at each 1 m voxel sees (near_field.hlsl cs_nf_vis):
+// heap NearField::kSrvVis, its own range in every table that reads probes.
+Texture3D<uint>          g_nf_vis    : register(t30);
 
 // How far `p` lies under the REAL top surface of its 1 m column (negative
 // under it), where the near field reaches. The heightfield's map holds the
@@ -66,7 +69,7 @@ bool nf_clear(float3 a, float3 b) {
 // The probes round a point, as the heightfield's SH. Each of the eight is
 // weighted by trilinear position, by facing (a probe behind the surface
 // sees the other side of it), and by whether rock lies between it and the
-// point -- two point loads of the occupancy -- so a tunnel under a metre of
+// point -- the visibility volume (cs_nf_vis) -- so a tunnel under a metre of
 // roof does not borrow the sunlit probes over it. False where the volume
 // does not reach; true with zeros where every probe is walled off.
 bool nf_sample(float3 world, float3 n, out float4 vis, out float4 sr, out float4 sg, out float4 sb) {
@@ -80,9 +83,17 @@ bool nf_sample(float3 world, float3 n, out float4 vis, out float4 sr, out float4
     const int3 lo = int3(l_nf.xyz) / 2 + 4, hi = int3(l_nf.xyz) / 2 + kNfProbeDims - 5;
     if (any(p0 < lo) || any(p0 + 1 > hi)) return false;
     float wsum = 0.0f;
+    // Which of them this point sees, by its voxel's mask (cs_nf_vis): one
+    // load where nf_clear marched every half metre to each of the eight.
+    const int3 vx = int3(floor(p + 0.5f));
+    const uint vmask = g_nf_vis.Load(int4(nf_wrap(vx, kNfDims), 0));
+    const int3 pc0 = vx >> 1;
     [loop] for (int c = 0; c < 8; ++c) {
         const int3 o = int3(c & 1, (c >> 1) & 1, c >> 2);
         const int3 q = p0 + o;
+        const int3 dq = q - pc0;
+        if (any(abs(dq) > 1)) continue;
+        if (((vmask >> uint((dq.x + 1) + 3 * (dq.y + 1) + 9 * (dq.z + 1))) & 1u) == 0u) continue;
         const float3 tw = lerp(1.0f - t, t, float3(o));
         float w = tw.x * tw.y * tw.z;
         const uint i4 = nf_probe_index(q) * uint(kNfProbeFloat4s);
@@ -93,7 +104,6 @@ bool nf_sample(float3 world, float3 n, out float4 vis, out float4 sr, out float4
         const float len = length(v);
         const float bf = 0.5f + 0.5f * dot(v / max(len, 1e-4f), n);
         w *= bf * bf + 0.05f;
-        if (!nf_clear(p, pc)) continue;
         vis += w * g_nf_probes[i4 + 0u];
         sr  += w * g_nf_probes[i4 + 1u];
         sg  += w * g_nf_probes[i4 + 2u];

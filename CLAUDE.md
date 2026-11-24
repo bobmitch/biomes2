@@ -2282,7 +2282,29 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
     below the point -- any slope -- and lit that sealed tunnel to EV100 5.
     More than 4 m under its map it is now enclosed.
   The reader's probe visibility marches the occupancy every half metre
-  (`nf_clear`) instead of two samples, which could straddle a 1 m roof.
+  instead of two samples, which could straddle a 1 m roof -- and since
+  the visibility volume (below) it does so once per voxel, not per pixel.
+- **The visibility volume: the reader's march, once per voxel**
+  (`cs_nf_vis`, `g_nf_vis` t30 at heap `NearField::kSrvVis`). The per-pixel
+  march to eight probes (`nf_clear`, up to ~50 occupancy loads) WAS the
+  reader's cost -- with it removed for an A/B the terrain pass at 1440p
+  lost 0.66 ms in a cave chamber and 0.39 in a dug tunnel; the probe reads
+  themselves cost little. Now each 1 m voxel holds 27 bits, one per probe
+  floor(v / 2) + d (d in -1..1 each way: every cell a reader within half a
+  metre of v can fall in), set by the same half-metre march from the
+  voxel's point to the probe where `nf_probe_mode` places it; a voxel in
+  rock may climb a metre out first (the reader 0.4 m off the surface
+  rounds into rock as often as not). It is computed for the blocks filled
+  each frame and the held blocks round them, skipping buried rock and air
+  3 m over the top map. Terrain pass, march -> mask: sealed chamber 3.20 ->
+  2.65 ms, torch-lit 3.31 -> 2.73, torch-lit 4 m tunnel 1.70 -> 1.39, cave
+  mouth 2.23 -> 1.93, the shipping world's dug ramp tunnel 1.79 -> 1.47.
+  Stills match the march's to 1 level (the cave mouth's leaves aside), the
+  thin-roof tunnels (1-1.5 m of roof, `--dig-tunnel --tunnel-depth 3.5`)
+  on 0.06% of pixels, `--leak-test` 0.001 nits. Walking 6.14 / 6.36 ms
+  (shipping / caves) against the march's 6.17 / 6.38. 4 MB. Every table
+  that reads the probes declares t30: terrain (rocks, character), trees,
+  foliage, the heightfield GI, the mist.
 - **Two levels** (Split Radiance Cascades' idea, `docs/2607.20384v2.pdf`:
   a coarser level with more directions over the longer interval, merged
   into the finer; not its hash map, screen-space split or hardware rays).
@@ -2465,8 +2487,9 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   level's ~0.19 ms is mostly the fine probes' merge (a visibility march
   per ray to up to eight coarse probes), not the coarse rays.
 - Heap: [40..42] (t26..t28, the range every lit table kept from DDGI): the
-  probes, the occupancy, the top map; [112..119] the near field's own;
-  [120..122] the mist's openness volumes (t16 in post). The mist root and
+  probes, the occupancy, the top map; [112..121] the near field's own
+  (its visibility volume's SRV and UAV the last two); [122..124] the
+  mist's openness volumes (t16 in post). The mist root and
   the heightfield's camera pass declare the range too.
 - **Not done**: see gaps.md -- the walls' own material, emitters as a
   kind of light, and the volume's reach. How dark a deep tunnel LOOKS is
