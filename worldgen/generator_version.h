@@ -81,7 +81,17 @@ namespace worldgen {
 //      to the mean of its own heights with an eased shoulder; trees and rocks
 //      keep off. Sites are smaller than the hash grid, so they are hashed by
 //      their buffer.
-static const int kGeneratorVersion = 17;
+//  18  layer 0 is an archipelago with no home floor (the design doc's "land
+//      as a lottery with fences", in part). centre_floor 0.20 -> 0. A regime
+//      field (7 km, its own feature seed, read in standard deviations) adds
+//      0.028 per std to the continent mask and moves the weight of a new
+//      fine continent noise (1564 m, 4 octaves, its own feature seed):
+//      0.63 at an average regime, 0.34 less per std. The coarse and fine
+//      noises' outputs are blended, variance kept. land_offset -0.0540 ->
+//      -0.05442. 200 seeds: 34.4 landmasses a seed (8.1), the spawn's
+//      holding 21.6% of the land (66.9%), 29.4% land (32.1%), 2.8 flat
+//      sites (19.1), 66 river segments (356).
+static const int kGeneratorVersion = 18;
 
 }  // namespace worldgen
 

@@ -76,6 +76,28 @@ struct WorldConstants {
     int      detail_octaves;
     float    detail_gain;
     unsigned s_detail;
+
+    // Layer 0 prototype: SeedWorld::l0 (the seed's draws; land_offset above
+    // is l0's, so the knee reaches the GPU too). Defaults evaluate nothing new.
+    float    fine_freq;
+    int      fine_octaves;
+    float    fine_weight;
+    float    fine_regime;
+
+    float    regime_freq;
+    int      regime_octaves;
+    float    regime_mean;
+    float    regime_amp;
+
+    int      regime_on;
+    float    shelf_depth;
+    float    shelf_width;
+    float    shelf_regime;
+
+    unsigned s_fine;
+    unsigned s_regime;
+    float    l0_pad0;
+    float    l0_pad1;
 };
 
 class WorldGpu {
@@ -85,6 +107,9 @@ public:
     // with layer 6's overhang term removed and nothing else moved. Applied
     // after build_world so rivers, cells and shafts are the real ones.
     static bool diag_no_overhang;
+    // The world seed the renderer builds (`--seed <n>`, 0 by default). The
+    // world viewer launches the engine with it to stand on a seed it shows.
+    static uint64_t world_seed;
 
     // Builds the seed on the CPU and uploads it. The CPU copy is kept: the
     // tolerance check compares against it, and physics has no other source.

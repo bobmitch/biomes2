@@ -29,11 +29,117 @@
 // The floor is blended out across r rather than driven to zero, because
 // wg_smax(base, 0, k) is a soft ReLU and would clamp every ocean in the world
 // to a uniform shelf -- interior ocean depth collapses sevenfold if you do.
-WG_FN float layer0_height(float x, float z, float r, float freq, int octaves, float centre_floor, float edge_drop, float land_offset, uint seed, float voxel) {
-    const float base = fbm_lod(x * freq, z * freq, octaves, 2.0f, 0.5f, seed, 1.0f / freq, voxel) + land_offset;
+// The radial half of layer 0: the centre floor and the edge taper, applied to
+// a base that already carries its offset. Split out so the land knee can
+// bisect the offset against precomputed noise and still run this exact code.
+WG_FN float layer0_shape(float base, float r, float centre_floor, float edge_drop) {
     const float t = wg_smoothstep(0.0f, 0.40f, r);
     const float lifted = wg_smax(base, centre_floor, 0.01f) * (1.0f - t) + base * t;
     return lifted - edge_drop * wg_smoothstep(0.80f, 1.0f, r);
+}
+
+WG_FN float layer0_height(float x, float z, float r, float freq, int octaves, float centre_floor, float edge_drop, float land_offset, uint seed, float voxel) {
+    const float base = fbm_lod(x * freq, z * freq, octaves, 2.0f, 0.5f, seed, 1.0f / freq, voxel) + land_offset;
+    return layer0_shape(base, r, centre_floor, edge_drop);
+}
+
+// --- layer 0, PROTOTYPE: land as a lottery with fences ----------------------
+// docs/worldgen-design.md, "Layer 0, proposed". Every switch here defaults to
+// off, and off is today's mask bit for bit: the regime is not evaluated, the
+// fine noise is not evaluated, and the base is the coarse fbm plus the offset
+// in the same order of operations as layer0_height above.
+//
+// The regime field is a low-frequency fbm, scaled by kRegimeNorm to read in
+// standard deviations (a 3-octave fbm's std is 0.248, measured). It sets two
+// things locally: an offset on the mask (regime_mean + regime_amp * regime),
+// and the weight of a FINE continent noise against the coarse one
+// (fine_weight - fine_regime * regime: low regime, more islets). The two
+// noises' OUTPUTS are blended, never their frequencies, and divided by
+// sqrt((1-w)^2 + w^2) so the blend keeps the noise's spread -- otherwise the
+// mix would change how much land a region holds as well as its shape.
+//
+// A frequency that is constant for a whole seed (the regime's, drawn per seed)
+// is not the "never blend noise parameters" mistake; that is about varying
+// them across space within one world.
+static const float kRegimeNorm = 4.0f;
+
+struct Layer0Params {
+    float freq;            // coarse continent noise, 1 / feature size
+    int   octaves;
+    float centre_floor;
+    float edge_drop;
+    float land_offset;     // this SEED's offset: the knee may have lowered it
+    float fine_freq;       // fine continent noise
+    int   fine_octaves;
+    float fine_weight;     // weight of the fine noise at regime 0
+    float fine_regime;     // how much the regime moves that weight, per std
+    float regime_freq;     // 1 / regime feature size (drawn per seed, or fixed)
+    int   regime_octaves;
+    float regime_mean;     // mask offset where the regime is average
+    float regime_amp;      // mask offset per std of the regime
+    int   regime_on;       // 0: the regime is never evaluated (and reads 0)
+    float shelf_depth;     // metres the shelf levels at under sea level
+    float shelf_width;     // mask units below sea level the shelf spans; 0 is off
+    float shelf_regime;    // how much the regime widens the shelf, per std
+    uint  seed;
+    uint  seed_fine;
+    uint  seed_regime;
+};
+
+// Layer 0's noise before the radial shape and the offset: n is the blended
+// continent noise with the regime's offset added; regime is the regime in
+// standard deviations (0 when it is off).
+struct Layer0Noise {
+    float n;
+    float regime;
+};
+
+WG_FN Layer0Noise layer0_noise(float x, float z, Layer0Params p, float voxel) {
+    Layer0Noise o;
+    float n = fbm_lod(x * p.freq, z * p.freq, p.octaves, 2.0f, 0.5f, p.seed, 1.0f / p.freq, voxel);
+    float regime = 0.0f;
+    if (p.regime_on != 0) {
+        regime = kRegimeNorm * fbm_lod(x * p.regime_freq, z * p.regime_freq, p.regime_octaves, 2.0f, 0.5f, p.seed_regime, 1.0f / p.regime_freq, voxel);
+    }
+    const float wf = wg_saturate(p.fine_weight - p.fine_regime * regime);
+    if (wf > 0.0f) {
+        const float fine = fbm_lod(x * p.fine_freq, z * p.fine_freq, p.fine_octaves, 2.0f, 0.5f, p.seed_fine, 1.0f / p.fine_freq, voxel);
+        const float wc = 1.0f - wf;
+        n = (n * wc + fine * wf) / sqrt(wc * wc + wf * wf);
+    }
+    if (p.regime_on != 0) {
+        n = n + (p.regime_mean + p.regime_amp * regime);
+    }
+    o.n = n;
+    o.regime = regime;
+    return o;
+}
+
+WG_FN float layer0_mask(float x, float z, float r, Layer0Params p, float voxel) {
+    const Layer0Noise o = layer0_noise(x, z, p, voxel);
+    return layer0_shape(o.n + p.land_offset, r, p.centre_floor, p.edge_drop);
+}
+
+// The shelf's width where the regime reads `regime`. Never below a tenth of
+// the set width, so a shelf that is on stays continuous at the coast.
+WG_FN float layer0_shelf_width(Layer0Params p, float regime) {
+    if (p.shelf_width <= 0.0f) return 0.0f;
+    const float w = p.shelf_width * (1.0f - p.shelf_regime * regime);
+    const float lo = 0.1f * p.shelf_width;
+    return w > lo ? w : lo;
+}
+
+// Metres of water over the seabed `u` mask units below sea level, with a
+// shelf. Rational (invariant 9): a quick rise to `depth` (half of it a tenth
+// of the way out), then the old slope `scale` coming in as t^4 / (1 + t^4),
+// t = u / width. Flat near the coast, the old gradient far out, deeper than
+// the old seabed by `depth` there. Positive for every u > 0, so the shelf
+// never reaches sea level: it creates no land and moves no coastline.
+WG_FN float shelf_depth_at(float u, float scale, float depth, float width) {
+    const float t = u / width;
+    const float t2 = t * t;
+    const float t4 = t2 * t2;
+    return depth * t / (t + 0.1f) + scale * u * t4 / (1.0f + t4);
 }
 
 // Layer 1 -- the danger field, defined on normalised AREA (r squared), never
@@ -225,6 +331,16 @@ WG_FN float layer4_blend(float h0, float w0, float h1, float w1, float h2, float
 WG_FN float layer4_height(float continent, float continent_scale, float blended, float sea_level) {
     const float land = wg_smoothstep(sea_level, sea_level + 0.12f, continent);
     return continent * continent_scale + blended * land;
+}
+
+// layer4_height with layer 0's shelf under the sea. shelf_width 0 is exactly
+// layer4_height. Below sea level the biome relief is already faded to zero,
+// so the seabed is the mask's mapping alone and the shelf replaces it there.
+WG_FN float layer4_height_shelf(float continent, float continent_scale, float blended, float sea_level, float shelf_depth, float shelf_width) {
+    if (shelf_width > 0.0f && continent < sea_level) {
+        return sea_level * continent_scale - shelf_depth_at(sea_level - continent, continent_scale, shelf_depth, shelf_width);
+    }
+    return layer4_height(continent, continent_scale, blended, sea_level);
 }
 
 // --- layer 5: rivers --------------------------------------------------------

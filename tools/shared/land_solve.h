@@ -31,7 +31,10 @@ namespace view {
 // a plain bisection.
 inline float land_fraction_for(const worldgen::WorldParams& wp, uint64_t seed, int grid) {
     using namespace worldgen;
-    const uint32_t s_cont = feature_seed(seed, FEATURE_CONTINENT);
+    // The seed's own layer 0: its draws, and the knee if it is on, exactly as
+    // build_world makes it.
+    Layer0Params l0 = make_layer0(wp, seed);
+    if (wp.knee) { float a, b, c; apply_land_knee(l0, wp, a, b, c); }
     const float R = wp.radius;
     const float step = 2.0f * R / grid;
     long long disc = 0, land = 0;
@@ -42,7 +45,7 @@ inline float land_fraction_for(const worldgen::WorldParams& wp, uint64_t seed, i
             const float rr = std::sqrt(x * x + z * z) / R;
             if (rr > 1.0f) continue;
             ++disc;
-            if (layer0_height(x, z, rr, wp, s_cont) > wp.sea_level) ++land;
+            if (layer0_height(x, z, rr, l0) > wp.sea_level) ++land;
         }
     }
     return disc > 0 ? static_cast<float>(static_cast<double>(land) / disc) : 0.0f;

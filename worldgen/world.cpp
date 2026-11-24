@@ -1,6 +1,9 @@
 #include "worldgen/world.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <string>
 #include <cmath>
 #include <functional>
 #include <queue>
@@ -114,7 +117,8 @@ std::vector<std::pair<float, float> > scatter_cells(const WorldParams& wp, uint3
 // from worldgen/shaders/field.h.
 float terrain_base(const SeedWorld& w, const WorldParams& wp,
                    const ArchetypeTable& table, float x, float z, float r, float voxel) {
-    const float cont = layer0_height(x, z, r, wp, w.s_cont, voxel);
+    const Layer0Noise l0n = layer0_noise(x, z, w.l0, voxel);
+    const float cont = layer0_shape(l0n.n + w.l0.land_offset, r, w.l0.centre_floor, w.l0.edge_drop);
 
     const float wx = x + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wx);
     const float wz = z + wp.warp_amp * fbm(x * wp.warp_freq, z * wp.warp_freq, 2, 2.0f, 0.5f, w.s_wz);
@@ -149,7 +153,154 @@ float terrain_base(const SeedWorld& w, const WorldParams& wp,
     }
 
     const float blended = layer4_blend(h[0], wt[0], h[1], wt[1], h[2], wt[2], h[3], wt[3], wall);
-    return layer4_height(cont, wp.continent_scale, blended, wp.sea_level);
+    return layer4_height_shelf(cont, wp.continent_scale, blended, wp.sea_level,
+                               w.l0.shelf_depth, layer0_shelf_width(w.l0, l0n.regime));
+}
+
+float still_water_depth(const SeedWorld& w, const WorldParams& wp, float x, float z, float r) {
+    const Layer0Noise l0n = layer0_noise(x, z, w.l0, 0.0f);
+    const float cont = layer0_shape(l0n.n + w.l0.land_offset, r, w.l0.centre_floor, w.l0.edge_drop);
+    if (cont > wp.sea_level) return 0.0f;
+    const float bed = layer4_height_shelf(cont, wp.continent_scale, 0.0f, wp.sea_level,
+                                          w.l0.shelf_depth, layer0_shelf_width(w.l0, l0n.regime));
+    return wp.sea_level * wp.continent_scale - bed;
+}
+
+int apply_param_spec(WorldParams& p, const char* spec) {
+    int applied = 0;
+    const std::string all = spec ? spec : "";
+    size_t at = 0;
+    while (at < all.size()) {
+        size_t end = all.find(',', at);
+        if (end == std::string::npos) end = all.size();
+        const std::string kv = all.substr(at, end - at);
+        at = end + 1;
+        const size_t eq = kv.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = kv.substr(0, eq);
+        while (!k.empty() && k[0] == ' ') k.erase(0, 1);
+        const float v = static_cast<float>(std::atof(kv.c_str() + eq + 1));
+        const float size = v > 1.0f ? v : 1.0f;
+        if (k == "centre_floor") p.centre_floor = v;
+        else if (k == "land_offset") p.land_offset = v;
+        else if (k == "fine_feat") p.fine_freq = 1.0f / size;
+        else if (k == "fine_weight") p.fine_weight = v;
+        else if (k == "fine_regime") p.fine_regime = v;
+        else if (k == "regime_feat") p.regime_freq = 1.0f / size;
+        else if (k == "regime_mean") p.regime_mean = v;
+        else if (k == "regime_amp") p.regime_amp = v;
+        else if (k == "regime_draw") p.regime_draw = v != 0.0f;
+        else if (k == "regime_size_lo") p.regime_size_lo = v;
+        else if (k == "regime_size_hi") p.regime_size_hi = v;
+        else if (k == "regime_mean_lo") p.regime_mean_lo = v;
+        else if (k == "regime_mean_hi") p.regime_mean_hi = v;
+        else if (k == "regime_amp_lo") p.regime_amp_lo = v;
+        else if (k == "regime_amp_hi") p.regime_amp_hi = v;
+        else if (k == "shelf_depth") p.shelf_depth = v;
+        else if (k == "shelf_width") p.shelf_width = v;
+        else if (k == "shelf_regime") p.shelf_regime = v;
+        else if (k == "knee") p.knee = v != 0.0f;
+        else if (k == "knee_k") p.knee_k = v;
+        else if (k == "knee_c") p.knee_c = v;
+        else if (k == "danger_w") p.danger_w = v;
+        else if (k == "danger_feat") p.danger_freq = 1.0f / size;
+        else continue;
+        ++applied;
+    }
+    return applied;
+}
+
+// --- layer 0 prototype: per-seed parameters and the land knee ----------------
+static float unit_draw(uint64_t world_seed, uint32_t feature) {
+    return static_cast<float>(feature_seed(world_seed, feature) >> 8) * (1.0f / 16777216.0f);
+}
+
+Layer0Params make_layer0(const WorldParams& wp, uint64_t world_seed) {
+    Layer0Params p;
+    p.freq = wp.continent_freq;
+    p.octaves = wp.continent_octaves;
+    p.centre_floor = wp.centre_floor;
+    p.edge_drop = wp.edge_drop;
+    p.land_offset = wp.land_offset;
+    p.fine_freq = wp.fine_freq;
+    p.fine_octaves = wp.fine_octaves;
+    p.fine_weight = wp.fine_weight;
+    p.fine_regime = wp.fine_regime;
+    p.regime_freq = wp.regime_freq;
+    p.regime_octaves = wp.regime_octaves;
+    p.regime_mean = wp.regime_mean;
+    p.regime_amp = wp.regime_amp;
+    if (wp.regime_draw) {
+        const float us = unit_draw(world_seed, FEATURE_REGIME_SCALE);
+        const float um = unit_draw(world_seed, FEATURE_REGIME_MEAN);
+        const float ua = unit_draw(world_seed, FEATURE_REGIME_AMP);
+        const float size = wp.regime_size_lo + (wp.regime_size_hi - wp.regime_size_lo) * us;
+        p.regime_freq = 1.0f / (size > 1.0f ? size : 1.0f);
+        p.regime_mean = wp.regime_mean_lo + (wp.regime_mean_hi - wp.regime_mean_lo) * um;
+        p.regime_amp = wp.regime_amp_lo + (wp.regime_amp_hi - wp.regime_amp_lo) * ua;
+    }
+    p.shelf_depth = wp.shelf_depth;
+    p.shelf_width = wp.shelf_width;
+    p.shelf_regime = wp.shelf_regime;
+    // The regime is evaluated only if something reads it; off, the mask is
+    // today's bit for bit.
+    p.regime_on = (p.regime_mean != 0.0f || p.regime_amp != 0.0f || p.fine_regime != 0.0f ||
+                   (p.shelf_width > 0.0f && p.shelf_regime != 0.0f)) ? 1 : 0;
+    p.seed = feature_seed(world_seed, FEATURE_CONTINENT);
+    p.seed_fine = feature_seed(world_seed, FEATURE_CONTINENT_FINE);
+    p.seed_regime = feature_seed(world_seed, FEATURE_REGIME);
+    return p;
+}
+
+void apply_land_knee(Layer0Params& l0, const WorldParams& wp,
+                     float& raw_land, float& knee_land, float& ms) {
+    const std::chrono::high_resolution_clock::time_point t0 = std::chrono::high_resolution_clock::now();
+    // The noise once per sample; the offset only enters layer0_shape, so each
+    // pass of the bisection is the radial shape and a comparison.
+    const int   G = wp.knee_grid > 8 ? wp.knee_grid : 8;
+    const float R = wp.radius;
+    const float step = 2.0f * R / G;
+    std::vector<float> nn, rr;
+    nn.reserve(static_cast<size_t>(G) * G);
+    rr.reserve(static_cast<size_t>(G) * G);
+    for (int j = 0; j < G; ++j) {
+        const float z = -R + (j + 0.5f) * step;
+        for (int i = 0; i < G; ++i) {
+            const float x = -R + (i + 0.5f) * step;
+            const float r = std::sqrt(x * x + z * z) / R;
+            if (r > 1.0f) continue;
+            nn.push_back(layer0_noise(x, z, l0, 0.0f).n);
+            rr.push_back(r);
+        }
+    }
+    const long long disc = static_cast<long long>(nn.size());
+    auto land_at = [&](float off) {
+        long long land = 0;
+        for (size_t k = 0; k < nn.size(); ++k) {
+            if (layer0_shape(nn[k] + off, rr[k], l0.centre_floor, l0.edge_drop) > wp.sea_level) ++land;
+        }
+        return land;
+    };
+    const long long raw = land_at(l0.land_offset);
+    raw_land = disc > 0 ? static_cast<float>(static_cast<double>(raw) / disc) : 0.0f;
+    knee_land = raw_land;
+    const float k = wp.knee_k, c = wp.knee_c;
+    if (disc > 0 && raw_land > k && c > k) {
+        const float e = raw_land - k;
+        const float target = k + (c - k) * e / (e + (c - k));
+        const long long want = static_cast<long long>(target * static_cast<float>(disc) + 0.5f);
+        // Land is monotone in the offset (smax is), so bisect: hi keeps
+        // land >= want, lo has less. 16 passes is 1e-5 of mask.
+        float hi = l0.land_offset, lo = l0.land_offset - 0.6f;
+        for (int it = 0; it < 16; ++it) {
+            const float mid = 0.5f * (lo + hi);
+            if (land_at(mid) >= want) hi = mid; else lo = mid;
+        }
+        l0.land_offset = hi;
+        knee_land = static_cast<float>(static_cast<double>(land_at(hi)) / disc);
+    }
+    const std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
+    ms = static_cast<float>(std::chrono::duration<double, std::milli>(t1 - t0).count());
 }
 
 // Distance to the nearest river segment, with that channel's shape. Shared by
@@ -1038,7 +1189,14 @@ SeedWorld build_world(uint64_t world_seed,
     w.s_rock_patch = feature_seed(world_seed, FEATURE_ROCK_PATCH);
     w.s_detail = feature_seed(world_seed, FEATURE_DETAIL);
     w.s_flats = feature_seed(world_seed, FEATURE_FLATS);
-    const uint32_t s_cont = w.s_cont, s_dang = w.s_dang, s_wx = w.s_wx, s_wz = w.s_wz;
+    const uint32_t s_dang = w.s_dang, s_wx = w.s_wx, s_wz = w.s_wz;
+
+    // Layer 0 first: the knee moves the offset, and everything from the
+    // raster (layers 2 and 3) down reads the result.
+    w.l0 = make_layer0(wp, world_seed);
+    if (wp.knee) {
+        apply_land_knee(w.l0, wp, w.knee_raw_land, w.knee_land, w.knee_ms);
+    }
     const uint32_t s_cell = feature_seed(world_seed, FEATURE_CELLS);
 
     w.pts = scatter_cells(wp, s_cell);
@@ -1081,7 +1239,7 @@ SeedWorld build_world(uint64_t world_seed,
             acc_x[ci] += x;
             acc_z[ci] += z;
 
-            const float h = layer0_height(x, z, rr, wp, s_cont);
+            const float h = layer0_height(x, z, rr, w.l0);
             if (rr > 0.95f && h > w.max_h_outer) w.max_h_outer = h;
             if (h > wp.sea_level) {
                 acc_land[ci] += sample_area;
@@ -1101,6 +1259,7 @@ SeedWorld build_world(uint64_t world_seed,
     }
 
     w.land_fraction = disc_area > 0.0 ? static_cast<float>(land_area / disc_area) : 0.0f;
+    if (!wp.knee) { w.knee_raw_land = w.land_fraction; w.knee_land = w.land_fraction; }
 
     // Build cell records from the rasterised truth.
     w.cells.resize(n);

@@ -39,7 +39,14 @@ enum FeatureId : uint32_t {
     FEATURE_ROCKS     = 12u,   // which cells hold a rock, and its rolls
     FEATURE_ROCK_PATCH = 13u,  // the rock patch noise
     FEATURE_DETAIL    = 14u,   // layer 4's shared micro-relief
-    FEATURE_FLATS     = 15u    // layer 5b: which cells hold a flat site, and its rolls
+    FEATURE_FLATS     = 15u,   // layer 5b: which cells hold a flat site, and its rolls
+    // Layer 0 prototype (docs/worldgen-design.md, "Layer 0, proposed"). Each
+    // draw has its own id so retuning one range never reshuffles another.
+    FEATURE_CONTINENT_FINE = 16u,  // the fine (~1.5 km) continent noise
+    FEATURE_REGIME       = 17u,    // the regime field's noise
+    FEATURE_REGIME_SCALE = 18u,    // per-seed draw: regime feature size
+    FEATURE_REGIME_MEAN  = 19u,    // per-seed draw: regime mean
+    FEATURE_REGIME_AMP   = 20u     // per-seed draw: regime amplitude
 };
 
 inline uint64_t hash64(uint64_t x) {
@@ -81,16 +88,51 @@ struct WorldParams {
     // layer 0 stand-in
     float continent_freq    = 1.0f / 5200.0f;
     int   continent_octaves = 5;
-    float centre_floor      = 0.20f;      // home-landmass floor, not a lift
+    // The home-landmass floor, not a lift. 0 since v18: a start may be a
+    // bare islet or a mainland, and finding the second is luck (the layer 0
+    // proposal). The design doc's history of the floor still applies if it
+    // ever comes back above 0.
+    float centre_floor      = 0.0f;
     float edge_drop         = 1.60f;      // B
     float sea_level         = 0.0f;
-    // Stand-in only: shifts the continent mask to hit the 55% land target.
-    // In the real generator this is sea level, which is a world constant.
-    // Solved globally for a 32% MEAN land fraction, then baked (v16; 35% and
-    // -0.0248 before). Seeds run about 28-36% around it, and that spread is
-    // where the islandness is: the archipelagos are its low tail, not a
-    // separate mode. validate --land-sweep / --land-target re-solve it.
-    float land_offset       = -0.0540f;
+    // Shifts the continent mask, which sets how much of the disc is land.
+    // Chosen by eye in view.exe for v18 (-0.0540 in v16-17, solved there for
+    // a 32% mean): with the v18 layer 0 it gives a 29.4% MEAN, seeds about
+    // 25.5-33.3% around it, and that spread is part of the islandness. Not
+    // re-solved per seed. validate --land-sweep / --land-target re-solve it
+    // globally.
+    float land_offset       = -0.05442f;
+
+    // --- layer 0: land as a lottery with fences -----------------------------
+    // docs/worldgen-design.md, "Layer 0, proposed". v18 ships the regime and
+    // the fine continent noise at values chosen by eye in view.exe: an
+    // archipelago of ~34 landmasses a seed, the spawn's holding ~22% of the
+    // land. The per-seed draws, the shelf and the knee stay off (prototype).
+    float fine_freq         = 1.0f / 1564.0f;   // the fine continent noise, islets
+    int   fine_octaves      = 4;
+    float fine_weight       = 0.63f;  // its weight where the regime is average
+    float fine_regime       = 0.34f;  // weight change per std of regime (low regime, more fine)
+    float regime_freq       = 1.0f / 7000.0f;   // 1 / regime feature size
+    int   regime_octaves    = 3;
+    float regime_mean       = 0.0f;   // mask offset where the regime is average
+    float regime_amp        = 0.028f; // mask offset per std of the regime
+    // Per-seed draws: when on, the three values above are drawn per seed,
+    // uniformly in these ranges, each from its own feature seed.
+    bool  regime_draw       = false;
+    float regime_size_lo    = 2500.0f, regime_size_hi = 8000.0f;   // metres
+    float regime_mean_lo    = -0.05f,  regime_mean_hi = 0.05f;
+    float regime_amp_lo     = 0.0f,    regime_amp_hi  = 0.15f;
+    // The shelf: seabed nearly flat at shelf_depth for about shelf_width mask
+    // units below sea level, then the old slope. Width 0 is off.
+    float shelf_depth       = 0.5f;   // metres
+    float shelf_width       = 0.0f;   // mask units
+    float shelf_regime      = 0.0f;   // width change per std of regime (low regime, wider)
+    // The land knee: a seed whose raw land fraction L is over knee_k has its
+    // offset lowered until land is k + (c-k)(L-k)/((L-k)+(c-k)).
+    bool  knee              = false;
+    float knee_k            = 0.35f;
+    float knee_c            = 0.40f;
+    int   knee_grid         = 256;    // coarse layer-0 grid the knee measures on
 
     // layer 1
     float danger_w          = 0.60f;      // the feel parameter; see tools/validate/README.md
@@ -133,13 +175,32 @@ struct WorldParams {
     float entrance_branch_p  = 0.6f;      // chance of a dead-end side passage
 };
 
-// Thin adapters onto the canonical field function in worldgen/shaders/field.h.
-// The arithmetic lives there so the harness, the engine and mapview cannot drift
-// apart -- these only unpack WorldParams into the scalars the dialect takes.
-// voxel is the LOD sample spacing in metres; 0 means full detail.
-static inline float layer0_height(float x, float z, float r, const WorldParams& wp, uint32_t seed, float voxel = 0.0f) {
-    return ::layer0_height(x, z, r, wp.continent_freq, wp.continent_octaves,
-                           wp.centre_floor, wp.edge_drop, wp.land_offset, seed, voxel);
+// Layer 0's parameters for one seed, before the knee: WorldParams plus the
+// per-seed draws, with the feature seeds filled in. build_world then applies
+// the knee (if on) and keeps the result in SeedWorld::l0, which is what every
+// caller of layer 0 reads -- CPU here, and the GPU through world_gpu.cpp.
+Layer0Params make_layer0(const WorldParams& wp, uint64_t world_seed);
+
+// The land knee. Measures the raw land fraction on a knee_grid^2 layer-0
+// grid and, when it is over knee_k, bisects l0.land_offset down until the
+// grid's land count reaches the knee's target. Comparisons only. Reports the
+// raw and final grid fractions and the milliseconds it took.
+void apply_land_knee(Layer0Params& l0, const WorldParams& wp,
+                     float& raw_land, float& knee_land, float& ms);
+
+// "key=value,key=value": the layer 0 prototype's parameters (and layer 1's
+// danger_w and danger_feat, which the viewer also has sliders for) by name.
+// What BIOMES_L0 holds: the engine and the viewer both read it, and the
+// viewer's Copy command writes it, so all three share these names. Feature
+// sizes are in metres (`*_feat`); unknown keys are ignored. Returns how many
+// keys were applied. Parsing, not generation: nothing here reaches the hash.
+int apply_param_spec(WorldParams& p, const char* spec);
+
+// Thin adapter onto the canonical field function in worldgen/shaders/field.h.
+// The arithmetic lives there so the harness, the engine and the viewer cannot
+// drift apart. voxel is the LOD sample spacing in metres; 0 means full detail.
+static inline float layer0_height(float x, float z, float r, const Layer0Params& l0, float voxel = 0.0f) {
+    return ::layer0_mask(x, z, r, l0, voxel);
 }
 
 static inline float layer1_danger(float x, float z, float r, const WorldParams& wp, uint32_t seed) {
@@ -272,6 +333,11 @@ struct SeedWorld {
     uint32_t s_rocks = 0, s_rock_patch = 0;
     uint32_t s_detail = 0, s_flats = 0;
     float    land_fraction = 0.0f;
+    // Layer 0 as this seed uses it: draws made, knee applied.
+    Layer0Params l0;
+    float    knee_raw_land = 0.0f;   // knee grid's land fraction before the knee
+    float    knee_land = 0.0f;       // and after (equal when it did not bite)
+    float    knee_ms = 0.0f;
 
     // --- layer 5 ---
     // The drainage network as segments, each from a grid cell to the one it
@@ -486,6 +552,11 @@ void rocks_in_cells(const SeedWorld& w, const WorldParams& wp, const ArchetypeTa
 float terrain_density(const SeedWorld& w, const WorldParams& wp,
                       const ArchetypeTable& table, float x, float y, float z,
                       float voxel = 0.0f);
+
+// Metres of still water over the seabed at (x, z), from layer 0 and the shelf
+// alone; 0 on land. Rivers and lakes are not in it. The readings use it for
+// what can be waded.
+float still_water_depth(const SeedWorld& w, const WorldParams& wp, float x, float z, float r);
 
 // One seed, from scatter through quota assignment to drainage.
 SeedWorld build_world(uint64_t world_seed, const WorldParams& wp,
