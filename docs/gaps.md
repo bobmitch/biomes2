@@ -260,3 +260,45 @@ Last gathered: 2026-11-21, after the exploration fog.
   per-biome mist map, which is baked once. [UI and scripting]
 - Keys are fixed: the controls screen is a table in `menu.lua`, not a
   binding table. The engine's own hotkeys stay in `wnd_proc`. [UI and scripting]
+
+## Future design: NPC simulation by distance (nothing built)
+
+A note from 2026-11-23, before any NPC code exists, so the first NPC work
+does not simulate every NPC in the world. NPCs and player constructions
+will NOT edit voxels; constructions are expected to be their own layer
+(not the brick store, maybe not the tree/rock instance streamers either --
+undecided).
+
+- **Simulation tiers by distance, as the terrain has LODs.**
+  - *Full* (~0-200 m, about physics' LOD 0-2 reach): physics capsule,
+    animation, real pathing, perception, combat. A hard cap on how many.
+  - *Reduced* (~200 m-1 km): no physics or animation; moves along a coarse
+    nav graph, ticked a few times a second round robin under a fixed
+    per-frame budget (as the mesh queue's budget). Drawn cheaply if at all
+    -- the exploration fog hides most of this band.
+  - *Abstract* (the rest): no per-frame update. A zone holds a compact
+    record (who lives there, what they are doing, stocks, construction
+    progress) and the time it was last simulated.
+  - *Never visited*: no state. Population and layout are a pure function
+    of seed and zone, as trees and rocks are of their cell.
+- **Catch up, do not tick.** Waking a zone resolves the elapsed time in one
+  step -- the weather's and the wet world's trick (state from the clock,
+  nothing stored). Schedules (sleep, work, travel) make "where is NPC n at
+  time t" a function to evaluate on activation. Cap the catch-up (a day or
+  so) so a week away is not a burst of work.
+- **Boundaries**: hysteresis -- wake at ~1.2 km, sleep at ~1.5 km -- or a
+  walk along the line thrashes it (the LOD hold's problem). Promote NPCs
+  into plausible spots out of view. A traveller between sleeping zones is
+  an event with an arrival time, not a moving entity.
+- **What a zone is**: a fixed grid of a few hundred metres aligned to the
+  64 m tiles, or -- since v18's archipelago -- a landmass, where travel
+  between them is rare and slow and so easy to abstract; big landmasses
+  split by grid.
+- **Ambient vs persistent NPCs**: ambient ones (wildlife, generic
+  passers-by) spawn procedurally round the player and are dropped out of
+  range, like grass, never saved. Only persistent ones (named, owners of
+  constructions, anyone the player has dealt with) carry records through
+  the tiers. Keeping most of the population ambient keeps the persistent
+  set small.
+- **Constructions ride the same zones**: waking a zone loads its buildings
+  and its people together, and its catch-up advances construction too.
