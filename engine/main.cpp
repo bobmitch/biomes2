@@ -3898,8 +3898,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const float sea = wg.params().sea_level;
         bool site = false;
         float cx = 0.0f, cz = 0.0f, grade = 0.0f;
+        // From the spawn, as every other mode starts: from (40, 40), the
+        // pre-v16 centre, v18's archipelago put the search in the sea on
+        // every seed tried, and the test reported nothing.
         for (int i = 0; i < 400 && !site; ++i) {
-            const float x = 40.0f + 8.0f * float(i % 20), z = 40.0f + 8.0f * float(i / 20);
+            const float x = g_spawn.x + 8.0f * float(i % 20) - 76.0f, z = g_spawn.z + 8.0f * float(i / 20) - 76.0f;
             const float h = wg.height(x, z);
             if (h < sea + 12.0f) continue;
             float worst = 0.0f;
