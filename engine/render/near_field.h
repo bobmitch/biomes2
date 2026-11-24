@@ -33,6 +33,8 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include "engine/render/sky_access.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -113,6 +115,11 @@ public:
     // which a sunlit wall's light passes through.
     bool init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT cloud_shadow_srv, std::string& error);
     bool ready() const { return ready_; }
+    // The world whose underground air the sky-access flood labels
+    // (sky_access.h). Without it no air is ever marked sealed.
+    void set_world(const WorldGpu* world) { sky_.init(world); }
+    const SkyAccess& sky_access() const { return sky_; }
+    bool camera_sealed() const { return cam_sealed_; }
 
     // The player's edits changed inside a world box: its blocks are filled
     // again (field + edits) and the probes whose cones can reach it re-traced.
@@ -147,6 +154,7 @@ public:
     int probes_planned() const { return int(probe_list_.size()); }
     int edits_planned() const { return int(edit_list_.size() / 4); }
     int blocks_pending() const { return pending_; }
+    int marks_planned() const { return int(marks_.size() / 20); }
     // Over its life: plans, plans that filled blocks, blocks filled, probes traced.
     unsigned long long plans() const { return plans_; }
     unsigned long long fill_frames() const { return fill_frames_; }
@@ -190,6 +198,14 @@ private:
     uint32_t rng_ = 0x9E3779B9u;         // the rays' rotation, a new one each update
 
     std::vector<int32_t> blocks_;        // 4 ints a planned block
+    // Sky access: the flood, the mask each storage block holds on the GPU
+    // (16 words), the flood's generation they were made at, and this frame's
+    // marks (20 words an entry: block xyz, pad, mask) for cs_nf_mark.
+    SkyAccess sky_;
+    std::vector<uint32_t> held_mask_;
+    uint64_t sky_gen_ = 0;
+    std::vector<uint32_t> marks_;
+    bool cam_sealed_ = false;            // the camera stands in sealed air (constants: l_nf.w 2)
     std::vector<float> edit_list_;       // 4 floats an entry
     std::vector<uint32_t> probe_list_;
     bool occ_dirty_ = false;
@@ -201,7 +217,8 @@ private:
     ComPtr<ID3D12CommandSignature> dispatch_sig_;
     bool live_rb_pending_[2] = {false, false};
     bool top_is_srv_ = false;
-    ComPtr<ID3D12Resource> cb_[2], blocks_up_[2], edits_up_[2], probes_up_[2], coarse_up_[2];
+    ComPtr<ID3D12Resource> cb_[2], blocks_up_[2], edits_up_[2], probes_up_[2], coarse_up_[2], marks_up_[2];
+    void* marks_cpu_[2] = {};
     void* cb_cpu_[2] = {};
     void* blocks_cpu_[2] = {};
     void* edits_cpu_[2] = {};
@@ -210,7 +227,7 @@ private:
     bool occ_is_srv_ = false, probes_is_srv_ = false;
     ComPtr<ID3D12RootSignature> root_;
     ComPtr<ID3D12PipelineState> fill_pso_, edits_pso_, occ_pso_, mip_pso_, probe_pso_, top_pso_, coarse_pso_,
-        probe_live_pso_, coarse_live_pso_, classify_pso_, live_pso_, live_args_pso_, clear_pso_;
+        probe_live_pso_, coarse_live_pso_, classify_pso_, live_pso_, live_args_pso_, clear_pso_, mark_pso_;
 };
 
 }  // namespace engine

@@ -74,6 +74,30 @@ Last gathered: 2026-11-21, after the exploration fog.
   them. [Near field; Local lights]
 - **Fast lights are held fast for 60 frames**, not seconds: 0.4 s at 144
   fps; at most 8 a frame. [Near field]
+- **Caves cost the near field what their covered air is** (measured with
+  caves back on in a scratch biome table, 1440p): standing on the surface
+  over sealed caves 8,022 live probes and 0.58 ms; in a 42 m chamber
+  21,440 and 1.19 ms, of which the coarse level ~0.55 (its 48 m rays do not
+  stop in open cave air); a screen of cave wall costs the reader 0.6 ms.
+  Probes in sealed air with no light near no longer trace (`nf_gated`:
+  1.17 -> 0.11 ms in the chamber), but OPEN cave air -- a sinkhole floor,
+  a cave with any way out -- still traces every covered probe (the trench
+  floor 6,484 live, 0.44 ms), and a torch in a big sealed cave wakes
+  every coarse probe within 48 m of its range (0.66 ms). Priority by
+  distance from the camera, and the coarse level's A/B, are next.
+  [Near field; Sky access]
+- **The sky-access flood runs in `plan`, on the main thread** (sky_access.h):
+  a cave world's first still spends 0.2-0.8 s on it, and a 15 s walk did
+  not show it past the 99th percentile, but a big sealed cave met in play
+  is a hitch. And an edit forgets every label, so digging beside one
+  re-searches it each dig. A worker thread or the GPU, and a local
+  re-flood, are step 2. [Sky access]
+- **The air past the volume is judged by the camera alone**: sealed if
+  the camera stands in sealed air (exact: a line of sight cannot leave
+  it), otherwise the open-air rule -- so from inside a long cave that
+  opens to the sky a kilometre off, the haze past 64 m is lit as daylit
+  air. The flood's distance to an opening (step 2) is the answer.
+  [Near field; Mist; Sky access]
 - **The live list has no priority**: past 8,192 covered probes (a big cave
   system, when caves come back) it is walked in longer turns, near and far
   alike, and every probe's history covers its turn. The camera's

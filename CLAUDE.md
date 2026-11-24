@@ -2396,6 +2396,57 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   shallow cover test (above), and **HLSL's `&&` does not short-circuit**:
   `knf > 0 && nf_sample(...)` ran the eight probes on every terrain pixel
   and threw the result away. Call anything costly inside an `if`.
+- **Sky access: a ray that leaves the volume through SEALED air is dark**
+  (`engine/render/sky_access.{h,cpp}`, step 1 of the underground GI plan:
+  a flood over air as the base layer, the probes as detail). With caves
+  back on (a scratch biome table, `cave_density` 0.7), a 42 m chamber 750 m
+  from spawn -- sealed, by a flood fill -- metered 4 nits at noon and 0 at
+  23:00: a ray leaving the 128 m volume took the heightfield's sky
+  (`nf_escape`), and the chamber is longer than the volume. A CPU flood
+  over 1 m cells (the field at a 1 m voxel and the edits, as the GPU fill
+  has them) labels underground air open or sealed: air above the column's
+  height plus the overhang term's reach there is open by construction;
+  a search from an unlabelled cell goes highest-first through air, and
+  reaching open air labels everything it saw open, exhausting the
+  component labels it sealed (over 4 M cells: sealed). Per 8 m block a
+  mask goes to `cs_nf_mark`, which stores sealed air in the density
+  volume less 1000 (`kNfSealBias`: still air, occupancy still 0), and
+  `nf_march` returns dark when it leaves the volume from air the trilinear
+  weights call sealed. **The air followed**: a line of sight from sealed
+  air stays in it until it meets rock, so a camera in sealed air
+  (`NearField::camera_sealed`, `l_nf.w` 2) sees nothing else. Then the
+  mist takes no sun and no eye's sky share (only the probes' openness),
+  `nf_openness` is 0 past the volume, and the composite's haze no longer
+  ramps back to daylit air past 64 m (`storm.y`). With the probes fixed
+  alone the walls went black and the haze down the 146 m tunnel glowed
+  white against the dark-adapted eye; each of the three took a fixed-
+  exposure A/B to find. The chamber now meters 0 nits (the 1.5 floor) at
+  noon and at night, a torch in it -2 EV100; every open view (sinkholes,
+  the shipping world, `--leak-test` 0.001 nits) is unchanged.
+  `--leak-test` now searches for its site from the spawn: from (40, 40),
+  the pre-v16 centre, it found only sea on v18 and reported nothing. With no caves and no edits a block's mask is zero without
+  touching the field: the shipping world spends 0 ms, a dug tunnel 5 ms
+  once. A cave world's still spends 0.2-0.8 s of CPU on it.
+  **Synchronous in `plan`**, and an edit forgets every label (a dig beside
+  a big sealed cave re-searches it) -- see gaps.md.
+  The `sky access:` line of `--gpu-profile` counts bricks, searches and ms.
+- **Probes in sealed air with no light near do not trace** (`nf_gated`,
+  `BIOMES_NF_NOGATE` for A/B). Neither sun nor sky can reach sealed air,
+  so only the hits' local lights (the frame's first 32, shadowed) can: a
+  fine probe is gated past a light's range + 8 m (a hit's 6 m and the
+  probes round it), a coarse one past range + 48 m. Gated, a probe is held
+  VALID and black -- switched off, the reader would fall back to the
+  heightfield's covered branch, which can borrow light. `cs_nf_live`
+  checks the gate both ways every frame over every traced probe, so a
+  torch carried in wakes its probes that frame (fresh, from black).
+  Measured (1440p, play's schedule): the sealed 42 m chamber 21,440 fine
+  and 502 coarse live probes, 1.17 ms -> 3,501 and 0, 0.11 ms; standing
+  on the surface over caves 8,022 -> 2,712, 0.58 -> 0.10 ms; the tunnel
+  under spawn 9,250 -> 2,897, 0.63 -> 0.10 ms; the list pass +0.007 ms.
+  With a torch in the chamber 8,215 and 462 stay live (0.66 ms) and the
+  still is the ungated one's to 1 level in 255. Sinkholes and the shipping
+  world are unchanged (no sealed air). Walking the cave world 6.72 ->
+  6.38 ms against the shipping world's 6.15.
 - Heap: [40..42] (t26..t28, the range every lit table kept from DDGI): the
   probes, the occupancy, the top map; [112..119] the near field's own;
   [120..122] the mist's openness volumes (t16 in post). The mist root and

@@ -2326,6 +2326,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                     std::fprintf(gf, "near field: %.0f probes listed by the CPU a frame%s; live, traced every frame: %u fine, %u coarse\n\n",
                                  nf_probes_frame, std::getenv("BIOMES_NF_PLAY") ? " (BIOMES_NF_PLAY: play's schedule)" : "",
                                  g_renderer.near_field().live_fine(), g_renderer.near_field().live_coarse());
+                    {
+                        const engine::SkyAccess& sa = g_renderer.near_field().sky_access();
+                        std::fprintf(gf, "sky access: %zu bricks, %llu searches (%llu sealed), %llu cells searched, "
+                                         "%llu evaluated, %.0f ms of CPU in all; the camera in %s air\n\n",
+                                     sa.bricks(), sa.searches(), sa.sealed_components(), sa.cells_searched(),
+                                     sa.cells_evaluated(), sa.ms(),
+                                     g_renderer.near_field().camera_sealed() ? "SEALED" : "open (or no)");
+                    }
                     std::fprintf(gf, "%-58s %9s %9s %7s\n", "pass (named by the mark that ends it)", "ms/frame", "max ms", "frames");
                     double sum = 0.0;
                     const std::vector<std::pair<std::string, engine::GpuProfiler::Segment> > segs = prof.ordered_segments();

@@ -137,7 +137,13 @@ void cs_fog_inject(uint3 id : SV_DispatchThreadID) {
     // scattered ray's (-d): looking into the light is the forward peak.
     // Through the clouds' shadow too (ADR-005 C2): sunbeams through the gaps
     // in a deck, and no sunlit glow under a closed one.
-    float3 L = kSunLux * (key_visibility(p) * cloud_shadow_at(g_cloud_shadow, g_lin, cloud_shadow, kSunDir, p) *
+    // The camera in sealed air (l_nf.w 2, sky_access.h): every froxel it can
+    // see is that same sealed air -- a line of sight from sealed air stays in
+    // it until it meets rock -- and no sun reaches it, whatever a cascade's
+    // texel says.
+    const bool sealed = l_nf.w > 1.5f;
+    float3 L = sealed ? float3(0.0f, 0.0f, 0.0f)
+             : kSunLux * (key_visibility(p) * cloud_shadow_at(g_cloud_shadow, g_lin, cloud_shadow, kSunDir, p) *
                           hg_phase(dot(d, kSunDir), phase_g));
     // The sky above and the ground below, scattered isotropically: the mean
     // radiance over the sphere.
@@ -146,8 +152,13 @@ void cs_fog_inject(uint3 id : SV_DispatchThreadID) {
     // Where the near field (hfgi.hlsli nf_openness) knows the point itself --
     // under the top surface, a tunnel's air -- its own share instead: the
     // eye's share lit a whole tunnel's mist from a sunlit shaft.
+    // The camera in sealed air: no sky reaches the air it can see, except
+    // as the probes say (k_here, open_here). The eye's share and its ramp
+    // back to open air at 64 m stood in for "somewhere else", and lit the
+    // last metres of the volume, where the probes give up, with daylight.
     const float share = in_rock ? 0.0f
-                                : lerp(lerp(cam_sky, 1.0f, saturate((length(p - shadow_cam) - 64.0f) / 192.0f)), open_here, k_here);
+                      : l_nf.w > 1.5f ? k_here * open_here
+                      : lerp(lerp(cam_sky, 1.0f, saturate((length(p - shadow_cam) - 64.0f) / 192.0f)), open_here, k_here);
     L += 0.5f * (kSkyMean + kGroundRadiance) * share;
     // For the composite, how much the ground over it darkens this air: 1 in
     // the open, the probes' openness under the top surface. Averaged along
