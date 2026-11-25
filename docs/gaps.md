@@ -155,8 +155,9 @@ Last gathered: 2026-11-21, after the exploration fog.
   in a trough shows from below as dark patches on the sand. [The sea]
 - **The connectivity flood is a first version** (ADR-006 stage 3): the
   fill is a prototype (a gravity-weighted arrival per cell: it steps in
-  0.5 m blocks at the front, clips the swash in squares, ignores the
-  breach's size, and pools by a slow step up rather than by volume); a
+  0.5 m blocks at the front, clips the swash in squares, takes a sideways
+  breach at the reference speed, and pools by a slow step up rather than
+  by volume); a
   pocket's own water surface below sea level is not drawn (physics has
   it), and the underwater pass dims light down to sea level, not to a
   pocket's floor; the sheet's mask reaches 64 m round the camera, so a

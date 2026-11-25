@@ -3491,9 +3491,20 @@ held no such cell and the water could not get down it.
   edit, or after a load, is shown whole at once. `--flood-test` case H: the
   breached tunnel 18 m from the breach wet after 3.7 s, its shaft's foot
   40 m off after 8.6 s, neither at once; `build/flood_fill_10s.bmp` and
-  `_13s` show the shaft filling. Not done: the per-column front steps in
-  0.5 m blocks where neighbours stand at different levels, and clips the
-  swash in squares; speed does not depend on the breach's size; pooling is
+  `_13s` show the shaft filling.
+  **Speed follows the breach's size**: every step is scaled by
+  `kBreachRef` (4 m^2, a 2 m hole) / the breach's area, held to x0.25 to
+  x8. The area is the hole's cross-section: the columns of open sea the
+  search meets that stand below the GENERATED bed (water in a hole dug
+  down into it), widened across neighbouring such columns -- counting the
+  wet cells beside the sea instead measured the tunnel's flank round the
+  hole (a 0.8 m hole read 17.5 m^2, a 3 m one 10). A breach with no such
+  footprint (opened sideways) takes the reference speed.
+  `BIOMES_FLOOD_BREACH_R=<m>` sets `--flood-test`'s hole: 0.8 m -> 1.75
+  m^2, x2.3, the far point wet after 20 s; 1.6 m (default) -> 8 m^2, x0.5,
+  4.3 s; 3 m -> 28 m^2, x0.25, 2.1 s. H's line prints the area and factor.
+  Not done: the per-column front steps in 0.5 m blocks where neighbours
+  stand at different levels, and clips the swash in squares; pooling is
   approximated by the slower step up, not by volume.
 - **Not done**: a pocket's own water surface below sea level
   is not drawn (physics has it); the underwater pass dims light down to sea

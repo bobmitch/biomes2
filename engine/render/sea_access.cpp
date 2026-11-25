@@ -230,6 +230,10 @@ void SeaAccess::component(int sx, int sy, int sz) {
     std::vector<int> cx, cy, cz;
     std::vector<uint8_t> vent, touch_sea;
     std::deque<uint32_t> q;
+    // The breach's footprint: columns of open sea the search meets that lie
+    // under the GENERATED seabed -- water standing in a hole dug down into
+    // the bed, which is the breach itself. Its area sets the fill's speed.
+    std::unordered_set<int64_t> breach_cols;
     bool sea = false, capped = false;
     // An air cell's kind: 0 to follow, 1 an opening to the sea, 2 an opening
     // to the sky (above sea level), and whether it is open straight up.
@@ -270,7 +274,11 @@ void SeaAccess::component(int sx, int sy, int sz) {
             bool open = false;
             const int k = kind(nx, ny, nz, st, open);
             if (k != 0) {
-                if (k == 1) { sea = true; touch_sea[i] = 1; }
+                if (k == 1) {
+                    sea = true;
+                    touch_sea[i] = 1;
+                    if (float(ny) * kC + 0.25f < column_h(nx, nz)) breach_cols.insert(cell_key(nx, 0, nz));
+                }
                 // An opening beside or above: this cell's air can rise to it.
                 if (y <= ny) vent[i] = 1;
                 continue;
@@ -335,6 +343,39 @@ void SeaAccess::component(int sx, int sy, int sz) {
         std::fill(at_t.begin(), at_t.end(), 1e30f);
         typedef std::pair<float, uint32_t> QE;
         std::priority_queue<QE, std::vector<QE>, std::greater<QE>> pq;
+        // Every step scaled by kBreachRef / the breach's area. A breach not
+        // dug down from the bed (a tunnel opened sideways into a cliff under
+        // the sea) has no footprint here: the reference speed.
+        // The search met the hole only at its rim: widen that to the hole's
+        // whole cross-section -- neighbouring columns of the sea whose open
+        // water reaches below the generated bed (dug), capped at 1000 m^2.
+        {
+            std::deque<int64_t> cq(breach_cols.begin(), breach_cols.end());
+            while (!cq.empty() && breach_cols.size() < 4000) {
+                const int64_t ck = cq.front();
+                cq.pop_front();
+                int x, y, z;
+                x = int((ck >> 42) & 0x1FFFFF) - (1 << 20);
+                z = int(ck & 0x1FFFFF) - (1 << 20);
+                (void)y;
+                const int d4[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+                for (int d = 0; d < 4; ++d) {
+                    const int nx = x + d4[d][0], nz = z + d4[d][1];
+                    const int64_t nk = cell_key(nx, 0, nz);
+                    if (breach_cols.count(nk)) continue;
+                    const float h = column_h(nx, nz);
+                    if (h >= sea_ || float(open_floor(nx, nz)) * kC + 0.25f >= h - 0.25f) continue;
+                    breach_cols.insert(nk);
+                    cq.push_back(nk);
+                }
+            }
+        }
+        const float area = float(breach_cols.size()) * kC * kC;
+        const float scale = area > 0.0f ? (std::min)(kBreachSlow, (std::max)(kBreachFast, kBreachRef / area)) : 1.0f;
+        if (area > 0.0f) {
+            last_breach_m2_ = area;
+            last_breach_scale_ = scale;
+        }
         for (uint32_t i = 0; i < n; ++i) {
             if (dist[i] == 0xFFFF) continue;
             if (touch_sea[i] || was_wet_.count(cell_key(cx[i], cy[i], cz[i]))) {
@@ -350,7 +391,7 @@ void SeaAccess::component(int sx, int sy, int sz) {
             for (int d = 0; d < 6; ++d) {
                 auto it = at.find(cell_key(cx[i] + kD6[d][0], cy[i] + kD6[d][1], cz[i] + kD6[d][2]));
                 if (it == at.end() || dist[it->second] == 0xFFFF) continue;
-                const float step = kD6[d][1] < 0 ? kFillDown : (kD6[d][1] > 0 ? kFillUp : kFillSide);
+                const float step = scale * (kD6[d][1] < 0 ? kFillDown : (kD6[d][1] > 0 ? kFillUp : kFillSide));
                 const float t = e.first + step;
                 if (t < at_t[it->second]) {
                     at_t[it->second] = t;

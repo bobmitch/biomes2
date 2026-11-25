@@ -5263,7 +5263,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (q.q == 1 || st.dry < st.frames) pass_f1 = false;
         }
         // The breach: a hole from the seabed down into the tunnel's far end.
-        for (float y = hgt(28.0f, -20.0f) + 0.5f; y >= yc; y -= 1.0f) dig_at(28.0f, -20.0f, y, 1.6f);
+        // BIOMES_FLOOD_BREACH_R=<m>: the breach hole's radius (1.6 by
+        // default), to compare a pinhole's fill with a big hole's.
+        const char* br_env = std::getenv("BIOMES_FLOOD_BREACH_R");
+        const float br = br_env ? float(std::atof(br_env)) : 1.6f;
+        for (float y = hgt(28.0f, -20.0f) + 0.5f; y >= yc; y -= 0.5f) dig_at(28.0f, -20.0f, y, br);
         // H. The fill: the water must ARRIVE, not appear. Frames until the
         // flood has answered, then the tunnel 18 m from the breach and its
         // shaft 40 m off are watched on the game clock: dry at first, wet
@@ -5277,9 +5281,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_renderer.flood_settle();
             frame();
             const float t_ans = t;
+            const float b_m2 = g_renderer.sea_access().last_breach_m2();
+            const float b_k = g_renderer.sea_access().last_breach_scale();
             float t_near = -1.0f, t_far = -1.0f;
             bool near0 = false, far0 = false;
-            for (int i = 0; i < 1200 && (t_near < 0.0f || t_far < 0.0f || t - t_ans < 13.5f); ++i) {
+            for (int i = 0; i < 4000 && (t_near < 0.0f || t_far < 0.0f || t - t_ans < 13.5f); ++i) {
                 const Q qn = ask(10.0f, -20.0f, yc - kTR + 0.25f);
                 const Q qf = ask(-12.0f, -20.0f, yc - kTR + 0.25f);
                 if (i == 0) { near0 = qn.q == 1; far0 = qf.q == 1; }
@@ -5304,10 +5310,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 frame();
             }
             std::fprintf(f, "H. the fill after the breach: the tunnel floor 18 m from it wet after %.2f s, the shaft's "
-                            "foot 40 m from it after %.2f s (wet at once: %s, %s); %llu component(s) timed\n",
+                            "foot 40 m from it after %.2f s (wet at once: %s, %s); %llu component(s) timed; "
+                            "breach %.2f m^2, time x%.2f\n",
                          t_near, t_far, near0 ? "YES" : "no", far0 ? "YES" : "no",
-                         g_renderer.sea_access().animated());
-            pass_h = !near0 && !far0 && t_near > 0.0f && t_far > t_near && t_far < 20.0f;
+                         g_renderer.sea_access().animated(), b_m2, b_k);
+            pass_h = !near0 && !far0 && t_near > 0.0f && t_far > t_near && t_far < 60.0f;
+            // Then until the shaft has filled to a metre under sea level (a
+            // small breach takes a while), so F below judges the full flood.
+            for (int i = 0; i < 6000 && ask(-12.0f, -20.0f, sea - 1.0f).q != 1; ++i) frame();
         }
         for (float s : {10.0f, -12.0f}) {
             const Q q = ask(s, -20.0f, yc - 1.0f);
