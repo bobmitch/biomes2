@@ -427,7 +427,7 @@ float g_cave_from[2] = {0.0f, 0.0f};
 void jump_to_cave(int step) {
     const worldgen::SeedWorld& w = g_renderer.world().world();
     if (w.caves.empty()) {
-        std::snprintf(g_tree_msg, sizeof g_tree_msg, "no caves in this world (BIOMES_L0 caves=1)");
+        std::snprintf(g_tree_msg, sizeof g_tree_msg, "no caves in this world");
         return;
     }
     const float px = g_walk ? g_feet[0] : g_camera.x, pz = g_walk ? g_feet[2] : g_camera.z;

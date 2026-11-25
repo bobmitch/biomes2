@@ -1929,6 +1929,7 @@ int main(int argc, char** argv) {
             wp.regime_amp_hi = static_cast<float>(std::atof(argv[++i]));
         }
         else if (!std::strcmp(argv[i], "--caves"))                   wp.placed_caves = true;
+        else if (!std::strcmp(argv[i], "--no-caves"))                wp.placed_caves = false;
         else if (!std::strcmp(argv[i], "--shelf-depth") && i + 1 < argc)  wp.shelf_depth = static_cast<float>(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--shelf-width") && i + 1 < argc)  wp.shelf_width = static_cast<float>(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--shelf-regime") && i + 1 < argc) wp.shelf_regime = static_cast<float>(std::atof(argv[++i]));

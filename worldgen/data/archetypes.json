@@ -53,7 +53,7 @@
   "ground_look": {"variation": 1.0, "detail_fade": [350.0, 700.0], "hex": 1, "far_detail": 1.2, "far_scale": 5.3},
   "weather": {"period_s": 480.0, "wind_min": 0.5, "wind_max": 24.0, "veer_period_s": 900.0, "veer": 1.75, "sea_lag_s": 90.0, "fetch_km": 150.0, "peak_shift": 1.4, "swell_min": 0.25, "swell_max": 3.0, "swell_wavelength": 110.0, "swell_lag_s": 600.0, "mist_drift": 0.5, "rain_storm": [0.55, 0.9], "dry_s": 900.0, "leaf_dry_s": 300.0, "soak_s": 120.0, "puddle_s": [240.0, 600.0], "lightning": {"storm": [0.78, 1.0], "per_minute": 14.0, "candela": 5e10, "range_m": 6000.0, "ground_share": 0.4}},
   "sea_level": 0.0,
-  "_note_placed_caves": "Placed caves (layer 7 since v19, docs/worldgen-design.md): each biome's caves.per_km2 is a GUARANTEED density -- a jittered candidate grid of 1 km / sqrt(per_km2) cells, one cave per cell, retried at up to `tries` spots. 0 or no block = none. Built only with WorldParams::placed_caves (BIOMES_L0 caves=1) until the bump.",
+  "_note_placed_caves": "Placed caves (layer 7 since v19, docs/worldgen-design.md): each biome's caves.per_km2 is a GUARANTEED density -- a jittered candidate grid of 1 km / sqrt(per_km2) cells, one cave per cell, retried at up to `tries` spots. 0 or no block = none. On since generator_version 19; BIOMES_L0 caves=0 turns them off for A/B.",
   "caves": {"tries": 48, "cover": 2.0, "max_slope": 0.6, "shore": 3.0, "river_clear": 10.0, "segment": 8.0, "wall_noise": 0.8, "wall_period": 5.0, "max_grade": 0.6},
   "biomes": [
     {

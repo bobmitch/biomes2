@@ -2843,12 +2843,44 @@ It did NOT notice normalising by the faded amplitude, because that error is
 smaller than the worst case already present — it is a guard against the loud
 version of the bug, not the quiet one.
 
-**Caves are OFF since v11.** Every `cave_density` in `archetypes.json` is 0,
-so layer 6 carves nothing, layer 7 builds no shafts (`worldgen::caves_enabled`
-gates it: a shaft must end in cave air) and `column_band` drops its 64 m cave
-padding (1129 → 736 chunks wanted). The `cave entrances` check asserts ZERO
-shafts while caves are off. What follows about layer 7 describes the code,
-which is intact, and applies again when the densities come back.
+**Caves are PLACED features since v19** (docs/worldgen-design.md, "Layer 7
+-- placed caves"); the v10 ridged tunnels and their shafts stay off (every
+`cave_density` 0) and their code is intact, unused. Per biome,
+`archetypes.json` `caves.per_km2` (meadows 1, forest 2, the rest 0) sets a
+jittered grid of 1 km / sqrt(per_km2) cells; a cell's FIRST spot decides
+whether it owes the biome a cave (so the density is per km2 of the biome's
+land), and up to `tries` spots find a workable one. Each cave is a pure
+function of (biome, i, j), `cave_id` its save identity: a mouth bowl, a
+tunnel of 8 m capsules that wanders and descends at a walkable grade, and
+chambers of overlapping horizontal capsules -- all carried in layer 7's old
+entrance buffers, so the carve, the GPU path and the binning are the shafts'
+(`cave_wall_sd` adds wall noise and moves the feathering OUTSIDE the wall:
+inside it, a 2 m tunnel pinched shut under 20-30 m of rock).
+- **Cover counts the carve's real reach** -- radius, feathering, wall noise
+  and layer 6's overhang drop -- every 2 m of tunnel and over a 5 x 5 grid
+  per room. Checked at 8 m vertices from the radius alone, a tunnel ran out
+  under the seabed and 0.7 m roofs let daylight through the near field's
+  1 m grid: both showed as a GLOW deep in a cave.
+- **The other glow**: a probe ray leaving the near field's 128 m volume
+  through open air took the heightfield's daylight; a forest tunnel is longer
+  than that. PR #6's distance to the sky (`underground.sky_falloff_m`) is what
+  darkens it -- 69 -> 3 luma at EV100 2, 33 m down.
+- Trees, rocks (`cave_mouth_near`) and grass (the foliage bake, within a
+  metre of the carve) keep off a mouth; floors under the real top surface
+  shade as rock (`mesh.hlsl`, the near field's top map).
+- Streaming pads only columns that hold a cave (`cave_bottom_in_box`, in
+  `column_band`'s cache and the sky-access flood's columns), not the old
+  global 64 m: 808 chunks wanted at spawn, caves on or off.
+- `validate`'s `cave entrances` check: the density per biome at 90% of
+  per_km2 or more (200 seeds: see the PR), every capsule's axis air from mouth
+  to chamber, every mouth open, no breach past the mouth. `--no-caves` A/Bs;
+  `--cave-sites <seed>` lists them nearest spawn (and any breach).
+- In the engine: **Insert** jumps to the next cave nearest first (Shift
+  back); `startup.txt` lists the eight nearest as `--cam` lines;
+  `--cave-walk <k>` walks into the k-th nearest unsettled, a frame every
+  1.5 s (`build/cave_walk.txt`); `--post-debug 6|7` the direct and ambient
+  targets alone. `BIOMES_L0="caves=0"` builds the world without them.
+  `view.exe` draws them with the flat sites.
 
 **Rocks are pinned the same way** (v14): at the same 24 sites, boulders over
 a 64 m tile and outcrops over 3 x 3 of their cells, with their own

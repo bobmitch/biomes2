@@ -177,9 +177,9 @@ struct WorldParams {
 
     // Placed caves (docs/worldgen-design.md, layer 7 since v19): per-biome
     // features from archetypes.json's caves blocks, carried in the entrance
-    // buffers in place of the shafts. Off until the version bump; on, the
-    // shafts are not built. BIOMES_L0 "caves=1".
-    bool  placed_caves       = false;
+    // buffers in place of the shafts, which are not built. On since v19;
+    // BIOMES_L0 "caves=0" (or validate --no-caves) turns them off for A/B.
+    bool  placed_caves       = true;
 };
 
 // Layer 0's parameters for one seed, before the knee: WorldParams plus the

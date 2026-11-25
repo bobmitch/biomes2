@@ -886,7 +886,7 @@ void draw_overlays(HDC dc) {
         DeleteObject(sh);
     }
 
-    // Placed caves (BIOMES_L0 caves=1 until v19), with the flat sites: the
+    // Placed caves (layer 7 since v19), with the flat sites: the
     // mouth as a circle, every capsule's axis as a line, chambers as circles.
     if (checked(g.ov_flats) && !g.world.caves.empty()) {
         HPEN axis = CreatePen(PS_SOLID, 2, RGB(255, 90, 200));
@@ -1445,7 +1445,7 @@ std::string l0_env() {
         e += fmt(",shelf_width=%.3f,shelf_depth=%.2f,shelf_regime=%.2f",
                  p.shelf_width, p.shelf_depth, p.shelf_regime);
     if (p.knee) e += fmt(",knee=1,knee_k=%.3f,knee_c=%.3f", p.knee_k, p.knee_c);
-    if (p.placed_caves) e += ",caves=1";
+    if (!p.placed_caves) e += ",caves=0";
     return e;
 }
 
