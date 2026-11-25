@@ -97,7 +97,9 @@ Texture2D<float> g_cloud_shadow : register(t6);   // clouds.hlsl cs_shadow
 // planes. The first: 0 no word (the column rule stands), 1 dry air in a land
 // column (never water), else 2 + the open sea's waves' share x 253 where the
 // cell under sea level is flooded. The second (the fill): how far under sea
-// level the water stands there now, 0.1 m (255 none in yet).
+// level the water stands there now, 0.1 m (255 none in yet). The third,
+// round flooded columns: the edited density at sea level (the sheet's own
+// height), 128 + 64 x density (rock positive; 255 rock where not computed).
 StructuredBuffer<uint> g_flood : register(t7);
 
 uint flood_byte(int2 c, uint plane) {
@@ -136,6 +138,33 @@ float4 flood_sample(float2 p) {
     return float4(w, calm, drop, dry);
 }
 
+// How far p is from a dug wall at sea level, sideways, in metres: negative
+// inside the dug air. From the edited density there (the third plane),
+// bilinear over the four columns round p, divided by its SIDEWAYS gradient:
+// at a dug wall the density changes fast across it, on a low beach -- rock
+// at sea level by a few centimetres, its density as small as a wall's --
+// it barely changes sideways at all, and reads as far from any wall. The
+// density alone could not tell 30 cm from the rim from 30 cm above the sea,
+// and a band set on it swallowed the whole low beach. A blend touching a
+// column not computed (255) is far from any wall. y: how steep the wall is
+// (the sideways gradient, per metre): a dug wall is steep, ground that meets
+// sea level gently is a beach.
+float2 flood_rim(float2 p) {
+    const float2 g = (p - flood_origin) / 0.5f;
+    const int2 c0 = int2(floor(g));
+    const float2 f = g - float2(c0);
+    float v[4];
+    [unroll] for (int k = 0; k < 4; ++k) {
+        const uint b = flood_byte(c0 + int2(k & 1, k >> 1), 2u);
+        if (b == 255u) return float2(1e3f, 0.0f);
+        v[k] = (float(b) - 128.0f) / 64.0f;
+    }
+    const float d = lerp(lerp(v[0], v[1], f.x), lerp(v[2], v[3], f.x), f.y);
+    const float2 grad = float2(lerp(v[1] - v[0], v[3] - v[2], f.y), lerp(v[2] - v[0], v[3] - v[1], f.x)) / 0.5f;
+    const float gl = length(grad);
+    return float2(d / max(gl, 0.05f), gl);
+}
+
 #include "engine/render/shaders/lighting.hlsli"
 #include "engine/render/atmosphere.h"
 #include "engine/render/shaders/haze.hlsli"
@@ -166,7 +195,8 @@ struct VSOut {
     float  minwl  : TEXCOORD5;   // shortest wave this spacing can carry
     float  hs     : TEXCOORD6;   // significant height the grid carries here (the foam's yardstick)
     float2 cap_q  : TEXCOORD7;   // ww_local's breaking scale and Q, for the pixel's own normal
-    float3 flood  : TEXCOORD8;   // the flood here (flood_sample): how flooded, the water's drop under sea level, its calm (1 open sea)
+    float3 flood  : TEXCOORD8;   // the flood here: how much it applies (0 the column rule), the water's drop under sea level, its calm (1 open sea)
+    float3 rim    : TEXCOORD9;   // a filling hole's whole drop (0 none); 1 on the land side; inside the dug wall (0..1)
 };
 
 // A PROJECTED grid: the vertices are laid out on the SCREEN and dropped onto
@@ -275,6 +305,7 @@ VSOut vs_main(uint vid : SV_VertexID) {
     const float r = sqrt(rest.x * rest.x + rest.y * rest.y) / w_radius;
     const float ground = real_terrain_height(rest.x, rest.y, r, 0.0f);
     float depth = sea_level - ground;
+    const float depth_gen = depth;
     // ADR-006 stage 3: where the flood says the cell under sea level is the
     // sea, it is, whatever the generated column says -- a channel dug in from
     // the coast -- and the open sea's waves reach it only as far as the
@@ -284,6 +315,9 @@ VSOut vs_main(uint vid : SV_VertexID) {
     float fade_w = fade;
     float fill_drop = 0.0f;    // the fill: how far under sea level the water stands now
     float calm_f = 1.0f;       // the share of the open sea's waves that reaches here
+    float drop_full = 0.0f;    // a filling hole's drop, before the rim decides where it applies
+    float k_out = 0.0f;        // how much the flood applies here (0 the column rule, 1 the flood's water)
+    float inside_out = 0.0f;   // inside the dug wall at sea level (flood_rim), 0..1
     const float4 fs = flood_sample(rest);
     if (fs.x > 0.0f) {
         // Blended by how flooded, so nothing switches at a column's edge.
@@ -294,8 +328,36 @@ VSOut vs_main(uint vid : SV_VertexID) {
         // how flooded; on the land side, rock, which has no waves to blend
         // towards -- a land vertex takes the flood's calm whole, or the walls
         // of a calm channel wore a band of surf all the way in.
-        const float k = max(fs.x, saturate(-depth / 0.25f));
+        // On the land side the flood applies only INSIDE the dug wall: the
+        // zero line of the edited density at sea level (flood_rim) -- the
+        // rim itself, between the lattice points, not a column's edge, at
+        // the sheet's own height. Outside it the beach keeps its own surf.
+        // The step is held to +-2 cm of the line: a low beach stands only
+        // centimetres above sea level, and a step set 5-15 cm into the rock
+        // took it for the hole and cut its surf in squares again; at the
+        // cell under sea level instead, a shaft's narrower waist left a ring
+        // of sea-level sheet inside the rim. On the sea side, by how
+        // flooded.
+        const float2 rim = flood_rim(rest);
+        const float inside = saturate((0.02f - rim.x) / 0.04f);   // metres from the wall (flood_rim)
+        // The calm and the forced depth switch at the wall too. A soft band
+        // outside it was tried, measured as density over its sideways
+        // gradient: the jump from a dug sphere's strongly negative inside to
+        // the beach's slightly positive density, half a metre apart, made
+        // every cell beside a dig read as "at a steep wall", and the band
+        // took the surf from a patch the shape of the computed columns.
+        const float inside_soft = inside;
+        // The flood changes only the LAND side, where its water is: the open
+        // sea is the column rule's. Blended on the sea side by how flooded
+        // the columns round it were, it forced the shallows beside a flooded
+        // shaft deeper in cell-shaped patches and took their surf. Where a
+        // channel crosses the old shoreline the change follows that
+        // shoreline (the generated depth's zero, a smooth curve).
+        const float land = saturate(-depth / 0.25f);
+        const float k = inside_soft * land;
         calm_f = lerp(1.0f, fs.y * (1.0f - still), k);
+        k_out = k;
+        inside_out = inside;
         fade_w = fade * calm_f;
         // A LAND column (no generated depth to tame the waves with) stands
         // in 2 m; the open beach beside a channel keeps its own shallow
@@ -303,12 +365,14 @@ VSOut vs_main(uint vid : SV_VertexID) {
         // the shoreline: 2 m on land, falling to the sea's own depth over
         // its first 0.4 m.
         const float target = depth < 0.0f ? 2.0f : max(depth, 2.0f - 4.0f * depth);
-        depth = lerp(depth, target, fs.x);
-        // The rising level's drop likewise: whole on the land side, faded
-        // by how flooded on the sea side -- taken whole there it stopped dead
-        // where the filter's reach ended, a step in the sheet that drew the
-        // surf round a filling hole in squares.
-        fill_drop = fs.z * k;
+        depth = lerp(depth, target, k);
+        // The rising level's drop: only INSIDE the dug wall (flood_rim's
+        // zero line, sharpened over 5 cm), so the step from the hole's level
+        // to the sea's falls on the rim itself. Faded by how flooded, or
+        // taken whole on the land side, it fell where the filter's reach
+        // ended, on the beach, and cut the surf there in squares.
+        fill_drop = fs.z * inside * land;
+        drop_full = fs.z;
     }
 
     float3 nrm;
@@ -337,7 +401,8 @@ VSOut vs_main(uint vid : SV_VertexID) {
     const float3 loc = ww_local(frame_sea(), depth, fade_w, minwl);
     o.hs = loc.z / max(fade_w, 1e-4f);
     o.cap_q = loc.xy;
-    o.flood = float3(fs.x, fill_drop, calm_f);
+    o.flood = float3(k_out, fill_drop, calm_f);
+    o.rim = float3(drop_full, depth_gen < 0.0f ? 1.0f : 0.0f, inside_out);
     return o;
 }
 
@@ -482,9 +547,6 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // Only a coarse cut: depth interpolated from the grid's vertices steps
     // with the grid. The edge itself is made per pixel, below (edge_fade).
     clip(i.depth + 0.3f);
-    // Never in a dry column -- a pit or a pocket the sea does not reach --
-    // however far the flood's filter bled (flood_sample).
-    if (flood_on > 0.5f && flood_byte(int2(floor((i.world.xz - flood_origin) / 0.5f + 0.5f)), 0u) == 1u) clip(-1.0f);
     // The water's own level here: sea level, or where the fill has risen to.
     const float lvl = sea_level - i.flood.y;
 
@@ -594,6 +656,43 @@ float4 ps_main(VSOut i) : SV_Target0 {
         const float gdepth = lvl - gp.y;
         // Blended by how flooded, never switched: a threshold drew a line.
         if (zb < 1.0f) px_depth = lerp(i.depth, min(i.depth, max(gdepth, 0.0f)), saturate(i.flood.x));
+        // Beside a filling hole, on the land side: a pixel of sheet still at
+        // the SEA's level whose ground lies deeper than the hole's water is
+        // hanging over the hole, and is not drawn. The density's zero line
+        // (flood_rim) puts the step within centimetres of the dug wall, but
+        // the mesher puts the wall by its own rule within a cell, and the
+        // gap between them showed as slivers of sheet on the shaft's wall.
+        // The depth copy is where the wall IS.
+        if (zb < 1.0f && i.rim.x > 0.01f && i.rim.y > 0.5f && i.flood.y < 0.05f && gdepth > i.rim.x + 0.1f)
+            clip(-1.0f);
+        // Never over a dry column -- a pit, or a pocket the sea does not
+        // reach -- however far the flood's filter bled (flood_sample): where
+        // the ground behind is well under the sheet, the sheet is over the
+        // dry air. Not where the ground is close: dry air trapped under a
+        // dug lip lies under the beach, and clipping every pixel over such a
+        // column cut the surf on the sand above it in squares.
+        if (zb < 1.0f && flood_on > 0.5f && gdepth > 0.3f &&
+            flood_byte(int2(floor((i.world.xz - flood_origin) / 0.5f + 0.5f)), 0u) == 1u)
+            clip(-1.0f);
+        // The grid's triangles that straddle the switch at a dug wall slope
+        // from the sea's sheet to the flood's, at neither: they lie on the
+        // wall itself, so they are not drawn and the rock shows. Drawn, they
+        // were a sawtooth between the surf and the rim (keeping their surf
+        // side by a per-pixel wall test brought the teeth back: those pixels
+        // are on the slope too). The cost: the surf's edge at a dug wall
+        // follows the water grid, steps of a few centimetres.
+        // The wall test ALONE: the flood's weight also fades with the land
+        // over the beach's first 25 cm above sea level, metres wide on a
+        // gentle beach, and testing that cut a band out of a channel where
+        // it crossed the old shoreline.
+        if (i.rim.y > 0.5f && i.rim.z > 0.02f && i.rim.z < 0.98f) clip(-1.0f);
+        // And where the flood has no word at all: on the land side the
+        // column rule's sheet is the swash, never more than ~1.6 m over its
+        // own ground (ww_swash_reach). Deeper ground behind it is DUG ground
+        // -- a hole wider at the beach than the cell under sea level the
+        // flood labels by, or one the sea does not reach -- and the sheet
+        // would hang over it.
+        if (zb < 1.0f && i.rim.y > 0.5f && i.flood.x < 0.01f && gdepth > 1.6f) clip(-1.0f);
         if (zb < 1.0f && gdepth < 1.6f) {
             const float sw = ww_swash(gp.x, gp.z, time, frame_swash()) * ww_swash_reach(gdepth) *
                              (1.0f - saturate(i.flood.y * 10.0f));
@@ -741,6 +840,10 @@ float4 ps_main(VSOut i) : SV_Target0 {
     const float foam = saturate(max(shore_foam, crest_foam));
 
     // 7: the folding measure, white at 1 (still), black at 0 (folding).
+    // 9: the flood -- red how flooded, green a filling hole's drop (0-2 m), blue the land side.
+    // 10: the shore foam's inputs -- red the calm, green the depth it sees (0-1 m), blue the fade.
+    if (debug_mode > 9.5f) return float4(saturate(i.flood.z), saturate(px_depth), saturate(i.fade), 0.0f);
+    if (debug_mode > 8.5f) return float4(saturate(i.flood.x), saturate(i.rim.x * 0.5f), i.rim.y, 0.0f);
     if (debug_mode > 7.5f) return float4(saturate(gs * 0.5f).xxx, 0.0f);   // 8: the gusts' ripple strength, grey = mean
     if (debug_mode > 6.5f) return float4(saturate(jac).xxx, 0.0f);
     const float4 dbg = debug_view(i, n, foam, hit.a);

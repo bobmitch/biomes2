@@ -755,7 +755,7 @@ bool Renderer::create_water_pipeline(std::string& error) {
         }
         // The flood's surface mask (ADR-006 stage 3): kFloodMask^2 bytes,
         // read as uints, one a frame in flight.
-        rd.Width = UINT64(kFloodMask) * kFloodMask * 2;   // the waves' share, then the fill's level
+        rd.Width = UINT64(kFloodMask) * kFloodMask * 3;   // the waves' share, the fill's level, the rim's density
         for (UINT i = 0; i < kFrameCount; ++i) {
             const HRESULT ch = device_->CreateCommittedResource(
                 &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
@@ -763,7 +763,7 @@ bool Renderer::create_water_pipeline(std::string& error) {
             if (FAILED(ch)) { error = hr_text("CreateCommittedResource (flood mask)", ch); return false; }
             D3D12_RANGE none = {0, 0};
             flood_mask_[i]->Map(0, &none, &flood_mask_cpu_[i]);
-            std::memset(flood_mask_cpu_[i], 0, size_t(kFloodMask) * kFloodMask * 2);
+            std::memset(flood_mask_cpu_[i], 0, size_t(kFloodMask) * kFloodMask * 3);
         }
     }
 
@@ -6135,7 +6135,20 @@ void Renderer::fill_flood_mask(const float cam[3]) {
     // will be water. The second (the fill): how far under sea level the
     // water stands there NOW, in 0.1 m (255: none in yet) -- the sheet drops
     // to it.
-    std::vector<uint8_t> buf(size_t(N) * N * 2, 0);
+    // The third plane: round every flooded column the water has reached,
+    // the edited density at sea level, 128 + 64 x density
+    // (rock positive), 255 (rock) where not computed. Its bilinear zero line
+    // is where the dug wall stands at that height, between the lattice
+    // points as the mesher puts it, and water.hlsl applies the flood (its
+    // calm, the forced depth, the rising level's drop) on the land side
+    // only inside it: the beach's surf keeps its height, swash and foam
+    // right up to the rim. Applied by the columns' filter instead, it fell
+    // half a cell out on the beach and cut the surf round a filling shaft in
+    // squares.
+    std::vector<uint8_t> buf(size_t(N) * N * 3, 0);
+    std::memset(buf.data() + size_t(N) * N * 2, 255, size_t(N) * N);
+    std::vector<int> filling;   // mask indices of flooded columns the water has reached
+    std::vector<int> open_sea;  // mask indices of the open sea's own columns (label 1)
     bool any = false;
     for (int bz = 0; bz < N / K; ++bz)
         for (int bx = 0; bx < N / K; ++bx) {
@@ -6159,7 +6172,24 @@ void Renderer::fill_flood_mask(const float cam[3]) {
                     // the column rule, which already calls it sea: marked, it
                     // took the flood's treatment only inside labelled blocks,
                     // and the surf showed the blocks' straight edges.
-                    if (c == 1) continue;
+                    if (c == 1) { open_sea.push_back(int(mi)); continue; }
+                    // Flooded under a LID: the cell at sea level over it is
+                    // rock, so there is no water surface here to draw -- a
+                    // shaft dug from stacked spheres bulges just under sea
+                    // level beneath a few centimetres of beach. Marked, the
+                    // column took the flood's calm, lost its surf, and the
+                    // calm sheet went under the sand: squares of bare beach
+                    // round the shaft. Left to the column rule instead.
+                    {
+                        uint8_t above = 0;
+                        const int x = ox + bx * K + i, z = oz + bz * K + k;
+                        const int yb = ys + 1, byb = fl_floor_div(yb, K);
+                        auto ib = flood_.find(fl_key(fl_floor_div(x, K), byb, fl_floor_div(z, K)));
+                        if (ib != flood_.end())
+                            above = ib->second.cell[((z - fl_floor_div(z, K) * K) * K + (yb - byb * K)) * K +
+                                                    (x - fl_floor_div(x, K) * K)];
+                        if (above == SeaAccess::kSolid) continue;
+                    }
                     const float w = std::exp(-float(c - 1) * kFlC / kFloodWaveFalloff);
                     buf[mi] = uint8_t(2 + int(w * 253.0f + 0.5f));
                     any = true;
@@ -6180,8 +6210,55 @@ void Renderer::fill_flood_mask(const float cam[3]) {
                         }
                     }
                     buf[size_t(N) * N + mi] = lv;
+                    if (lv != 255) filling.push_back(int(mi));
                 }
         }
+    if (!filling.empty()) {
+        if (edits_.generation() != flood_rim_gen_) {
+            flood_rim_.clear();
+            flood_rim_gen_ = edits_.generation();
+        }
+        // At SEA LEVEL, the sheet's own height: at the cell under it (0.5 m
+        // down) a shaft dug from stacked spheres was narrower than where the
+        // sheet lies, and a ring of sea-level sheet showed inside the rim.
+        const float y = sea;
+        for (int mi : filling) {
+            const int i0 = mi % N, k0 = mi / N;
+            // Four rings (2 m): a shaft dug from stacked spheres is wider at
+            // sea level than at the cell under it the flood labels by, and a
+            // patch of two rings ended inside its air, a straight edge in the
+            // water. A blend touching a column not computed (255) is far from
+            // any wall.
+            for (int dk = -4; dk <= 4; ++dk)
+                for (int di = -4; di <= 4; ++di) {
+                    const int i = i0 + di, k = k0 + dk;
+                    if (i < 0 || k < 0 || i >= N || k >= N) continue;
+                    const size_t ri = size_t(N) * N * 2 + size_t(k) * N + size_t(i);
+                    if (buf[ri] != 255) continue;   // done
+                    const int x = ox + i, z = oz + k;
+                    const int64_t key = fl_key(x, 0, z);
+                    auto it = flood_rim_.find(key);
+                    if (it == flood_rim_.end())
+                        it = flood_rim_.emplace(key, edited_density(float(x) * kFlC, y, float(z) * kFlC)).first;
+                    const float d = (std::max)(-2.0f, (std::min)(1.98f, it->second));
+                    buf[ri] = uint8_t(int(128.0f + d * 64.0f + 0.5f));
+                }
+        }
+        if (flood_rim_.size() > 200000) flood_rim_.clear();
+        // The open sea's own columns INSIDE that patch are marked after all,
+        // as open water (the waves whole, none to come): where a channel
+        // runs out through the shallows, the flood calls a column the open
+        // sea while the shader's generated height calls it land, and with
+        // no word there the land side's sheet over the deep channel was cut
+        // (the clip for sheet hanging over dug ground). Only near flooded
+        // columns, and only the land side reads it, so the open sea keeps
+        // no block edges.
+        for (int mi : open_sea) {
+            if (buf[size_t(N) * N * 2 + size_t(mi)] == 255) continue;
+            buf[size_t(mi)] = 255;
+            buf[size_t(N) * N + size_t(mi)] = 0;
+        }
+    }
     std::memcpy(m, buf.data(), buf.size());
     flood_mask_on_ = any;
 }

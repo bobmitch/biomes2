@@ -5285,14 +5285,33 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             const float b_k = g_renderer.sea_access().last_breach_scale();
             float t_near = -1.0f, t_far = -1.0f;
             bool near0 = false, far0 = false;
+            bool rising_shot = false;
+            float rising_surface = 0.0f;
             for (int i = 0; i < 4000 && (t_near < 0.0f || t_far < 0.0f || t - t_ans < 13.5f); ++i) {
                 const Q qn = ask(10.0f, -20.0f, yc - kTR + 0.25f);
                 const Q qf = ask(-12.0f, -20.0f, yc - kTR + 0.25f);
                 if (i == 0) { near0 = qn.q == 1; far0 = qf.q == 1; }
                 if (t_near < 0.0f && qn.q == 1) t_near = t - t_ans;
                 if (t_far < 0.0f && qf.q == 1) t_far = t - t_ans;
-                // Stills of the shaft from above as it fills, 10 s and 13 s in.
+                // Stills of the shaft from above as it fills, 10 s and 13 s in;
+                // and one while it is still RISING, half a second after the
+                // water reaches its foot -- the hole's level under the surf's,
+                // where the step between them has to fall on the rim.
                 const float since = t - t_ans;
+                if (!rising_shot && t_far > 0.0f && since >= t_far + 0.5f) {
+                    rising_shot = true;
+                    const Q qs = ask(-12.0f, -20.0f, yc - kTR + 0.25f);
+                    rising_surface = qs.surface;
+                    float q2[2];
+                    pt(-12.0f, -20.0f, q2);
+                    engine::Camera c = g_camera;
+                    c.x = q2[0] + 0.5f; c.z = q2[1]; c.y = hgt(-12.0f, -20.0f) + 4.0f;
+                    c.yaw = 0.0f; c.pitch = -1.45f;
+                    engine::ViewConstants cv = {};
+                    fill_view(c, g_res_w, g_res_h, t, cv);
+                    std::string e3;
+                    g_renderer.capture(cv, "build/flood_fill_rising.bmp", e3);
+                }
                 for (int si = 0; si < 2; ++si) {
                     const float at_s = si == 0 ? 10.0f : 13.0f;
                     if (since >= at_s && since < at_s + kDt) {
@@ -5314,6 +5333,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                             "breach %.2f m^2, time x%.2f\n",
                          t_near, t_far, near0 ? "YES" : "no", far0 ? "YES" : "no",
                          g_renderer.sea_access().animated(), b_m2, b_k);
+            std::fprintf(f, "   the shaft's water 0.5 s after it reached the foot: surface at %.2f "
+                            "(build/flood_fill_rising.bmp)\n", rising_surface);
             pass_h = !near0 && !far0 && t_near > 0.0f && t_far > t_near && t_far < 60.0f;
             // Then until the shaft has filled to a metre under sea level (a
             // small breach takes a while), so F below judges the full flood.

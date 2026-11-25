@@ -3513,19 +3513,42 @@ held no such cell and the water could not get down it.
   the water -- harmless, because the edge is decided per pixel against the
   real (dug) ground at the water's OWN level (`edge_fade` against
   sea level less the fill's drop), and the shore's foam takes its depth
-  from that ground too, so it follows the dug edge. Three rules keep it
-  honest: the open sea itself (label 1) stays out of the mask, so labelled
-  and unlabelled sea draw alike (marked, the surf showed the labelled
-  blocks' straight edges); dry air in a land column is its own value and
-  never draws water, however the filter bleeds (a pit beyond a thin wall);
-  on the land side a vertex takes the flood's calm and drop whole -- rock
-  has no waves to blend towards, and blending to them gave a calm
-  channel's walls a band of surf 15 m in. Shore foam also falls with the
-  calm squared (surf needs breaking waves).
-- **Not done**: while a hole is still FILLING beside surf, the surf is cut
-  in squares round its rim -- the sheet must step from the hole's level
-  to the sea's somewhere, and any step outside the true rim shows on the
-  low beach (gone once it has filled; it was there before the filter);
+  from that ground too, so it follows the dug edge.
+- **The flood applies only inside the dug wall, and only on the land
+  side.** The mask's third plane holds the EDITED DENSITY AT SEA LEVEL
+  (the sheet's own height) for 4 rings of columns round every flooded
+  column (cached per edit generation); `flood_rim` turns it into metres
+  from the wall, and the calm, the forced depth and a filling hole's drop
+  switch within +-2 cm of its zero line -- the rim itself, not a column's
+  edge -- times how much the vertex is land (the generated depth's first
+  25 cm). On the sea side the flood changes nothing: open sea is the
+  column rule's. The open sea's own columns (label 1) stay out of the
+  mask, except inside a flooded patch, where a channel runs out through
+  shallows the shader's height calls land. Four per-pixel cuts finish it:
+  sheet still at sea level over ground deeper than a filling hole's water;
+  the column rule's sheet on land over ground more than 1.6 m down (dug
+  ground no swash reaches); sheet over a dry-air column where the ground
+  is well under it; and the grid triangles that straddle the switch (they
+  slope between the two sheets, on the wall itself). Columns flooded only
+  UNDER a lid (the cell at sea level is rock) are left to the column rule.
+  What each step fixed, in `--flood-test`'s stills (`flood_fill_10s`,
+  `_13s`, `_rising` while the shaft is still filling): the surf round a
+  shaft cut in squares (the calm and forced depth taken whole by beach
+  columns the filter reached); squares of bare beach (columns flooded
+  under a lid); a ring of sheet inside the rim (the density read 0.5 m
+  down, where a shaft of stacked spheres is narrower); a band cut out of a
+  channel where it crossed the old shoreline (the triangle cut tested the
+  land factor too). Tried and dropped: a soft 30 cm band outside the wall
+  by density over its gradient -- next to a dig every cell reads "at a
+  steep wall" -- and keeping the surf side of straddling triangles by a
+  per-pixel test (they are on the slope too: a sawtooth). Shore foam also
+  falls with the calm squared (surf needs breaking waves). `--water-debug
+  9` (how much the flood applies, a filling drop, the land side) and `10`
+  (the shore foam's calm, depth and fade) are the instruments.
+- **Not done**: the surf's edge at a dug wall follows the water grid in
+  steps of a few centimetres (the straddling triangles are dropped whole);
+  a dug rim can show a straight-edged notch where a chunk border crosses
+  it (terrain, not water: the same shape with `--no-water`);
   a pocket's own water surface below sea level
   is not drawn (physics has it); the underwater pass dims light down to sea
   level, not to a pocket's floor; the mask reaches 64 m round the camera,

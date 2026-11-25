@@ -825,6 +825,11 @@ private:
     struct FloodBlock { uint64_t gen; double t0; uint8_t cell[SeaAccess::kCells]; uint8_t arrive[SeaAccess::kCells]; };
     double flood_now_ = 0.0;
     bool  flood_arrived(const FloodBlock& b, int idx) const;
+    // The edited density at the cell under sea level of columns round a
+    // FILLING hole (the mask's third plane), by world column; forgotten at
+    // every edit (BrickStore::generation).
+    std::unordered_map<int64_t, float> flood_rim_;
+    uint64_t flood_rim_gen_ = ~0ull;
     std::unordered_map<int64_t, FloodBlock> flood_;
     std::unordered_map<int64_t, uint64_t> flood_asked_;
     std::unordered_map<int64_t, float> flood_cave_lo_;
