@@ -23,7 +23,7 @@ struct LocalLightGpu {
     float3 intensity; float type;      // candela per channel; 0 point, 1 spot
     float3 spot_dir; float cos_outer;
     float  cos_inner; int shadow;      // first face in g_light_faces, or -1
-    float2 pad;
+    float  moving;    float pad;       // 1: moved within 60 frames (local_lights.h)
 };
 
 struct LightFaceGpu {

@@ -852,6 +852,7 @@ private:
         unsigned long long drawn = 0;     // post_frame_ when its faces were drawn
         int      faces = 6;
         unsigned long long fast_until = 0;   // the near field traces its probes on the timer until then
+        unsigned long long moving_until = 0; // moved (not just placed) within 60 frames: no far hits (near_field.hlsl nf_hit)
         uint32_t body_faces = 0;             // faces last drawn with the player's body in them
         unsigned long long body_serial = 0;  // the pose they were drawn with
     };

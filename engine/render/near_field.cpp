@@ -23,7 +23,8 @@ namespace {
 struct NfConstants {
     int32_t origin[4];
     uint32_t edits, probes;
-    float keep_box, keep_rr;   // a frame's blend at the fine memory: a still's base, a probe traced from the CPU's list
+    float keep_box;            // a frame's blend at the fine memory: a still's base, a probe traced from the CPU's list
+    float far_lights;          // 1: local lights at FAR hits too (BIOMES_NF_NOFARLIGHTS: 0)
     float rot[3][4];   // rows of this update's random rotation of the ray set
     float cloud[4];    // the clouds' shadow map
     uint32_t lights, coarse;   // local lights a near hit is lit by; entries in the coarse list
@@ -719,7 +720,6 @@ void NearField::plan(const float cam[3], const BrickStore* edits, bool settle, f
     const float step = settle ? 1.0f / 60.0f : dt_smooth_;
     keep_box_ = std::exp(-step / (std::max)(sched_.near_memory, 0.01f));
     keep_light_ = std::exp(-step / (std::max)(sched_.light_memory, 0.01f));
-    keep_rr_ = keep_box_;
     keep_live_ = keep_box_;
     keep_live_light_ = keep_light_;
     keep_live_coarse_ = std::exp(-step / (std::max)(sched_.coarse_memory, 0.01f));
@@ -789,7 +789,10 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
     c.edits = uint32_t(edit_list_.size() / 4);
     c.probes = uint32_t(probe_list_.size());
     c.keep_box = keep_box_;
-    c.keep_rr = keep_rr_;
+    // BIOMES_NF_NOFARLIGHTS: local lights at near hits only, as before the
+    // coarse level's hits took them (near_field.hlsl nf_march), for A/B.
+    static const bool no_far_lights = std::getenv("BIOMES_NF_NOFARLIGHTS") != nullptr;
+    c.far_lights = no_far_lights ? 0.0f : 1.0f;
     random_rotation(rng_, c.rot);   // unused by the shader now; advances rng_, the jitters' seed
     for (int k = 0; k < 4; ++k) c.cloud[k] = cloud ? cloud[k] : 0.0f;
     // A/B: BIOMES_NF_NOLIGHTS (no local light at a hit), BIOMES_NF_NOCOARSE

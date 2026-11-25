@@ -2235,13 +2235,21 @@ void Renderer::record_lights(const ViewConstants& view) {
     // slot, within the last 60 frames -- the carried torch always (its flame
     // wanders), a campfire just dropped. Their probes ride the camera box's
     // timer with a short memory, so the bounce keeps up (near_field.h).
+    // A light that MOVED within those frames (not one just placed) is
+    // flagged in its record: the near field's FAR hits (past kNfSplit, and
+    // the coarse level's) skip it, whose probes there keep a long memory and
+    // would trail its old light.
+    std::vector<char> is_moving(act.size(), 0);
     {
         std::vector<float> fast;
         for (size_t i = 0; i < act.size(); ++i) {
             if (slot_of[i] < 0) continue;
             ShadowSlot& sl = shadow_slots_[slot_of[i]];
             const float dx = act[i].l.pos[0] - sl.pos[0], dy = act[i].l.pos[1] - sl.pos[1], dz = act[i].l.pos[2] - sl.pos[2];
-            if (!sl.ready || dx * dx + dy * dy + dz * dz > 1e-4f) sl.fast_until = post_frame_ + 60;
+            const bool moved = sl.ready && dx * dx + dy * dy + dz * dz > 1e-4f;
+            if (!sl.ready || moved) sl.fast_until = post_frame_ + 60;
+            if (moved) sl.moving_until = post_frame_ + 60;
+            if (sl.moving_until > post_frame_) is_moving[i] = 1;
             if (sl.fast_until <= post_frame_) continue;
             fast.push_back(act[i].l.pos[0]);
             fast.push_back(act[i].l.pos[1]);
@@ -2395,6 +2403,7 @@ void Renderer::record_lights(const ViewConstants& view) {
         g.cos_inner = std::cos(L.spot_inner_deg * 3.14159265f / 180.0f);
         g.shadow = (slot_of[i] >= 0 && shadow_slots_[slot_of[i]].ready) ? slot_of[i] * 6 : -1;
         if (g.shadow >= 0) ++light_stats_.shadowed;
+        g.moving = is_moving[i] ? 1.0f : 0.0f;
         gl[i] = g;
     }
     std::memcpy(faces_up_cpu_[frame_], faces_cpu_, sizeof faces_cpu_);

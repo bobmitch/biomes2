@@ -54,7 +54,7 @@ struct LocalLightGpu {
     float intensity[3]; float type;    // candela, per channel
     float spot_dir[3]; float cos_outer;
     float cos_inner;   int32_t shadow;  // first face in the face table, or -1
-    float pad[2];
+    float moving;      float pad;       // 1: moved within 60 frames (the carried torch): the near field's far hits skip it
 };
 static_assert(sizeof(LocalLightGpu) == 64, "LocalLightGpu must match local_lights.hlsli");
 
