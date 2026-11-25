@@ -820,7 +820,11 @@ private:
     // not blink the water off), what is asked and not yet answered, and the
     // blocks' columns' placed caves (lowest cave air, cached).
     SeaAccess sea_access_;
-    struct FloodBlock { uint64_t gen; uint8_t cell[SeaAccess::kCells]; };
+    // arrive and t0: the fill (sea_access.h) -- a wet cell counts from
+    // t0 + arrive x kArriveStep on the game clock (flood_now_).
+    struct FloodBlock { uint64_t gen; double t0; uint8_t cell[SeaAccess::kCells]; uint8_t arrive[SeaAccess::kCells]; };
+    double flood_now_ = 0.0;
+    bool  flood_arrived(const FloodBlock& b, int idx) const;
     std::unordered_map<int64_t, FloodBlock> flood_;
     std::unordered_map<int64_t, uint64_t> flood_asked_;
     std::unordered_map<int64_t, float> flood_cave_lo_;

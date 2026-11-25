@@ -12,6 +12,8 @@
 #include <cmath>
 #include <cstring>
 #include <execution>
+#include <functional>
+#include <queue>
 
 namespace engine {
 
@@ -155,8 +157,11 @@ void SeaAccess::run() {
             forget(inv.lo, inv.hi);
             worker_gen_ = inv.gen;
         } else if (have_inv) {
+            // A load: everything is shown full at once.
             bricks_.clear();
             floor_.clear();
+            was_wet_.clear();
+            have_edit_ = false;
             worker_gen_ = inv.gen;
         } else if (!blocks.empty()) {
             answer(blocks);
@@ -201,6 +206,7 @@ void SeaAccess::answer(std::vector<Cmd>& blocks) {
                 br = brick(b[0], b[1], b[2]);   // the search may have evaluated (and moved) bricks
             } else {
                 br->label[idx] = label;
+                br->arrive[idx] = 0;   // the open sea, rock or dry air: no fill to watch
                 br->known[idx >> 6] |= uint64_t(1) << (idx & 63);
             }
         }
@@ -208,6 +214,7 @@ void SeaAccess::answer(std::vector<Cmd>& blocks) {
         for (int k = 0; k < 3; ++k) r.b[k] = b[k];
         r.gen = worker_gen_;
         std::memcpy(r.cell, br->label, sizeof r.cell);
+        std::memcpy(r.arrive, br->arrive, sizeof r.arrive);
     }
     if (!out.empty()) {
         std::lock_guard<std::mutex> lk(mutex_);
@@ -310,9 +317,55 @@ void SeaAccess::component(int sx, int sy, int sz) {
             q.push_back(j);
         }
     }
+    // The fill: when the water reaches each wet cell, from where it came in
+    // -- the cells beside the open sea, and any wet before the edit -- by a
+    // Dijkstra search over the wet cells with gravity in the step costs, so
+    // it pours down a shaft, runs along a floor and rises last. Only for the
+    // component the latest edit touched.
+    std::vector<float> at_t(n, 0.0f);
+    bool animate = false;
+    if (fills && have_edit_) {
+        for (uint32_t i = 0; i < n && !animate; ++i) {
+            const float wx = float(cx[i]) * kC, wy = float(cy[i]) * kC, wz = float(cz[i]) * kC;
+            animate = wx >= edit_lo_[0] - 1.0f && wx <= edit_hi_[0] + 1.0f && wy >= edit_lo_[1] - 1.0f &&
+                      wy <= edit_hi_[1] + 1.0f && wz >= edit_lo_[2] - 1.0f && wz <= edit_hi_[2] + 1.0f;
+        }
+    }
+    if (animate) {
+        std::fill(at_t.begin(), at_t.end(), 1e30f);
+        typedef std::pair<float, uint32_t> QE;
+        std::priority_queue<QE, std::vector<QE>, std::greater<QE>> pq;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (dist[i] == 0xFFFF) continue;
+            if (touch_sea[i] || was_wet_.count(cell_key(cx[i], cy[i], cz[i]))) {
+                at_t[i] = 0.0f;
+                pq.push(QE(0.0f, i));
+            }
+        }
+        while (!pq.empty()) {
+            const QE e = pq.top();
+            pq.pop();
+            const uint32_t i = e.second;
+            if (e.first > at_t[i]) continue;
+            for (int d = 0; d < 6; ++d) {
+                auto it = at.find(cell_key(cx[i] + kD6[d][0], cy[i] + kD6[d][1], cz[i] + kD6[d][2]));
+                if (it == at.end() || dist[it->second] == 0xFFFF) continue;
+                const float step = kD6[d][1] < 0 ? kFillDown : (kD6[d][1] > 0 ? kFillUp : kFillSide);
+                const float t = e.first + step;
+                if (t < at_t[it->second]) {
+                    at_t[it->second] = t;
+                    pq.push(QE(t, it->second));
+                }
+            }
+        }
+        ++animated_;
+    }
     for (uint32_t i = 0; i < n; ++i) {
         int idx;
         Brick* b = brick_of(cx[i], cy[i], cz[i], idx);
+        const float tq = at_t[i] < 1e29f ? at_t[i] / kArriveStep + 0.5f : 0.0f;
+        b->arrive[idx] = uint8_t(tq > 255.0f ? 255.0f : tq);
+        was_wet_.erase(cell_key(cx[i], cy[i], cz[i]));
         uint8_t label = kDry;
         // Vented water joined to the sea through vented water: dist set. A
         // vented cell the water cannot reach without passing through
@@ -326,6 +379,20 @@ void SeaAccess::component(int sx, int sy, int sz) {
 // An edit can join or split a component of any size: every label goes. The
 // bricks it touched are evaluated again, and the open floors over it.
 void SeaAccess::forget(const float lo[3], const float hi[3]) {
+    // What is wet now stays wet through the relabel: the fill starts from it.
+    for (auto& kv : bricks_) {
+        const int64_t k = kv.first;
+        const int bx = int((k >> 42) & 0x1FFFFF) - (1 << 20), by = int((k >> 21) & 0x1FFFFF) - (1 << 20),
+                  bz = int(k & 0x1FFFFF) - (1 << 20);
+        for (int idx = 0; idx < kCells; ++idx) {
+            if (!((kv.second.known[idx >> 6] >> (idx & 63)) & 1u)) continue;
+            const uint8_t l = kv.second.label[idx];
+            if (l == kDry || l == kSolid) continue;
+            was_wet_.insert(cell_key(bx * kBrick + (idx & 15), by * kBrick + ((idx >> 4) & 15), bz * kBrick + (idx >> 8)));
+        }
+    }
+    have_edit_ = true;
+    for (int k = 0; k < 3; ++k) { edit_lo_[k] = lo[k]; edit_hi_[k] = hi[k]; }
     for (auto& kv : bricks_) std::memset(kv.second.known, 0, sizeof kv.second.known);
     const int c0[3] = {int(std::floor(lo[0] / kC)) - 2, int(std::floor(lo[1] / kC)) - 2, int(std::floor(lo[2] / kC)) - 2};
     const int c1[3] = {int(std::ceil(hi[0] / kC)) + 2, int(std::ceil(hi[1] / kC)) + 2, int(std::ceil(hi[2] / kC)) + 2};
@@ -407,6 +474,7 @@ void SeaAccess::evaluate_batch(const std::vector<int>& bxyz) {
         if (bricks_.count(k)) continue;
         Brick& b = bricks_[k];
         std::memset(b.label, 0, sizeof b.label);
+        std::memset(b.arrive, 0, sizeof b.arrive);
         std::memset(b.known, 0, sizeof b.known);
         const Column& c = column(bx, bz);
         const bool has_edits = has_edits_locked(bx, by, bz);

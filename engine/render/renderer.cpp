@@ -755,7 +755,7 @@ bool Renderer::create_water_pipeline(std::string& error) {
         }
         // The flood's surface mask (ADR-006 stage 3): kFloodMask^2 bytes,
         // read as uints, one a frame in flight.
-        rd.Width = UINT64(kFloodMask) * kFloodMask;
+        rd.Width = UINT64(kFloodMask) * kFloodMask * 2;   // the waves' share, then the fill's level
         for (UINT i = 0; i < kFrameCount; ++i) {
             const HRESULT ch = device_->CreateCommittedResource(
                 &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
@@ -763,7 +763,7 @@ bool Renderer::create_water_pipeline(std::string& error) {
             if (FAILED(ch)) { error = hr_text("CreateCommittedResource (flood mask)", ch); return false; }
             D3D12_RANGE none = {0, 0};
             flood_mask_[i]->Map(0, &none, &flood_mask_cpu_[i]);
-            std::memset(flood_mask_cpu_[i], 0, size_t(kFloodMask) * kFloodMask);
+            std::memset(flood_mask_cpu_[i], 0, size_t(kFloodMask) * kFloodMask * 2);
         }
     }
 
@@ -4404,6 +4404,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         // decides instead -- a flooded channel inland, a breached tunnel, an
         // air pocket -- and the surface over the eye is the flood's (the open
         // sea's waves calmed along the path in, or a pocket's floor).
+        flood_now_ = view.time;   // the fill runs on the game clock
         update_flood(view.cam_pos);
         fill_flood_mask(view.cam_pos);
         wc.flood_on = flood_mask_on_ ? 1.0f : 0.0f;
@@ -5989,7 +5990,9 @@ void Renderer::update_flood(const float cam[3]) {
             if (it != flood_.end() && it->second.gen > r.gen) continue;
             FloodBlock& fb = flood_[k];
             fb.gen = r.gen;
+            fb.t0 = flood_now_;
             std::memcpy(fb.cell, r.cell, sizeof fb.cell);
+            std::memcpy(fb.arrive, r.arrive, sizeof fb.arrive);
         }
         res.clear();
     };
@@ -6047,8 +6050,17 @@ void Renderer::flood_settle() {
         FloodBlock& fb = flood_[fl_key(r.b[0], r.b[1], r.b[2])];
         if (fb.gen > r.gen) continue;
         fb.gen = r.gen;
+        fb.t0 = flood_now_;
         std::memcpy(fb.cell, r.cell, sizeof fb.cell);
+        std::memcpy(fb.arrive, r.arrive, sizeof fb.arrive);
     }
+}
+
+// The fill (sea_access.h): a wet cell is water once the clock passes its
+// arrival. (A load or a place approached is timed 0: shown whole at once.)
+bool Renderer::flood_arrived(const FloodBlock& b, int idx) const {
+    if (b.arrive[idx] == 0) return true;
+    return flood_now_ >= b.t0 + double(b.arrive[idx]) * double(SeaAccess::kArriveStep);
 }
 
 int Renderer::flood_label(int x, int y, int z, uint8_t& code) const {
@@ -6056,7 +6068,11 @@ int Renderer::flood_label(int x, int y, int z, uint8_t& code) const {
     const int bx = fl_floor_div(x, K), by = fl_floor_div(y, K), bz = fl_floor_div(z, K);
     auto it = flood_.find(fl_key(bx, by, bz));
     if (it == flood_.end()) return 0;
-    code = it->second.cell[((z - bz * K) * K + (y - by * K)) * K + (x - bx * K)];
+    const int idx = ((z - bz * K) * K + (y - by * K)) * K + (x - bx * K);
+    code = it->second.cell[idx];
+    // Not reached yet: dry air for now, so the surface over the water already
+    // in is the front's (water_at's pocket branch) and rises with it.
+    if (code != SeaAccess::kDry && code != SeaAccess::kSolid && !flood_arrived(it->second, idx)) code = SeaAccess::kDry;
     return 1;
 }
 
@@ -6112,7 +6128,10 @@ void Renderer::fill_flood_mask(const float cam[3]) {
     const float sea = world_.params().sea_level;
     const int ys = int(std::floor((sea - 0.25f) / kFlC));
     const int by = fl_floor_div(ys, K), ly = ys - by * K;
-    std::vector<uint8_t> buf(size_t(N) * N, 0);
+    // Two planes: the waves' share where the column's top cell under sea
+    // level will be water, and (the fill) how far under sea level the water
+    // stands there NOW, in 0.1 m (255: none in yet) -- the sheet drops to it.
+    std::vector<uint8_t> buf(size_t(N) * N * 2, 0);
     bool any = false;
     for (int bz = 0; bz < N / K; ++bz)
         for (int bx = 0; bx < N / K; ++bx) {
@@ -6120,11 +6139,30 @@ void Renderer::fill_flood_mask(const float cam[3]) {
             if (it == flood_.end()) continue;
             for (int k = 0; k < K; ++k)
                 for (int i = 0; i < K; ++i) {
-                    const uint8_t c = it->second.cell[(k * K + ly) * K + i];
+                    const int ci = (k * K + ly) * K + i;
+                    const uint8_t c = it->second.cell[ci];
                     if (c == SeaAccess::kDry || c == SeaAccess::kSolid) continue;
                     const float w = std::exp(-float(c - 1) * kFlC / kFloodWaveFalloff);
-                    buf[size_t(bz * K + k) * N + size_t(bx * K + i)] = uint8_t((std::max)(1, int(w * 255.0f + 0.5f)));
+                    const size_t mi = size_t(bz * K + k) * N + size_t(bx * K + i);
+                    buf[mi] = uint8_t((std::max)(1, int(w * 255.0f + 0.5f)));
                     any = true;
+                    // The front: down the column to the highest cell the
+                    // water has reached (at most 25 m).
+                    uint8_t lv = 0;
+                    if (!flood_arrived(it->second, ci)) {
+                        lv = 255;
+                        const int x = ox + bx * K + i, z = oz + bz * K + k;
+                        for (int y = ys - 1; y >= ys - 50; --y) {
+                            uint8_t u = 0;
+                            if (!flood_label(x, y, z, u) || u == SeaAccess::kSolid) break;
+                            if (u != SeaAccess::kDry) {
+                                const float d = sea - (float(y) * kFlC + 0.25f);
+                                lv = uint8_t((std::min)(254.0f, (std::max)(0.0f, d * 10.0f + 0.5f)));
+                                break;
+                            }
+                        }
+                    }
+                    buf[size_t(N) * N + mi] = lv;
                 }
         }
     std::memcpy(m, buf.data(), buf.size());

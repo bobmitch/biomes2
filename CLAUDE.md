@@ -3477,8 +3477,25 @@ held no such cell and the water could not get down it.
   is the mutant -- stages 1-2 only -- and fails the channel, the breach and
   the passage. Worker time for the whole test ~200 ms, 0.9 M lattice
   points evaluated.
-- **Not done**: the water appears as soon as the worker answers (a frame or
-  a few) rather than rising; a pocket's own water surface below sea level
+- **The fill (a prototype)**: after an edit lets the sea in, the water
+  ARRIVES. The worker times every newly wet cell of the component the edit
+  touched by a Dijkstra search from the cells beside the open sea and those
+  wet before the edit, with gravity in the step costs (`kFillDown` 0.05 s a
+  0.5 m cell, `kFillSide` 0.08, `kFillUp` 0.16): it pours down, runs along
+  the floor, rises last. Each result carries the times (`arrive`, 0.1 s
+  steps); the main thread counts a wet cell from its answer's arrival on
+  the GAME clock (`flood_arrived`), so physics, the eye and the mask all
+  see the front, and a pocket-style surface over it rises with it. The mask
+  has a second plane, the front's depth under sea level per column, and the
+  sheet drops to it (still water). Anything labelled away from the latest
+  edit, or after a load, is shown whole at once. `--flood-test` case H: the
+  breached tunnel 18 m from the breach wet after 3.7 s, its shaft's foot
+  40 m off after 8.6 s, neither at once; `build/flood_fill_10s.bmp` and
+  `_13s` show the shaft filling. Not done: the per-column front steps in
+  0.5 m blocks where neighbours stand at different levels, and clips the
+  swash in squares; speed does not depend on the breach's size; pooling is
+  approximated by the slower step up, not by volume.
+- **Not done**: a pocket's own water surface below sea level
   is not drawn (physics has it); the underwater pass dims light down to sea
   level, not to a pocket's floor; the mask reaches 64 m round the camera,
   so a flooded channel further off draws dry; the beach's foam stops in a

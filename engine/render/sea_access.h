@@ -56,6 +56,7 @@
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace engine {
@@ -76,7 +77,19 @@ public:
         int b[3];
         uint64_t gen;
         uint8_t cell[kCells];   // (x + 16 y + 256 z): kDry, kSolid, or 1 + cells (0.5 m) to the open sea
+        // THE FILL (ADR-006, the shown fill): when the water reaches a wet
+        // cell after the edit that let it in, in kArriveStep seconds from the
+        // moment the answer lands (255: that or later). 0 for water that was
+        // there before the edit, and for anything labelled away from the
+        // latest edit (approached, loaded): only a breach is watched filling.
+        uint8_t arrive[kCells];
     };
+    static constexpr float kArriveStep = 0.1f;
+    // Seconds for the water to cross one 0.5 m cell: falling, spreading
+    // along a floor, and rising (which a cell does once the water has pooled
+    // below it -- approximated by a slower step up). A Dijkstra search from
+    // the breach over the wet cells with these step costs.
+    static constexpr float kFillDown = 0.05f, kFillSide = 0.08f, kFillUp = 0.16f;
 
     ~SeaAccess() { shutdown(); }
     void init(const WorldGpu* world, const BrickStore* edits, float sea_level);
@@ -98,6 +111,7 @@ public:
 
     // Diagnostics over the life of the object.
     unsigned long long components() const { return components_.load(); }
+    unsigned long long animated() const { return animated_.load(); }   // components whose fill was timed
     unsigned long long capped() const { return capped_.load(); }
     unsigned long long cells_searched() const { return cells_searched_.load(); }
     unsigned long long points_evaluated() const { return points_evaluated_.load(); }
@@ -108,6 +122,7 @@ private:
     struct Brick {
         uint8_t st[kCells];
         uint8_t label[kCells];
+        uint8_t arrive[kCells];
         uint64_t known[kCells / 64];
     };
     struct Column {
@@ -150,6 +165,12 @@ private:
     std::unordered_map<int64_t, Column> columns_;
     std::unordered_map<int64_t, int> floor_;
     uint64_t worker_gen_ = 0;
+    // The fill: cells wet before the latest edit (their water is already
+    // there: arrival 0), and the edit itself (only a component touching it
+    // is watched filling; any other is shown whole at once).
+    std::unordered_set<int64_t> was_wet_;
+    bool  have_edit_ = false;
+    float edit_lo_[3] = {0, 0, 0}, edit_hi_[3] = {0, 0, 0};
 
     mutable std::shared_mutex edits_mutex_;
     mutable std::mutex mutex_;
@@ -161,6 +182,7 @@ private:
     std::thread thread_;
     std::atomic<uint64_t> gen_{1};
 
+    std::atomic<unsigned long long> animated_{0};
     std::atomic<unsigned long long> components_{0}, capped_{0}, cells_searched_{0}, points_evaluated_{0};
     std::atomic<unsigned long long> us_{0};
 };

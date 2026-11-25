@@ -108,6 +108,16 @@ float flood_at(float2 p) {
     return b == 0u ? -1.0f : float(b) / 255.0f;
 }
 
+// The fill: metres under sea level the water stands at in a flooded column
+// right now (0 full, -1 none in yet). Only where flood_at says water.
+float flood_level(float2 p) {
+    const int2 c = int2(floor((p - flood_origin) / 0.5f + 0.5f));
+    if (any(c < 0) || any(c >= 256)) return 0.0f;
+    const uint i = uint(65536 + c.y * 256 + c.x);
+    const uint b = (g_flood[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu;
+    return b == 255u ? -1.0f : float(b) * 0.1f;
+}
+
 #include "engine/render/shaders/lighting.hlsli"
 #include "engine/render/atmosphere.h"
 #include "engine/render/shaders/haze.hlsli"
@@ -253,10 +263,14 @@ VSOut vs_main(uint vid : SV_VertexID) {
     // train). A flooded land column has no generated depth to tame the
     // waves with; 2 m stands in, the waves already calmed by the path.
     float fade_w = fade;
+    float fill_drop = 0.0f;    // the fill: how far under sea level the water stands now
     {
-        const float fl = flood_at(rest);
+        // None in yet: as if the flood had no word (the column rule).
+        const float fl = flood_level(rest) < 0.0f ? -1.0f : flood_at(rest);
         if (fl >= 0.0f) {
             fade_w = fade * fl;
+            const float lv = flood_level(rest);
+            if (lv > 0.0f) { fill_drop = lv; fade_w = 0.0f; }   // rising water is still
             // Only a LAND column: the open beach beside a channel keeps its
             // own shallow depth, its swash and its foam.
             if (depth < 0.0f) depth = 2.0f;
@@ -277,7 +291,7 @@ VSOut vs_main(uint vid : SV_VertexID) {
     // it: the edge is cut per pixel (edge_fade, in the pixel shader), which
     // can only cut away water that was drawn.
     if (depth + swash > -0.3f) y = max(y, 0.12f - depth);
-    const float3 world = float3(p.x, sea_level + y, p.z);
+    const float3 world = float3(p.x, sea_level + y - fill_drop, p.z);
 
     o.world = world;
     o.clip = mul(float4(world, 1.0f), view_proj);

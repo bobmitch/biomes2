@@ -5264,10 +5264,50 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         }
         // The breach: a hole from the seabed down into the tunnel's far end.
         for (float y = hgt(28.0f, -20.0f) + 0.5f; y >= yc; y -= 1.0f) dig_at(28.0f, -20.0f, y, 1.6f);
+        // H. The fill: the water must ARRIVE, not appear. Frames until the
+        // flood has answered, then the tunnel 18 m from the breach and its
+        // shaft 40 m off are watched on the game clock: dry at first, wet
+        // later, the near point before the far one.
+        bool pass_h = true;
         {
             float p[2];
             pt(10.0f, -20.0f, p);
-            settle(p[0], yc - kTR + 0.3f, p[1], 60);
+            g_physics.place_character(p[0], yc - kTR + 0.3f, p[1]);
+            frame();
+            g_renderer.flood_settle();
+            frame();
+            const float t_ans = t;
+            float t_near = -1.0f, t_far = -1.0f;
+            bool near0 = false, far0 = false;
+            for (int i = 0; i < 1200 && (t_near < 0.0f || t_far < 0.0f || t - t_ans < 13.5f); ++i) {
+                const Q qn = ask(10.0f, -20.0f, yc - kTR + 0.25f);
+                const Q qf = ask(-12.0f, -20.0f, yc - kTR + 0.25f);
+                if (i == 0) { near0 = qn.q == 1; far0 = qf.q == 1; }
+                if (t_near < 0.0f && qn.q == 1) t_near = t - t_ans;
+                if (t_far < 0.0f && qf.q == 1) t_far = t - t_ans;
+                // Stills of the shaft from above as it fills, 10 s and 13 s in.
+                const float since = t - t_ans;
+                for (int si = 0; si < 2; ++si) {
+                    const float at_s = si == 0 ? 10.0f : 13.0f;
+                    if (since >= at_s && since < at_s + kDt) {
+                        float q2[2];
+                        pt(-12.0f, -20.0f, q2);
+                        engine::Camera c = g_camera;
+                        c.x = q2[0] + 0.5f; c.z = q2[1]; c.y = hgt(-12.0f, -20.0f) + 4.0f;
+                        c.yaw = 0.0f; c.pitch = -1.45f;
+                        engine::ViewConstants cv = {};
+                        fill_view(c, g_res_w, g_res_h, t, cv);
+                        std::string e3;
+                        g_renderer.capture(cv, si == 0 ? "build/flood_fill_10s.bmp" : "build/flood_fill_13s.bmp", e3);
+                    }
+                }
+                frame();
+            }
+            std::fprintf(f, "H. the fill after the breach: the tunnel floor 18 m from it wet after %.2f s, the shaft's "
+                            "foot 40 m from it after %.2f s (wet at once: %s, %s); %llu component(s) timed\n",
+                         t_near, t_far, near0 ? "YES" : "no", far0 ? "YES" : "no",
+                         g_renderer.sea_access().animated());
+            pass_h = !near0 && !far0 && t_near > 0.0f && t_far > t_near && t_far < 20.0f;
         }
         for (float s : {10.0f, -12.0f}) {
             const Q q = ask(s, -20.0f, yc - 1.0f);
@@ -5346,10 +5386,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (drawn == 0 || st.chunks_classified == 0)
             std::fprintf(f, "\nVOID RUN: %d frames drawn, %llu chunks classified\n", drawn, st.chunks_classified);
         std::fprintf(f, "\nE (a channel dug in from the coast fills): %s\nF (a vented tunnel is dry until breached): %s\n"
-                        "F (breached, it floods to sea level): %s\nG (a dome breached from below keeps its air): %s\n",
+                        "F (breached, it floods to sea level): %s\nG (a dome breached from below keeps its air): %s\n"
+                        "H (the water arrives, near before far): %s\n",
                      pass_e ? "PASS" : "FAIL", pass_f1 ? "PASS" : "FAIL", pass_f2 ? "PASS" : "FAIL",
-                     pass_g ? "PASS" : "FAIL");
-        const bool pass = pass_e && pass_f1 && pass_f2 && pass_g && drawn > 0;
+                     pass_g ? "PASS" : "FAIL", pass_h ? "PASS" : "FAIL");
+        const bool pass = pass_e && pass_f1 && pass_f2 && pass_g && pass_h && drawn > 0;
         std::fprintf(f, "%s\n", pass ? "PASS" : "FAIL");
         std::fclose(f);
         g_renderer.shutdown();
