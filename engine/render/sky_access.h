@@ -119,6 +119,7 @@ private:
         float h[kBrick * kBrick];   // the column's height at a 1 m voxel (terrain_height)
         float reach = 0.0f;         // the overhang term's largest reach here, + 1 m
         float hmin = 0.0f, hmax = 0.0f;
+        float cave_lo = 3.4e38f;    // lowest placed-cave air under the column, or 3.4e38
     };
     struct Cmd {
         enum Kind { kBlock, kInvalidate, kInvalidateAll } kind;
@@ -146,6 +147,7 @@ private:
     bool has_edits_locked(int bx, int by, int bz) const;
 
     const WorldGpu* world_ = nullptr;
+    bool placed_ = false;   // the world has placed caves (layer 7 since v19)
     const BrickStore* edits_ = nullptr;
     bool caves_ = false;
     int reach_ = 96;

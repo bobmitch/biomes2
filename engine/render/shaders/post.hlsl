@@ -548,6 +548,11 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     if (debug > 1.5f && debug < 2.5f) { c = cs.xxx; mark = 0.0f; }
     // The clouds' shadow on the key light (ADR-005 C2): white sun, dark shade.
     if (debug > 4.5f && debug < 5.5f) { c = cls.xxx; mark = 0.0f; }
+    // The two scene targets alone, in nits x 1/16 (log-ish enough to see a
+    // cave's 0.1 nits next to the day's thousands): 6 direct (the key light
+    // after every shadow), 7 everything else (sky, bounce, local lights).
+    if (debug > 5.5f && debug < 6.5f) { c = sqrt(max(dir, 0.0f)) / 16.0f; mark = 0.0f; }
+    if (debug > 6.5f && debug < 7.5f) { c = sqrt(max(amb, 0.0f)) / 16.0f; mark = 0.0f; }
     // Puddle reflections: green a hit, blue far along the ray, red the
     // terrain's sky; grey no puddle.
     if (debug > 3.5f && debug < 4.5f) {

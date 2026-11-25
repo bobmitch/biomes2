@@ -78,8 +78,8 @@ cbuffer WorldConstants : register(b1) {
 
     uint  w_s_fine;
     uint  w_s_regime;
-    float w_l0_pad0;
-    float w_l0_pad1;
+    float w_cave_wall_amp;    // placed caves' wall noise, metres (0 = none)
+    float w_cave_wall_freq;
 };
 
 // The CPU's SeedWorld::l0, rebuilt from the constants.
@@ -392,7 +392,9 @@ float real_terrain_density(float x, float y, float z, float voxel) {
 
     // Layer 7 last and outside the depth mask: the shaft is the one thing
     // allowed to reach daylight.
-    const float sd = real_nearest_entrance(x, y, z);
+    const float sd = cave_wall_sd(real_nearest_entrance(x, y, z), x, y, z,
+                                  w_cave_wall_amp, w_cave_wall_freq, w_s_entrance, voxel,
+                                  w_entrance_falloff);
     if (sd < 0.0f) d = entrance_carve(d, sd, w_entrance_falloff, w_cave_carve);
     return d;
 }

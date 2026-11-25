@@ -524,6 +524,25 @@ WG_FN float entrance_radius(float u, float mouth, float throat, float bowl, floa
     return r * (1.0f - 0.35f * tail);
 }
 
+// Placed caves (layer 7 since v19) roughen their capsule walls with one
+// octave of 3D simplex: sd plus amp x noise, so a tunnel reads as rock rather
+// than a drilled pipe. Only evaluated near a wall (sd < amp), faded out with
+// the voxel like any octave so coarse LODs see the smooth capsule. amp 0
+// returns sd unchanged, which is what keeps a world without placed caves
+// (the shafts, whose amp is 0) bit-identical.
+//
+// It also moves the carve's feathering OUTSIDE the wall (less `falloff`):
+// entrance_carve is fully open only `falloff` inside sd = 0, and under 20-30 m
+// of rock a partly open blend loses to the overburden, so a 1.8 m tunnel
+// pinched shut wherever the noise thinned it. Placed caves always have
+// amp > 0 (the table requires it), so the shift rides on the same switch.
+WG_FN float cave_wall_sd(float sd, float x, float y, float z, float amp, float freq, uint seed, float voxel, float falloff) {
+    if (amp <= 0.0f) { return sd; }
+    if (sd > amp + falloff) { return sd; }
+    const float fade = octave_weight(1.0f / freq, voxel);
+    return sd - falloff + amp * fade * simplex3(x * freq, y * freq, z * freq, seed);
+}
+
 // --- layer 8: trees ---------------------------------------------------------
 //
 // One candidate per cell of a square grid. The cell's hash decides everything

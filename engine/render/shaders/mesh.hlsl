@@ -469,7 +469,13 @@ SceneOut ps_main(VSOut i) {
     // The biome's material (ADR-004 L1): its ground on the level, its rock on
     // anything steeper than about 40 degrees. Was one hard-coded rock and
     // one green, blended by n.y squared, in every biome alike.
-    const float level = smoothstep(0.62f, 0.86f, n.y);
+    float level = smoothstep(0.62f, 0.86f, n.y);
+    // Under the real top surface (a cave, a dug tunnel) a floor is the
+    // rock's, not the meadow's: grass on a cave floor 10 m down read as a
+    // lawn. One load of the near field's top map; past its 128 m nothing is
+    // close enough to tell.
+    float under_dh;
+    if (nf_depth(i.world, under_dh)) level *= 1.0f - smoothstep(-1.0f, -2.5f, under_dh);
     const float4 mat = lerp(i.rock, i.ground, level);
     float3 albedo = mat.rgb;
     float rough = mat.a;

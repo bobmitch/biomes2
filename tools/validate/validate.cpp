@@ -88,6 +88,11 @@ struct SeedResult {
     int   entrance_mouth_sealed = 0;
     int   entrance_pinched = 0;     // sampled shaft segments still solid inside
     float entrance_reach = 0.0f;    // mean metres down to the cave it found
+    // Placed caves (layer 7 since v19): per biome, candidate cells on its dry
+    // land and how many hold a cave; caves built.
+    std::vector<int> cave_cells, cave_filled, cave_count;
+    int   caves_built = 0;
+    int   caves_breached = 0;   // run out of the rock past the mouth
     int   river_segments = 0;
     int   river_paths_total = 0, river_paths_to_ocean = 0, river_ascending = 0;
     // Layer 8, sampled: a 32 m square of candidate cells at every land cell's
@@ -322,9 +327,67 @@ static SeedResult eval_seed(uint64_t world_seed,
         if (!w.entrance_mouths.empty()) {
             out.entrance_reach = static_cast<float>(reach / w.entrance_mouths.size());
         }
-        // Every 16th segment, sampled at its midpoint. Exhaustive costs a
-        // minute over 200 seeds; --entrances does it exhaustively.
-        for (size_t m = 0; m < w.entrances.size(); m += 16) {
+        // Placed caves: every capsule's axis must be air wherever it is
+        // underground, every metre of it. The capsules chain end to start
+        // from the mouth to the last chamber, so an open axis is a walk from
+        // daylight to the chamber: reachability, not just presence.
+        out.cave_cells = w.cave_cells;
+        out.cave_filled = w.cave_filled;
+        out.cave_count.assign(table.size(), 0);
+        for (size_t m = 0; m < w.caves.size(); ++m) ++out.cave_count[size_t(w.caves[m].biome)];
+        out.caves_built = static_cast<int>(w.caves.size());
+        for (size_t m = 0; m < w.entrances.size() && !w.caves.empty(); ++m) {
+            const SeedWorld::EntranceSeg& e = w.entrances[m];
+            const float dx = e.bx - e.ax, dy = e.by - e.ay, dz = e.bz - e.az;
+            const int steps = 1 + static_cast<int>(std::sqrt(dx * dx + dy * dy + dz * dz));
+            for (int k = 0; k <= steps; ++k) {
+                const float t = static_cast<float>(k) / static_cast<float>(steps);
+                const float px = e.ax + dx * t, py = e.ay + dy * t, pz = e.az + dz * t;
+                const float rr = std::sqrt(px * px + pz * pz) / wp.radius;
+                if (py > terrain_height(w, wp, table, px, pz, rr)) continue;
+                if (terrain_density(w, wp, table, px, py, pz) > 0.0f) { ++out.entrance_pinched; break; }
+            }
+        }
+        // Placed caves: no breach. Past the mouth and its throat (the first
+        // two capsules), every metre of every capsule has at least a metre
+        // of ground over its carve (radius, feathering, wall noise) -- a
+        // tunnel that runs out under a slope or the seabed is a second,
+        // unplanned mouth, and under the sea a hole onto lit water.
+        for (size_t m = 0; m < w.caves.size(); ++m) {
+            const SeedWorld::Cave& c = w.caves[m];
+            bool breached = false;
+            for (int k = c.sealed ? 0 : 2; k < c.seg_count && !breached; ++k) {
+                // The tunnel's first capsules inside twice the mouth's radius
+                // are the mouth's own reach, as build_caves exempts them.
+                if (!c.sealed && static_cast<float>(k - 1) * table.caves.segment <=
+                                     2.0f * w.entrances[static_cast<size_t>(c.seg_begin)].ra) continue;
+                const SeedWorld::EntranceSeg& e = w.entrances[static_cast<size_t>(c.seg_begin + k)];
+                const float dx = e.bx - e.ax, dy = e.by - e.ay, dz = e.bz - e.az;
+                const int steps = 1 + static_cast<int>(std::sqrt(dx * dx + dy * dy + dz * dz));
+                // From a quarter along, as build_caves checks it: each capsule's
+                // start is the one before's end, and the first tunnel
+                // capsule's start is the throat, the mouth's own lip.
+                for (int q = (steps + 3) / 4; q <= steps && !breached; ++q) {
+                    const float t = static_cast<float>(q) / static_cast<float>(steps);
+                    const float px = e.ax + dx * t, py = e.ay + dy * t, pz = e.az + dz * t;
+                    const float r = e.ra + (e.rb - e.ra) * t + wp.entrance_falloff + w.cave_wall_amp;
+                    const float rr = std::sqrt(px * px + pz * pz) / wp.radius;
+                    // Under the REAL surface: layer 6's overhang term can drop
+                    // it up to strength x overhang_scale under the 2.5D height.
+                    int bio[8];
+                    float bw[8];
+                    const int nb = biome_mix(w, wp, px, pz, bio, bw);
+                    float ov = 0.0f;
+                    for (int b2 = 0; b2 < nb; ++b2) ov += bw[b2] * table[bio[b2]].overhang_strength;
+                    if (terrain_height(w, wp, table, px, pz, rr) - ov * wp.overhang_scale - (py + r) < 1.0f)
+                        breached = true;
+                }
+            }
+            if (breached) ++out.caves_breached;
+        }
+        // Shafts: every 16th segment, sampled at its midpoint. Exhaustive
+        // costs a minute over 200 seeds; --entrances does it exhaustively.
+        for (size_t m = 0; m < w.entrances.size() && w.caves.empty(); m += 16) {
             const SeedWorld::EntranceSeg& e = w.entrances[m];
             const float mx = 0.5f * (e.ax + e.bx);
             const float my = 0.5f * (e.ay + e.by);
@@ -637,6 +700,12 @@ static SeedResult eval_seed(uint64_t world_seed,
         // in metres.
         h = fnv1a(h, static_cast<uint64_t>(w.entrance_count));
         lh[2] = fnv1a(lh[2], static_cast<uint64_t>(w.entrance_count));
+        // Placed caves add their identities (empty, nothing: the shipping
+        // hash before v19 does not move).
+        for (size_t m = 0; m < w.caves.size(); ++m) {
+            h = fnv1a(h, static_cast<uint64_t>(w.caves[m].id));
+            lh[2] = fnv1a(lh[2], static_cast<uint64_t>(w.caves[m].id));
+        }
         for (size_t m = 0; m < w.entrances.size(); ++m) {
             const SeedWorld::EntranceSeg& e = w.entrances[m];
             h = fnv1a(h, static_cast<uint64_t>(static_cast<int64_t>(e.ax * 64.0f)));
@@ -914,6 +983,10 @@ struct Summary {
     int   entrance_mouths_sealed = 0, entrance_segs_pinched = 0;
     int   min_entrance_trunks = 1 << 30;
     float mean_entrance_trunks = 0.0f, mean_entrance_reach = 0.0f;
+    std::vector<int> cave_cells, cave_filled, cave_count;   // placed caves, summed over seeds
+    int   caves_built = 0;
+    int   caves_breached = 0;
+    bool  placed_caves = false;
     std::vector<double> tree_per_ha;  // per biome, mean over seeds that have it
     std::vector<int>    tree_seeds;   // seeds each biome appeared in
     int   tree_failures = 0;          // set after the loop; see the trees check
@@ -1011,7 +1084,23 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
         // rather than a broken layer.
         // With caves off (every cave_density 0) the check inverts: a single
         // shaft would be a hole in the ground that leads nowhere.
-        if (caves_enabled(table)) {
+        if (r.caves_built > 0 || !r.cave_cells.empty()) {
+            if (r.entrance_mouth_sealed > 0 || r.entrance_pinched > 0 || r.caves_breached > 0)
+                ++sm.entrance_failures;
+            sm.caves_breached += r.caves_breached;
+            if (sm.cave_cells.empty()) {
+                sm.cave_cells.assign(r.cave_cells.size(), 0);
+                sm.cave_filled.assign(r.cave_filled.size(), 0);
+                sm.cave_count.assign(r.cave_filled.size(), 0);
+            }
+            for (size_t b = 0; b < r.cave_cells.size(); ++b) {
+                sm.cave_cells[b] += r.cave_cells[b];
+                sm.cave_filled[b] += r.cave_filled[b];
+                sm.cave_count[b] += r.cave_count[b];
+            }
+            sm.caves_built += r.caves_built;
+            sm.placed_caves = true;
+        } else if (caves_enabled(table)) {
             if (r.entrance_trunks < 8 || r.entrance_mouth_sealed > 0 ||
                 r.entrance_pinched > 0) ++sm.entrance_failures;
         } else if (r.entrance_trunks != 0 || r.entrance_segs != 0) {
@@ -1210,6 +1299,19 @@ static Summary run(int nseeds, const WorldParams& wp, const ArchetypeTable& tabl
         sm.tree_failures = fails;
     }
     sm.mean_entrance_trunks *= inv; sm.mean_entrance_reach *= inv;
+    // Placed caves' guarantee: at least 90% of the cells whose centre stands
+    // on a biome's dry land hold a cave, for every biome that has caves.
+    if (sm.placed_caves) {
+        for (size_t b = 0; b < sm.cave_cells.size(); ++b) {
+            if (table[b].cave_per_km2 <= 0.0f) continue;
+            // Caves of the biome per km2 of its dry land. The land is the
+            // candidate cells (centre on its dry land) times a cell's area,
+            // 1 / per_km2 km2 each, so the density is count / cells x
+            // per_km2. Every cave counts, edge cells included: a cell whose
+            // centre is sea can still hold its biome's cave.
+            if (sm.cave_cells[b] == 0 || sm.cave_count[b] < 0.9 * sm.cave_cells[b]) ++sm.entrance_failures;
+        }
+    }
     sm.mean_cave_fraction *= inv; sm.mean_overhang_cols *= inv;
     sm.mean_home_share *= inv; sm.mean_landmasses *= inv;
     sm.mean_raw_land *= inv; sm.mean_knee_land *= inv; sm.mean_knee_ms *= inv;
@@ -1729,6 +1831,8 @@ int main(int argc, char** argv) {
     bool tree_sites = false;
     uint64_t tree_sites_seed = 0;
     bool entrance_section = false;
+    bool cave_sites = false;
+    unsigned long long cave_sites_seed = 0;
     bool section = false;
     uint64_t section_seed = 0;
     float section_width = 4000.0f;
@@ -1824,12 +1928,18 @@ int main(int argc, char** argv) {
             wp.regime_amp_lo = static_cast<float>(std::atof(argv[++i]));
             wp.regime_amp_hi = static_cast<float>(std::atof(argv[++i]));
         }
+        else if (!std::strcmp(argv[i], "--caves"))                   wp.placed_caves = true;
+        else if (!std::strcmp(argv[i], "--no-caves"))                wp.placed_caves = false;
         else if (!std::strcmp(argv[i], "--shelf-depth") && i + 1 < argc)  wp.shelf_depth = static_cast<float>(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--shelf-width") && i + 1 < argc)  wp.shelf_width = static_cast<float>(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--shelf-regime") && i + 1 < argc) wp.shelf_regime = static_cast<float>(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--knee"))                         wp.knee = true;
         else if (!std::strcmp(argv[i], "--knee-k") && i + 1 < argc)       wp.knee_k = static_cast<float>(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--knee-c") && i + 1 < argc)       wp.knee_c = static_cast<float>(std::atof(argv[++i]));
+        else if (!std::strcmp(argv[i], "--cave-sites") && i + 1 < argc) {
+            cave_sites = true;
+            cave_sites_seed = std::strtoull(argv[++i], nullptr, 10);
+        }
         else if (!std::strcmp(argv[i], "--dump-seeds") && i + 1 < argc) {
             dump_world_seed = std::strtoull(argv[++i], nullptr, 10);
             dump = true;
@@ -1844,6 +1954,67 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("archetypes: %d biomes, invariants OK\n", static_cast<int>(table.size()));
+
+    if (cave_sites) {
+        // Every placed cave of one seed, nearest the spawn first: for a --cam.
+        // Placed caves only exist with --caves (until v19 ships them).
+        const SeedWorld cw = build_world(cave_sites_seed, wp, table, ap);
+        const SpawnPoint sp = find_spawn(cw, wp, table);
+        std::vector<std::pair<float, int> > order;
+        for (size_t m = 0; m < cw.caves.size(); ++m) {
+            const float dx = cw.caves[m].x - sp.x, dz = cw.caves[m].z - sp.z;
+            order.push_back(std::make_pair(std::sqrt(dx * dx + dz * dz), static_cast<int>(m)));
+        }
+        std::sort(order.begin(), order.end());
+        std::printf("seed %llu: %d caves, spawn (%.0f, %.0f)\n", (unsigned long long)cave_sites_seed,
+                    static_cast<int>(cw.caves.size()), sp.x, sp.z);
+        for (size_t b = 0; b < cw.cave_unfilled.size(); ++b)
+            if (table[b].cave_per_km2 > 0.0f)
+                std::printf("%s: %d caves, %d cells owed one and got none\n", table[b].name.c_str(),
+                            static_cast<int>(std::count_if(cw.caves.begin(), cw.caves.end(),
+                                [&](const SeedWorld::Cave& c) { return c.biome == static_cast<int>(b); })),
+                            cw.cave_unfilled[b]);
+        std::printf("unfilled cells' failed spots: outside %d, biome %d, sea %d, slope %d, river %d, flat %d, shape %d\n",
+                    cw.cave_reject[0], cw.cave_reject[1], cw.cave_reject[2], cw.cave_reject[3],
+                    cw.cave_reject[4], cw.cave_reject[5], cw.cave_reject[6]);
+        // Every breached cave first: which capsule (of how many) and by how much.
+        for (size_t m = 0; m < cw.caves.size(); ++m) {
+            const SeedWorld::Cave& c = cw.caves[m];
+            for (int k = c.sealed ? 0 : 2; k < c.seg_count; ++k) {
+                if (!c.sealed && static_cast<float>(k - 1) * table.caves.segment <=
+                                     2.0f * cw.entrances[static_cast<size_t>(c.seg_begin)].ra) continue;
+                const SeedWorld::EntranceSeg& e = cw.entrances[static_cast<size_t>(c.seg_begin + k)];
+                const float dx = e.bx - e.ax, dy = e.by - e.ay, dz = e.bz - e.az;
+                const int steps = 1 + static_cast<int>(std::sqrt(dx * dx + dy * dy + dz * dz));
+                float worst = 1.0e9f;
+                for (int q = (steps + 3) / 4; q <= steps; ++q) {
+                    const float t = static_cast<float>(q) / static_cast<float>(steps);
+                    const float px = e.ax + dx * t, py = e.ay + dy * t, pz = e.az + dz * t;
+                    const float r = e.ra + (e.rb - e.ra) * t + wp.entrance_falloff + cw.cave_wall_amp;
+                    int bio[8];
+                    float bw[8];
+                    const int nb = biome_mix(cw, wp, px, pz, bio, bw);
+                    float ov = 0.0f;
+                    for (int b2 = 0; b2 < nb; ++b2) ov += bw[b2] * table[bio[b2]].overhang_strength;
+                    const float rr = std::sqrt(px * px + pz * pz) / wp.radius;
+                    const float c2 = terrain_height(cw, wp, table, px, pz, rr) - ov * wp.overhang_scale - (py + r);
+                    if (c2 < worst) worst = c2;
+                }
+                if (worst < 1.0f)
+                    std::printf("  BREACH %s cave at (%.0f, %.0f): capsule %d of %d (r %.1f..%.1f, length %.1f), cover %.2f m\n",
+                                table[c.biome].name.c_str(), c.x, c.z, k, c.seg_count, e.ra, e.rb,
+                                std::sqrt(dx * dx + dy * dy + dz * dz), worst);
+            }
+        }
+        for (size_t o = 0; o < order.size() && o < 40; ++o) {
+            const SeedWorld::Cave& c = cw.caves[order[o].second];
+            std::printf("  %-9s %5.0f m from spawn  mouth (%.1f, %.1f, %.1f) heading (%.2f, %.2f)  "
+                        "tunnel %3.0f m  floor %5.1f (%4.1f m down)  chamber (%.1f, %.1f, %.1f)  %d capsules%s\n",
+                        table[c.biome].name.c_str(), order[o].first, c.x, c.y, c.z, c.hx, c.hz, c.length,
+                        c.floor_y, c.y - c.floor_y, c.cx, c.cy, c.cz, c.seg_count, c.sealed ? "  SEALED" : "");
+        }
+        return 0;
+    }
 
     // M2: the gate and the pin, both on their own. These return straight out
     // -- the 200-seed sweep below asks a different question (is this world any
@@ -2675,7 +2846,26 @@ int main(int argc, char** argv) {
                           s.mean_flats, per.c_str(), s.flat_mean_radius, s.flat_worst_pad, s.flat_worst_rim);
             line("flat sites", s.flat_failures == 0, d);
         }
-        if (caves_enabled(table)) {
+        if (s.placed_caves) {
+            // The guarantee: of the cells whose centre stands on a biome's
+            // dry land, at least 90% hold a cave, for every biome with caves.
+            std::string per;
+            int under = 0;
+            for (size_t b = 0; b < s.cave_cells.size(); ++b) {
+                if (table[b].cave_per_km2 <= 0.0f) continue;
+                const double share = s.cave_cells[b] > 0 ? double(s.cave_filled[b]) / s.cave_cells[b] : 0.0;
+                const double dens = s.cave_cells[b] > 0 ? table[b].cave_per_km2 * double(s.cave_count[b]) / s.cave_cells[b] : 0.0;
+                if (dens < 0.9 * table[b].cave_per_km2) ++under;
+                char t[160];
+                std::snprintf(t, sizeof(t), " %s %.2f/km2 of %.1f (cells filled %.0f%%)", table[b].name.c_str(),
+                              dens, table[b].cave_per_km2, 100.0 * share);
+                per += t;
+            }
+            std::snprintf(d, sizeof(d), "placed: %.1f caves/seed; density%s (floor 90%% of per_km2); "
+                          "%.0f m mean depth; %d mouths sealed, %d caves blocked on the way in, %d breached",
+                          double(s.caves_built) / std::max(1, s.seeds), per.c_str(), s.mean_entrance_reach,
+                          s.entrance_mouths_sealed, s.entrance_segs_pinched, s.caves_breached);
+        } else if (caves_enabled(table)) {
             std::snprintf(d, sizeof(d), "%.1f shafts/seed (min %d, floor 8), reaching cave air "
                           "%.0f m down; %d mouths sealed, %d sampled segments still solid",
                           s.mean_entrance_trunks, s.min_entrance_trunks, s.mean_entrance_reach,

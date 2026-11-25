@@ -91,7 +91,16 @@ namespace worldgen {
 //      -0.05442. 200 seeds: 34.4 landmasses a seed (8.1), the spawn's
 //      holding 21.6% of the land (66.9%), 29.4% land (32.1%), 2.8 flat
 //      sites (19.1), 66 river segments (356).
-static const int kGeneratorVersion = 18;
+//  19  caves come back as PLACED features (layer 7, docs/worldgen-design.md):
+//      per biome a jittered grid of 1 km / sqrt(per_km2) cells, the first spot
+//      deciding whether a cell owes a cave, retried for a workable one; each
+//      a pure function of its cell -- a mouth bowl, a winding tunnel that
+//      descends at a walkable grade, chambers of overlapping capsules --
+//      carved in the old shafts' buffers with wall noise and the feathering
+//      outside the wall. Meadows 1/km2 (shallow, big mouth), forest 2/km2
+//      (long tunnel, a cavern). Trees and rocks keep off a mouth. The shafts
+//      and the ridged tunnels stay off. Hashed by their buffer and ids.
+static const int kGeneratorVersion = 19;
 
 }  // namespace worldgen
 

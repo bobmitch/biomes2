@@ -46,7 +46,8 @@ enum FeatureId : uint32_t {
     FEATURE_REGIME       = 17u,    // the regime field's noise
     FEATURE_REGIME_SCALE = 18u,    // per-seed draw: regime feature size
     FEATURE_REGIME_MEAN  = 19u,    // per-seed draw: regime mean
-    FEATURE_REGIME_AMP   = 20u     // per-seed draw: regime amplitude
+    FEATURE_REGIME_AMP   = 20u,    // per-seed draw: regime amplitude
+    FEATURE_CAVES        = 21u     // placed caves: which spot in a cell, and the shape's rolls
 };
 
 inline uint64_t hash64(uint64_t x) {
@@ -173,6 +174,12 @@ struct WorldParams {
     float entrance_bowls     = 3.5f;      // chambers along the shaft
     float entrance_falloff   = 1.5f;      // metres of feathering at the tube wall
     float entrance_branch_p  = 0.6f;      // chance of a dead-end side passage
+
+    // Placed caves (docs/worldgen-design.md, layer 7 since v19): per-biome
+    // features from archetypes.json's caves blocks, carried in the entrance
+    // buffers in place of the shafts, which are not built. On since v19;
+    // BIOMES_L0 "caves=0" (or validate --no-caves) turns them off for A/B.
+    bool  placed_caves       = true;
 };
 
 // Layer 0's parameters for one seed, before the knee: WorldParams plus the
@@ -331,7 +338,7 @@ struct SeedWorld {
     uint32_t s_overhang = 0, s_cave = 0, s_entrance = 0;
     uint32_t s_trees = 0, s_tree_patch = 0;
     uint32_t s_rocks = 0, s_rock_patch = 0;
-    uint32_t s_detail = 0, s_flats = 0;
+    uint32_t s_detail = 0, s_flats = 0, s_caves = 0;
     float    land_fraction = 0.0f;
     // Layer 0 as this seed uses it: draws made, knee applied.
     Layer0Params l0;
@@ -389,6 +396,29 @@ struct SeedWorld {
     std::vector<EntranceMouth> entrance_mouths;
     int   entrance_count = 0;      // trunks; each reaches cave air by construction
     int   entrance_tries_used = 0;
+    // Placed caves (layer 7 since v19): one per filled candidate cell, its
+    // capsules a run of entrances[] (and an entrance_mouths entry, so the
+    // old readers keep working). Pure functions of (biome, i, j).
+    struct Cave {
+        uint32_t id;               // cave_id(biome, i, j)
+        int   biome;
+        float x, y, z;             // the mouth: where it breaks the ground (y the ground)
+        float hx, hz;              // initial heading
+        float floor_y;             // the (last) chamber's floor
+        float cx, cy, cz;          // the (last) chamber's centre
+        float length;              // metres of tunnel, mouth to chamber
+        bool  sealed;              // no mouth: a pocket only digging finds
+        int   seg_begin, seg_count;
+    };
+    std::vector<Cave> caves;
+    // Per biome: candidate cells whose centre stands on its dry land, and
+    // how many of those hold a cave. The guarantee validate asserts.
+    std::vector<int> cave_cells, cave_filled;
+    // Why tried spots failed, summed over the cells that owed a cave and
+    // ended with none: outside, biome, sea, slope, river, flat, shape.
+    int cave_reject[7] = {0, 0, 0, 0, 0, 0, 0};
+    std::vector<int> cave_unfilled;   // per biome: cells that owed a cave and ended with none
+    float cave_wall_amp = 0.0f, cave_wall_freq = 0.2f;   // 0 amp: no wall noise
     int   egrid_n = 0;
     float egrid_cell = 0.0f;
     std::vector<std::vector<int> > egrid;
@@ -438,6 +468,11 @@ void build_flats(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& tabl
 // the test past the shoulder (trees and rocks keep clear by tree_clear).
 int flat_site_at(const SeedWorld& w, float x, float z, float margin);
 
+// Whether (x, z) is within a placed cave's mouth bowl (1.6 x its radius,
+// which covers the bowl's reach along the heading) plus margin. Trees and
+// rocks keep clear.
+bool cave_mouth_near(const SeedWorld& w, float x, float z, float margin);
+
 // A site's identity, a pure function of its candidate cell.
 inline uint32_t flat_id(int i, int j) {
     return (static_cast<uint32_t>(i) & 0xFFFFu) | ((static_cast<uint32_t>(j) & 0xFFFFu) << 16);
@@ -454,6 +489,23 @@ float nearest_entrance(const SeedWorld& w, const WorldParams& wp,
 // their 360 m and find nothing. Read by validate and the engine too, so the
 // whole pipeline agrees on what "caves off" means.
 bool caves_enabled(const ArchetypeTable& table);
+
+// A placed cave's identity: biome (5 bits) and its candidate cell.
+inline uint32_t cave_id(int biome, int i, int j) {
+    return (static_cast<uint32_t>(biome & 31) << 27) |
+           ((static_cast<uint32_t>(i + 4096) & 0x1FFFu) << 14) |
+           (static_cast<uint32_t>(j + 8192) & 0x3FFFu);
+}
+
+// Placed caves (layer 7 since v19). Replaces build_entrances when
+// wp.placed_caves; builds nothing when no biome has caves.per_km2 > 0.
+void build_caves(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table);
+
+// The lowest point any cave capsule (radius and wall noise included) reaches
+// under the XZ box, less pad; +3.4e38 when none reaches under it. What the
+// streamer's band and the sky-access flood pad a column by, instead of one
+// global depth for every column.
+float cave_bottom_in_box(const SeedWorld& w, float x0, float z0, float x1, float z1, float pad);
 
 // Layer 7. Runs after the drainage, because the walk descends against the
 // finished heightfield, and writes into w.entrances only once every walk is

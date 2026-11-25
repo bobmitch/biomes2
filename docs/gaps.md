@@ -260,6 +260,23 @@ Last gathered: 2026-11-21, after the exploration fog.
   trees' draw distance a site's glade is covered by the shell's canopy
   (sites are 1-3 of its 20 m texels). [Micro-relief and flat sites]
 
+## Placed caves (v19)
+
+- **Only meadows and forest have caves**, and nothing is in them yet: no
+  resources, no danger, no sealed pockets (`sealed` is built, 0 everywhere,
+  waiting for a way to find one).
+- **Floors are the capsules' rounded bottoms**, not levelled; walkable, but a
+  wide cavern's floor is a shallow bowl.
+- **Two biomes' caves can overlap** (each biome its own grid); rare at
+  700-1000 m cells, not checked.
+- **The forest density is 1.83 a km2 for 2** (meadows 0.98 for 1): what
+  fails is mostly thin strips of forest on a coast or a border, where no
+  spot passes. Raise `per_km2` a little if the target must be met exactly.
+- **The canopy shell does not know a mouth's trees are gone**: from past the
+  trees' draw distance a forest mouth is under canopy.
+- **One flight worst frame of 14 ms** with caves on (7 ms off) over the
+  forest caves, not reproduced or run down.
+
 ## The player character
 
 - **No starts, stops or turns**: locomotion is one blend by speed, so a

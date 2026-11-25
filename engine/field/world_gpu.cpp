@@ -319,6 +319,8 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
     constants_.s_overhang = world_.s_overhang;
     constants_.s_cave = world_.s_cave;
     constants_.s_entrance = world_.s_entrance;
+    constants_.cave_wall_amp = world_.cave_wall_amp;
+    constants_.cave_wall_freq = world_.cave_wall_freq;
     constants_.cell_buckets = world_.lookup.B;
     constants_.cell_bucket_size = world_.lookup.bucket;
     constants_.river_grid = world_.rgrid_n;
@@ -401,11 +403,12 @@ void WorldGpu::column_band(float x0, float z0, float x1, float z1,
         (static_cast<unsigned long long>(static_cast<unsigned>(int(std::floor(x0))) & 0xFFFFFu)) |
         (static_cast<unsigned long long>(static_cast<unsigned>(int(std::floor(z0))) & 0xFFFFFu) << 20) |
         (static_cast<unsigned long long>(static_cast<unsigned>(int(x1 - x0)) & 0xFFFFFu) << 40);
-    float mn = 1.0e9f, mx = -1.0e9f;
+    float mn = 1.0e9f, mx = -1.0e9f, cave = 3.4e38f;
     std::unordered_map<unsigned long long, ColumnSpan>::const_iterator hit = column_cache_.find(key);
     if (hit != column_cache_.end()) {
         mn = hit->second.mn;
         mx = hit->second.mx;
+        cave = hit->second.cave;
     } else {
         // The FULL height, not layer 0 alone. Sampling only the continent and
         // then padding by the tallest biome amplitude is what made this band
@@ -424,8 +427,12 @@ void WorldGpu::column_band(float x0, float z0, float x1, float z1,
         }
         // Bounded: a long flight visits columns without end. 200k is ~5 MB.
         if (column_cache_.size() > 200000) column_cache_.clear();
+        // Placed caves pad only the columns that hold one (2 m for the
+        // feathering and the mesher's ghost cells), where the old global
+        // 64 m padded every column in the world.
+        cave = worldgen::cave_bottom_in_box(world_, x0, z0, x1, z1, 2.0f);
         ColumnSpan c;
-        c.mn = mn; c.mx = mx;
+        c.mn = mn; c.mx = mx; c.cave = cave;
         column_cache_[key] = c;
     }
 
@@ -445,6 +452,7 @@ void WorldGpu::column_band(float x0, float z0, float x1, float z1,
     // (generator_version 11) the 64 m was solid rock: chunks meshed to
     // nothing, every column, at every LOD.
     lo = mn - margin - params_.overhang_scale - (caves_ ? 64.0f : 0.0f);
+    if (cave < lo) lo = cave;
     hi = mx + margin + params_.overhang_scale;
     if (core_lo) *core_lo = mn - margin;
     if (core_hi) *core_hi = mx + margin;

@@ -217,6 +217,11 @@ void cs_bake(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
         const uint hx = t.x * 2u + (q & 1u), hz = t.y * 2u + (q >> 1);
         if (g_edit_top[g.x * 1024u + hz * 32u + hx] >= y - 1.0f) bare |= 1u << q;
     }
+    // A placed cave's mouth (layer 7): the bake stands a cell on the 2.5D
+    // height unless the overhang term asks for a bisection, so over a mouth
+    // the grass floated where the ground had been, a lawn over the hole.
+    // Anything within a metre of a cave's carve grows nothing.
+    if (real_nearest_entrance(x, y, z) < 1.0f + w_cave_wall_amp + w_entrance_falloff) bare = 15u;
     if (bare == 15u) grass = flowers = bushes = 0.0f;
     c.bare = bare;
 
