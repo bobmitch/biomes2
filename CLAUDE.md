@@ -3547,8 +3547,40 @@ held no such cell and the water could not get down it.
   the column rule's sheet on land over ground more than 1.6 m down (dug
   ground no swash reaches); sheet over a dry-air column where the ground
   is well under it; and the grid triangles that straddle the switch (they
-  slope between the two sheets, on the wall itself). Columns flooded only
-  UNDER a lid (the cell at sea level is rock) are left to the column rule.
+  slope between the two sheets, on the wall itself) -- only while a hole
+  fills, or where the triangle runs from the flood's calm to open surf
+  (a low beach): cut whole on high ground, where both ends are calm, they
+  took stair-shaped bites out of a pit's edge. The coarse land cut
+  (`i.depth + 0.3`) skips vertices inside the wall and triangles crossing
+  it; gated on the flood's FILTER instead, whose reach ends on column
+  edges, it left a straight-edged notch in the surf beside a shaft.
+  Columns flooded only under a lid are NOT left to the column rule any
+  more: that rule stopped the water under an undercut in steps.
+- **High ground keeps the calm, the wall keeps the depth.** Where the
+  generated ground stands 0.5-1.5 m and more over sea level, no swash is
+  ever seen, so the calm reaches past the wall into the rock (by the
+  filter's weight): falling back to the open sea's waves and foam there
+  drew a white sawtooth along a pit's wall. The FORCED depth still switches
+  at the wall: a vertex in the rock given a depth between the beach's and
+  the hole's lands just under sea level, where the 12 cm lift and the
+  swash raised grid triangles up the wall in teeth.
+- **Inside the flood the edge fades over the last 1.2 m of the view ray
+  under water** (`under_len`), so a dug wall shows through its own first
+  centimetres of water and the steps the grid leaves dissolve (0.4 m left
+  them showing). Not on natural shores.
+- **`--flood-pit`** (`build/flood_pit.bmp`, `_top.bmp`, `.txt`): from the
+  coast nearest spawn, a pit 4 m spheres wide dug from 16 m inland, an
+  undercut on one side and an inlet to the sea, viewed from 12 m up after
+  the fill. `BIOMES_PIT_UNDERCUT=<m>` the undercut's centre under sea
+  level (2.5, its roof tangent to the water); `BIOMES_PIT_PICK="px py
+  ..."` names what a pixel shows, marched through the EDITED density
+  (`--pick` reads the generated field). `--water-debug 11` (the filter's
+  weight, inside the wall, land) and `12` (the same with every flood cut
+  off), `13` (the edge's fade, the ray under water, how much the flood
+  applies) and `14` (the real shading, every flood cut painting its pixel
+  instead: red the coarse land cut, green a filling hole's, blue a dry
+  column's, yellow a straddling triangle's, magenta "no word") are the
+  instruments; 14 is what traced the notch.
   What each step fixed, in `--flood-test`'s stills (`flood_fill_10s`,
   `_13s`, `_rising` while the shaft is still filling): the surf round a
   shaft cut in squares (the calm and forced depth taken whole by beach
@@ -3564,9 +3596,11 @@ held no such cell and the water could not get down it.
   9` (how much the flood applies, a filling drop, the land side) and `10`
   (the shore foam's calm, depth and fade) are the instruments.
 - **Not done**: the surf's edge at a dug wall follows the water grid in
-  steps of a few centimetres (the straddling triangles are dropped whole);
-  a dug rim can show a straight-edged notch where a chunk border crosses
-  it (terrain, not water: the same shape with `--no-water`);
+  steps of a few centimetres where the surf meets it (the straddling
+  triangles are dropped whole); a dig whose top comes within a voxel of
+  the surface leaves a skin the 0.5 m lattice cannot hold -- a small hole
+  in the ground (`--flood-pit`'s far rim); a filling shaft can show a
+  sliver of sheet at its rim for a few frames;
   a pocket's own water surface below sea level
   is not drawn (physics has it); the underwater pass dims light down to sea
   level, not to a pocket's floor; the mask reaches 64 m round the camera,

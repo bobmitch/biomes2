@@ -1626,8 +1626,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     const bool leak_mode = hl.find("--leak-test") != std::string::npos;
     const bool seabed_mode = hl.find("--seabed-tunnel") != std::string::npos;
     const bool flood_mode = hl.find("--flood-test") != std::string::npos;
+    const bool pit_mode = hl.find("--flood-pit") != std::string::npos;
     const bool headless = report_mode || fell_mode || dig_tree_mode || lights_mode || leak_mode ||
-                          seabed_mode || flood_mode ||
+                          seabed_mode || flood_mode || pit_mode ||
                           !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
@@ -5081,6 +5082,156 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         g_renderer.shutdown();
         g_physics.shutdown();
         return fell ? 1 : 0;
+    }
+
+    if (pit_mode) {
+        // --flood-pit: a look, not a test. A big pit dug into the beach
+        // nearest spawn, open to the sea through an inlet, one side undercut
+        // under the beach; the water let in, then stills from up and to the
+        // side (build/flood_pit.bmp, flood_pit_top.bmp) -- the view that
+        // showed the water's edge stepping in cells and the dug rim's
+        // notches. build/flood_pit.txt says where.
+        const engine::WorldGpu& wg = g_renderer.world();
+        const float sea = wg.params().sea_level;
+        g_renderer.set_vsync(true);
+        g_walk = true;
+        FILE* f = std::fopen("build/flood_pit.txt", "w");
+        if (!f) return 1;
+        float best_rc = 1e9f, dx = 0.0f, dz = 1.0f;
+        for (int sp = 0; sp < 72; ++sp) {
+            const float a = 6.2831853f * float(sp) / 72.0f;
+            const float ux = std::sin(a), uz = std::cos(a);
+            auto at = [&](float r) { return wg.height(g_spawn.x + ux * r, g_spawn.z + uz * r); };
+            float rc = -1.0f;
+            for (float r = 10.0f; r < 4000.0f && r < best_rc; r += 2.0f)
+                if (at(r) < sea) { rc = r; break; }
+            if (rc < 0.0f || at(rc - 20.0f) < sea + 0.5f) continue;
+            bool ok = true;
+            for (float s = 3.0f; s <= 20.0f && ok; s += 1.0f) ok = at(rc + s) < sea - 0.3f;
+            if (!ok) continue;
+            best_rc = rc; dx = ux; dz = uz;
+        }
+        if (best_rc >= 1e9f) { std::fprintf(f, "VOID RUN: no coast\n"); std::fclose(f); return 1; }
+        auto pt = [&](float s, float side, float out[2]) {
+            out[0] = g_spawn.x + dx * (best_rc + s) - dz * side;
+            out[1] = g_spawn.z + dz * (best_rc + s) + dx * side;
+        };
+        auto dig_at = [&](float s, float side, float y, float r) {
+            float p[2];
+            pt(s, side, p);
+            g_renderer.dig(p[0], y, p[1], r, -4.0f, 1);
+        };
+        float t = 0.0f;
+        const float kDt = 1.0f / 60.0f;
+        auto frame = [&]() {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+            sync_physics_terrain();
+            sync_sea(t);
+            g_physics.update(kDt, 0.0f, 0.0f, false);
+            g_physics.character_position(g_feet);
+            g_camera.x = g_feet[0]; g_camera.y = g_feet[1] + kEyeAboveFeet; g_camera.z = g_feet[2];
+            t += kDt;
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            if (cr.right - cr.left < 1 || cr.bottom - cr.top < 1) return;
+            engine::ViewConstants v = {};
+            fill_view(g_camera, float(cr.right - cr.left), float(cr.bottom - cr.top), t, v);
+            g_renderer.render(v);
+        };
+        {
+            float p[2];
+            pt(-12.0f, 12.0f, p);
+            g_physics.place_character(p[0], Spawn::above(p[0], p[1]), p[1]);
+            for (int i = 0; i < 120; ++i) frame();
+        }
+        // The pit: 4 m spheres from 16 m inland to 4 m, two rows, centres a
+        // metre under sea level; an undercut under its inland side; an inlet
+        // out through the beach into the sea.
+        for (float s = -16.0f; s <= -4.0f; s += 2.0f)
+            for (float side = -3.0f; side <= 3.0f; side += 3.0f) dig_at(s, side, sea - 1.0f, 4.0f);
+        // BIOMES_PIT_UNDERCUT=<m>: the undercut's centre under sea level (2.5
+        // by default, its ceiling tangent to the water -- the worst case for
+        // the waterline, which runs along rock barely crossing it).
+        float under_c = 2.5f;
+        if (const char* e = std::getenv("BIOMES_PIT_UNDERCUT")) under_c = float(std::atof(e));
+        for (float s = -16.0f; s <= -6.0f; s += 2.0f) dig_at(s, -7.0f, sea - under_c, 2.5f);
+        for (float s = -4.0f; s <= 6.0f; s += 1.0f) dig_at(s, 0.0f, sea - 1.5f, 2.0f);
+        // Stand at the rim while the meshes and the flood settle, the water
+        // comes in, and the fill finishes.
+        {
+            float p[2];
+            pt(-10.0f, 9.0f, p);
+            g_physics.place_character(p[0], Spawn::above(p[0], p[1]) + 1.0f, p[1]);
+            for (int i = 0; i < 900; ++i) {
+                frame();
+                if (i == 3) g_renderer.flood_settle();
+            }
+        }
+        float c0[2];
+        pt(4.0f, 14.0f, c0);
+        float aim[2];
+        pt(-10.0f, -2.0f, aim);
+        engine::Camera c = g_camera;
+        c.x = c0[0]; c.z = c0[1]; c.y = sea + 12.0f;
+        c.yaw = std::atan2(aim[0] - c.x, aim[1] - c.z);
+        c.pitch = -0.55f;
+        engine::ViewConstants cv = {};
+        fill_view(c, g_res_w, g_res_h, t, cv);
+        std::string e3;
+        g_renderer.capture(cv, "build/flood_pit.bmp", e3);
+        std::fprintf(f, "pit: coast %.0f m from spawn along (%.3f, %.3f)\nstill: --cam %.2f %.2f %.2f %.4f %.2f\n",
+                     best_rc, dx, dz, c.x, c.y, c.z, c.yaw, c.pitch);
+        // BIOMES_PIT_PICK="px py [px py ...]": what the still shows at a pixel,
+        // marched through the EDITED density (--pick reads the generated
+        // field), with the LOD 0 chunk borders near the hit.
+        if (const char* pk = std::getenv("BIOMES_PIT_PICK")) {
+            float fwd[3], right[3], up[3];
+            c.basis(fwd, right, up);
+            const char* s2 = pk;
+            float px = 0.0f, py = 0.0f;
+            int used = 0;
+            while (std::sscanf(s2, "%f %f%n", &px, &py, &used) == 2) {
+                s2 += used;
+                const float nx = ((px + 0.5f) / g_res_w) * 2.0f - 1.0f;
+                const float ny = 1.0f - ((py + 0.5f) / g_res_h) * 2.0f;
+                float d[3];
+                for (int k = 0; k < 3; ++k)
+                    d[k] = fwd[k] + right[k] * nx * cv.tan_half_fov * cv.aspect + up[k] * ny * cv.tan_half_fov;
+                const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                for (int k = 0; k < 3; ++k) d[k] /= dl;
+                float t0 = 0.0f, t1 = -1.0f;
+                for (float tt = 0.0f; tt < 200.0f; tt += 0.05f) {
+                    if (g_renderer.edited_density(c.x + d[0] * tt, c.y + d[1] * tt, c.z + d[2] * tt) > 0.0f) {
+                        t1 = tt;
+                        break;
+                    }
+                    t0 = tt;
+                }
+                if (t1 < 0.0f) { std::fprintf(f, "pick (%.0f, %.0f): no hit\n", px, py); continue; }
+                for (int it = 0; it < 30; ++it) {
+                    const float tm = 0.5f * (t0 + t1);
+                    if (g_renderer.edited_density(c.x + d[0] * tm, c.y + d[1] * tm, c.z + d[2] * tm) > 0.0f) t1 = tm;
+                    else t0 = tm;
+                }
+                const float hx = c.x + d[0] * t1, hy = c.y + d[1] * t1, hz = c.z + d[2] * t1;
+                const float S = engine::lod_chunk_size(0);
+                const float fx = hx / S - std::floor(hx / S), fz = hz / S - std::floor(hz / S);
+                const float fy = hy / S - std::floor(hy / S);
+                std::fprintf(f, "pick (%.0f, %.0f): hit (%.2f, %.2f, %.2f) at %.1f m, %.2f m over sea level; "
+                             "in its LOD 0 chunk x %.2f y %.2f z %.2f m (of %.0f); generated height %.2f\n",
+                             px, py, hx, hy, hz, t1, hy - sea, fx * S, fy * S, fz * S, S, wg.height(hx, hz));
+            }
+        }
+        float top[2];
+        pt(-10.0f, -2.0f, top);
+        c.x = top[0]; c.z = top[1]; c.y = sea + 22.0f; c.pitch = -1.5f;
+        fill_view(c, g_res_w, g_res_h, t, cv);
+        g_renderer.capture(cv, "build/flood_pit_top.bmp", e3);
+        std::fclose(f);
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return 0;
     }
 
     if (flood_mode) {

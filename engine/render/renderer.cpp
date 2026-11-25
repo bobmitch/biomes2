@@ -6198,23 +6198,6 @@ void Renderer::fill_flood_mask(const float cam[3]) {
                     // took the flood's treatment only inside labelled blocks,
                     // and the surf showed the blocks' straight edges.
                     if (c == 1) { open_sea.push_back(int(mi)); continue; }
-                    // Flooded under a LID: the cell at sea level over it is
-                    // rock, so there is no water surface here to draw -- a
-                    // shaft dug from stacked spheres bulges just under sea
-                    // level beneath a few centimetres of beach. Marked, the
-                    // column took the flood's calm, lost its surf, and the
-                    // calm sheet went under the sand: squares of bare beach
-                    // round the shaft. Left to the column rule instead.
-                    {
-                        uint8_t above = 0;
-                        const int x = ox + bx * K + i, z = oz + bz * K + k;
-                        const int yb = ys + 1, byb = fl_floor_div(yb, K);
-                        auto ib = flood_.find(fl_key(fl_floor_div(x, K), byb, fl_floor_div(z, K)));
-                        if (ib != flood_.end())
-                            above = ib->second.cell[((z - fl_floor_div(z, K) * K) * K + (yb - byb * K)) * K +
-                                                    (x - fl_floor_div(x, K) * K)];
-                        if (above == SeaAccess::kSolid) continue;
-                    }
                     const float w = std::exp(-float(c - 1) * kFlC / kFloodWaveFalloff);
                     buf[mi] = uint8_t(2 + int(w * 253.0f + 0.5f));
                     any = true;
