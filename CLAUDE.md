@@ -3503,14 +3503,33 @@ held no such cell and the water could not get down it.
   `BIOMES_FLOOD_BREACH_R=<m>` sets `--flood-test`'s hole: 0.8 m -> 1.75
   m^2, x2.3, the far point wet after 20 s; 1.6 m (default) -> 8 m^2, x0.5,
   4.3 s; 3 m -> 28 m^2, x0.25, 2.1 s. H's line prints the area and factor.
-  Not done: the per-column front steps in 0.5 m blocks where neighbours
-  stand at different levels, and clips the swash in squares; pooling is
-  approximated by the slower step up, not by volume.
-- **Not done**: a pocket's own water surface below sea level
+  Not done: pooling is approximated by the slower step up, not by volume.
+- **The mask never draws an edge** (water.hlsl `flood_sample`). Sampled at
+  the nearest 0.5 m column, the calming, the forced depth and the fill's
+  drop all switched at a column's edge: the beach's foam and swash stopped
+  in a staircase at a channel's mouth, and a filling hole's sheet stood in
+  squares. Now the vertex shader filters four columns, weighted by how
+  flooded each is, and the values bleed half a cell into the rock beside
+  the water -- harmless, because the edge is decided per pixel against the
+  real (dug) ground at the water's OWN level (`edge_fade` against
+  sea level less the fill's drop), and the shore's foam takes its depth
+  from that ground too, so it follows the dug edge. Three rules keep it
+  honest: the open sea itself (label 1) stays out of the mask, so labelled
+  and unlabelled sea draw alike (marked, the surf showed the labelled
+  blocks' straight edges); dry air in a land column is its own value and
+  never draws water, however the filter bleeds (a pit beyond a thin wall);
+  on the land side a vertex takes the flood's calm and drop whole -- rock
+  has no waves to blend towards, and blending to them gave a calm
+  channel's walls a band of surf 15 m in. Shore foam also falls with the
+  calm squared (surf needs breaking waves).
+- **Not done**: while a hole is still FILLING beside surf, the surf is cut
+  in squares round its rim -- the sheet must step from the hole's level
+  to the sea's somewhere, and any step outside the true rim shows on the
+  low beach (gone once it has filled; it was there before the filter);
+  a pocket's own water surface below sea level
   is not drawn (physics has it); the underwater pass dims light down to sea
   level, not to a pocket's floor; the mask reaches 64 m round the camera,
-  so a flooded channel further off draws dry; the beach's foam stops in a
-  0.5 m staircase at a channel's mouth; light in a flooded tunnel is
+  so a flooded channel further off draws dry; light in a flooded tunnel is
   still the near field's air (no light through water); nothing can seal a
   pocket yet (stages 4-5).
 

@@ -155,14 +155,15 @@ Last gathered: 2026-11-21, after the exploration fog.
   in a trough shows from below as dark patches on the sand. [The sea]
 - **The connectivity flood is a first version** (ADR-006 stage 3): the
   fill is a prototype (a gravity-weighted arrival per cell: it steps in
-  0.5 m blocks at the front, clips the swash in squares, takes a sideways
+  0.5 m blocks at the front, takes a sideways
   breach at the reference speed, and pools by a slow step up rather than
   by volume); a
   pocket's own water surface below sea level is not drawn (physics has
   it), and the underwater pass dims light down to sea level, not to a
   pocket's floor; the sheet's mask reaches 64 m round the camera, so a
-  flooded channel further off draws dry; the beach's foam stops in a 0.5 m
-  staircase at a channel's mouth; light in a flooded tunnel is the near
+  flooded channel further off draws dry; while a hole is still filling
+  beside surf, the surf is cut in squares round its rim (gone once full);
+  light in a flooded tunnel is the near
   field's air (no light through water); a component over 1 M cells is left
   dry; nothing can seal a pocket yet (stages 4-5). [The connectivity
   flood]

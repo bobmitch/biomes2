@@ -93,29 +93,47 @@ Texture2DArray<float4> g_detail : register(t5);
 SamplerState g_wrap : register(s3);
 Texture2D<float> g_cloud_shadow : register(t6);   // clouds.hlsl cs_shadow
 // ADR-006 stage 3: the flood round the camera (renderer.cpp fill_flood_mask),
-// a byte a 0.5 m column (the edit lattice), 256 x 256 from flood_origin: 0
-// no word (the column rule stands), else the cell under sea level here is
-// flooded, the open sea's waves reaching it x 255.
+// a byte a 0.5 m column (the edit lattice), 256 x 256 from flood_origin, two
+// planes. The first: 0 no word (the column rule stands), 1 dry air in a land
+// column (never water), else 2 + the open sea's waves' share x 253 where the
+// cell under sea level is flooded. The second (the fill): how far under sea
+// level the water stands there now, 0.1 m (255 none in yet).
 StructuredBuffer<uint> g_flood : register(t7);
 
-// -1 where the flood has no word, else the waves' share (0..1].
-float flood_at(float2 p) {
-    if (flood_on < 0.5f) return -1.0f;
-    const int2 c = int2(floor((p - flood_origin) / 0.5f + 0.5f));
-    if (any(c < 0) || any(c >= 256)) return -1.0f;
-    const uint i = uint(c.y * 256 + c.x);
-    const uint b = (g_flood[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu;
-    return b == 0u ? -1.0f : float(b) / 255.0f;
+uint flood_byte(int2 c, uint plane) {
+    if (any(c < 0) || any(c >= 256)) return 0u;
+    const uint i = plane * 65536u + uint(c.y * 256 + c.x);
+    return (g_flood[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu;
 }
 
-// The fill: metres under sea level the water stands at in a flooded column
-// right now (0 full, -1 none in yet). Only where flood_at says water.
-float flood_level(float2 p) {
-    const int2 c = int2(floor((p - flood_origin) / 0.5f + 0.5f));
-    if (any(c < 0) || any(c >= 256)) return 0.0f;
-    const uint i = uint(65536 + c.y * 256 + c.x);
-    const uint b = (g_flood[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu;
-    return b == 255u ? -1.0f : float(b) * 0.1f;
+// The flood at p, FILTERED: x how flooded (bilinear over the four columns
+// round p, a column counting once the water has reached it), y their waves'
+// share, z their drop under sea level (the fill), w 1 where the NEAREST
+// column is dry air. Point-sampled, every one of these switched on a 0.5 m
+// column's edge, and the beach's foam and swash, the forced depth and a
+// rising level's sheet all stepped in squares. Filtered, the values bleed
+// half a cell into the rock beside the water, which is harmless: water is
+// drawn only where the real ground behind the pixel is under its level
+// (edge_fade in ps_main), and never in a dry column.
+float4 flood_sample(float2 p) {
+    if (flood_on < 0.5f) return float4(0.0f, 1.0f, 0.0f, 0.0f);
+    const float2 g = (p - flood_origin) / 0.5f;   // column centres on the integers
+    const int2 c0 = int2(floor(g));
+    const float2 f = g - float2(c0);
+    float w = 0.0f, calm = 0.0f, drop = 0.0f;
+    [unroll] for (int k = 0; k < 4; ++k) {
+        const int2 c = c0 + int2(k & 1, k >> 1);
+        const float wt = ((k & 1) ? f.x : 1.0f - f.x) * ((k >> 1) ? f.y : 1.0f - f.y);
+        const uint b = flood_byte(c, 0u);
+        const uint lv = flood_byte(c, 1u);
+        if (b < 2u || lv == 255u) continue;
+        w += wt;
+        calm += wt * float(b - 2u) / 253.0f;
+        drop += wt * float(lv) * 0.1f;
+    }
+    if (w > 1e-4f) { calm /= w; drop /= w; } else calm = 1.0f;
+    const float dry = flood_byte(int2(floor(g + 0.5f)), 0u) == 1u ? 1.0f : 0.0f;
+    return float4(w, calm, drop, dry);
 }
 
 #include "engine/render/shaders/lighting.hlsli"
@@ -148,6 +166,7 @@ struct VSOut {
     float  minwl  : TEXCOORD5;   // shortest wave this spacing can carry
     float  hs     : TEXCOORD6;   // significant height the grid carries here (the foam's yardstick)
     float2 cap_q  : TEXCOORD7;   // ww_local's breaking scale and Q, for the pixel's own normal
+    float3 flood  : TEXCOORD8;   // the flood here (flood_sample): how flooded, the water's drop under sea level, its calm (1 open sea)
 };
 
 // A PROJECTED grid: the vertices are laid out on the SCREEN and dropped onto
@@ -264,17 +283,32 @@ VSOut vs_main(uint vid : SV_VertexID) {
     // waves with; 2 m stands in, the waves already calmed by the path.
     float fade_w = fade;
     float fill_drop = 0.0f;    // the fill: how far under sea level the water stands now
-    {
-        // None in yet: as if the flood had no word (the column rule).
-        const float fl = flood_level(rest) < 0.0f ? -1.0f : flood_at(rest);
-        if (fl >= 0.0f) {
-            fade_w = fade * fl;
-            const float lv = flood_level(rest);
-            if (lv > 0.0f) { fill_drop = lv; fade_w = 0.0f; }   // rising water is still
-            // Only a LAND column: the open beach beside a channel keeps its
-            // own shallow depth, its swash and its foam.
-            if (depth < 0.0f) depth = 2.0f;
-        }
+    float calm_f = 1.0f;       // the share of the open sea's waves that reaches here
+    const float4 fs = flood_sample(rest);
+    if (fs.x > 0.0f) {
+        // Blended by how flooded, so nothing switches at a column's edge.
+        // Rising water is still; a flooded column takes its path's calm.
+        const float still = saturate(fs.z * 10.0f);
+        // The columns without a word are the column rule's: on the SEA side
+        // the open sea's full waves, so a sea vertex blends towards them by
+        // how flooded; on the land side, rock, which has no waves to blend
+        // towards -- a land vertex takes the flood's calm whole, or the walls
+        // of a calm channel wore a band of surf all the way in.
+        const float k = max(fs.x, saturate(-depth / 0.25f));
+        calm_f = lerp(1.0f, fs.y * (1.0f - still), k);
+        fade_w = fade * calm_f;
+        // A LAND column (no generated depth to tame the waves with) stands
+        // in 2 m; the open beach beside a channel keeps its own shallow
+        // depth, its swash and its foam. The target is continuous through
+        // the shoreline: 2 m on land, falling to the sea's own depth over
+        // its first 0.4 m.
+        const float target = depth < 0.0f ? 2.0f : max(depth, 2.0f - 4.0f * depth);
+        depth = lerp(depth, target, fs.x);
+        // The rising level's drop likewise: whole on the land side, faded
+        // by how flooded on the sea side -- taken whole there it stopped dead
+        // where the filter's reach ended, a step in the sheet that drew the
+        // surf round a filling hole in squares.
+        fill_drop = fs.z * k;
     }
 
     float3 nrm;
@@ -303,6 +337,7 @@ VSOut vs_main(uint vid : SV_VertexID) {
     const float3 loc = ww_local(frame_sea(), depth, fade_w, minwl);
     o.hs = loc.z / max(fade_w, 1e-4f);
     o.cap_q = loc.xy;
+    o.flood = float3(fs.x, fill_drop, calm_f);
     return o;
 }
 
@@ -447,6 +482,11 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // Only a coarse cut: depth interpolated from the grid's vertices steps
     // with the grid. The edge itself is made per pixel, below (edge_fade).
     clip(i.depth + 0.3f);
+    // Never in a dry column -- a pit or a pocket the sea does not reach --
+    // however far the flood's filter bled (flood_sample).
+    if (flood_on > 0.5f && flood_byte(int2(floor((i.world.xz - flood_origin) / 0.5f + 0.5f)), 0u) == 1u) clip(-1.0f);
+    // The water's own level here: sea level, or where the fill has risen to.
+    const float lvl = sea_level - i.flood.y;
 
     // The normal is recomputed HERE rather than interpolated from the
     // vertices. A grid cell in the mid-ground is tens of metres across, so an
@@ -542,12 +582,21 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // between the SHEET and the ground only softened the steps: near the shore
     // the sheet's height is itself interpolated across grid cells, clamped to
     // the ground at its vertices, so the fade inherited the grid's shape.
+    // Against the water's OWN level (lvl): in a hole the water is rising in,
+    // its edge is where that level meets the dug walls, not where sea level
+    // would. Rising water has no swash. px_depth: the water over the ground
+    // behind this pixel, for the shore's foam where the flood has a word --
+    // so the foam follows the dug ground's real edge, not the columns'.
     float edge_fade = 1.0f;
+    float px_depth = i.depth;
     {
         const float3 gp = cam_pos - v * (dist + min(under_len, 1e4f));
-        const float gdepth = sea_level - gp.y;
+        const float gdepth = lvl - gp.y;
+        // Blended by how flooded, never switched: a threshold drew a line.
+        if (zb < 1.0f) px_depth = lerp(i.depth, min(i.depth, max(gdepth, 0.0f)), saturate(i.flood.x));
         if (zb < 1.0f && gdepth < 1.6f) {
-            const float sw = ww_swash(gp.x, gp.z, time, frame_swash()) * ww_swash_reach(gdepth);
+            const float sw = ww_swash(gp.x, gp.z, time, frame_swash()) * ww_swash_reach(gdepth) *
+                             (1.0f - saturate(i.flood.y * 10.0f));
             edge_fade = saturate((gdepth + sw) / 0.08f);
         }
     }
@@ -567,7 +616,7 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // along the view ray: both legs attenuate. Beer-Lambert per channel --
     // red goes first, which is the whole colour of shallow water.
     const float3 seabed_p = cam_pos - v * (dist + min(under_len, 1e4f));
-    const float down = below ? 0.0f : max(sea_level - seabed_p.y, 0.0f);
+    const float down = below ? 0.0f : max(lvl - seabed_p.y, 0.0f);
     // A rough sea is a murky one: breaking waves stir up the bottom and fill
     // the water with bubbles. Without this a gale over sand showed the
     // seabed through every trough as pale blobs.
@@ -656,10 +705,15 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // The last 0.6 m of water, not 2.2: with the swash a sheet runs up the
     // beach over a few tens of centimetres, and a band keyed to 2.2 m turned
     // the whole sheet white. Foam at its leading edge, clear water behind.
-    const float shallow = saturate(1.0f - i.depth / 0.6f);
+    const float shallow = saturate(1.0f - px_depth / 0.6f);
     const float lace = 0.6f * wnoise(i.world.xz * 0.45f + float2(time * 0.13f, time * 0.07f)) +
                        0.4f * wnoise(i.world.xz * 1.7f - float2(time * 0.21f, -time * 0.11f));
-    const float shore_foam = smoothstep(1.0f - shallow, 1.25f - shallow, lace) * shallow * i.fade;
+    // Surf needs breaking waves: where the flood calms the water (a channel,
+    // a flooded hole) shore foam goes faster than the waves (calm squared,
+    // i.fade carries one), so a channel's mouth has some and its calm inner
+    // reach none -- at the waves' own rate its walls wore a band of white
+    // fifteen metres in.
+    const float shore_foam = smoothstep(1.0f - shallow, 1.25f - shallow, lace) * shallow * i.fade * i.flood.z;
     // Whitecaps where the surface FOLDS: the Jacobian of the trains' throw
     // (ww_surface_with) and the ripples' (ocean_fft.hlsl) together, 1 on
     // still water and 0 where a crest comes to a point and breaks. The wind

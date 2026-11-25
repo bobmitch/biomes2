@@ -6128,9 +6128,13 @@ void Renderer::fill_flood_mask(const float cam[3]) {
     const float sea = world_.params().sea_level;
     const int ys = int(std::floor((sea - 0.25f) / kFlC));
     const int by = fl_floor_div(ys, K), ly = ys - by * K;
-    // Two planes: the waves' share where the column's top cell under sea
-    // level will be water, and (the fill) how far under sea level the water
-    // stands there NOW, in 0.1 m (255: none in yet) -- the sheet drops to it.
+    // Two planes. The first: 0 no word (rock, or not labelled: the column
+    // rule), 1 DRY AIR in a land column (a pit or a pocket the sea does not
+    // reach: water.hlsl never draws there, however its filter bleeds), else
+    // 2 + the waves' share x 253 where the column's top cell under sea level
+    // will be water. The second (the fill): how far under sea level the
+    // water stands there NOW, in 0.1 m (255: none in yet) -- the sheet drops
+    // to it.
     std::vector<uint8_t> buf(size_t(N) * N * 2, 0);
     bool any = false;
     for (int bz = 0; bz < N / K; ++bz)
@@ -6141,10 +6145,23 @@ void Renderer::fill_flood_mask(const float cam[3]) {
                 for (int i = 0; i < K; ++i) {
                     const int ci = (k * K + ly) * K + i;
                     const uint8_t c = it->second.cell[ci];
-                    if (c == SeaAccess::kDry || c == SeaAccess::kSolid) continue;
-                    const float w = std::exp(-float(c - 1) * kFlC / kFloodWaveFalloff);
                     const size_t mi = size_t(bz * K + k) * N + size_t(bx * K + i);
-                    buf[mi] = uint8_t((std::max)(1, int(w * 255.0f + 0.5f)));
+                    if (c == SeaAccess::kSolid) continue;
+                    if (c == SeaAccess::kDry) {
+                        // Only in a LAND column: a capped component leaves the
+                        // sea's own cells dry, and marking those would cut
+                        // holes in the sea.
+                        const float wx = float(ox + bx * K + i) * kFlC, wz = float(oz + bz * K + k) * kFlC;
+                        if (world_.height(wx, wz) > sea - 0.25f) buf[mi] = 1;
+                        continue;
+                    }
+                    // The open sea itself (label 1: no path to it) is left to
+                    // the column rule, which already calls it sea: marked, it
+                    // took the flood's treatment only inside labelled blocks,
+                    // and the surf showed the blocks' straight edges.
+                    if (c == 1) continue;
+                    const float w = std::exp(-float(c - 1) * kFlC / kFloodWaveFalloff);
+                    buf[mi] = uint8_t(2 + int(w * 253.0f + 0.5f));
                     any = true;
                     // The front: down the column to the highest cell the
                     // water has reached (at most 25 m).
