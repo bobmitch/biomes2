@@ -2144,9 +2144,13 @@ void Renderer::record_lights(const ViewConstants& view) {
         a.importance = 1e30f;   // the light in your hand is always the one that matters
         act.push_back(a);
     }
-    for (size_t i = 0; i < lights_.size(); ++i) {
+    // The placed lights, then the mushroom clusters' round the camera (ids
+    // stable per cluster, so a cluster keeps its shadow slot).
+    std::vector<LocalLight> emitters;
+    if (mushrooms_on_) mushrooms_.lights(cam, emitters);
+    for (size_t i = 0; i < lights_.size() + emitters.size(); ++i) {
         Active a;
-        a.l = lights_[i];
+        a.l = i < lights_.size() ? lights_[i] : emitters[i - lights_.size()];
         const float dx = a.l.pos[0] - cam[0], dy = a.l.pos[1] - cam[1], dz = a.l.pos[2] - cam[2];
         a.importance = a.l.lumens / (std::max)(dx * dx + dy * dy + dz * dz, 1.0f);
         act.push_back(a);
@@ -3008,6 +3012,9 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         // two placement workers.
         if (!rocks_.init(device_.Get(), queue_.Get(), mesh_root_.Get(), error)) return false;
         rock_field_.init(&world_, 2);
+        if (!mushrooms_.init(device_.Get(), queue_.Get(), mesh_root_.Get(), "worldgen/data/archetypes.json", error))
+            return false;
+        mushrooms_.set_world(&world_.world());
     }
     startup_log().push_back(std::make_pair(std::string("phase: tree models + impostor bake"), startup_now_ms() - t0));
     t0 = startup_now_ms();
@@ -3041,6 +3048,12 @@ void Renderer::update_trees(const ViewConstants& view, bool settle) {
         }
     }
     tree_field_.update(view.cam_pos[0], view.cam_pos[2], radius);
+    // The caves the camera has come near grow their mushrooms: one cave a
+    // frame in play (a few ms of field evaluations each), all of them for a still.
+    if (mushrooms_on_)
+        mushrooms_.update(view.cam_pos,
+                          [this](float x, float z, float from_y) { return ground_below(x, z, from_y, true); },
+                          settle ? 1 << 20 : 1);
     if (settle) {
         // A still waits for every tile, the way it waits for every chunk.
         for (int i = 0; i < 4000 && !tree_field_.settled(); ++i) {
@@ -4029,6 +4042,11 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         build_view_proj(view, rvp);
         rocks_.prepare(UINT(frame_), rock_field_.rocks(), view.cam_pos, rvp);
     }
+    if (mushrooms_on_ && mushrooms_.ready() && mode_ != Mode::Wireframe) {
+        float mvp[16];
+        build_view_proj(view, mvp);
+        mushrooms_.prepare(UINT(frame_), view.cam_pos, mvp);
+    }
     // The character's pose for this frame, before the cascades draw it.
     character_.prepare(UINT(frame_));
     // Local lights (ADR-004 L3): their list, their clusters and their shadow
@@ -4247,6 +4265,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         // Rocks right after the ground, on its root signature and constants.
         if (rocks_on_ && rocks_.ready() && !wire) rocks_.record(cmd_.Get(), UINT(frame_));
         prof_.mark(cmd_.Get(), "rocks");
+        if (mushrooms_on_ && mushrooms_.ready() && !wire) mushrooms_.record(cmd_.Get(), UINT(frame_));
         // The player's character, on the same root.
         if (!wire) character_.record(cmd_.Get(), UINT(frame_));
     }
@@ -5819,6 +5838,14 @@ bool Renderer::aim_terrain(const float from[3], const float dir[3], float reach,
     dist = t1;
     for (int k = 0; k < 3; ++k) hit[k] = from[k] + dir[k] * t1;
     return true;
+}
+
+bool Renderer::pick_mushroom(const float eye[3], const float dir[3], const float hand[3], float reach) {
+    if (!mushrooms_on_) return false;
+    // Whatever the camera's ray meets first hides what is behind it.
+    float hit[3], occ = 1e30f;
+    if (!aim_terrain(eye, dir, 60.0f, hit, occ)) occ = 1e30f;
+    return mushrooms_.pick(eye, dir, hand, reach, occ);
 }
 
 float Renderer::ground_below(float x, float z, float from_y, bool with_edits) const {

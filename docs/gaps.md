@@ -70,9 +70,18 @@ Last gathered: 2026-11-21, after the exploration fog.
   its own 6 m point is air, that too) lends its bin. A probe on the
   surface seen through a tunnel's mouth can still lend its view along a
   ray the tunnel would have closed. [Near field]
-- **Coarse hits see no local lights**: a fire 10 m down a tunnel reaches
-  walls past 6 m from a probe only second-hand, through the fine probes by
-  them. [Near field; Local lights]
+- **Far hits skip a moving light**: the carried torch's light reaches
+  walls past 6 m from a probe only second-hand, through the fine probes
+  by it (the coarse level's 1 s memory would trail it). A campfire just
+  placed fades in at far hits over that second. [Near field; Local lights]
+- **Glowing mushrooms** (a test collectable): picks are not saved; a
+  cluster on ground dug out from under it floats (rocks and trees settle,
+  these do not); no inventory, only a count; a torch does not light them
+  (they take no local light, or their own cluster's burnt them white);
+  their clusters are ordinary local lights, so past the 24 shadowed ones
+  they light through rock within 5 m and give no bounce -- the emitter
+  plan (glowing cells the probes' rays see) is still the better design for
+  many small lights. [Glowing mushrooms]
 - **Fast lights are held fast for 60 frames**, not seconds: 0.4 s at 144
   fps; at most 8 a frame. [Near field]
 - **Caves cost the near field what their covered air is** (measured with

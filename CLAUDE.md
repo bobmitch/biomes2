@@ -19,6 +19,7 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `engine/character/` | The player's character: the packed model, the procedural animator, the skinned draw. |
 | `tools/models/` | `pack_character.py`: the rigged glTF characters and the animation library in `assets/models/` (not in git) to `assets/models/packed/` (`*.chr`, `ual.anim`). |
 | `engine/rocks/` | Layer 9's rocks: procedural meshes, the CPU tile streamer, instanced drawing on the terrain's root signature, static colliders. |
+| `engine/props/` | Things to pick up. So far the caves' glowing mushrooms (`glow_mushrooms.h`): placement, drawing, a light per cluster, picking with E. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32), Windows only: seeds as maps plus their gameplay numbers. See "The world viewer". |
 | `tools/shared/` | Presentation (`render.h`) and gameplay measures of a seed (`seed_metrics.h`), shared by the harness and the viewer. |
@@ -1186,6 +1187,48 @@ level's top.
   it. Fixed in the post chain's `contact_shadow` (see the frame section).
   Turn things off one at a time before believing which pass a pattern is.
 
+### Glowing mushrooms: the first thing to pick up
+
+Clusters of glowing blue mushrooms on the floors of the placed caves
+(`engine/props/glow_mushrooms.{h,cpp}`, `shaders/mushrooms.hlsl`), a
+collectable for testing emitters. **E** picks the one the crosshair is on,
+within 2.5 m of the head (`kPickReach`), in front of whatever the camera's
+ray meets; it is gone and counted (the message line). No inventory yet,
+and picks are not saved.
+
+- **Placement is the engine's, not the golden hash's**: per cave, from its
+  capsules (`SeedWorld::caves`, `entrances[]`), a pure function of the
+  cave's id -- `per_chamber` clusters per chamber capsule, a
+  `tunnel_chance` per tunnel capsule, none in the mouth's bowl -- each on
+  the floor found by marching the edited field down from the capsule's
+  axis (`Renderer::ground_below`). A cave is populated when the camera
+  comes within 160 m + its length (one a frame in play, a few ms; all for
+  a still). archetypes.json `glow_mushrooms`; presentation only. The
+  forest cave 960 m from spawn holds 16 clusters, 87 mushrooms.
+- **Each cluster is one local light**: steady blue, `lumens_each` (4) per
+  mushroom left, `range` 5 m, 45 cm over the caps (lower, the floor under it
+  was a hot spot), ids stable per cluster so it keeps its shadow slot;
+  clusters within 70 m of the camera. Shadowed like any light while among
+  the 24 most important; past them it lights through rock within its 5 m
+  and the probes leave it out (gaps.md).
+- **Drawn** on the terrain's root signature after the rocks: three
+  procedural models (stem, gills, domed cap), double sided, absolute
+  indices. Lit by the sun, sky and bounce, plus a glow (`nits` 1.2 at the
+  gills, about half on the cap) into the AMBIENT target with no AO. **Not
+  by the local lights**: their own cluster's light over the caps burnt them
+  white; at 3 nits they were white anyway against an eye keyed to the lit
+  floor. So a torch held to one does not light it.
+- `--shot ... --mushroom-test` stands over the cluster nearest the camera
+  (`build/mushroom_before.bmp`), picks every cap within 1.5 m by aiming at
+  it as E would, after a ray at the roof that must pick nothing, and shoots
+  again (`mushroom_after.bmp`); `build/mushroom_test.txt` says what went and
+  the lumens lost. Every shot report has a `mushrooms:` line and the
+  nearest cluster. `--no-mushrooms` for A/B.
+- **Cost**, the forest cave at 23:00, 1440p: frame 5.22 -> 5.40 ms with 13
+  cluster lights in reach -- the terrain walking their clusters, and the
+  probes they wake in sealed air (1,674 -> 2,253 live). Nothing where no
+  cave is near.
+
 ### The player character
 
 Walk mode (Tab) is third person: Quaternius's **Universal Base Character**
@@ -2205,6 +2248,26 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   with the bounce in the probes and no coarse level: the meter's 90th
   percentile 0.234-0.399 nits, sd 0.023 -- what the fill gave. A light
   past the 24 shadowed ones is left out (it would bounce through rock).
+- **Far hits are lit by the local lights too** (past 6 m: the coarse
+  level's, and a fine ray's that found no coarse probe -- in sealed air
+  every fine ray past 6 m, since it takes no coarse bins). Until then a fire
+  10 m down a tunnel reached walls more than 6 m from a probe only
+  second-hand. A far hit holds the light a FOOTPRINT away -- the patch of
+  wall the ray's share of the sphere covers there, 0.25 t for the fine
+  level's 64 rays, 0.125 t for the coarse level's 256 (`kNfFootFine`,
+  `kNfFootCoarse`) -- or one ray striking rock beside a flame 30 m off lit
+  its probe tenfold. It skips a light that MOVED within 60 frames
+  (`LocalLightGpu::moving`, the carried torch always): the probes seeing it
+  from far keep the coarse level's 1 s memory and would trail its old
+  light. A light just placed is not moving; its far bounce fades in over
+  that second, and a still shows it whole. Measured at 23:00, fixed
+  exposure: a campfire 24 m down the dug tunnel at spawn, walls round the
+  camera mean luma 5.84 -> 6.85 (fine rays alone, `BIOMES_NF_NOCOARSE`,
+  6.19); the forest cave's chamber fire lights the tunnel walls round its
+  opening from 30 m up. Near field 0.097 / 0.096 ms, unchanged; `--shake`
+  frame-to-frame change within the flame's own; `--leak-test` sealed 0.001
+  nits, the held torch 0.0954 -> 0.0988 (it holds still in the test).
+  `BIOMES_NF_NOFARLIGHTS` A/Bs it.
 - **Three things made a lit tunnel pulse and creep** (the torch walk of
   `--adapt-test --torch`, its meter's 90th percentile per frame):
   - **One rotation of the ray set for every probe.** Down a straight

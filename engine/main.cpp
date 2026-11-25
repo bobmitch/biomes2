@@ -67,6 +67,7 @@ engine::TreeFelling  g_felling;
 worldgen::SpawnPoint g_spawn;
 bool  g_walk = false;
 bool  g_want_chop = false;
+bool  g_want_pick = false;   // E: pick up what the crosshair is on (a glowing mushroom)
 bool  g_want_save = false, g_want_load = false;
 // F8: a snapshot -- everything needed to stand exactly here again
 // (write_snapshot; --snapshot <dir> reads it back).
@@ -82,6 +83,8 @@ char  g_tree_msg[160] = "";
 const float kDigRadii[] = {0.5f, 0.75f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f};
 const int   kDigSizes = int(sizeof(kDigRadii) / sizeof(kDigRadii[0]));
 const float kDigReach = 80.0f;
+// How far from the head E reaches to pick something up.
+const float kPickReach = 2.5f;
 const float kDigRepeat = 0.2f;
 int   g_dig_size = 0;
 bool  g_want_dig = false, g_dig_held = false;
@@ -294,6 +297,19 @@ void write_rock_report(FILE* f, float x, float z, bool probe) {
                      g_renderer.rocks().colliders(), g_renderer.rocks().shapes_built(),
                      g_physics.prop_error().empty() ? "" : ", last shape error: ", g_physics.prop_error().c_str());
     }
+}
+
+// The caves' glowing mushrooms in a report: what is populated, drawn and
+// picked, and the nearest cluster for a --cam.
+void write_mushroom_report(FILE* f, float x, float y, float z) {
+    engine::GlowMushrooms& gm = g_renderer.mushrooms();
+    std::fprintf(f, "mushrooms: %zu caves populated, %zu clusters, %zu mushrooms, %zu drawn, %zu picked\n",
+                 gm.caves_populated(), gm.clusters(), gm.mushrooms(), gm.drawn(), gm.picked());
+    const float p[3] = {x, y, z};
+    float c[3];
+    if (gm.nearest(p, c))
+        std::fprintf(f, "  nearest cluster: (%.1f, %.1f, %.1f), %.1f m away\n", c[0], c[1], c[2],
+                     std::sqrt((c[0] - x) * (c[0] - x) + (c[1] - y) * (c[1] - y) + (c[2] - z) * (c[2] - z)));
 }
 
 // Hand this frame's streamed height patches to physics, and drop the ones
@@ -609,6 +625,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // Local lights (ADR-004 L3): F carries a torch; V drops a campfire
             // on the ground four metres ahead; C clears the campfires.
             if (wp == 'F') { g_renderer.set_carried_torch(!g_renderer.carried_torch()); return 0; }
+            // E picks up what the crosshair is on: for now a glowing mushroom
+            // in a cave (engine/props/glow_mushrooms.h), counted, no inventory.
+            if (wp == 'E') { if (g_captured) g_want_pick = true; return 0; }
             if (wp == 'V') {
                 float f[3], r[3], u[3];
                 g_camera.basis(f, r, u);
@@ -1889,6 +1908,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (an != std::string::npos) g_renderer.set_scan_aniso(float(std::atof(c2.c_str() + an + 8)));
         }
         if (c2.find("--no-rocks") != std::string::npos) g_renderer.set_rocks(false);
+        if (c2.find("--no-mushrooms") != std::string::npos) g_renderer.set_mushrooms(false);
         // Bare ground (GroundLook): --no-ground-look is the scans as they
         // were; the others set one part. Not "--ground-...": --ground is
         // taken (the camera at eye height), and a find() for it matches.
@@ -2309,6 +2329,60 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             run("out", 4.0f, -30.0f, -30.0f);
             if (af) std::fclose(af);
             g_renderer.set_post_dt_override(-1.0f);
+        }
+
+        // --mushroom-test: the cluster of glowing mushrooms nearest the
+        // still's camera, seen from a metre over it (build/mushroom_before.bmp),
+        // then picked one by one by aiming the camera's ray at each cap as E
+        // would, and seen again (build/mushroom_after.bmp). The light that
+        // cluster gave goes with them. build/mushroom_test.txt says what.
+        {
+            const std::string cl = cmdline ? cmdline : "";
+            if (ok && cl.find("--mushroom-test") != std::string::npos) {
+                engine::GlowMushrooms& gm = g_renderer.mushrooms();
+                FILE* mf = std::fopen("build/mushroom_test.txt", "w");
+                const float p[3] = {g_camera.x, g_camera.y, g_camera.z};
+                float c[3];
+                if (!gm.nearest(p, c)) {
+                    if (mf) std::fprintf(mf, "no cluster populated near (%.1f, %.1f, %.1f)\n", p[0], p[1], p[2]);
+                } else {
+                    g_camera.x = c[0] - 0.9f; g_camera.y = c[1] + 1.0f; g_camera.z = c[2];
+                    g_camera.yaw = 1.5708f; g_camera.pitch = -0.85f;   // +x, towards it
+                    fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
+                    ok = g_renderer.capture(v, "build/mushroom_before.bmp", error);
+                    std::vector<engine::LocalLight> lit;
+                    gm.lights(v.cam_pos, lit);
+                    std::vector<float> caps;
+                    gm.targets_near(c, 1.5f, caps);
+                    const size_t before = gm.picked();
+                    const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
+                    // A ray at nothing first: straight up, into the roof.
+                    const float upd[3] = {0.0f, 1.0f, 0.0f};
+                    const bool miss = g_renderer.pick_mushroom(eye, upd, eye, kPickReach);
+                    int aimed = 0, got = 0;
+                    for (size_t k = 0; k + 2 < caps.size(); k += 3) {
+                        float d[3] = {caps[k] - eye[0], caps[k + 1] - eye[1], caps[k + 2] - eye[2]};
+                        const float l = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                        for (int q = 0; q < 3; ++q) d[q] /= l;
+                        ++aimed;
+                        if (g_renderer.pick_mushroom(eye, d, eye, kPickReach)) ++got;
+                    }
+                    std::vector<engine::LocalLight> lit_after;
+                    gm.lights(v.cam_pos, lit_after);
+                    float lm0 = 0.0f, lm1 = 0.0f;
+                    for (const engine::LocalLight& l : lit) lm0 += l.lumens;
+                    for (const engine::LocalLight& l : lit_after) lm1 += l.lumens;
+                    if (ok) ok = g_renderer.capture(v, "build/mushroom_after.bmp", error);
+                    if (mf)
+                        std::fprintf(mf, "cluster at (%.1f, %.1f, %.1f), camera (%.2f, %.2f, %.2f)\n"
+                                         "a ray at the roof picked %s; aimed at %d caps within 1.5 m, picked %d "
+                                         "(total picked %zu -> %zu)\n"
+                                         "cluster lights within reach: %zu (%.1f lm) before, %zu (%.1f lm) after\n",
+                                     c[0], c[1], c[2], eye[0], eye[1], eye[2], miss ? "ONE (wrong)" : "nothing",
+                                     aimed, got, before, gm.picked(), lit.size(), lm0, lit_after.size(), lm1);
+                }
+                if (mf) std::fclose(mf);
+            }
         }
 
         // --cave-walk <k>: the k-th placed cave nearest the still's camera,
@@ -2891,6 +2965,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::fprintf(f, "vertices %u\nindices %u\ntriangles %u\nslots overflowed %u\n",
                          st.vertices, st.indices, st.indices / 3, st.overflowed);
             write_rock_report(f, g_camera.x, g_camera.z, false);
+            write_mushroom_report(f, g_camera.x, g_camera.y, g_camera.z);
             {
                 const engine::Renderer::CrackCount& cc = g_renderer.last_cracks();
                 std::fprintf(f, "cracks below the horizon: %zu undrawn (far depth, scene targets clear); "
@@ -5939,6 +6014,19 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (r == 0) std::snprintf(g_tree_msg, sizeof g_tree_msg, "nothing in reach");
             else if (r == 1) std::snprintf(g_tree_msg, sizeof g_tree_msg, "chop %d/%d", hits, need);
             else std::snprintf(g_tree_msg, sizeof g_tree_msg, "TIMBER (%zu felled)", g_felling.felled());
+        }
+        if (g_want_pick) {
+            g_want_pick = false;
+            float fwd[3], right[3], up[3];
+            g_camera.basis(fwd, right, up);
+            const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
+            float hand[3];
+            chop_origin(hand);
+            if (g_renderer.pick_mushroom(eye, fwd, hand, kPickReach))
+                std::snprintf(g_tree_msg, sizeof g_tree_msg, "picked a glowing mushroom (%zu)",
+                              g_renderer.mushrooms().picked());
+            else
+                std::snprintf(g_tree_msg, sizeof g_tree_msg, "nothing to pick up in reach");
         }
         if (g_dig_held && g_captured && !g_paused) {
             g_dig_timer += float(dt);
