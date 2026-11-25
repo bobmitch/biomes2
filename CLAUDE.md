@@ -118,7 +118,7 @@ that will be played -- per-pixel passes scale 4x from 720p to 1440p.
 The engine's headless modes all write a text file under `build/` and exit:
 `--shot`, `--flight <s>`, `--walk <s>`, `--overhang`, `--dig`, `--dig-save`,
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
-`--band-report`, `--sea-report`, `--swim`, `--blend-report`, `--tab-test`,
+`--band-report`, `--sea-report`, `--swim`, `--seabed-tunnel`, `--blend-report`, `--tab-test`,
 `--clock-jump` (with `--shot`: the light under the ground after the clock
 jumps or runs, `build/time_jump.txt`; see The near field),
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
@@ -3329,14 +3329,33 @@ the real one at every LOD. That is M1 paying off somewhere other than terrain.
 water body. The character asks `ww_height_at` in `water_wave.h` each step,
 the same function the shader draws, with the same level, sea state and
 clock. Whether there is sea in a column at all is the shader's own rule:
-`real_terrain_height` below sea level. `streamer.h` still contains no
+`real_terrain_height` below sea level -- **except under a roof** (ADR-006
+stage 1): physics also asks `Renderer::solid_between` whether anything
+solid, generated or dug, lies between 0.5 m over the feet and sea level,
+and if it does there is no sea (`PhysicsWorld::set_sea_cover`). The column
+rule alone had the character SWIM in a sealed tunnel under the seabed, and
+in any v19 cave that runs out under it. A march up the edited field,
+careful near surfaces: ~6 us a step, 10 in an open pit. Interim: it looks
+only straight up, so a tunnel that breaks through into the sea is dry too
+until ADR-006's connectivity flood. **`--seabed-tunnel`** is the test
+(`build/seabed_tunnel.txt`, `seabed_tunnel.bmp`; add `--torch` to see the
+still): from the coast nearest spawn it digs a sealed 4 m tunnel from under
+the beach to 30 m out, 2.5 m under the seabed, and a pit in the bed open to
+the sea, and stands the character in each -- in the tunnel at 5, 15 and
+25 m out it must stay dry and standing, over it and in the pit it must be
+in the sea. `BIOMES_SEA_COLUMN_ONLY=1` is the mutant (the old rule): the
+tunnel fails, swimming 75 frames of 75 and floating 0.75 m up toward the
+roof. The DRAWN sea is unchanged: it never showed inside a tunnel (the rock
+hides the sheet), and still stops at the old shoreline in a dug channel.
+`streamer.h` still contains no
 reference to the sea. Keep it that way: `--band-report`'s "worst miss"
 compares the band against `worldgen::terrain_height`, and a water surface
 feeding residency would leave that check passing while it measured something
 else. Adding swimming left the band report byte-identical.
 
-`--swim [s]` walks off the nearest gentle beach, swims out, turns and comes
-back. Its headline is **frames standing on the seabed in water too deep to
+`--swim [s]` walks off the gentle beach nearest SPAWN, swims out, turns and
+comes back (from the origin until v19: v18's archipelago put the origin in
+the sea, and every run found no beach and swam nothing). Its headline is **frames standing on the seabed in water too deep to
 stand in**, printed beside the number of deep-water frames it is out of. It
 also prints where the eye sat relative to the water when the shot was taken.
 

@@ -468,6 +468,12 @@ void PhysicsWorld::update(float dt, float vx, float vz, bool jump, float swim) {
             // is here wherever the running sheet covers the ground, as drawn.
             const float swash = ww_swash(fx, fz, sea_.time, sea_.swash) * ww_swash_reach(depth);
             sea_here_ = depth + swash > -0.02f;
+            // Rock between the feet and sea level is a roof: whatever the
+            // generated column says, there is no sea under it.
+            if (sea_here_ && sea_cover_) {
+                const float lo = fy + kCoverFrom;
+                if (lo < sea_.level && sea_cover_(fx, fz, lo, sea_.level)) sea_here_ = false;
+            }
             if (sea_here_) {
                 // The depth the shader reads at the rest point, read here at
                 // the asked point (water_wave.h, ww_rest_point).

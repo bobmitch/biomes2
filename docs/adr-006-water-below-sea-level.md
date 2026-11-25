@@ -1,8 +1,9 @@
 # ADR-006: Water below sea level -- dug holes, tunnels and caves
 
-Status: proposed, 2026-11-25. Nothing built. This records the direction
-chosen in discussion and the corrections found while choosing it, so the
-first implementation starts from them.
+Status: proposed, 2026-11-25. Stage 1 (no sea under a roof, for physics)
+built; the rest not. This records the direction chosen in discussion and
+the corrections found while choosing it, so the first implementation starts
+from them.
 
 ## Context
 
@@ -176,7 +177,11 @@ for water.
    search: the character is in the sea only if nothing solid lies between
    the feet and sea level above them -- a short march up through the edited
    density at the feet. Under-sea tunnels become dry today; stage 3's
-   query replaces it.
+   query replaces it. **Done**: `PhysicsWorld::set_sea_cover` over
+   `Renderer::solid_between`, from 0.5 m over the feet, ~6 us a step;
+   `engine.exe --seabed-tunnel` tests it (a sealed tunnel under the
+   shallows dry and standing, open water and an open pit in the bed still
+   sea), and fails under `BIOMES_SEA_COLUMN_ONLY=1`, the old rule.
 2. **Underwater rendering (now, independent).** Extinction and in-scatter
    toward the water's colour, the surface seen from below, light dimming
    with depth. Already a gap for the open sea; flooding has nothing to show

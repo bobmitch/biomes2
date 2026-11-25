@@ -133,11 +133,24 @@ public:
     // The BASE terrain's column height, which is the shader's rule for where
     // sea exists at all: water.hlsl clips wherever real_terrain_height is
     // above sea level. Using the same rule is what stops a pit dug on a beach
-    // filling with water nobody can see, or a cave under the sea floor being
-    // dry while the sea is drawn over it.
+    // filling with water nobody can see.
     void set_column_height(std::function<float(float, float)> fn) {
         column_height_ = fn;
     }
+    // Whether anything solid lies in the column at (x, z) between two heights
+    // -- the EDITED field, generated rock and the player's digging both. The
+    // column rule alone put the sea in every tunnel and cave under the seabed:
+    // a character walking a sealed tunnel 8 m under the shallows swam in dry
+    // air, with rock overhead. With this set, the sea is only where nothing
+    // solid lies between the feet and sea level. Interim, ADR-006 stage 1:
+    // the column above the feet is all it asks, so a tunnel that BREAKS
+    // through into the sea is dry too until the connectivity flood (stage 3).
+    void set_sea_cover(std::function<bool(float x, float z, float y_lo, float y_hi)> fn) {
+        sea_cover_ = fn;
+    }
+    // The cover test starts this far over the feet: inside the capsule, so
+    // in air, clear of the ground the feet rest on.
+    static constexpr float kCoverFrom = 0.5f;
 
     // Diagnostics: what physics actually has. A ray straight up, once
     // ignoring back faces and once not, and what kind of body it met; and
@@ -198,6 +211,7 @@ private:
 
     SeaParams sea_;
     std::function<float(float, float)> column_height_;
+    std::function<bool(float, float, float, float)> sea_cover_;
     Medium medium_ = Medium::Dry;
     bool   sea_here_ = false;
     float  water_y_ = 0.0f;

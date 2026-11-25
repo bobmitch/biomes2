@@ -5809,6 +5809,22 @@ float Renderer::edited_density(float x, float y, float z) const {
     return acc;
 }
 
+bool Renderer::solid_between(float x, float z, float y_lo, float y_hi) const {
+    float d = edited_density(x, y_lo, z);
+    if (d > 0.0f) return true;
+    // aim_terrain's step: density is roughly metres to the surface in air,
+    // halved because overhangs make it no strict bound, and never under
+    // 10 cm, so the thinnest roof the edit lattice can leave is not stepped
+    // over.
+    for (float y = y_lo; y < y_hi;) {
+        y += (std::min)(1.0f, (std::max)(0.1f, -0.5f * d));
+        if (y > y_hi) y = y_hi;
+        d = edited_density(x, y, z);
+        if (d > 0.0f) return true;
+    }
+    return false;
+}
+
 bool Renderer::aim_terrain(const float from[3], const float dir[3], float reach,
                            float hit[3], float& dist) const {
     auto at = [&](float t) {

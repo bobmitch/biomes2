@@ -588,6 +588,11 @@ public:
     // lattice corner where one is stored, else the field at the 0.5 m voxel,
     // trilinear between. Away from any edit it is the field itself.
     float edited_density(float x, float y, float z) const;
+    // Whether the column at (x, z) holds anything solid between y_lo and
+    // y_hi, by the same field: a march up, careful near surfaces, with no
+    // bisection after the first rock. Physics' sea cover (a roof between
+    // the feet and sea level means no sea).
+    bool solid_between(float x, float z, float y_lo, float y_hi) const;
     // Where a ray first enters the terrain (edits included), within `reach`
     // metres. False if it starts inside rock or meets nothing.
     bool aim_terrain(const float from[3], const float dir[3], float reach,

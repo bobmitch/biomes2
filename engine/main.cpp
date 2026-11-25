@@ -364,6 +364,9 @@ void sync_physics_terrain() {
     for (size_t i = 0; i < gone.size(); ++i) g_physics.remove_chunk(gone[i]);
 }
 
+// The sea cover's cost (PhysicsWorld::set_sea_cover), for --seabed-tunnel.
+unsigned long long g_cover_calls = 0, g_cover_ticks = 0;
+
 // Hand physics the sea the renderer is about to draw: same level, same sea
 // state, same clock. `t` must be the time this frame passes to fill_view, or
 // the swimmer bobs on a swell that is somewhere else on screen. --no-water
@@ -1618,7 +1621,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     const bool dig_tree_mode = hl.find("--dig-settle") != std::string::npos;
     const bool lights_mode = hl.find("--lights-report") != std::string::npos;
     const bool leak_mode = hl.find("--leak-test") != std::string::npos;
+    const bool seabed_mode = hl.find("--seabed-tunnel") != std::string::npos;
     const bool headless = report_mode || fell_mode || dig_tree_mode || lights_mode || leak_mode ||
+                          seabed_mode ||
                           !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
@@ -1970,6 +1975,19 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     g_physics.set_column_height([](float x, float z) {
         return g_renderer.world().height(x, z);
     });
+    // No sea under a roof (ADR-006 stage 1). BIOMES_SEA_COLUMN_ONLY=1 leaves
+    // the column rule alone: the old behaviour, --seabed-tunnel's mutant.
+    if (!std::getenv("BIOMES_SEA_COLUMN_ONLY")) {
+        g_physics.set_sea_cover([](float x, float z, float lo, float hi) {
+            LARGE_INTEGER a, b;
+            QueryPerformanceCounter(&a);
+            const bool solid = g_renderer.solid_between(x, z, lo, hi);
+            QueryPerformanceCounter(&b);
+            ++g_cover_calls;
+            g_cover_ticks += (unsigned long long)(b.QuadPart - a.QuadPart);
+            return solid;
+        });
+    }
 
     if (sea_shot) {
         // Waves are metres tall and the world is twenty kilometres wide,
@@ -5047,6 +5065,226 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return fell ? 1 : 0;
     }
 
+    if (seabed_mode) {
+        // --seabed-tunnel: ADR-006 stage 1. The sea was wherever the
+        // GENERATED column is below sea level, so a character in a sealed
+        // tunnel under the seabed swam in dry air. Finds the coast nearest
+        // spawn, digs a sealed tunnel from under the beach out under the
+        // shallows, and a pit in the seabed open to the sea beside it, then
+        // stands the character in each place in turn:
+        //   A. three points in the tunnel, under sea columns: must stay DRY,
+        //      on its feet, not floated up to the roof;
+        //   B. open water over the tunnel's far end: must be in the sea;
+        //   C. the bottom of the open pit: must be in the sea.
+        // BIOMES_SEA_COLUMN_ONLY=1 is the mutant (the old rule): A must FAIL.
+        const engine::WorldGpu& wg = g_renderer.world();
+        const float sea = wg.params().sea_level;
+        g_renderer.set_vsync(true);
+        g_walk = true;
+        std::remove("build/seabed_tunnel.txt");
+        FILE* f = std::fopen("build/seabed_tunnel.txt", "w");
+        if (!f) return 1;
+        const bool mutant = std::getenv("BIOMES_SEA_COLUMN_ONLY") != nullptr;
+
+        // The coast: the nearest point to spawn along any of 72 spokes where
+        // land gives way to sea that stays sea for 30 m and is at least
+        // 1.5 m deep 25 m out.
+        float best_rc = 1e9f, dx = 0.0f, dz = 1.0f;
+        for (int sp = 0; sp < 72; ++sp) {
+            const float a = 6.2831853f * float(sp) / 72.0f;
+            const float ux = std::sin(a), uz = std::cos(a);
+            auto at = [&](float r) { return wg.height(g_spawn.x + ux * r, g_spawn.z + uz * r); };
+            float rc = -1.0f;
+            for (float r = 10.0f; r < 4000.0f && r < best_rc; r += 2.0f)
+                if (at(r) < sea) { rc = r; break; }
+            if (rc < 0.0f || at(rc - 10.0f) < sea) continue;
+            bool ok = true;
+            for (float s = 3.0f; s <= 30.0f && ok; s += 1.0f) ok = at(rc + s) < sea - 0.3f;
+            if (!ok || at(rc + 25.0f) > sea - 1.5f) continue;
+            best_rc = rc; dx = ux; dz = uz;
+        }
+        if (best_rc >= 1e9f) {
+            std::fprintf(f, "VOID RUN: no coast within 4 km of spawn with 30 m of sea 1.5 m deep\n");
+            std::fclose(f);
+            g_renderer.shutdown();
+            g_physics.shutdown();
+            return 1;
+        }
+        auto pt = [&](float s, float side, float out[2]) {
+            out[0] = g_spawn.x + dx * (best_rc + s) - dz * side;
+            out[1] = g_spawn.z + dz * (best_rc + s) + dx * side;
+        };
+
+        // The tunnel: 4 m across, from 10 m inland to 30 m out, its roof at
+        // least 2.5 m under the lowest seabed it passes beneath.
+        const float kR = 2.0f, kRoof = 2.5f;
+        float hmin = 1e9f;
+        for (float s = -10.0f; s <= 30.0f; s += 1.0f) {
+            float p[2];
+            pt(s, 0.0f, p);
+            hmin = (std::min)(hmin, wg.height(p[0], p[1]));
+        }
+        const float yc = hmin - kRoof - kR;
+        // The pit: 8 m to one side, half under the seabed, open to the sea.
+        float pit[2];
+        pt(15.0f, 8.0f, pit);
+        if (wg.height(pit[0], pit[1]) > sea - 0.5f) pt(15.0f, -8.0f, pit);
+        const float pit_r = 2.5f, pit_y = wg.height(pit[0], pit[1]);
+
+        float t = 0.0f;
+        const float kDt = 1.0f / 60.0f;
+        auto frame = [&]() -> bool {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+            sync_physics_terrain();
+            sync_sea(t);
+            g_physics.update(kDt, 0.0f, 0.0f, false);
+            g_physics.character_position(g_feet);
+            g_camera.x = g_feet[0]; g_camera.y = g_feet[1] + kEyeAboveFeet; g_camera.z = g_feet[2];
+            t += kDt;
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
+            if (w < 1.0f || h < 1.0f) return false;
+            engine::ViewConstants v = {};
+            fill_view(g_camera, w, h, t, v);
+            g_renderer.render(v);
+            return true;
+        };
+
+        // Stream the place in from the beach above the tunnel's land end.
+        {
+            float p[2];
+            pt(-10.0f, 0.0f, p);
+            g_physics.place_character(p[0], Spawn::above(p[0], p[1]), p[1]);
+        }
+        int drawn = 0;
+        for (int i = 0; i < 120; ++i) drawn += frame() ? 1 : 0;
+
+        for (float s = -10.0f; s <= 30.0f; s += 1.0f) {
+            float p[2];
+            pt(s, 0.0f, p);
+            g_renderer.dig(p[0], yc, p[1], kR, -4.0f, 1);
+        }
+        g_renderer.dig(pit[0], pit_y, pit[1], pit_r, -4.0f, 1);
+
+        // Until every tunnel chunk physics holds is a MESH shape: before
+        // that a chunk is a heightfield, solid to its top surface, and a
+        // character placed in the tunnel would be pushed up onto the seabed.
+        const float kS[3] = {5.0f, 15.0f, 25.0f};
+        const float S0 = engine::lod_chunk_size(0);
+        auto key_at = [&](float x, float y, float z) {
+            engine::ChunkKey k;
+            k.x = int(std::floor(x / S0)); k.y = int(std::floor(y / S0));
+            k.z = int(std::floor(z / S0)); k.lod = 0;
+            return k;
+        };
+        int mesh_frames = -1;
+        for (int i = 1; i <= 900 && mesh_frames < 0; ++i) {
+            drawn += frame() ? 1 : 0;
+            bool all = true;
+            for (int k = 0; k < 3 && all; ++k) {
+                float p[2];
+                pt(kS[k], 0.0f, p);
+                all = g_physics.chunk_shape(key_at(p[0], yc, p[1])) == 2;
+            }
+            if (all && g_physics.chunk_shape(key_at(pit[0], pit_y - pit_r, pit[1])) == 2) mesh_frames = i;
+        }
+
+        std::fprintf(f, "seabed tunnel%s\n", mutant ? " -- MUTANT: BIOMES_SEA_COLUMN_ONLY, the old column rule" : "");
+        std::fprintf(f, "coast %.0f m from spawn (%.1f, %.1f) along (%.3f, %.3f); sea level %.2f\n",
+                     best_rc, g_spawn.x, g_spawn.z, dx, dz, sea);
+        std::fprintf(f, "tunnel: radius %.1f m, centre y %.2f, from 10 m inland to 30 m out; "
+                        "lowest seabed over it %.2f (roof >= %.1f m under it)\n", kR, yc, hmin, kRoof);
+        std::fprintf(f, "pit: radius %.1f m at the seabed (%.1f, %.2f, %.1f)\n", pit_r, pit[0], pit_y, pit[1]);
+        std::fprintf(f, "physics mesh shapes in place after %d frame(s)%s\n\n", mesh_frames,
+                     mesh_frames < 0 ? " -- NEVER: the cases below may stand on heightfields" : "");
+
+        // One case: place, run 1.5 s, count what physics called it.
+        struct Case { int dry = 0, wade = 0, swim = 0, frames = 0; float rise = 0.0f; bool grounded = false;
+                      unsigned long long calls = 0; double ms = 0.0; };
+        LARGE_INTEGER qf;
+        QueryPerformanceFrequency(&qf);
+        auto run = [&](float x, float y, float z) {
+            Case c;
+            g_physics.place_character(x, y, z);
+            const unsigned long long c0 = g_cover_calls, k0 = g_cover_ticks;
+            float settled = 1e9f;
+            for (int i = 0; i < 90; ++i) {
+                drawn += frame() ? 1 : 0;
+                if (i < 15) { settled = g_feet[1]; continue; }   // falls the last few cm
+                ++c.frames;
+                const engine::Medium md = g_physics.medium();
+                if (md == engine::Medium::Dry) ++c.dry;
+                else if (md == engine::Medium::Wading) ++c.wade;
+                else ++c.swim;
+                c.rise = (std::max)(c.rise, g_feet[1] - settled);
+            }
+            c.grounded = g_physics.character_grounded();
+            c.calls = g_cover_calls - c0;
+            c.ms = double(g_cover_ticks - k0) * 1000.0 / double(qf.QuadPart);
+            return c;
+        };
+        auto line = [&](const char* name, const Case& c, float x, float z) {
+            std::fprintf(f, "%-24s generated column %+6.2f m (%s); dry %d, wading %d, swimming %d of %d; "
+                            "rose %.2f m; %s; cover test %llu calls, %.1f us each\n",
+                         name, wg.height(x, z) - sea, wg.height(x, z) < sea ? "sea by the old rule" : "land",
+                         c.dry, c.wade, c.swim, c.frames, c.rise, c.grounded ? "on its feet" : "NOT grounded",
+                         c.calls, c.calls ? c.ms * 1000.0 / double(c.calls) : 0.0);
+        };
+
+        bool pass_a = mesh_frames > 0, pass_b = false, pass_c = false;
+        for (int k = 0; k < 3; ++k) {
+            float p[2];
+            pt(kS[k], 0.0f, p);
+            const Case c = run(p[0], yc - kR + 0.3f, p[1]);
+            char name[64];
+            std::snprintf(name, sizeof(name), "A. tunnel, %2.0f m out:", kS[k]);
+            line(name, c, p[0], p[1]);
+            if (c.dry != c.frames || !c.grounded || c.rise > 0.3f) pass_a = false;
+        }
+        {
+            float p[2];
+            pt(25.0f, 0.0f, p);
+            const float bed = wg.height(p[0], p[1]);
+            const Case c = run(p[0], (std::max)(bed + 0.3f, sea - engine::PhysicsWorld::kFloatDepth), p[1]);
+            line("B. open water over it:", c, p[0], p[1]);
+            pass_b = c.frames > 0 && c.dry == 0;
+        }
+        {
+            const Case c = run(pit[0], pit_y - pit_r + 0.3f, pit[1]);
+            line("C. open pit in the bed:", c, pit[0], pit[1]);
+            pass_c = c.frames > 0 && c.dry == 0;
+        }
+
+        // A still down the tunnel, seaward, from its 5 m point.
+        {
+            float p[2];
+            pt(5.0f, 0.0f, p);
+            engine::Camera c = g_camera;
+            c.x = p[0]; c.z = p[1]; c.y = yc + 0.3f;
+            c.yaw = std::atan2(dx, dz);
+            c.pitch = 0.0f;
+            engine::ViewConstants cv = {};
+            fill_view(c, g_res_w, g_res_h, t, cv);
+            std::string e3;
+            g_renderer.capture(cv, "build/seabed_tunnel.bmp", e3);
+            std::fprintf(f, "\nstill: build/seabed_tunnel.bmp -- --cam %.2f %.2f %.2f %.4f 0\n", c.x, c.y, c.z, c.yaw);
+        }
+
+        const engine::FrameStats st = g_renderer.stats();
+        if (drawn == 0 || st.chunks_classified == 0)
+            std::fprintf(f, "\nVOID RUN: %d frames drawn, %llu chunks classified\n", drawn, st.chunks_classified);
+        std::fprintf(f, "\nA (tunnel dry, standing): %s\nB (open water is sea): %s\nC (open pit is sea): %s\n",
+                     pass_a ? "PASS" : "FAIL", pass_b ? "PASS" : "FAIL", pass_c ? "PASS" : "FAIL");
+        const bool pass = pass_a && pass_b && pass_c && drawn > 0;
+        std::fprintf(f, "%s\n", pass ? "PASS" : "FAIL");
+        std::fclose(f);
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return pass ? 0 : 1;
+    }
+
     if (swim_seconds > 0.0) {
         // --swim: walk off a beach, swim out, turn round, swim back and walk
         // out. The thing being measured is the bug this replaces -- a
@@ -5071,33 +5309,37 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const float deep = engine::PhysicsWorld::kFloatDepth +
                            ww_total_amplitude(wsea) + 1.0f;
 
-        // A beach: the nearest coast to the origin along any of 72 spokes
-        // where the land side is low enough to walk down (under 6 m, 20 m
-        // in) and the sea side stays sea and gets deep within 40 m.
+        // A beach: the nearest coast to SPAWN along any of 72 spokes where
+        // the land side is low enough to walk down (under 6 m, 20 m in) and
+        // the sea side stays sea and gets deep within 40 m. From the origin
+        // until v19: v18's archipelago put the origin in the sea, and every
+        // run since found no beach and swam nothing.
+        const float ox = g_spawn.x, oz = g_spawn.z;
+        auto hgt = [&](float dx, float dz, float r) { return wg.height(ox + dx * r, oz + dz * r); };
         float best_rc = 1e9f, dir_x = 0.0f, dir_z = 1.0f;
         for (int sp = 0; sp < 72; ++sp) {
             const float a = 6.2831853f * float(sp) / 72.0f;
             const float dx = std::sin(a), dz = std::cos(a);
             float rc = -1.0f;
             for (float r = 20.0f; r < 6000.0f && r < best_rc; r += 5.0f) {
-                if (wg.height(dx * r, dz * r) < sea) { rc = r; break; }
+                if (hgt(dx, dz, r) < sea) { rc = r; break; }
             }
             if (rc < 0.0f) continue;
-            const float land = wg.height(dx * (rc - 20.0f), dz * (rc - 20.0f));
+            const float land = hgt(dx, dz, rc - 20.0f);
             if (land < sea || land > sea + 6.0f) continue;
             bool open = true;
             for (float r = rc; r <= rc + 70.0f; r += 5.0f) {
-                if (wg.height(dx * r, dz * r) >= sea) { open = false; break; }
+                if (hgt(dx, dz, r) >= sea) { open = false; break; }
             }
             if (!open) continue;
-            if (sea - wg.height(dx * (rc + 40.0f), dz * (rc + 40.0f)) < deep) continue;
+            if (sea - hgt(dx, dz, rc + 40.0f) < deep) continue;
             best_rc = rc; dir_x = dx; dir_z = dz;
         }
 
         FILE* f = std::fopen("build/swim.txt", "w");
         if (best_rc >= 1e9f) {
             if (f) {
-                std::fprintf(f, "no beach found within 6 km of the origin that is walkable on\n"
+                std::fprintf(f, "no beach found within 6 km of spawn that is walkable on\n"
                                 "the land side and deeper than %.2f m 40 m out. Nothing was swum.\n",
                              deep);
                 std::fclose(f);
@@ -5109,7 +5351,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
 
         g_renderer.set_vsync(true);
         g_walk = true;
-        const float sx = dir_x * (best_rc - 20.0f), sz = dir_z * (best_rc - 20.0f);
+        const float sx = ox + dir_x * (best_rc - 20.0f), sz = oz + dir_z * (best_rc - 20.0f);
         g_physics.place_character(sx, Spawn::above(sx, sz), sz);
         g_physics.character_position(g_feet);
         const float yaw_out = std::atan2(dir_x, dir_z);
@@ -5193,7 +5435,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                   (g_feet[2] - pz) * (g_feet[2] - pz));
             }
 
-            const double along = double(g_feet[0]) * dir_x + double(g_feet[2]) * dir_z;
+            const double along = double(g_feet[0] - ox) * dir_x + double(g_feet[2] - oz) * dir_z;
             if (along - best_rc > out_max) out_max = along - best_rc;
 
             const float column = sea - wg.height(g_feet[0], g_feet[2]);
@@ -5289,7 +5531,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             }
             std::fprintf(f, "swim off a beach and back, %.1f s, sea state %.2f\n",
                          swim_seconds, state);
-            std::fprintf(f, "beach: coast %.0f m from the origin along (%.3f, %.3f), "
+            std::fprintf(f, "beach: coast %.0f m from spawn along (%.3f, %.3f), "
                             "start 20 m inland\n", best_rc, dir_x, dir_z);
             std::fprintf(f, "frames %llu, judged %llu (after 1.5 s of streaming)\n",
                          frames, judged);
