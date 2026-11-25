@@ -67,7 +67,8 @@ public:
     // The probe visibility volume (cs_nf_vis): read by every table that
     // reads the probes (t30), written here.
     static const UINT kSrvVis = kUavTop + 1, kUavVis = kUavTop + 2;
-    static const UINT kHeapEnd = kUavTop + 3;
+    static const UINT kUavSky = kUavTop + 3;   // the sky access's distances (u22)
+    static const UINT kHeapEnd = kUavTop + 4;
     // Per-frame budgets: blocks filled from the field, probes listed.
     static const int kBlocksPerFrame = 48;
     static const int kProbesPerFrame = 2048;   // the round robin: placing and copying
@@ -112,6 +113,10 @@ public:
         // coarse pass is latency, not work: a stride saves it nothing.
         int live_stride = 2;
         int coarse_stride = 1;
+        // Sky access (sky_access.h): metres of path through air over which
+        // the open sky's light falls by e -- how fast daylight dies down a
+        // tunnel. archetypes.json `underground` sky_falloff_m; live.
+        float sky_falloff = 12.0f;
     };
     Schedule& schedule() { return sched_; }
 
@@ -121,15 +126,21 @@ public:
     bool ready() const { return ready_; }
     // The world whose underground air the sky-access flood labels
     // (sky_access.h). Without it no air is ever marked sealed.
-    void set_world(const WorldGpu* world, const BrickStore* edits) { sky_.init(world, edits); }
+    void set_world(const WorldGpu* world, const BrickStore* edits) { sky_.init(world, edits, sky_reach_); }
+    // archetypes.json's `underground` block: sky_falloff_m, sky_reach_m.
+    // Before set_world (the reach is the flood's).
+    bool load_config(const char* path, std::string& error);
     // Whoever writes the edit store holds this for the write (the flood's
     // worker reads it).
     std::unique_lock<std::shared_mutex> sky_edit_lock() { return sky_.edit_lock(); }
     // Stops the flood's worker; before the world it reads goes away.
     void shutdown() { sky_.shutdown(); }
     const SkyAccess& sky_access() const { return sky_; }
-    bool camera_sealed() const { return cam_sealed_; }
-    // Held blocks still marked "not labelled" (waiting on the flood).
+    // The camera's cell: metres to the sky by path (255 none), and its
+    // darkness, 1 - exp(-path / L) (constants: l_nf.w 1 + darkness).
+    int camera_sky_dist() const { return cam_dist_; }
+    float camera_dark() const { return cam_dark_; }
+    // Held blocks still marked "not answered" (waiting on the flood).
     int sky_unlabelled() const { int n = 0; for (uint8_t u : held_unknown_) n += u; return n; }
 
     // The player's edits changed inside a world box: its blocks are filled
@@ -165,7 +176,7 @@ public:
     int probes_planned() const { return int(probe_list_.size()); }
     int edits_planned() const { return int(edit_list_.size() / 4); }
     int blocks_pending() const { return pending_; }
-    int marks_planned() const { return int(marks_.size() / 20); }
+    int marks_planned() const { return int(marks_.size() / kMarkWords); }
     // Over its life: plans, plans that filled blocks, blocks filled, probes traced.
     unsigned long long plans() const { return plans_; }
     unsigned long long fill_frames() const { return fill_frames_; }
@@ -213,13 +224,20 @@ private:
     // (16 words), the flood's generation they were made at, and this frame's
     // marks (20 words an entry: block xyz, pad, mask) for cs_nf_mark.
     SkyAccess sky_;
-    std::vector<uint32_t> held_mask_;
+    static const int kMarkWords = 4 + SkyAccess::kCells / 4;   // an entry: block, flag, 512 bytes (cs_nf_mark)
+    float sky_reach_ = 96.0f;
+    std::vector<uint8_t> held_dist_;     // per storage block: the distances the GPU holds (512)
+    std::vector<uint8_t> sky_pending_;   // per storage block: asked, not answered
+    std::vector<float> sky_boxes_;       // edit boxes since the last plan (6 floats each)
+    bool sky_all_ = false;               // an invalidate_all since the last plan
+    uint8_t cam_dist_ = 0;
+    float cam_dark_ = 0.0f;
     std::vector<uint8_t> held_unknown_;  // per storage block: its GPU marks are the "not labelled" rule
     std::vector<uint32_t> mark_stamp_;   // per storage block: the plan that last listed it for cs_nf_mark
     uint32_t mark_plan_ = 0;
     uint64_t sky_gen_ = 0;
     // Masks the flood has answered under the current generation, by world block.
-    std::unordered_map<int64_t, std::vector<uint32_t> > sky_cache_;
+    std::unordered_map<int64_t, std::vector<uint8_t> > sky_cache_;
     std::vector<SkyAccess::Result> sky_results_;
     std::vector<uint32_t> marks_;
     // The visibility volume's blocks this frame (4 ints each): the filled
@@ -227,7 +245,7 @@ private:
     std::vector<int32_t> vis_blocks_;
     std::vector<uint32_t> vis_stamp_;
     uint32_t vis_plan_ = 0;
-    bool cam_sealed_ = false;            // the camera stands in sealed air (constants: l_nf.w 2)
+
     std::vector<float> edit_list_;       // 4 floats an entry
     std::vector<uint32_t> probe_list_;
     bool occ_dirty_ = false;
@@ -235,7 +253,7 @@ private:
 
     ComPtr<ID3D12Device> dev_;
     ComPtr<ID3D12DescriptorHeap> heap_;
-    ComPtr<ID3D12Resource> density_, occ_, probes_, top_, coarse_, aux_, args_, live_rb_[2], vis_;
+    ComPtr<ID3D12Resource> density_, occ_, probes_, top_, coarse_, aux_, args_, live_rb_[2], vis_, sky_vol_;
     bool vis_is_srv_ = false;
     ComPtr<ID3D12CommandSignature> dispatch_sig_;
     bool live_rb_pending_[2] = {false, false};

@@ -2987,6 +2987,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         if (!hfgi_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         // The near field: the light under it.
         if (!near_.init(device_.Get(), srv_heap_.Get(), Clouds::kShadowSrv, error)) return false;
+        if (!near_.load_config("worldgen/data/archetypes.json", error)) return false;
         near_.set_world(&world_, &edits_);   // the sky-access flood reads its field and the edits (sky_access.h)
         // The key light's shadow past the cascades.
         if (!far_.init(device_.Get(), srv_heap_.Get(), error)) return false;
@@ -3685,7 +3686,7 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
         pc.wet[3] = puddle_now > 0.0f ? 1.0f : 0.0f;
     }
     pc.storm[0] = storm_dim();
-    pc.storm[1] = (near_on_ && near_.camera_sealed()) ? 1.0f : 0.0f;   // post.hlsl: the haze past 64 m
+    pc.storm[1] = near_on_ ? near_.camera_dark() : 0.0f;   // post.hlsl: the haze past 64 m
     height_fog_constants(pc.hfog, !wire);
     pc.fog_near = kFogNear;
     pc.fog_log_ratio = std::log(kFogFar / kFogNear);
