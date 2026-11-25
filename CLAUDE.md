@@ -2478,6 +2478,39 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   sealed cave lets the light in ~0.1-0.6 s later. A/B: `BIOMES_SKY_SYNC`
   (wait every frame) and `BIOMES_SKY_FORGET_ALL` (an edit forgets every
   label) -- both set is the old behaviour.
+- **Step 2: distance to the sky, not open or sealed.** With v10's cave
+  densities -- caves reached through layer 7's shafts, the likeliest kind
+  of cave system -- 14 of 19 sampled open columns were 200 m or more by
+  path from any opening, the farthest 1,163 m, and that air read as OPEN:
+  the deepest tunnel lit at noon (walls and white haze at EV100 4) and
+  dark at 23:00. (The shallow and sinkhole stress variants have none of
+  this: sealed, or open within 64 m.) The flood now gives every cell the
+  shortest path through air to the sky -- to air with open sky straight
+  above it (`sky_floor`) -- capped at the reach, 255 past it or sealed:
+  for a batch of requested blocks a forward search through air from all
+  their cells out to the reach, noting every sky cell met, then a search
+  back from those over what it reached, which is exact for the requested
+  cells and costs the air within the reach however big the cave. The GPU
+  keeps a byte a voxel (`u_sky`, R32_UINT, `cs_nf_mark` writes it; the
+  density volume is no longer biased) and turns it into an access
+  exp(-path / L): a ray that leaves the volume brings back the
+  heightfield's sky times the access of the air it left by
+  (`nf_sky_access`), probes gate on access under 0.01, and the camera's
+  darkness (1 - its access, `l_nf.w` 1 + it, `storm.y` in post) dims the
+  air where the near field knows nothing (`nf_beyond`: past the volume,
+  and its 2 m edge band) -- and, when it is total (sealed, or no sky in
+  the reach), every froxel it sees, as step 1 had it: graded, a camera
+  down a tunnel still sees the sunlit air at its mouth. **L is
+  archetypes.json `underground` sky_falloff_m (12 m), live in the tuning
+  panel's Near field group, and `--sky-falloff <m>`; sky_reach_m (96 m)
+  caps the flood**, for cave designs to come. Measured: the deepest v10
+  tunnel at EV100 4 is black (luma 3, the display's floor; it was lit),
+  its live probes 4,162 -> 2,021; the sealed chamber stays black (3.0 at
+  EV100 6); every dug tunnel and the cave views match their stills from
+  before within noise, the sinkhole's cave mouth 1% darker (122.2 ->
+  120.9: cave air 20-60 m from the sky); flight and dig-play frame times
+  unchanged; `--leak-test` 0.001 nits. A camera rounding into rock (a
+  still's camera set in a wall) takes the nearest air within 2 m.
 - **Probes in sealed air with no light near do not trace** (`nf_gated`,
   `BIOMES_NF_NOGATE` for A/B). Neither sun nor sky can reach sealed air,
   so only the hits' local lights (the frame's first 32, shadowed) can: a

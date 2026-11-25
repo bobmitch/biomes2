@@ -141,9 +141,19 @@ void cs_fog_inject(uint3 id : SV_DispatchThreadID) {
     // see is that same sealed air -- a line of sight from sealed air stays in
     // it until it meets rock -- and no sun reaches it, whatever a cascade's
     // texel says.
-    const bool sealed = l_nf.w > 1.5f;
-    float3 L = sealed ? float3(0.0f, 0.0f, 0.0f)
-             : kSunLux * (key_visibility(p) * cloud_shadow_at(g_cloud_shadow, g_lin, cloud_shadow, kSunDir, p) *
+    // The camera's darkness (l_nf.w - 1, 1 - its sky access). Where the
+    // near field knows nothing (nf_beyond) it takes the sun out: that air
+    // is the camera's own. With none at all (sealed, or no sky within the
+    // reach) every froxel it can see is that air too -- a line of sight
+    // from sealed air stays in it -- and the cascades let sun into a sealed
+    // chamber's mist (luma 130 at EV100 6 without this). Graded, inside the
+    // volume the cascades and the probes say what is lit: a camera down a
+    // tunnel sees the sunlit air at its mouth.
+    const float sdark = saturate(l_nf.w - 1.0f);
+    const bool dark_eye = sdark > 0.999f;
+    const float sun_k = dark_eye ? 0.0f : (nf_beyond(p) ? 1.0f - sdark : 1.0f);
+    float3 L = kSunLux * (sun_k * key_visibility(p) *
+                          cloud_shadow_at(g_cloud_shadow, g_lin, cloud_shadow, kSunDir, p) *
                           hg_phase(dot(d, kSunDir), phase_g));
     // The sky above and the ground below, scattered isotropically: the mean
     // radiance over the sphere.
@@ -156,8 +166,10 @@ void cs_fog_inject(uint3 id : SV_DispatchThreadID) {
     // as the probes say (k_here, open_here). The eye's share and its ramp
     // back to open air at 64 m stood in for "somewhere else", and lit the
     // last metres of the volume, where the probes give up, with daylight.
+    // (nf_openness gives the camera's darkness as k_here, with no openness,
+    // where it knows nothing.)
     const float share = in_rock ? 0.0f
-                      : l_nf.w > 1.5f ? k_here * open_here
+                      : dark_eye ? k_here * open_here
                       : lerp(lerp(cam_sky, 1.0f, saturate((length(p - shadow_cam) - 64.0f) / 192.0f)), open_here, k_here);
     L += 0.5f * (kSkyMean + kGroundRadiance) * share;
     // For the composite, how much the ground over it darkens this air: 1 in

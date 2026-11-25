@@ -63,6 +63,7 @@ cbuffer NfConstants : register(b0) {
     float4 nf_live;                     // keep fine, keep by a fast light, keep coarse, the coarse rays' reach (m; 0: 48)
     uint4  nf_live2;                    // fast lights, plans so far, the fine and coarse strides (frames)
     float4 nf_fast[8];
+    float4 nf_sky;                      // the sky access (sky_access.h): x 1 / L (sky_falloff, m), y the reach (m)
 };
 // A dug wall's albedo: soil and rock, a little warm. The terrain's own
 // material per biome would be better (gaps.md); this is its mean.
@@ -95,11 +96,15 @@ StructuredBuffer<float4> g_edits      : register(t3);   // x: storage index (bit
 StructuredBuffer<uint>   g_probe_list : register(t4);   // probe storage indices to update
 StructuredBuffer<uint>   g_coarse_list : register(t5);  // coarse probe (block) storage indices to update
 // Sky access (sky_access.h): per entry, a world block (8 m units, 3 ints),
-// a flag, and 16 words, a bit per 1 m voxel (x + 8 y + 64 z) of air the
-// CPU's flood found no path from to the open sky. Flag 1: not labelled yet
-// (the flood runs on its own thread): every air voxel under the top surface
-// counts as sealed until its labels come -- dark, never a leak.
+// a flag, and 128 words, a byte per 1 m voxel (x + 8 y + 64 z): the path
+// through air to the open sky in metres, 255 none within the reach. Flag 1:
+// not answered yet (the flood runs on its own thread): every air voxel under
+// the top surface counts as having none until its answer comes -- dark,
+// never a leak.
 StructuredBuffer<uint>   g_marks      : register(t6);
+static const uint kNfMarkWords = 132u;
+// Those distances, per voxel (0 where a fill left no answer: open).
+RWTexture3D<uint>        u_sky        : register(u22);
 // The probe visibility volume (hfgi.hlsli nf_sample): per 1 m voxel v, a bit
 // per probe P = floor(v / 2) + d, d in {-1, 0, 1}^3, bit (dx+1) + 3 (dy+1) +
 // 9 (dz+1), set when a reader there sees that probe. Every 2 m cell a reader
@@ -153,6 +158,7 @@ uint nf_coarse_index(int3 b) {
 void cs_nf_fill(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
     const int3 w = g_blocks[g.x].xyz * 8 + int3(t);
     u_density[nf_wrap(w, kNfDims)] = real_terrain_density(float(w.x), float(w.y), float(w.z), 1.0f);
+    u_sky[nf_wrap(w, kNfDims)] = 0u;   // open, until the flood says otherwise (cs_nf_mark)
     // The block's probes are off until traced again (the plan queues them).
     // The volume is toroidal: a slot that scrolls in still held a probe from
     // the far side -- daylight from the surface, say -- and a neighbour's hit
@@ -178,33 +184,21 @@ void cs_nf_edits(uint3 id : SV_DispatchThreadID) {
     u_density[s] = e.y;
 }
 
-// SEALED air -- no path through air to the open sky, by the CPU's flood
-// (sky_access.h) -- is stored in the density volume less kNfSealBias. Its
-// sign stays air and its occupancy stays 0 (saturate(0.5 + d)), so nothing
-// that reads occupancy changes; a ray that leaves the volume through it is
-// dark, not the heightfield's sky (nf_march). Only air is ever marked: the
-// CPU's field agrees with this one to a tolerance, and a voxel it calls air
-// that this one calls rock stays rock.
-static const float kNfSealBias = 1000.0f;
-float nf_unseal(float d) { return d <= -0.5f * kNfSealBias ? d + kNfSealBias : d; }
-bool nf_sealed(float d) { return d <= -0.5f * kNfSealBias; }
+// (Step 1 kept sealed air in the density volume less a bias; the distances
+// have their own volume now, and this leaves density as it was.)
+float nf_unseal(float d) { return d; }
 
-// After the fill and the edits, before the occupancy: each listed block's
-// marks, the old ones taken off first (a block re-marked as the flood learns
-// more, a cave dug open).
+// After the fill, the edits and the top map: each listed block's distances.
 [numthreads(8, 8, 8)]
 void cs_nf_mark(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
-    const uint e = g.x * 20u;
+    const uint e = g.x * kNfMarkWords;
     const int3 w = int3(int(g_marks[e]), int(g_marks[e + 1u]), int(g_marks[e + 2u])) * 8 + int3(t);
     const uint idx = t.x + 8u * t.y + 64u * t.z;
-    bool bit = ((g_marks[e + 4u + (idx >> 5)] >> (idx & 31u)) & 1u) != 0u;
-    // Not labelled yet: under the top map (written this frame, cs_nf_top --
-    // only a block filled this frame is ever listed so).
-    if (g_marks[e + 3u] != 0u) bit = float(w.y) < u_top[nf_wrap(int3(w.x, 0, w.z), kNfDims).xz] - 0.5f;
-    const int3 s = nf_wrap(w, kNfDims);
-    float d = nf_unseal(u_density[s]);
-    if (bit && d < 0.0f) d -= kNfSealBias;
-    u_density[s] = d;
+    uint d = (g_marks[e + 4u + (idx >> 2)] >> ((idx & 3u) * 8u)) & 255u;
+    // Not answered yet: none under the top map (written this frame,
+    // cs_nf_top -- only a block filled this frame is ever listed so).
+    if (g_marks[e + 3u] != 0u) d = float(w.y) < u_top[nf_wrap(int3(w.x, 0, w.z), kNfDims).xz] - 0.5f ? 255u : 0u;
+    u_sky[nf_wrap(w, kNfDims)] = d;
 }
 
 // The visibility volume. The reader marched from its point to each of its
@@ -326,26 +320,29 @@ bool nf_inside(float3 wp) {
     return all(rel >= 0.5f) && all(rel <= float3(kNfDims) - 1.5f);
 }
 
-// Whether the air round p (inside the volume) is sealed: the trilinear
-// weights of the eight voxels round it, sealed air against open air (rock
-// counts for neither). A ray's last point in air sits beside rock as often
-// as not, and a 1 m wall between a sealed cave and an open one puts both
-// kinds in one cell: the weights decide.
-bool nf_sealed_at(float3 p) {
+// How much of the open sky's light reaches the air round p (inside the
+// volume), by the flood's path to the sky: exp(-path / L), 0 with none in
+// the reach -- the trilinear weights of the eight voxels round it, over the
+// air ones (a ray's last point in air sits beside rock as often as not).
+// 1 with no air round it: nothing known, the open air's rule.
+float nf_sky_access(float3 p) {
     const float3 f = floor(p);
     const float3 t = p - f;
-    float ws = 0.0f, wo = 0.0f;
+    float wa = 0.0f, ws = 0.0f;
     [unroll] for (int c = 0; c < 8; ++c) {
         const int3 off = int3(c & 1, (c >> 1) & 1, c >> 2);
         const float3 tw = lerp(1.0f - t, t, float3(off));
         const float w = tw.x * tw.y * tw.z;
-        const float d = u_density[nf_wrap(int3(f) + off, kNfDims)];
-        if (d >= 0.0f) continue;
-        if (nf_sealed(d)) ws += w;
-        else wo += w;
+        const int3 s = nf_wrap(int3(f) + off, kNfDims);
+        if (u_density[s] >= 0.0f) continue;
+        const uint d = u_sky[s];
+        wa += w * (d >= 255u ? 0.0f : exp(-float(d) * nf_sky.x));
+        ws += w;
     }
-    return ws > wo;
+    return ws > 0.0f ? wa / ws : 1.0f;
 }
+// Below this a probe is in the dark (nf_gated) and a ray brings back nothing.
+static const float kNfGateAccess = 0.01f;
 
 float nf_occ_point(float3 wp) {
     return g_nf_occ.Load(int4(nf_wrap(int3(floor(wp + 0.5f)), kNfDims), 0));
@@ -616,6 +613,7 @@ void nf_march(float3 o, float3 d, uint bin, bool fine, bool merge, out float a, 
     float t = 0.3f, t_air = 0.0f;
     bool tried = !fine || !merge;
     uint outcome = 0u;   // 0 ran out (dark), 1 got out, 2 met rock
+    float esc = 1.0f;    // the sky access of the air a ray left the volume by
     float2 uv_out = 0.0f;
     bool on_out = false;
     [loop] for (int i = 0; i < 128; ++i) {
@@ -627,9 +625,13 @@ void nf_march(float3 o, float3 d, uint bin, bool fine, bool merge, out float a, 
         if (!nf_inside(q) || above) {
             // Out of the volume under the top surface: what lies beyond is
             // not here to march, and taking the heightfield's sky for it lit
-            // a sealed cave longer than the volume with daylight. The air it
-            // left by says whether there is any way out (sky_access.h).
-            if (!above && nf_sealed_at(o + d * t_air)) break;   // outcome 0: dark
+            // a sealed cave longer than the volume with daylight -- and an
+            // open one 1.2 km from its mouth. The air it left by says how
+            // much of the sky comes that way (sky_access.h).
+            if (!above) {
+                esc = nf_sky_access(o + d * t_air);
+                if (esc <= kNfGateAccess * 0.1f) break;   // outcome 0: dark
+            }
             outcome = 1u;
             uv_out = uv;
             on_out = on_map;
@@ -671,6 +673,8 @@ void nf_march(float3 o, float3 d, uint bin, bool fine, bool merge, out float a, 
     }
     if (outcome == 1u) {
         nf_escape(on_out, uv_out, d, vis, rad);
+        vis *= esc;
+        rad *= esc;
     } else if (outcome == 2u) {
         if (!fine && t_air < kNfSplit) { a = 0.0f; return; }
         const bool near_hit = t_air < kNfSplit;
@@ -722,7 +726,7 @@ bool nf_near_fast(float3 c) {
 // VALID and black, not switched off: off, the reader would fall back to
 // the heightfield's covered branch, which can borrow light.
 bool nf_gated(float3 c, float reach) {
-    if (nf_gate == 0u || !nf_sealed_at(c)) return false;
+    if (nf_gate == 0u || nf_sky_access(c) > kNfGateAccess) return false;
     if (l_cluster.w > 0.5f) {
         const uint nlights = min(uint(l_cluster.w), nf_lights);
         [loop] for (uint i = 0u; i < nlights; ++i) {
@@ -808,7 +812,7 @@ void nf_probe_body(uint li, uint k, bool from_live) {
     // sees cost more than its rays marching on themselves -- the torch in the
     // 4 m tunnel 0.29 ms against 0.16 with the coarse level off, the same
     // still. Uniform over the group, as mode is.
-    const bool merge = !(mode == 3u && nf_gate != 0u && nf_sealed_at(c + off));
+    const bool merge = !(mode == 3u && nf_gate != 0u && nf_sky_access(c + off) <= kNfGateAccess);
     const bool settle = nf_settle != 0xFFFFFFFFu;
     const bool fresh = from_live ? (u_aux[pi] & kNfModeFresh) != 0u : (entry & 0x80000000u) != 0u;
 
@@ -1160,7 +1164,8 @@ void cs_nf_live(uint3 id : SV_DispatchThreadID) {
             // carry its bounce. A/B with the coarse level off: a torch in the
             // sealed 42 m chamber and in the 4 m tunnel under spawn drew the
             // same still to 1 level in 255, for 0.36 and 0.16 ms of coarse.
-            gated = nf_gate != 0u && nf_sealed_at(float3((ob + nf_wrap(s - ob, kNfCoarseDims)) * 8 + 4) + meta.yzw);
+            gated = nf_gate != 0u &&
+                    nf_sky_access(float3((ob + nf_wrap(s - ob, kNfCoarseDims)) * 8 + 4) + meta.yzw) <= kNfGateAccess;
         }
         if (m > 1.5f && m < 2.5f && !gated) {   // placed under cover, and not gated
             InterlockedAdd(u_aux[nf_count_slot() + 1u], 1u, slot);

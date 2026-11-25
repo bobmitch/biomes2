@@ -7,6 +7,7 @@
 #include "engine/field/world_gpu.h"
 #include "engine/svdag/brick_store.h"
 #include "engine/render/shader_heaps.h"
+#include "worldgen/assign/json_lite.h"
 
 #include <algorithm>
 #include <climits>
@@ -31,8 +32,9 @@ struct NfConstants {
     float live[4];                   // the live pass's blends: fine, by a fast light, coarse; -
     uint32_t live2[4];               // fast lights, plans so far, fine and coarse strides
     float fast[8][4];                // fast lights: x, y, z, reach^2
+    float sky[4];                    // the sky access: 1 / L, the reach (m), -, -
 };
-static_assert(sizeof(NfConstants) == 288, "NfConstants must match near_field.hlsl");
+static_assert(sizeof(NfConstants) == 304, "NfConstants must match near_field.hlsl");
 
 // A uniformly random rotation (Shoemake's quaternion from three uniforms),
 // as matrix rows. Presentation; sin and cos are fine here.
@@ -90,7 +92,8 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
     dirty_.assign(kBlocks, 0);
     probe_dirty_.assign(kProbes, 0);
     stamp_.assign(kProbes, 0u);
-    held_mask_.assign(size_t(kBlocks) * SkyAccess::kMaskWords, 0u);
+    held_dist_.assign(size_t(kBlocks) * SkyAccess::kCells, 0);
+    sky_pending_.assign(kBlocks, 0);
     held_unknown_.assign(kBlocks, 0);
     mark_stamp_.assign(kBlocks, 0u);
     vis_stamp_.assign(kBlocks, 0u);
@@ -200,7 +203,7 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
             !buffer(edits_up_[f], UINT64(kMaxEdits) * 16, up, false, gr) ||
             !buffer(probes_up_[f], UINT64(kProbes) * 4, up, false, gr) ||
             !buffer(coarse_up_[f], UINT64(kCoarse) * 4, up, false, gr) ||
-            !buffer(marks_up_[f], UINT64(kBlocks) * 20 * 4, up, false, gr) ||
+            !buffer(marks_up_[f], UINT64(kBlocks) * kMarkWords * 4, up, false, gr) ||
             !buffer(vis_up_[f], UINT64(kBlocks) * 16, up, false, gr)) {
             error = "near field uploads";
             return false;
@@ -275,13 +278,38 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
         ud.Texture3D.WSize = UINT(kNz);
         device->CreateUnorderedAccessView(vis_.Get(), nullptr, &ud, cpu(kUavVis));
     }
+    // The sky access's distances (cs_nf_mark writes, the probe passes read):
+    // R32 so typed UAV loads of it are guaranteed.
+    {
+        D3D12_RESOURCE_DESC td = {};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        td.Width = kNx;
+        td.Height = kNy;
+        td.DepthOrArraySize = kNz;
+        td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R32_UINT;
+        td.SampleDesc.Count = 1;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(device->CreateCommittedResource(&dh, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                   nullptr, IID_PPV_ARGS(&sky_vol_)))) {
+            error = "near field sky access volume";
+            return false;
+        }
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = DXGI_FORMAT_R32_UINT;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        ud.Texture3D.WSize = UINT(kNz);
+        device->CreateUnorderedAccessView(sky_vol_.Get(), nullptr, &ud, cpu(kUavSky));
+    }
 
     // Root: the update's constants, the world (the field's), the frame's
     // shadow constants (the heightfield's corner), the world's ten buffers,
     // one table (the density and occupancy UAVs, the occupancy and probes'
     // SRVs, the heightfield's maps), the three lists, the probes, the mip.
     {
-        D3D12_DESCRIPTOR_RANGE r[9] = {};
+        D3D12_DESCRIPTOR_RANGE r[10] = {};
+        r[9].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; r[9].NumDescriptors = 1; r[9].BaseShaderRegister = 22;
+        r[9].OffsetInDescriptorsFromTableStart = kUavSky;   // the sky access's distances
         r[8].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; r[8].NumDescriptors = 1; r[8].BaseShaderRegister = 21;
         r[8].OffsetInDescriptorsFromTableStart = kUavVis;   // the visibility volume
         // A ray's hit is lit by the sun's cascades (t8 at [0]), the local
@@ -312,7 +340,7 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
             p[3 + k].Descriptor.ShaderRegister = UINT(11 + k);
         }
         p[13].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[13].DescriptorTable.NumDescriptorRanges = 9;
+        p[13].DescriptorTable.NumDescriptorRanges = 10;
         p[13].DescriptorTable.pDescriptorRanges = r;
         p[14].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[14].Descriptor.ShaderRegister = 2;
         p[15].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[15].Descriptor.ShaderRegister = 3;
@@ -386,9 +414,25 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
     return true;
 }
 
+bool NearField::load_config(const char* path, std::string& error) {
+    try {
+        const jsonlite::Value root = jsonlite::parse_file(path);
+        if (!root.has("underground")) return true;
+        const jsonlite::Value& u = root.at("underground");
+        if (u.has("sky_falloff_m")) sched_.sky_falloff = float(u.number("sky_falloff_m"));
+        if (u.has("sky_reach_m")) sky_reach_ = float(u.number("sky_reach_m"));
+    } catch (const std::exception& e) {
+        error = std::string("archetypes.json underground: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
 void NearField::invalidate_box(const float lo[3], const float hi[3]) {
     if (held_.empty()) return;
     sky_.invalidate_box(lo, hi);
+    for (int k = 0; k < 3; ++k) sky_boxes_.push_back(lo[k]);
+    for (int k = 0; k < 3; ++k) sky_boxes_.push_back(hi[k]);
     // The blocks holding the box, by a voxel of margin (the 1 m sample on a
     // block's face belongs to one block only).
     const int b0[3] = {floor_div(int(std::floor(lo[0])) - 1, kBlock), floor_div(int(std::floor(lo[1])) - 1, kBlock),
@@ -419,6 +463,7 @@ void NearField::invalidate_box(const float lo[3], const float hi[3]) {
 }
 
 void NearField::invalidate_all() {
+    sky_all_ = true;
     sky_.invalidate_all();
     std::fill(dirty_.begin(), dirty_.end(), uint8_t(1));
 }
@@ -467,25 +512,54 @@ void NearField::plan(const float cam[3], const BrickStore* edits, bool settle, f
     const size_t budget = settle ? want.size() : (std::min)(want.size(), size_t(kBlocksPerFrame));
     std::vector<BrickKey> touched;
     // Sky access (sky_access.h), on its own thread: a block that can hold
-    // sealed air is asked for; until its answer comes the GPU marks it by the
-    // "not labelled" rule (its air under the top surface dark). Each storage
-    // block gets at most one entry a frame: two in one mark pass would race.
-    const int kW = SkyAccess::kMaskWords;
+    // air away from the sky is asked for its distances; until its answer
+    // comes the GPU marks it by the "not answered" rule (its air under the
+    // top surface has none). Each storage block gets at most one entry a
+    // frame: two in one mark pass would race.
+    const int kC = SkyAccess::kCells;
     ++mark_plan_;
     auto sky_key = [](const int w[3]) {
         return (int64_t(w[0] + (1 << 20)) << 42) | (int64_t(w[1] + (1 << 20)) << 21) | int64_t(w[2] + (1 << 20));
     };
-    auto push_mark = [&](int s, const int w[3], const uint32_t* m, bool unknown) {
+    auto push_mark = [&](int s, const int w[3], const uint8_t* d, bool unknown) {
         marks_.push_back(uint32_t(w[0])); marks_.push_back(uint32_t(w[1])); marks_.push_back(uint32_t(w[2]));
         marks_.push_back(unknown ? 1u : 0u);
-        static const uint32_t zero[SkyAccess::kMaskWords] = {};
-        marks_.insert(marks_.end(), m ? m : zero, (m ? m : zero) + kW);
-        uint32_t* held = &held_mask_[size_t(s) * kW];
-        if (m) std::copy(m, m + kW, held); else std::fill(held, held + kW, 0u);
+        uint8_t* held = &held_dist_[size_t(s) * kC];
+        if (d) std::memcpy(held, d, size_t(kC)); else std::memset(held, 0, size_t(kC));
+        const size_t at = marks_.size();
+        marks_.resize(at + size_t(kC / 4));
+        std::memcpy(&marks_[at], held, size_t(kC));
         held_unknown_[size_t(s)] = unknown ? 1 : 0;
+        sky_pending_[size_t(s)] = 0;
         mark_stamp_[size_t(s)] = mark_plan_;
     };
-    if (sky_.generation() != sky_gen_) sky_cache_.clear();   // answers made before an edit
+    // Whether a world block is within the reach of an edit box (paths
+    // through the box can change its distances).
+    const float reach = sky_.reach() + float(kBlock) * 2.0f;
+    auto near_edit = [&](const int w[3]) {
+        for (size_t b = 0; b + 5 < sky_boxes_.size(); b += 6) {
+            bool in = true;
+            for (int k = 0; k < 3; ++k) {
+                const float lo = float(w[k] * kBlock), hi = lo + float(kBlock);
+                if (hi < sky_boxes_[b + k] - reach || lo > sky_boxes_[b + 3 + k] + reach) in = false;
+            }
+            if (in) return true;
+        }
+        return false;
+    };
+    // An edit: the answers it can have changed are dropped.
+    const bool edited = sky_.generation() != sky_gen_;
+    if (edited) {
+        if (sky_all_) sky_cache_.clear();
+        else
+            for (auto it = sky_cache_.begin(); it != sky_cache_.end();) {
+                const int64_t k = it->first;
+                const int w[3] = {int((k >> 42) & 0x1FFFFF) - (1 << 20), int((k >> 21) & 0x1FFFFF) - (1 << 20),
+                                  int(k & 0x1FFFFF) - (1 << 20)};
+                if (near_edit(w)) it = sky_cache_.erase(it);
+                else ++it;
+            }
+    }
     std::vector<int> pending_fill;   // storage blocks filled this frame, waiting on the flood
     std::vector<uint8_t> filled(size_t(kBlocks), 0);
     for (size_t i = 0; i < budget; ++i) {
@@ -497,17 +571,19 @@ void NearField::plan(const float cam[3], const BrickStore* edits, bool settle, f
         dirty_[size_t(s)] = 0;
         blocks_.push_back(w[0]); blocks_.push_back(w[1]); blocks_.push_back(w[2]); blocks_.push_back(0);
         filled[size_t(s)] = 1;
-        // A fill writes plain density: no marks until listed again.
-        std::fill(&held_mask_[size_t(s) * kW], &held_mask_[size_t(s) * kW] + kW, 0u);
+        // A fill leaves every distance 0 (open): nothing listed until asked.
+        std::memset(&held_dist_[size_t(s) * kC], 0, size_t(kC));
         held_unknown_[size_t(s)] = 0;
+        sky_pending_[size_t(s)] = 0;
         if (sky_.may_seal_cheap(w[0], w[1], w[2])) {
             auto it = sky_cache_.find(sky_key(w));
             if (it != sky_cache_.end()) {
                 bool any = false;
-                for (int k = 0; k < kW; ++k) any = any || it->second[size_t(k)] != 0u;
+                for (int k = 0; k < kC && !any; ++k) any = it->second[size_t(k)] != 0;
                 if (any) push_mark(s, w, it->second.data(), false);
             } else {
                 sky_.request_block(w[0], w[1], w[2]);
+                sky_pending_[size_t(s)] = 1;
                 pending_fill.push_back(s);
             }
         }
@@ -541,16 +617,24 @@ void NearField::plan(const float cam[3], const BrickStore* edits, bool settle, f
                     edit_list_.push_back(0.0f);
                 }
     }
-    // An edit since the last plan: every block held that can hold sealed
-    // air is asked again (its GPU marks stand until the answer comes).
-    if (sky_.generation() != sky_gen_) {
+    // An edit since the last plan: the blocks held within its reach are
+    // asked again, and every block still waiting (its question was asked
+    // before the edit, and the answer will be dropped). Their GPU marks
+    // stand until the answers come.
+    if (edited) {
         sky_gen_ = sky_.generation();
         for (int s = 0; s < kBlocks; ++s) {
             const int* h = &held_[size_t(s) * 3];
             if (h[0] == INT_MIN || filled[size_t(s)]) continue;
-            if (sky_.may_seal_cheap(h[0], h[1], h[2])) sky_.request_block(h[0], h[1], h[2]);
+            if (!sky_all_ && !sky_pending_[size_t(s)] && !near_edit(h)) continue;
+            if (sky_.may_seal_cheap(h[0], h[1], h[2])) {
+                sky_.request_block(h[0], h[1], h[2]);
+                sky_pending_[size_t(s)] = 1;
+            }
         }
     }
+    sky_boxes_.clear();
+    sky_all_ = false;
     sky_.request_camera(cam[0], cam[1], cam[2]);
     // A still waits for every answer, so it shows what play settles to.
     // BIOMES_SKY_SYNC: every frame does, as when the flood ran in plan (A/B).
@@ -560,24 +644,27 @@ void NearField::plan(const float cam[3], const BrickStore* edits, bool settle, f
     sky_.take_results(sky_results_);
     for (const SkyAccess::Result& r : sky_results_) {
         if (r.gen != sky_gen_) continue;   // made before an edit; asked again
-        sky_cache_[sky_key(r.b)] = std::vector<uint32_t>(r.mask, r.mask + kW);
+        sky_cache_[sky_key(r.b)] = std::vector<uint8_t>(r.dist, r.dist + kC);
         const int s = (wrap(r.b[2], kBz) * kBy + wrap(r.b[1], kBy)) * kBx + wrap(r.b[0], kBx);
         const int* h = &held_[size_t(s) * 3];
         if (h[0] != r.b[0] || h[1] != r.b[1] || h[2] != r.b[2]) continue;   // scrolled away
         if (mark_stamp_[size_t(s)] == mark_plan_) continue;
-        if (!held_unknown_[size_t(s)] && std::equal(r.mask, r.mask + kW, &held_mask_[size_t(s) * kW])) {
+        if (!held_unknown_[size_t(s)] && std::memcmp(r.dist, &held_dist_[size_t(s) * kC], size_t(kC)) == 0) {
             // Answered, and the GPU already holds it (a block filled this
-            // frame with nothing sealed): nothing to list, but answered --
-            // the stamp keeps the "not labelled" rule below off it.
+            // frame all open): nothing to list, but answered -- the stamp
+            // keeps the "not answered" rule below off it.
             mark_stamp_[size_t(s)] = mark_plan_;
+            sky_pending_[size_t(s)] = 0;
             continue;
         }
-        push_mark(s, r.b, r.mask, false);
+        push_mark(s, r.b, r.dist, false);
     }
     // Filled this frame and not answered yet: the "not labelled" rule.
     for (int s : pending_fill)
         if (mark_stamp_[size_t(s)] != mark_plan_) push_mark(s, &held_[size_t(s) * 3], nullptr, true);
-    cam_sealed_ = sky_.camera_sealed();
+    cam_dist_ = sky_.camera_dist();
+    cam_dark_ = cam_dist_ >= SkyAccess::kNoSky ? 1.0f
+                                                : 1.0f - std::exp(-float(cam_dist_) / (std::max)(sched_.sky_falloff, 0.1f));
     // The visibility volume: every filled block and the held blocks round it
     // (a voxel's marches reach ~3.5 m, so a block's change reaches its
     // neighbours'). A neighbour not filled yet is done when it is.
@@ -746,6 +833,8 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
     // (near_field.hlsl nf_gated), for A/B.
     static const bool no_gate = std::getenv("BIOMES_NF_NOGATE") != nullptr;
     c.gate = no_gate ? 0u : 1u;
+    c.sky[0] = 1.0f / (std::max)(sched_.sky_falloff, 0.1f);
+    c.sky[1] = sky_.reach();
     std::memcpy(cb_cpu_[f], &c, sizeof c);
     if (!blocks_.empty()) std::memcpy(blocks_cpu_[f], blocks_.data(), blocks_.size() * 4);
     if (!edit_list_.empty()) std::memcpy(edits_cpu_[f], edit_list_.data(), edit_list_.size() * 4);
@@ -780,7 +869,7 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
     auto apply_marks = [&]() {
         if (marks_.empty()) return;
         cmd->SetPipelineState(mark_pso_.Get());
-        cmd->Dispatch(UINT(marks_.size() / 20), 1, 1);
+        cmd->Dispatch(UINT(marks_.size() / kMarkWords), 1, 1);
         uav_barrier(cmd, density_.Get());
     };
 
@@ -897,7 +986,7 @@ void NearField::constants(bool on, float out[4]) const {
     out[1] = float(origin_[1]);
     out[2] = float(origin_[2]);
     // 2: on, and the camera stands in sealed air (sky_access.h sealed_at).
-    out[3] = (on && ready_) ? (cam_sealed_ ? 2.0f : 1.0f) : 0.0f;
+    out[3] = (on && ready_) ? 1.0f + cam_dark_ : 0.0f;
 }
 
 }  // namespace engine

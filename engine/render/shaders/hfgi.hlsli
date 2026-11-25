@@ -125,17 +125,25 @@ bool nf_sample(float3 world, float3 n, out float4 vis, out float4 sr, out float4
 // Open air keeps the caller's rule: lighting it by the heightfield's sky
 // visibility instead moved 63% of an open meadow's pixels, by up to 47
 // levels, against haze and height fog tuned to the old one.
+// Where the near field knows nothing of a point: past its volume, or in the
+// 2 m band at its sides where nf_depth gives up.
+bool nf_beyond(float3 p) {
+    const int3 rel = int3(floor(p + 0.5f)) - int3(l_nf.xyz);
+    return any(rel < 0) || rel.y >= kNfDims.y || any(rel.xz < 2) || any(rel.xz >= kNfDims.xz - 2);
+}
+
 float nf_openness(float3 p, out float k) {
     k = 0.0f;
     if (l_hf.w < 0.5f || l_nf.w < 0.5f) return 1.0f;
-    // The camera in SEALED air (l_nf.w 2, sky_access.h): a line of sight
-    // from it stays in that air until it meets rock, so past the volume,
-    // where nothing here knows the point, it is that same sealed air. Open
-    // air there lit the far end of a sealed 42 m chamber white.
-    if (l_nf.w > 1.5f) {
-        const int3 rel = int3(floor(p + 0.5f)) - int3(l_nf.xyz);
-        if (any(rel < 0) || any(rel >= kNfDims)) { k = 1.0f; return 0.0f; }
-    }
+    // The camera's darkness (l_nf.w - 1: 1 - its sky access, sky_access.h)
+    // where nothing here knows the point (nf_beyond): the air a line of
+    // sight from the camera reaches there is the camera's own -- exactly so
+    // when it is sealed, and nearly so far down a cave. Open air there lit
+    // the far end of a sealed 42 m chamber white. Inside the volume the
+    // probes know better: a camera in a tunnel sees the sunlit air at its
+    // mouth, and the camera's own darkness would have dimmed that.
+    const float sdark = saturate(l_nf.w - 1.0f);
+    if (sdark > 0.0f && nf_beyond(p)) { k = sdark; return 0.0f; }
     const float2 uv = float2((p.x - l_hf.x) / kHfExtent, 1.0f - (p.z - l_hf.y) / kHfExtent);
     if (any(uv <= 0.0f) || any(uv >= 1.0f)) return 1.0f;
     float dh;

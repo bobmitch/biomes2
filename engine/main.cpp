@@ -964,6 +964,10 @@ void register_tunables() {
               [] { return S.coarse_memory; }, [](float v) { S.coarse_memory = v; });
         range("nf_light_memory", NF, "By a moving light", 0.02f, 1.0f, 0.02f, "s",
               [] { return S.light_memory; }, [](float v) { S.light_memory = v; });
+        // How fast daylight dies down a cave (sky_access.h): archetypes.json
+        // `underground` sky_falloff_m; for cave designs to come.
+        range("nf_sky_falloff", NF, "Daylight's falloff down a cave", 2.0f, 60.0f, 1.0f, "m",
+              [] { return S.sky_falloff; }, [](float v) { S.sky_falloff = v; });
     }
     const char* E = "Exposure";
     range("ev_comp", E, "Exposure compensation", -4.0f, 4.0f, 0.25f, "EV", [&] { return R.ev_comp(); },
@@ -1786,6 +1790,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             engine::NearField::Schedule& s = g_renderer.near_field_schedule();
             if (ns != std::string::npos)
                 std::sscanf(c2.c_str() + ns + 14, "%f %f %f", &s.near_memory, &s.coarse_memory, &s.light_memory);
+            // --sky-falloff <m>: how fast daylight dies down a cave (sky_access.h).
+            const size_t sf = c2.find("--sky-falloff ");
+            if (sf != std::string::npos) s.sky_falloff = float(std::atof(c2.c_str() + sf + 14));
         }
         // Dark vision for A/B: --ev-floor <open> <under> (EV100), the display
         // floor off, the player's brightness.
@@ -2390,13 +2397,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                  g_renderer.near_field().live_fine(), g_renderer.near_field().live_coarse());
                     {
                         const engine::SkyAccess& sa = g_renderer.near_field().sky_access();
-                        std::fprintf(gf, "sky access: %zu bricks, %llu searches (%llu sealed), %llu cells searched, "
-                                         "%llu evaluated, %.0f ms of CPU in all; the camera in %s air; "
-                                         "%d blocks not labelled yet\n\n",
-                                     sa.bricks(), sa.searches(), sa.sealed_components(), sa.cells_searched(),
-                                     sa.cells_evaluated(), sa.ms(),
-                                     g_renderer.near_field().camera_sealed() ? "SEALED" : "open (or no)",
-                                     g_renderer.near_field().sky_unlabelled());
+                        std::fprintf(gf, "sky access: %zu bricks, %llu searches, %llu cells searched (%llu answered "
+                                         "no sky), %llu evaluated, %.0f ms of CPU in all; the camera %d m from the "
+                                         "sky by path (255 none), darkness %.3f; %d blocks not answered yet\n\n",
+                                     sa.bricks(), sa.searches(), sa.cells_searched(), sa.cells_no_sky(),
+                                     sa.cells_evaluated(), sa.ms(), g_renderer.near_field().camera_sky_dist(),
+                                     g_renderer.near_field().camera_dark(), g_renderer.near_field().sky_unlabelled());
+                        std::fprintf(gf, "sky access, camera cell: state %d, its column's sky floor %d\n\n",
+                                     sa.dbg_cam_st_.load(), sa.dbg_cam_floor_.load());
                     }
                     std::fprintf(gf, "%-58s %9s %9s %7s\n", "pass (named by the mark that ends it)", "ms/frame", "max ms", "frames");
                     double sum = 0.0;
