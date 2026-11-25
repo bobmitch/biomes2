@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <thread>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -5880,7 +5881,31 @@ bool Renderer::dig(float x, float y, float z, float radius, float strength,
     {
         auto lock = near_.sky_edit_lock();   // the flood's worker reads the edits
         auto lock2 = sea_access_.edit_lock();       // and the sea's (ADR-006 stage 3)
-        if (!edits_.edit_sphere(x, y, z, radius, strength, material, lo, hi)) return false;
+        // The field at the lattice points the edit asks about: on every core
+        // for a big dig (an 8 m one asks ~13 thousand), in place for a small
+        // one, where starting threads would cost more than it saves.
+        const std::function<void(const int*, size_t, float*)> base = [this](const int* xyz, size_t n,
+                                                                            float* out) {
+            auto run = [this, xyz, out](size_t a, size_t b) {
+                for (size_t k = a; k < b; ++k)
+                    out[k] = world_.density(float(xyz[3 * k]) * kEditVoxel, float(xyz[3 * k + 1]) * kEditVoxel,
+                                            float(xyz[3 * k + 2]) * kEditVoxel, kEditVoxel);
+            };
+            unsigned nt = std::thread::hardware_concurrency();
+            nt = nt ? nt : 4;
+            if (n < 256 || nt < 2) {
+                run(0, n);
+                return;
+            }
+            std::vector<std::thread> pool;
+            const size_t per = (n + nt - 1) / nt;
+            for (unsigned t = 0; t < nt; ++t) {
+                const size_t a = size_t(t) * per, b = (std::min)(n, a + per);
+                if (a < b) pool.emplace_back(run, a, b);
+            }
+            for (std::thread& t : pool) t.join();
+        };
+        if (!edits_.edit_sphere(x, y, z, radius, strength, material, base, lo, hi)) return false;
     }
     sea_access_.invalidate_box(lo, hi);
     streamer_.invalidate_box(lo, hi);

@@ -19,6 +19,7 @@
 #ifndef ENGINE_BRICK_STORE_H
 #define ENGINE_BRICK_STORE_H
 
+#include <functional>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -31,6 +32,8 @@ namespace engine {
 // visible as aliasing on a dug hole seen from far away, not as the hole
 // disappearing.
 static const float kEditVoxel = 0.5f;
+// How far past a sphere edit its signed distance is written (edit_sphere).
+static const float kEditBand = 1.0f;
 
 static const int kBrickSide = 16;                 // 8 m at 0.5 m voxels
 static const int kBrickVoxels = kBrickSide * kBrickSide * kBrickSide;
@@ -84,11 +87,18 @@ public:
     // Carve or fill a sphere. Returns the world-space box that changed, so the
     // caller knows which chunks to re-mesh.
     //
-    // `strength` is the absolute density written at the centre, falling to the
-    // surface value at the rim: negative digs, positive fills. Absolute, not a
-    // subtraction from the base -- see invariant 5.
+    // `strength`'s sign says which: negative digs, positive fills. Every
+    // lattice point inside the sphere and in a band kEditBand past it is
+    // written as the union of what was there and the sphere's signed
+    // distance -- min(old, d - r) for a dig -- so the surface lies where
+    // the sphere's does, between lattice points. `base` gives the unedited
+    // field at n lattice points (xyz triples; what the mesher reads there),
+    // asked once per edit, for those it can matter at. Absolute, not
+    // a subtraction from the base -- see invariant 5. A point the sphere
+    // does not change is not written.
     bool edit_sphere(float cx, float cy, float cz, float radius,
                      float strength, uint8_t material,
+                     const std::function<void(const int*, size_t, float*)>& base,
                      float out_min[3], float out_max[3]);
 
     // Every brick overlapping a world box, by key. Turning those into GPU

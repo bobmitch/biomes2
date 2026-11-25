@@ -1390,14 +1390,32 @@ marches `edited_density` -- the edit store at each lattice corner, else
 the field at the 0.5 m voxel, trilinear between: what LOD 0 meshes -- so a
 second click digs deeper into the first hole. It centres the sphere on the
 nearest SOLID lattice point half a voxel past the hit, so even the smallest
-dig removes rock. Under 1 ms a dig at any size. `--shot ... --dig-row` digs
+dig removes rock. `--shot ... --dig-row` digs
 one of each size across the view before the still and writes
-`<shot>.dig.txt` (hit, centre, voxels written, how far the ray now goes).
-Two edit-store fixes came with it: `edit_sphere` measured each voxel from
-its middle while the mesher reads it at the lattice POINT (every edit sat a
-quarter voxel towards +xyz), and it wrote exactly 0 on the rim and
-overwrote earlier edits -- now strictly inside, never past -5 cm of its
-sign, and the deeper of old and new wins.
+`<shot>.dig.txt` (hit, centre, voxels written, ms, how far the ray now
+goes). Two edit-store fixes came with it: `edit_sphere` measured each voxel
+from its middle while the mesher reads it at the lattice POINT (every edit
+sat a quarter voxel towards +xyz), and it wrote exactly 0 on the rim and
+overwrote earlier edits.
+
+**A dig writes a signed distance, not a fill value.** Every lattice point
+inside the sphere and within `kEditBand` (1 m) outside it becomes the union
+of what was there and the sphere: min(old, d - r) for a dig, the reverse
+for a fill; a point it does not change is not written. It used to write
+the inside only, as -strength x (1 - t^2) held under -5 cm, so the rock
+point beside it kept the FIELD's value -- metres, under ground -- and every
+surface vertex landed beside the air point: dug walls in half-metre steps,
+blocky rims, and a toothed waterline wherever the sea crossed a wall. Now
+the surface lies where the sphere's does, between lattice points. Signs are
+unchanged everywhere, so the flood, sky access, physics and the near field
+label exactly as before. `old` is the edit store's value, else the field
+(`base`, a batch callback, spread over every core past 256 points); a
+point more than kEditBand inside the sphere asks nothing, since no surface
+can cross an edge it ends. The column map (grass, settling trees) marks
+only points written as air: the band's rock stays rock. Cost
+(`--dig-row`): 0.3 ms at 0.5 m, under 1 ms to 3 m, 1.2 ms at 4 m, 3.7 ms
+at 8 m (asking the field everywhere, single-threaded: 30 ms). Saves load
+as before; old edits keep their steps.
 
 - **Grass goes where an edit reaches the ground.** The edit store keeps a
   derived map (`BrickStore::column_top`, rebuilt on load, not saved): per
