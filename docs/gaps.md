@@ -142,6 +142,11 @@ Last gathered: 2026-11-21, after the exploration fog.
   [Volumetric clouds ... not done]
 - **No underwater rendering**: a submerged camera sees the seabed lit like
   dry land. [The sea]
+- **The sea ignores edits.** Drawing and swimming both decide "sea here"
+  from the GENERATED column height: a sealed tunnel under the seabed is
+  swum in, a hole dug below sea level stays dry, a channel dug in from the
+  coast meets a wall of water at the old shoreline. The plan is
+  `docs/adr-006-water-below-sea-level.md`. [The sea]
 - A faint strip just under the horizon where the sea's SSR misses land.
   [The sea]
 - **Puddle reflections are screen space** (nothing off screen or behind a
