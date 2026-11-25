@@ -2449,9 +2449,35 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   the pre-v16 centre, it found only sea on v18 and reported nothing. With no caves and no edits a block's mask is zero without
   touching the field: the shipping world spends 0 ms, a dug tunnel 5 ms
   once. A cave world's still spends 0.2-0.8 s of CPU on it.
-  **Synchronous in `plan`**, and an edit forgets every label (a dig beside
-  a big sealed cave re-searches it) -- see gaps.md.
-  The `sky access:` line of `--gpu-profile` counts bricks, searches and ms.
+  The `sky access:` line of `--gpu-profile` counts bricks, searches and ms,
+  and the blocks not labelled yet.
+- **The flood runs on its own thread** (`SkyAccess::run`). It ran in
+  `plan`: flying over the sealed chamber at 20 m/s the worst frame was
+  254-267 ms, now 11.2 (median 5.2 and 99th 9.1 ms either way; the
+  shipping world's flight unchanged). The main thread posts requests (a
+  block's mask, the camera's cell, an edit) and takes results; the worker
+  owns every label. Results carry the generation of the last edit they
+  saw: the main thread drops older ones, and the worker skips a request
+  made before an edit the main thread has since made (it asks again).
+  The edit store is read under a shared lock only while a batch of bricks
+  is evaluated; `Renderer::dig` and `load_edits` take it exclusively
+  (`NearField::sky_edit_lock`). **Until a block's answer comes**, its
+  marks are the "not labelled" rule: air under the top surface counts as
+  sealed (`cs_nf_mark`, flag 1, read from the top map -- so the mark pass
+  now runs after `cs_nf_top`): dark, never a leak. A still waits for the
+  worker every frame it settles, so stills are as before to the probe
+  count. **An edit forgets only what it can have changed**: every
+  component of air within a cell of it, by a fill through the labels
+  themselves (open-by-construction cells stop it), and the bricks it
+  touched. Measured with `--dig-play 240` (a small dig every sixth frame,
+  each frame timed with its dig, `<shot>.digplay.txt`): 8 m over the
+  sealed tunnel, worst frame 21.0 -> 7.2 ms and the flood's work 510 ->
+  48 ms; digging the 42 m chamber's floor (each dig re-labels the whole
+  chamber, ~0.1 s on the worker), worst frame 83 -> 7.3 ms. The GPU keeps
+  a block's old marks until the new answer, so a dig that breaks into a
+  sealed cave lets the light in ~0.1-0.6 s later. A/B: `BIOMES_SKY_SYNC`
+  (wait every frame) and `BIOMES_SKY_FORGET_ALL` (an edit forgets every
+  label) -- both set is the old behaviour.
 - **Probes in sealed air with no light near do not trace** (`nf_gated`,
   `BIOMES_NF_NOGATE` for A/B). Neither sun nor sky can reach sealed air,
   so only the hits' local lights (the frame's first 32, shadowed) can: a

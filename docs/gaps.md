@@ -87,12 +87,14 @@ Last gathered: 2026-11-21, after the exploration fog.
   coarse probes only, which took that to 0.26 ms; what is left is the fine
   probes' own rays. Priority by distance from the camera is next.
   [Near field; Sky access]
-- **The sky-access flood runs in `plan`, on the main thread** (sky_access.h):
-  a cave world's first still spends 0.2-0.8 s on it, and a 15 s walk did
-  not show it past the 99th percentile, but a big sealed cave met in play
-  is a hitch. And an edit forgets every label, so digging beside one
-  re-searches it each dig. A worker thread or the GPU, and a local
-  re-flood, are step 2. [Sky access]
+- **The sky-access flood is on its own thread now, but it is still a CPU
+  flood**: a big sealed cave takes it ~0.1-0.8 s, during which its blocks
+  read dark (the "not labelled" rule) or keep their old marks after an
+  edit -- so breaking into a sealed cave lets the light in that much
+  later. Digging into a cave re-labels the whole cave each dig. And a
+  roof the player builds over open air is only seen by the bricks with
+  edits in them (`open_above` reads `column_top` per brick). Step 2 (on
+  the GPU, as regions stream in) answers all three. [Sky access]
 - **The air past the volume is judged by the camera alone**: sealed if
   the camera stands in sealed air (exact: a line of sight cannot leave
   it), otherwise the open-air rule -- so from inside a long cave that

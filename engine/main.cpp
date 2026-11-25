@@ -2114,6 +2114,68 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         }
 
         bool ok = g_renderer.capture(v, shot_path.c_str(), error);
+        // --dig-play <n>: after the still has settled, n frames of play (a
+        // simulated 1/60 s each) with a small dig at the view's middle every
+        // sixth, each frame timed on the wall clock with its dig: what digging
+        // costs while the world runs -- the sky-access flood forgetting and
+        // searching again (sky_access.h). <shot>.digplay.txt.
+        {
+            const std::string cl = cmdline ? cmdline : "";
+            const size_t at = cl.find("--dig-play ");
+            if (ok && at != std::string::npos) {
+                const int n = std::atoi(cl.c_str() + at + 11);
+                float fwd[3], right[3], up[3];
+                g_camera.basis(fwd, right, up);
+                const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
+                const engine::SkyAccess& sa = g_renderer.near_field().sky_access();
+                const unsigned long long s0 = sa.searches(), c0 = sa.cells_searched(), r0 = sa.cells_reset();
+                const double m0 = sa.ms();
+                std::vector<double> ms;
+                uint32_t h = 0x9E3779B9u;
+                int hits = 0;
+                float t = 0.0f;
+                LARGE_INTEGER qf;
+                QueryPerformanceFrequency(&qf);
+                for (int i = 0; i < n; ++i) {
+                    LARGE_INTEGER q0, q1;
+                    QueryPerformanceCounter(&q0);
+                    if (i % 6 == 0) {
+                        h = h * 1664525u + 1013904223u;
+                        const float jx = (float(h >> 8) / 16777216.0f - 0.5f) * 120.0f;
+                        h = h * 1664525u + 1013904223u;
+                        const float jy = (float(h >> 8) / 16777216.0f - 0.5f) * 120.0f;
+                        const float nx = jx / (0.5f * g_res_w), ny = -jy / (0.5f * g_res_h);
+                        float d[3];
+                        for (int k = 0; k < 3; ++k)
+                            d[k] = fwd[k] + right[k] * nx * v.tan_half_fov * v.aspect + up[k] * ny * v.tan_half_fov;
+                        const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                        for (int k = 0; k < 3; ++k) d[k] /= dl;
+                        if (g_renderer.dig_aimed(eye, d, kDigReach, 1.0f).dug) ++hits;
+                    }
+                    t += 1.0f / 60.0f;
+                    fill_view(g_camera, g_res_w, g_res_h, t, v);
+                    g_renderer.step_offscreen(v);
+                    QueryPerformanceCounter(&q1);
+                    ms.push_back(double(q1.QuadPart - q0.QuadPart) * 1000.0 / double(qf.QuadPart));
+                }
+                g_renderer.flush();
+                std::vector<double> sorted = ms;
+                std::sort(sorted.begin(), sorted.end());
+                double sum = 0.0;
+                for (double x : ms) sum += x;
+                if (FILE* df = std::fopen((shot_path + ".digplay.txt").c_str(), "w")) {
+                    std::fprintf(df, "dig play: %d frames, %d of %d digs landed\n", n, hits, (n + 5) / 6);
+                    if (!sorted.empty())
+                        std::fprintf(df, "frame (wall clock, dig included): mean %.2f ms, 99th %.2f ms, worst %.2f ms\n",
+                                     sum / double(ms.size()), sorted[(sorted.size() * 99) / 100], sorted.back());
+                    std::fprintf(df, "sky access over it: %llu searches, %llu cells searched, %llu cells forgotten, %.0f ms "
+                                     "on its thread; %zu requests still queued at the end\n",
+                                 sa.searches() - s0, sa.cells_searched() - c0, sa.cells_reset() - r0, sa.ms() - m0,
+                                 sa.queued());
+                    std::fclose(df);
+                }
+            }
+        }
         // --adapt-test (with --dig-tunnel): the eye's adaptation, timed. From
         // 10 m outside the tunnel's entrance in daylight (3 s), down it and
         // 20 m in at walking pace, holding there for 75 s, then back out --
@@ -2329,10 +2391,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                     {
                         const engine::SkyAccess& sa = g_renderer.near_field().sky_access();
                         std::fprintf(gf, "sky access: %zu bricks, %llu searches (%llu sealed), %llu cells searched, "
-                                         "%llu evaluated, %.0f ms of CPU in all; the camera in %s air\n\n",
+                                         "%llu evaluated, %.0f ms of CPU in all; the camera in %s air; "
+                                         "%d blocks not labelled yet\n\n",
                                      sa.bricks(), sa.searches(), sa.sealed_components(), sa.cells_searched(),
                                      sa.cells_evaluated(), sa.ms(),
-                                     g_renderer.near_field().camera_sealed() ? "SEALED" : "open (or no)");
+                                     g_renderer.near_field().camera_sealed() ? "SEALED" : "open (or no)",
+                                     g_renderer.near_field().sky_unlabelled());
                     }
                     std::fprintf(gf, "%-58s %9s %9s %7s\n", "pass (named by the mark that ends it)", "ms/frame", "max ms", "frames");
                     double sum = 0.0;

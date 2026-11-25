@@ -2987,7 +2987,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         if (!hfgi_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         // The near field: the light under it.
         if (!near_.init(device_.Get(), srv_heap_.Get(), Clouds::kShadowSrv, error)) return false;
-        near_.set_world(&world_);   // the sky-access flood reads its field (sky_access.h)
+        near_.set_world(&world_, &edits_);   // the sky-access flood reads its field and the edits (sky_access.h)
         // The key light's shadow past the cascades.
         if (!far_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         canopy_.set_models(trees_.models(), trees_.looks());
@@ -5723,7 +5723,10 @@ bool Renderer::save_edits(const char* path, std::string& error) const {
 }
 
 bool Renderer::load_edits(const char* path, std::string& error, bool& field_mismatch) {
-    if (!edits_.load(path, world_.field_id(), error, field_mismatch)) return false;
+    {
+        auto lock = near_.sky_edit_lock();   // the flood's worker reads the edits
+        if (!edits_.load(path, world_.field_id(), error, field_mismatch)) return false;
+    }
     // Everything resident was meshed from terrain that has just changed, and
     // every lease points at pool contents that are now wrong.
     pager_.init(kMaxBricks);
@@ -5738,7 +5741,10 @@ bool Renderer::load_edits(const char* path, std::string& error, bool& field_mism
 bool Renderer::dig(float x, float y, float z, float radius, float strength,
                    unsigned char material) {
     float lo[3], hi[3];
-    if (!edits_.edit_sphere(x, y, z, radius, strength, material, lo, hi)) return false;
+    {
+        auto lock = near_.sky_edit_lock();   // the flood's worker reads the edits
+        if (!edits_.edit_sphere(x, y, z, radius, strength, material, lo, hi)) return false;
+    }
     streamer_.invalidate_box(lo, hi);
     foliage_.invalidate_box(lo, hi);
     near_.invalidate_box(lo, hi);
@@ -6057,6 +6063,7 @@ void Renderer::slot_report(const char* path) {
 
 void Renderer::shutdown() {
     if (ready_) wait_for_gpu();
+    near_.shutdown();   // the flood's worker, before the world it reads
     tree_field_.shutdown();
     trees_.shutdown();
     ready_ = false;

@@ -37,6 +37,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace engine {
@@ -120,9 +121,16 @@ public:
     bool ready() const { return ready_; }
     // The world whose underground air the sky-access flood labels
     // (sky_access.h). Without it no air is ever marked sealed.
-    void set_world(const WorldGpu* world) { sky_.init(world); }
+    void set_world(const WorldGpu* world, const BrickStore* edits) { sky_.init(world, edits); }
+    // Whoever writes the edit store holds this for the write (the flood's
+    // worker reads it).
+    std::unique_lock<std::shared_mutex> sky_edit_lock() { return sky_.edit_lock(); }
+    // Stops the flood's worker; before the world it reads goes away.
+    void shutdown() { sky_.shutdown(); }
     const SkyAccess& sky_access() const { return sky_; }
     bool camera_sealed() const { return cam_sealed_; }
+    // Held blocks still marked "not labelled" (waiting on the flood).
+    int sky_unlabelled() const { int n = 0; for (uint8_t u : held_unknown_) n += u; return n; }
 
     // The player's edits changed inside a world box: its blocks are filled
     // again (field + edits) and the probes whose cones can reach it re-traced.
@@ -206,7 +214,13 @@ private:
     // marks (20 words an entry: block xyz, pad, mask) for cs_nf_mark.
     SkyAccess sky_;
     std::vector<uint32_t> held_mask_;
+    std::vector<uint8_t> held_unknown_;  // per storage block: its GPU marks are the "not labelled" rule
+    std::vector<uint32_t> mark_stamp_;   // per storage block: the plan that last listed it for cs_nf_mark
+    uint32_t mark_plan_ = 0;
     uint64_t sky_gen_ = 0;
+    // Masks the flood has answered under the current generation, by world block.
+    std::unordered_map<int64_t, std::vector<uint32_t> > sky_cache_;
+    std::vector<SkyAccess::Result> sky_results_;
     std::vector<uint32_t> marks_;
     // The visibility volume's blocks this frame (4 ints each): the filled
     // ones and their held neighbours.

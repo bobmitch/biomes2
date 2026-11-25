@@ -94,9 +94,11 @@ StructuredBuffer<int4>   g_blocks     : register(t2);   // world block (8 m unit
 StructuredBuffer<float4> g_edits      : register(t3);   // x: storage index (bits), y: density
 StructuredBuffer<uint>   g_probe_list : register(t4);   // probe storage indices to update
 StructuredBuffer<uint>   g_coarse_list : register(t5);  // coarse probe (block) storage indices to update
-// Sky access (sky_access.h): per entry, a world block (8 m units, 3 ints and
-// a pad) and 16 words, a bit per 1 m voxel (x + 8 y + 64 z) of air the
-// CPU's flood found no path from to the open sky.
+// Sky access (sky_access.h): per entry, a world block (8 m units, 3 ints),
+// a flag, and 16 words, a bit per 1 m voxel (x + 8 y + 64 z) of air the
+// CPU's flood found no path from to the open sky. Flag 1: not labelled yet
+// (the flood runs on its own thread): every air voxel under the top surface
+// counts as sealed until its labels come -- dark, never a leak.
 StructuredBuffer<uint>   g_marks      : register(t6);
 // The probe visibility volume (hfgi.hlsli nf_sample): per 1 m voxel v, a bit
 // per probe P = floor(v / 2) + d, d in {-1, 0, 1}^3, bit (dx+1) + 3 (dy+1) +
@@ -195,7 +197,10 @@ void cs_nf_mark(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
     const uint e = g.x * 20u;
     const int3 w = int3(int(g_marks[e]), int(g_marks[e + 1u]), int(g_marks[e + 2u])) * 8 + int3(t);
     const uint idx = t.x + 8u * t.y + 64u * t.z;
-    const bool bit = ((g_marks[e + 4u + (idx >> 5)] >> (idx & 31u)) & 1u) != 0u;
+    bool bit = ((g_marks[e + 4u + (idx >> 5)] >> (idx & 31u)) & 1u) != 0u;
+    // Not labelled yet: under the top map (written this frame, cs_nf_top --
+    // only a block filled this frame is ever listed so).
+    if (g_marks[e + 3u] != 0u) bit = float(w.y) < u_top[nf_wrap(int3(w.x, 0, w.z), kNfDims).xz] - 0.5f;
     const int3 s = nf_wrap(w, kNfDims);
     float d = nf_unseal(u_density[s]);
     if (bit && d < 0.0f) d -= kNfSealBias;
