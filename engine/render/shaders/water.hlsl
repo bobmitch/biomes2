@@ -39,7 +39,7 @@ cbuffer WaterConstants : register(b0) {
     float3 cam_right;  float tan_half_fov;
     float3 cam_up;     float pad1;
     float  sea_level;  float sea_state;  float grid_cells;  float extent;
-    float  debug_mode; float cam_water; float2 pad0;
+    float  debug_mode; float cam_water; float flood_on; float pad0;   // flood_on: g_flood is bound (ADR-006 stage 3)
     // The frame's light (ADR-004 L2), the same values the shadow constants
     // carry for everything else; lighting.hlsli reads them by these names.
     float4 l_sun_dir;
@@ -63,7 +63,7 @@ cbuffer WaterConstants : register(b0) {
     float3 moon_disk;     float cam_sky;
     float3 extinction;    float ssr_on;       // per metre, linear rgb
     float3 deep_colour;   float refraction;   // linear; the screen shift at full strength
-    float  frame;         float storm_turbidity;  float2 pad3;   // extinction x (1 + this x roughness^2)
+    float  frame;         float storm_turbidity;  float2 flood_origin;   // extinction x (1 + this x roughness^2); the flood mask's corner (whole metres)
     // The ripples (ocean_detail.h): on/off, the mean square slope each FFT
     // tile carries, and the choppiness its Jacobian was made with.
     float  detail_on;     float detail_var0;  float detail_var1;  float choppy;
@@ -92,6 +92,21 @@ SamplerState g_wrap_u : register(s2);
 Texture2DArray<float4> g_detail : register(t5);
 SamplerState g_wrap : register(s3);
 Texture2D<float> g_cloud_shadow : register(t6);   // clouds.hlsl cs_shadow
+// ADR-006 stage 3: the flood round the camera (renderer.cpp fill_flood_mask),
+// a byte a 0.5 m column (the edit lattice), 256 x 256 from flood_origin: 0
+// no word (the column rule stands), else the cell under sea level here is
+// flooded, the open sea's waves reaching it x 255.
+StructuredBuffer<uint> g_flood : register(t7);
+
+// -1 where the flood has no word, else the waves' share (0..1].
+float flood_at(float2 p) {
+    if (flood_on < 0.5f) return -1.0f;
+    const int2 c = int2(floor((p - flood_origin) / 0.5f + 0.5f));
+    if (any(c < 0) || any(c >= 256)) return -1.0f;
+    const uint i = uint(c.y * 256 + c.x);
+    const uint b = (g_flood[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu;
+    return b == 0u ? -1.0f : float(b) / 255.0f;
+}
 
 #include "engine/render/shaders/lighting.hlsli"
 #include "engine/render/atmosphere.h"
@@ -230,10 +245,26 @@ VSOut vs_main(uint vid : SV_VertexID) {
     // water is thrown to, a few metres off: on a beach that is centimetres.
     const float r = sqrt(rest.x * rest.x + rest.y * rest.y) / w_radius;
     const float ground = real_terrain_height(rest.x, rest.y, r, 0.0f);
-    const float depth = sea_level - ground;
+    float depth = sea_level - ground;
+    // ADR-006 stage 3: where the flood says the cell under sea level is the
+    // sea, it is, whatever the generated column says -- a channel dug in from
+    // the coast -- and the open sea's waves reach it only as far as the
+    // flood's path through the water lets them (fade, which scales every
+    // train). A flooded land column has no generated depth to tame the
+    // waves with; 2 m stands in, the waves already calmed by the path.
+    float fade_w = fade;
+    {
+        const float fl = flood_at(rest);
+        if (fl >= 0.0f) {
+            fade_w = fade * fl;
+            // Only a LAND column: the open beach beside a channel keeps its
+            // own shallow depth, its swash and its foam.
+            if (depth < 0.0f) depth = 2.0f;
+        }
+    }
 
     float3 nrm;
-    const float3 p = ww_surface(rest.x, rest.y, time, frame_sea(), depth, fade, minwl, nrm);
+    const float3 p = ww_surface(rest.x, rest.y, time, frame_sea(), depth, fade_w, minwl, nrm);
     // The swash (water_wave.h): within a metre and a half of the still-water
     // line the sheet rises and falls with each arriving set, so the water
     // runs up the beach and back; the terrain in front hides it where the
@@ -253,10 +284,10 @@ VSOut vs_main(uint vid : SV_VertexID) {
     o.nrm = nrm;
     o.depth = depth + swash;   // the water actually over the bed here, for the clip and the shading
     o.dist = d;
-    o.fade = fade;
+    o.fade = fade_w;
     o.minwl = minwl;
-    const float3 loc = ww_local(frame_sea(), depth, fade, minwl);
-    o.hs = loc.z / max(fade, 1e-4f);
+    const float3 loc = ww_local(frame_sea(), depth, fade_w, minwl);
+    o.hs = loc.z / max(fade_w, 1e-4f);
     o.cap_q = loc.xy;
     return o;
 }

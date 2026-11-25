@@ -118,7 +118,7 @@ that will be played -- per-pixel passes scale 4x from 720p to 1440p.
 The engine's headless modes all write a text file under `build/` and exit:
 `--shot`, `--flight <s>`, `--walk <s>`, `--overhang`, `--dig`, `--dig-save`,
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
-`--band-report`, `--sea-report`, `--swim`, `--seabed-tunnel`, `--blend-report`, `--tab-test`,
+`--band-report`, `--sea-report`, `--swim`, `--seabed-tunnel`, `--flood-test`, `--blend-report`, `--tab-test`,
 `--clock-jump` (with `--shot`: the light under the ground after the clock
 jumps or runs, `build/time_jump.txt`; see The near field),
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
@@ -271,6 +271,20 @@ last run's.
   absolute. Make indices absolute and pass base vertex 0, so the answer
   does not depend on the driver. `--tree-debug 2|3|4` isolated it to one
   level in one run.
+- **An upload heap the GPU reads when the frame RUNS needs one per frame in
+  flight.** The mesher's brick header table and brick staging were single
+  buffers with two frames in flight. A dig burst too big for one frame's 64
+  brick uploads spilled into the next, whose CPU then overwrote the staging
+  and the headers the previous frame had not executed yet: bricks copied
+  into the wrong pool slots and marked uploaded, chunks reading the wrong
+  brick lists -- a channel dug through a beach drawn as untouched sand,
+  for good, while physics and the edit store had it. Found by
+  `--flood-test`, which digs 54 bricks at once; 16 at once never showed it.
+  Both are halved by `begin_frame_bricks(ring)` now. Next to it,
+  `push_brick_headers` returned 0 when the table was full and the chunk read
+  the first chunk's bricks as its own; `plan_work` now checks the room first
+  and holds the chunk a frame (`header_deferrals`), and a capture throws
+  chunks away over a brick whose upload was deferred, as the frame loop did.
 - **Never read back from an upload heap.** It is write-combined, uncached
   memory. The impostor mip chain averaged each level by reading the one
   above out of the upload buffer it had just written: a 20 s startup for
@@ -3413,6 +3427,64 @@ tunnel under the seabed is not. `Renderer::camera_underwater()` /
   it for a frame; caustics on the seabed; light shafts in the water; any
   particles; in a shallow storm the sheet, clamped just over the bed in a
   trough, shows from below as dark patches on the sand.
+
+**The connectivity flood (ADR-006 stage 3)**: which air below sea level is
+SEA. `engine/render/sea_access.{h,cpp}`, a worker thread like sky access,
+labels 0.5 m cells -- the EDIT LATTICE itself, air or rock as the LOD 0
+mesher reads each point -- so a wall the mesh draws stops the water and a
+gap the mesh shows lets it through, whatever the material (no seepage, by
+choice). The ADR's first plan, 1 m cells open only where all 27 lattice
+points in them are air, was built and measured: a 3 m shaft dug off the grid
+held no such cell and the water could not get down it.
+- **The open sea is where it always was** (air below sea level with only air
+  straight above it, in a column whose generated height is under sea
+  level); the search stops at it, and at open air above sea level, so it
+  never walks the seabed or the land surface. From a cell its component of
+  air is followed at any height, through caves and up shafts; it is sea if
+  it meets the open sea.
+- **Venting**: water fills a connected cell only if its air can rise to an
+  opening (the sea's surface, or air open to the sky) without ever going
+  down -- propagated from the openings down and sideways. A dome breached
+  from below keeps its air; a tunnel dug from the land and breached at the
+  far end floods to sea level, its air out through the shaft.
+- **Distance** by path through the water to the open sea: the waves reach a
+  channel or a flooded tunnel as exp(-path / 6 m) (`kFloodWaveFalloff`).
+- **Asked only where it matters**: blocks of 8 m below sea level (to 40 m
+  under it) within 32 m of the camera or the player (`set_flood_focus`,
+  from `sync_sea`), where the player has dug within 8 m or a placed cave
+  reaches below sea level. Anywhere else the column rule is exact and
+  nothing is asked: walking costs nothing (3.53 ms uncapped at 720p). An
+  edit forgets every label (a breach can change a component of any size)
+  and re-evaluates only the bricks it touched; the main thread keeps the
+  old answer until the new one lands. A component over 1 M cells is left
+  dry (`kMaxComponent`). Stills wait for the worker.
+- **Readers**: `Renderer::water_at` (-1 not labelled, 0 not water, 1 water
+  with its surface -- sea level, or an air pocket's floor -- and the waves'
+  share). Physics asks it first (`PhysicsWorld::set_water_query`) and falls
+  back to the column rule and stage 1's roof test where it says -1; the eye
+  asks it for `cam_under_`. The sea's sheet reads a 256 x 256 mask of the
+  0.5 m columns round the camera (`g_flood`, a root SRV on an upload
+  buffer a frame in flight): a flooded column draws water whatever the
+  generated height says, its waves calmed by the path in, and the existing
+  per-pixel edge (`edge_fade`, from the depth copy) stops it at the dug
+  walls.
+- **`--flood-test`** (`build/flood_test.txt`, `flood_channel.bmp`,
+  `flood_channel_top.bmp`): from the coast nearest spawn, a channel dug in
+  from 25 m inland (fills: water, physics in the water), a tunnel under the
+  shallows vented by a shaft from the land (dry), then breached from the
+  seabed (floods, up its shaft to sea level), and a dome breached from
+  below (its passage floods, the dome keeps its air). `BIOMES_NO_FLOOD=1`
+  is the mutant -- stages 1-2 only -- and fails the channel, the breach and
+  the passage. Worker time for the whole test ~200 ms, 0.9 M lattice
+  points evaluated.
+- **Not done**: the water appears as soon as the worker answers (a frame or
+  a few) rather than rising; a pocket's own water surface below sea level
+  is not drawn (physics has it); the underwater pass dims light down to sea
+  level, not to a pocket's floor; the mask reaches 64 m round the camera,
+  so a flooded channel further off draws dry; the beach's foam stops in a
+  0.5 m staircase at a channel's mouth; light in a flooded tunnel is
+  still the near field's air (no light through water); nothing can seal a
+  pocket yet (stages 4-5).
 
 `--overhang` has no landmark to aim at: it searches for a real ceiling
 (phase A), reports what it found and how the capsule left it, then digs a

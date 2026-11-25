@@ -151,6 +151,14 @@ public:
     // The cover test starts this far over the feet: inside the capsule, so
     // in air, clear of the ground the feet rest on.
     static constexpr float kCoverFrom = 0.5f;
+    // ADR-006 stage 3: the connectivity flood's word at a point, asked first
+    // (Renderer::water_at): -1 not labelled there (the column rule and the
+    // cover test above decide, as before), 0 not water, 1 water -- with the
+    // surface over it (sea level, or an air pocket's floor) and the share of
+    // the open sea's waves that reaches it along the water's path.
+    void set_water_query(std::function<int(float x, float y, float z, float& surface, float& waves)> fn) {
+        water_query_ = fn;
+    }
 
     // Diagnostics: what physics actually has. A ray straight up, once
     // ignoring back faces and once not, and what kind of body it met; and
@@ -212,6 +220,7 @@ private:
     SeaParams sea_;
     std::function<float(float, float)> column_height_;
     std::function<bool(float, float, float, float)> sea_cover_;
+    std::function<int(float, float, float, float&, float&)> water_query_;
     Medium medium_ = Medium::Dry;
     bool   sea_here_ = false;
     float  water_y_ = 0.0f;

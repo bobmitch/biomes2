@@ -219,6 +219,7 @@ if(BIOMES2_ENGINE)
     engine/render/height_gi.cpp
     engine/render/near_field.cpp
     engine/render/sky_access.cpp
+    engine/render/sea_access.cpp
     engine/render/far_shadow.cpp
     engine/render/scan_library.cpp
     engine/render/forest_map.cpp

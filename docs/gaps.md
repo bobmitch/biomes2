@@ -153,13 +153,16 @@ Last gathered: 2026-11-21, after the exploration fog.
   swimmer's eye in a crest flips it for a frame), no caustics, no light
   shafts, no particles; in a shallow storm the sheet clamped over the bed
   in a trough shows from below as dark patches on the sand. [The sea]
-- **The sea ignores edits.** Drawing and swimming both decide "sea here"
-  from the GENERATED column height: a hole dug below sea level stays dry,
-  and a channel dug in from the coast meets a wall of water at the old
-  shoreline. Since ADR-006 stage 1, physics calls anywhere under a roof
-  dry, so a sealed tunnel under the seabed is no longer swum in -- but a
-  tunnel that BREAKS into the sea is dry too, until the connectivity flood
-  (stage 3). The plan is `docs/adr-006-water-below-sea-level.md`. [The sea]
+- **The connectivity flood is a first version** (ADR-006 stage 3): the
+  water appears as soon as the worker answers rather than rising; a
+  pocket's own water surface below sea level is not drawn (physics has
+  it), and the underwater pass dims light down to sea level, not to a
+  pocket's floor; the sheet's mask reaches 64 m round the camera, so a
+  flooded channel further off draws dry; the beach's foam stops in a 0.5 m
+  staircase at a channel's mouth; light in a flooded tunnel is the near
+  field's air (no light through water); a component over 1 M cells is left
+  dry; nothing can seal a pocket yet (stages 4-5). [The connectivity
+  flood]
 - A faint strip just under the horizon where the sea's SSR misses land.
   [The sea]
 - **Puddle reflections are screen space** (nothing off screen or behind a

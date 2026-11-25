@@ -467,17 +467,35 @@ void PhysicsWorld::update(float dt, float vx, float vz, bool jump, float swim) {
             // The swash runs the water up the beach (water_wave.h), so the sea
             // is here wherever the running sheet covers the ground, as drawn.
             const float swash = ww_swash(fx, fz, sea_.time, sea_.swash) * ww_swash_reach(depth);
-            sea_here_ = depth + swash > -0.02f;
-            // Rock between the feet and sea level is a roof: whatever the
-            // generated column says, there is no sea under it.
-            if (sea_here_ && sea_cover_) {
-                const float lo = fy + kCoverFrom;
-                if (lo < sea_.level && sea_cover_(fx, fz, lo, sea_.level)) sea_here_ = false;
+            // The connectivity flood first (ADR-006 stage 3), where it has
+            // labelled this place: a channel dug in from the coast is sea,
+            // a breached tunnel is sea, an air pocket is not.
+            float fl_surface = sea_.level, fl_waves = 1.0f;
+            const int fl = water_query_ ? water_query_(fx, fy + kCoverFrom, fz, fl_surface, fl_waves) : -1;
+            if (fl >= 0) {
+                sea_here_ = fl == 1;
+            } else {
+                sea_here_ = depth + swash > -0.02f;
+                // Rock between the feet and sea level is a roof: whatever the
+                // generated column says, there is no sea under it.
+                if (sea_here_ && sea_cover_) {
+                    const float lo = fy + kCoverFrom;
+                    if (lo < sea_.level && sea_cover_(fx, fz, lo, sea_.level)) sea_here_ = false;
+                }
             }
             if (sea_here_) {
                 // The depth the shader reads at the rest point, read here at
-                // the asked point (water_wave.h, ww_rest_point).
-                water_y_ = sea_.level + ww_water_at(fx, fz, sea_.time, sea_.sea, sea_.swash, depth);
+                // the asked point (water_wave.h, ww_rest_point). Under the
+                // flood: the open sea's waves as far as they reach in (a
+                // flooded land column has no generated depth: 2 m stands in,
+                // as in water.hlsl), or a pocket's still floor.
+                if (fl == 1 && fl_surface < sea_.level - 1e-3f)
+                    water_y_ = fl_surface;
+                else if (fl == 1)
+                    water_y_ = sea_.level + fl_waves * ww_water_at(fx, fz, sea_.time, sea_.sea, sea_.swash,
+                                                                   depth < 0.5f ? 2.0f : depth);
+                else
+                    water_y_ = sea_.level + ww_water_at(fx, fz, sea_.time, sea_.sea, sea_.swash, depth);
                 float sub = water_y_ - fy;
                 const float body = 2.0f * (half_height_ + radius_);
                 submerged_ = sub < 0.0f ? 0.0f : (sub > body ? body : sub);

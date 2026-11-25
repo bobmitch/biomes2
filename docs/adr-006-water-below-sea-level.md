@@ -1,7 +1,8 @@
 # ADR-006: Water below sea level -- dug holes, tunnels and caves
 
-Status: proposed, 2026-11-25. Stages 1 (no sea under a roof, for physics)
-and 2 (underwater rendering, a first version) built; the rest not. This records the direction chosen in discussion and
+Status: proposed, 2026-11-25. Stages 1 (no sea under a roof, for physics),
+2 (underwater rendering) and 3 (the connectivity flood) built, first
+versions; stages 4-5 wait for something that can seal a pocket. This records the direction chosen in discussion and
 the corrections found while choosing it, so the first implementation starts
 from them.
 
@@ -197,6 +198,16 @@ for water.
    distance, venting and air pockets, the shown fill. Water a function of
    geometry only. A placed cave that is sealed under the seabed stays dry
    from the same labels; one whose carve meets the sea floods.
+   **Done** (`engine/render/sea_access.{h,cpp}`, `--flood-test`), with one
+   change to this record: **not conservative 1 m cells but the 0.5 m edit
+   lattice itself**, each point air or rock as the LOD 0 mesher reads it.
+   The conservative cells were built and measured, and a 3 m shaft dug off
+   the grid held no fully open cell: the water could not get down it. On
+   the lattice a wall the mesh draws stops the water and a gap it shows
+   lets it through, which is the "solid blocks water completely" rule at
+   the resolution the player digs at. Not done: the shown fill (the water
+   appears when the worker answers), a pocket's own surface drawn, light
+   through water (CLAUDE.md, "The connectivity flood").
 4. **Stored volumes**: when anything can seal a pocket (a fill tool, or
    constructions that block water). Sealed flooded pockets keep their
    water, saved with the edits.
