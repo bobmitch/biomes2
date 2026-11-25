@@ -647,6 +647,58 @@ float4 ps_main(VSOut i) : SV_Target0 {
     const float4 dbg = debug_view(i, n, foam, hit.a);
     if (dbg.a < 0.5f) return dbg;
 
+    // --- the surface from below (ADR-006 stage 2) -------------------------
+    // Light leaving water for air bends away from the normal, so the whole sky
+    // is squeezed into a cone of about 97 degrees overhead -- Snell's window --
+    // and outside it the surface is a mirror (total internal reflection) of
+    // the water's own dim body. n and gn face down here, towards the eye.
+    // Nothing of the AIR is laid over it: the path to it is water, which
+    // post.hlsl's cs_underwater lays over the whole view after this. Only for
+    // an eye under the water: from above, a pixel that sees a crest's
+    // underside keeps the old shading, so no view from the air changes.
+    if (below && cam_pos.y < cam_water) {
+        // The water's in-scatter just under the surface, as cs_underwater has
+        // it (level water's light: deep_in above took the flipped normal).
+        const float3 s0 = deep_colour * (kSunLux * (max(kSunDir.y, 0.0f) * (0.25f + 0.75f * saturate(l.y)) * cls) +
+                                         kPi * kSkyMean) / kPi;
+        // Outside the window the surface is a mirror of the water UNDER it:
+        // the seabed, where SSR finds it in the depth copy, through the water
+        // along the reflected ray and the sunlight's path down to it; and the
+        // water's own glow along that ray (cs_underwater's closed form). A
+        // flat deep colour here drew a navy ceiling over bright sand.
+        const float3 r = reflect(-v, n);
+        const float bed_d = max(i.depth, 0.0f);
+        const float lr = bed_d / max(-r.y, 0.15f);
+        const float rup = 1.0f - r.y;
+        const float4 bh = ssr(i.world + gn * 0.05f, r, px);
+        const float3 glow_r = s0 * (1.0f - exp(-ext * rup * lr)) / rup;
+        // Where SSR finds nothing (the reflected ray leaves the screen, as it
+        // does looking steeply up), the seabed's own authored colour, lit as
+        // level ground, stands in for the hit (g_arch's last row set is the
+        // seabed's material, linear).
+        const float3 bed_albedo = g_arch[w_biome_count * kArchRows + 3].rgb;
+        const float3 bed_lit = bed_albedo * (kSunLux * (max(kSunDir.y, 0.0f) * cls) + kPi * kSkyMean) / kPi;
+        const float3 bed = lerp(bed_lit, bh.rgb, bh.a);
+        float3 wcol = glow_r + bed * exp(-ext * (lr + bed_d));
+        const float3 t = refract(-v, n, 1.333f);
+        if (dot(t, t) > 1e-6f) {
+            const float3 tt = normalize(t);
+            // Fresnel on the AIR side's angle, as Schlick wants for n1 > n2.
+            const float ft = 0.02f + 0.98f * pow(1.0f - saturate(dot(tt, -n)), 5.0f);
+            // The sky the refracted ray meets, as the viewer would see it
+            // (sky_reflection: the composited sky where it is on screen).
+            const float3 sky_t = sky_reflection(float3(tt.x, max(tt.y, 0.01f), tt.z));
+            // The sun through the window, spread by the ripples as the glint
+            // above is: a dancing bright patch, not a disk.
+            const float3 sun_t = kSunLux * ((shine + 2.0f) / (2.0f * kPi) * pow(saturate(dot(tt, l)), shine)) *
+                                 (cls * step(0.0f, l.y));
+            wcol = lerp(sky_t + sun_t, wcol, ft);
+        }
+        // Foam is a white raft on the water, lit from above through itself.
+        wcol = lerp(wcol, srgb_to_linear(float3(0.86f, 0.90f, 0.93f)) * light_in * 0.35f, foam);
+        return float4(min(wcol, kSceneMaxNits), 1.0f);
+    }
+
     float3 col = lerp(under, refl, fres) + spec;
     col = lerp(col, srgb_to_linear(float3(0.86f, 0.90f, 0.93f)) * light_in, foam);
     col = min(col, kSceneMaxNits);

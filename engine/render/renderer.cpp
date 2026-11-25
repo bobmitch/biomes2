@@ -247,8 +247,9 @@ struct PostConstants {
     float hfog[3][4];      // the exploration fog (haze.hlsli): layers, base and on, colour
     float adapt[4];        // dark vision: into the dark fast, slow (s); into the light (s); fast stops
     float dark[4];         // dark vision's display floor: lift, threshold nits, on; the player's brightness
+    float water[3][4];     // under the sea (cs_underwater): extinction + eye under; sun's in-scatter + sea level; sky's
 };
-static_assert(sizeof(PostConstants) == 544, "PostConstants must match post.hlsl");
+static_assert(sizeof(PostConstants) == 592, "PostConstants must match post.hlsl");
 
 // Matches cbuffer FogConstants in fog.hlsl.
 struct FogConstants {
@@ -3339,7 +3340,7 @@ bool Renderer::create_post_pipelines(std::string& error) {
             up.Type = D3D12_HEAP_TYPE_UPLOAD;
             D3D12_RESOURCE_DESC bd = {};
             bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            bd.Width = 768;   // PostConstants, 544 bytes
+            bd.Width = 768;   // PostConstants, 592 bytes
             bd.Height = 1;
             bd.DepthOrArraySize = 1;
             bd.MipLevels = 1;
@@ -3390,10 +3391,11 @@ bool Renderer::create_post_pipelines(std::string& error) {
         }
     }
     const char* kPost = "engine/render/shaders/post.hlsl";
-    const char* cs_e[7] = {"cs_ao", "cs_composite", "cs_taa", "cs_hist_clear", "cs_histogram", "cs_exposure", "cs_ssgi"};
-    ComPtr<ID3D12PipelineState>* cs_o[7] = {&ao_pso_, &composite_pso_, &taa_pso_,
-                                            &hist_clear_pso_, &hist_pso_, &expo_pso_, &ssgi_pso_};
-    for (int k = 0; k < 7; ++k) {
+    const char* cs_e[8] = {"cs_ao", "cs_composite", "cs_taa", "cs_hist_clear", "cs_histogram", "cs_exposure", "cs_ssgi",
+                           "cs_underwater"};
+    ComPtr<ID3D12PipelineState>* cs_o[8] = {&ao_pso_, &composite_pso_, &taa_pso_,
+                                            &hist_clear_pso_, &hist_pso_, &expo_pso_, &ssgi_pso_, &underwater_pso_};
+    for (int k = 0; k < 8; ++k) {
         ComPtr<ID3DBlob> cs;
         if (!compile_shader(kPost, cs_e[k], "cs_5_1", cs, error)) return false;
         D3D12_COMPUTE_PIPELINE_STATE_DESC cd = {};
@@ -3762,6 +3764,26 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     pc.dark[1] = dark_.threshold;
     pc.dark[2] = dark_.on ? 1.0f : 0.0f;
     pc.dark[3] = dark_.brightness;
+    // Under the sea (ADR-006 stage 2): the sea's own optics, as water.hlsl
+    // has them -- the extinction murkier with the sea's roughness, and the
+    // body's in-scatter, deep_colour x the light on level water under the
+    // surface (water.hlsl's deep_in), split so the shader can put the
+    // clouds' shadow on the sun's part.
+    {
+        const float rough = Weather::roughness(weather_now_);
+        const float turb = 1.0f + water_optics_.storm_turbidity * rough * rough;
+        float lt[7][4];
+        fill_light(lt);
+        const float sy = lt[0][1] > 0.0f ? lt[0][1] : 0.0f;
+        const float sun_k = sy * (0.25f + 0.75f * sy) / 3.14159265f;
+        for (int k = 0; k < 3; ++k) {
+            pc.water[0][k] = water_optics_.extinction[k] * turb;
+            pc.water[1][k] = water_optics_.deep_colour[k] * lt[1][k] * sun_k;
+            pc.water[2][k] = water_optics_.deep_colour[k] * lt[2][k];
+        }
+        pc.water[0][3] = cam_under_ ? 1.0f : 0.0f;
+        pc.water[1][3] = world_.params().sea_level;
+    }
     pc.ev_comp = ev_comp_;
     pc.ev100_fixed = ev100_fixed_;
     pc.tonemap = wire ? 0u : tonemap_;
@@ -3845,8 +3867,10 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     cmd_->SetPipelineState(composite_pso_.Get());
     cmd_->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
     // The sea and the rain draw onto the scene as a render target.
-    const bool rain = rain_.ready() && (rain_intensity() > 0.001f || drips() > 0.001f);
-    const bool bolt = lightning_.ready() && strike_.active && strike_.ground && strike_.channel > 0.001f && !wire;
+    // Under the sea neither the rain nor the bolt is seen: they are in the air.
+    const bool rain = !cam_under_ && rain_.ready() && (rain_intensity() > 0.001f || drips() > 0.001f);
+    const bool bolt = !cam_under_ && lightning_.ready() && strike_.active && strike_.ground &&
+                      strike_.channel > 0.001f && !wire;
     if (water_pending_) record_water();
     else if (rain || bolt) tr(scene_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET);
     if (rain) record_rain();
@@ -3861,7 +3885,19 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
         cmd_->SetComputeRootUnorderedAccessView(3, lumhist_->GetGPUVirtualAddress());
         cmd_->SetComputeRootUnorderedAccessView(4, expo_->GetGPUVirtualAddress());
         cmd_->SetComputeRootDescriptorTable(5, ssgi_uav);
-        tr(scene_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
+        if (cam_under_) {
+            // The water between the eye and everything it sees, the sea's
+            // surface overhead included (its depth is in depth_ now).
+            tr(scene_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            prof_.mark(cmd_.Get(), "scene, composite and the sea");
+            cmd_->SetPipelineState(underwater_pso_.Get());
+            cmd_->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
+            prof_.mark(cmd_.Get(), "underwater");
+            uavb(scene_.Get());
+            tr(scene_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+        } else {
+            tr(scene_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
+        }
     } else {
         tr(scene_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
     }
@@ -4299,6 +4335,8 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     // the lit scene: it needs that scene for what shows through it and for
     // what it reflects (record_water).
     water_pending_ = false;
+    cam_under_ = false;
+    cam_under_depth_ = 0.0f;
     if (water_ && water_pso_ && mode_ != Mode::Wireframe) {
         WaterConstants wc = {};
         std::memcpy(wc.view_proj, mc.view_proj, sizeof wc.view_proj);
@@ -4337,6 +4375,20 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         wc.cam_water = wc.sea_level + ww_water_at(view.cam_pos[0], view.cam_pos[2],
                                                   view.time, sea_, swash_,
                                                   wc.sea_level - world_.height(view.cam_pos[0], view.cam_pos[2]));
+        // The eye under the sea (ADR-006 stage 2), by physics' own rule for
+        // the swimmer: the generated column holds sea (the swash included),
+        // the eye is below the water over it, and nothing solid lies between
+        // the eye and sea level -- a dry tunnel under the seabed is not the
+        // sea (stage 1, PhysicsWorld::set_sea_cover).
+        {
+            const float cx = view.cam_pos[0], cy = view.cam_pos[1], cz = view.cam_pos[2];
+            const float depth = wc.sea_level - world_.height(cx, cz);
+            const float sw = ww_swash(cx, cz, view.time, swash_) * ww_swash_reach(depth);
+            if (depth + sw > -0.02f && cy < wc.cam_water) {
+                cam_under_ = !(cy < wc.sea_level && solid_between(cx, cz, cy, wc.sea_level));
+                if (cam_under_) cam_under_depth_ = wc.cam_water - cy;
+            }
+        }
         // What the post chain knows, for the haze and the sky (haze.hlsli).
         wc.inv_size[0] = 1.0f / float(width_ ? width_ : 1);
         wc.inv_size[1] = 1.0f / float(height_ ? height_ : 1);

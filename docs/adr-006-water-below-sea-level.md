@@ -1,7 +1,7 @@
 # ADR-006: Water below sea level -- dug holes, tunnels and caves
 
-Status: proposed, 2026-11-25. Stage 1 (no sea under a roof, for physics)
-built; the rest not. This records the direction chosen in discussion and
+Status: proposed, 2026-11-25. Stages 1 (no sea under a roof, for physics)
+and 2 (underwater rendering, a first version) built; the rest not. This records the direction chosen in discussion and
 the corrections found while choosing it, so the first implementation starts
 from them.
 
@@ -185,7 +185,13 @@ for water.
 2. **Underwater rendering (now, independent).** Extinction and in-scatter
    toward the water's colour, the surface seen from below, light dimming
    with depth. Already a gap for the open sea; flooding has nothing to show
-   without it.
+   without it. **Done** (first version): the eye under the sea by physics'
+   rule and stage 1's roof test; post.hlsl's `cs_underwater` (the view and
+   sunlight legs through the water, the body's glow in closed form, 0.053
+   ms at 1440p); the composite lays no air over surfaces; the surface from
+   below as Snell's window and total internal reflection of the seabed;
+   no rain or bolt underwater. `--seabed-tunnel` case D. Not done: the
+   waterline across the lens, caustics, light shafts (gaps.md).
 3. **The connectivity flood**: the search, the conservative cells, the
    mask and sheet, the shared point query for physics, wave damping by path
    distance, venting and air pockets, the shown fill. Water a function of

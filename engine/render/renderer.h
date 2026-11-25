@@ -180,6 +180,10 @@ public:
     // physics sync) that needs this frame's sea before the frame is drawn.
     void  set_sea_state(float s) { weather_.set_storm(s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s)); }
     float sea_state() const { return weather_now_.storm; }
+    // Whether the last frame's eye was under the sea (ADR-006 stage 2), and
+    // how far under the surface over it.
+    bool  camera_underwater() const { return cam_under_; }
+    float camera_water_depth() const { return cam_under_depth_; }
     Weather& weather() { return weather_; }
     const WeatherState& weather_state() const { return weather_now_; }
     const WwSea& sea() const { return sea_; }
@@ -788,6 +792,11 @@ private:
     ComPtr<ID3D12Resource> puddle_;   // the scene's third target: the puddle mask (ADR-005 C4)
     ComPtr<ID3D12RootSignature> post_root_;
     ComPtr<ID3D12PipelineState> ao_pso_, composite_pso_, taa_pso_, final_pso_, ssgi_pso_;
+    // ADR-006 stage 2: the water between the eye and everything, while the
+    // eye is under the sea (post.hlsl cs_underwater; cam_under_ decides).
+    ComPtr<ID3D12PipelineState> underwater_pso_;
+    bool  cam_under_ = false;
+    float cam_under_depth_ = 0.0f;   // metres of water over the eye
     ComPtr<ID3D12Resource> ssgi_;              // the screen-space bounce (L6): irradiance, distance
     HeightGi hfgi_;
     NearField near_;

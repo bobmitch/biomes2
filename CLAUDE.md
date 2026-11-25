@@ -1827,7 +1827,6 @@ archetypes.json `clouds` block. F3 / `--no-clouds`.
     flash casts no shadows of its own; the sea's glint does not see it; no
     sheet lightning across the cloud tops seen from above.
 - **Not done (later phases)**: rain on the camera lens;
-  underwater the rain still draws;
   1/16-pixel-a-frame cloud rendering (Decima's cost path); the base can
   look like a flat ceiling from the ground -- tuning.
 - **"The sun through a gap in the storm" was the shadow's 10% FLOOR, not a
@@ -3122,8 +3121,7 @@ detectors historical.
 - **Cost** at 2560 x 1440, the sea filling the frame: 0.83 ms light wind
   (SSR 0.39 of it), ~1.0 ms gale; was 0.25 / 0.38. Walking where the sea is
   incidental: +0.25 ms (the two full-frame copies and the grid).
-- **Not done**: a faint strip just under the horizon where SSR misses land;
-  no underwater rendering.
+- **Not done**: a faint strip just under the horizon where SSR misses land.
 
 ### The shoreline: swash and wet ground
 
@@ -3378,8 +3376,43 @@ Three things that cost time here and will again:
   swimmer was never drawn: 1.1% of the bottom quarter of the frame was water,
   and 99.6% after the fix. A camera more than 0.5 m above sea level gets the
   old plane (A/B: 1 pixel in 921,600 differed, by 2 levels).
-  **A submerged camera has no underwater rendering:** the seabed is lit like
-  dry land, with the surface overhead.
+
+**Under the sea (ADR-006 stage 2).** The eye is under the sea when the
+generated column holds sea (the swash included), the eye is below the water
+over it (`cam_water`, physics' own `ww_water_at`) and nothing solid lies
+between the eye and sea level (`solid_between`, stage 1's roof test): a dry
+tunnel under the seabed is not. `Renderer::camera_underwater()` /
+`camera_water_depth()`; every shot report has an `underwater:` line. Then:
+- **The composite lays no air over a surface** (no haze, height fog, mist or
+  cloud in front): the path is water.
+- **`cs_underwater`** (post.hlsl), after the sea draws and before TAA, over
+  every pixel by the depth the sea left: the view leg and the sunlight's leg
+  down to what is seen dim per channel (the sea's own `extinction`, murkier
+  with the roughness, as from above), and the water's body glows into the
+  gap -- its in-scatter at depth h is the surface's (`deep_colour` x level
+  water's light, the sun's part under the clouds' shadow) times
+  exp(-ext h), integrated along the ray in closed form, so looking down is
+  darker and bluer, looking up brighter, and a deeper eye sees a darker sea.
+  0.053 ms at 1440p; the whole underwater frame 4.0 ms.
+- **The surface from below** (water.hlsl, only while the eye is under, so
+  no view from the air changes): Snell's window -- the sky the refracted ray
+  meets (`sky_reflection`, the composited sky, clouds and all) and the sun
+  spread by the ripples' unresolved slope as the glint is -- and outside it,
+  total internal reflection of the water UNDER the surface: the seabed by
+  SSR through the reflected ray's water, or, where SSR finds nothing
+  (looking steeply up, the reflected rays leave the screen), the seabed's
+  authored colour (`g_arch`'s last row set) lit as level ground. A flat deep
+  colour there drew a navy ceiling over bright sand.
+- No rain, splashes or lightning bolt are drawn while the eye is under.
+- `--seabed-tunnel` checks it both ways: an eye in the dry tunnel is never
+  drawn as underwater, an eye 1.5 m under open water always is
+  (`build/seabed_under.bmp`). Stills: `--cam 575 -2.4 -288 -1.5708 0.25`
+  (seed 0, 3 m of water west of spawn), `--sea-state 0.8` for a storm.
+- **Not done**: the waterline across the lens -- the whole view switches at
+  once as the eye crosses the surface, so a swimmer's eye in a crest flips
+  it for a frame; caustics on the seabed; light shafts in the water; any
+  particles; in a shallow storm the sheet, clamped just over the bed in a
+  trough, shows from below as dark patches on the sand.
 
 `--overhang` has no landmark to aim at: it searches for a real ceiling
 (phase A), reports what it found and how the capsule left it, then digs a

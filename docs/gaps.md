@@ -147,10 +147,12 @@ Last gathered: 2026-11-21, after the exploration fog.
 
 ## Weather, water and wet
 
-- **Rain draws under the sea**, and there are no drops on the camera lens.
-  [Volumetric clouds ... not done]
-- **No underwater rendering**: a submerged camera sees the seabed lit like
-  dry land. [The sea]
+- **No drops on the camera lens.** [Volumetric clouds ... not done]
+- **Underwater is a first version** (ADR-006 stage 2): no waterline across
+  the lens (the view switches whole as the eye crosses the surface, so a
+  swimmer's eye in a crest flips it for a frame), no caustics, no light
+  shafts, no particles; in a shallow storm the sheet clamped over the bed
+  in a trough shows from below as dark patches on the sand. [The sea]
 - **The sea ignores edits.** Drawing and swimming both decide "sea here"
   from the GENERATED column height: a hole dug below sea level stays dry,
   and a channel dug in from the coast meets a wall of water at the old

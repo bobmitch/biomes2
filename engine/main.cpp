@@ -3020,6 +3020,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                  w.wind_dir[0], w.wind_dir[1], w.gust, w.sea_wind, w.swell_hs, w.swell_dir[0],
                                  w.swell_dir[1], 4.0 * std::sqrt(m0), g_camera.x, g_camera.y, g_camera.z, depth,
                                  depth > 0.0f ? ww_significant_height_lod(sea, depth, 0.0f) : 0.0f);
+                    // ADR-006 stage 2: which side of the water the still was
+                    // taken from decides everything in it.
+                    if (g_renderer.camera_underwater())
+                        std::fprintf(f, "underwater: the eye is %.2f m under the surface (post.hlsl cs_underwater)\n",
+                                     g_renderer.camera_water_depth());
+                    else
+                        std::fprintf(f, "underwater: no\n");
                     {
                         const engine::Strike& st = g_renderer.strike();
                         if (st.active)
@@ -5201,8 +5208,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                      mesh_frames < 0 ? " -- NEVER: the cases below may stand on heightfields" : "");
 
         // One case: place, run 1.5 s, count what physics called it.
-        struct Case { int dry = 0, wade = 0, swim = 0, frames = 0; float rise = 0.0f; bool grounded = false;
-                      unsigned long long calls = 0; double ms = 0.0; };
+        struct Case { int dry = 0, wade = 0, swim = 0, frames = 0, eye_under = 0; float rise = 0.0f;
+                      bool grounded = false; unsigned long long calls = 0; double ms = 0.0; };
         LARGE_INTEGER qf;
         QueryPerformanceFrequency(&qf);
         auto run = [&](float x, float y, float z) {
@@ -5219,6 +5226,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 else if (md == engine::Medium::Wading) ++c.wade;
                 else ++c.swim;
                 c.rise = (std::max)(c.rise, g_feet[1] - settled);
+                // The renderer's own verdict on the eye (ADR-006 stage 2).
+                if (g_renderer.camera_underwater()) ++c.eye_under;
             }
             c.grounded = g_physics.character_grounded();
             c.calls = g_cover_calls - c0;
@@ -5227,10 +5236,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         };
         auto line = [&](const char* name, const Case& c, float x, float z) {
             std::fprintf(f, "%-24s generated column %+6.2f m (%s); dry %d, wading %d, swimming %d of %d; "
-                            "rose %.2f m; %s; cover test %llu calls, %.1f us each\n",
+                            "rose %.2f m; %s; drawn as underwater %d; cover test %llu calls, %.1f us each\n",
                          name, wg.height(x, z) - sea, wg.height(x, z) < sea ? "sea by the old rule" : "land",
                          c.dry, c.wade, c.swim, c.frames, c.rise, c.grounded ? "on its feet" : "NOT grounded",
-                         c.calls, c.calls ? c.ms * 1000.0 / double(c.calls) : 0.0);
+                         c.eye_under, c.calls, c.calls ? c.ms * 1000.0 / double(c.calls) : 0.0);
         };
 
         bool pass_a = mesh_frames > 0, pass_b = false, pass_c = false;
@@ -5241,7 +5250,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             char name[64];
             std::snprintf(name, sizeof(name), "A. tunnel, %2.0f m out:", kS[k]);
             line(name, c, p[0], p[1]);
-            if (c.dry != c.frames || !c.grounded || c.rise > 0.3f) pass_a = false;
+            if (c.dry != c.frames || !c.grounded || c.rise > 0.3f || c.eye_under > 0) pass_a = false;
         }
         {
             float p[2];
@@ -5255,6 +5264,41 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             const Case c = run(pit[0], pit_y - pit_r + 0.3f, pit[1]);
             line("C. open pit in the bed:", c, pit[0], pit[1]);
             pass_c = c.frames > 0 && c.dry == 0;
+        }
+
+        // D. The eye itself under open water, over the tunnel's far end: the
+        // renderer must draw the view as underwater (stage 2), and the still
+        // looks back up the slope at the surface from below.
+        bool pass_d = false;
+        float d_depth = 0.0f;
+        {
+            float p[2];
+            pt(25.0f, 0.0f, p);
+            const float bed = wg.height(p[0], p[1]);
+            engine::Camera c = g_camera;
+            c.x = p[0]; c.z = p[1]; c.y = 0.5f * (sea + bed);
+            c.yaw = std::atan2(-dx, -dz);
+            c.pitch = 0.25f;
+            int under = 0;
+            for (int i = 0; i < 8; ++i) {
+                sync_sea(t);
+                engine::ViewConstants cv = {};
+                fill_view(c, g_res_w, g_res_h, t, cv);
+                g_renderer.render(cv);
+                t += kDt;
+                if (g_renderer.camera_underwater()) ++under;
+            }
+            d_depth = g_renderer.camera_water_depth();
+            pass_d = under == 8;
+            std::fprintf(f, "D. eye under open water:  camera (%.1f, %.2f, %.1f) over a %.2f m column; drawn as "
+                            "underwater %d of 8 frames, %.2f m under the surface\n",
+                         c.x, c.y, c.z, sea - bed, under, d_depth);
+            engine::ViewConstants cv = {};
+            fill_view(c, g_res_w, g_res_h, t, cv);
+            std::string e3;
+            g_renderer.capture(cv, "build/seabed_under.bmp", e3);
+            std::fprintf(f, "  still: build/seabed_under.bmp -- --cam %.2f %.2f %.2f %.4f %.2f\n",
+                         c.x, c.y, c.z, c.yaw, c.pitch);
         }
 
         // A still down the tunnel, seaward, from its 5 m point.
@@ -5275,9 +5319,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const engine::FrameStats st = g_renderer.stats();
         if (drawn == 0 || st.chunks_classified == 0)
             std::fprintf(f, "\nVOID RUN: %d frames drawn, %llu chunks classified\n", drawn, st.chunks_classified);
-        std::fprintf(f, "\nA (tunnel dry, standing): %s\nB (open water is sea): %s\nC (open pit is sea): %s\n",
-                     pass_a ? "PASS" : "FAIL", pass_b ? "PASS" : "FAIL", pass_c ? "PASS" : "FAIL");
-        const bool pass = pass_a && pass_b && pass_c && drawn > 0;
+        std::fprintf(f, "\nA (tunnel dry, standing, not drawn as underwater): %s\nB (open water is sea): %s\n"
+                        "C (open pit is sea): %s\nD (an eye under open water is drawn as underwater): %s\n",
+                     pass_a ? "PASS" : "FAIL", pass_b ? "PASS" : "FAIL", pass_c ? "PASS" : "FAIL",
+                     pass_d ? "PASS" : "FAIL");
+        const bool pass = pass_a && pass_b && pass_c && pass_d && drawn > 0;
         std::fprintf(f, "%s\n", pass ? "PASS" : "FAIL");
         std::fclose(f);
         g_renderer.shutdown();
