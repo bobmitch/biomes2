@@ -829,6 +829,7 @@ private:
     // FILLING hole (the mask's third plane), by world column; forgotten at
     // every edit (BrickStore::generation).
     std::unordered_map<int64_t, float> flood_rim_;
+    std::unordered_map<int64_t, float> flood_gen_h_;   // the generated height of dug columns (fill_flood_mask)
     uint64_t flood_rim_gen_ = ~0ull;
     std::unordered_map<int64_t, FloodBlock> flood_;
     std::unordered_map<int64_t, uint64_t> flood_asked_;

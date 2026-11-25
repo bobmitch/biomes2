@@ -107,6 +107,39 @@ bool BrickStore::edit_sphere(float cx, float cy, float cz, float radius,
         for (size_t k = 0; k < need_at.size(); ++k) pts[need_at[k]].old = got[k];
     }
 
+    // Every gathered point by its lattice position, for the roof test below.
+    const int nx = v1x - v0x + 1, ny = v1y - v0y + 1, nz = v1z - v0z + 1;
+    std::vector<int> at(size_t(nx) * ny * nz, -1);
+    for (size_t k = 0; k < pts.size(); ++k)
+        at[(size_t(pts[k].z - v0z) * ny + size_t(pts[k].y - v0y)) * nx + size_t(pts[k].x - v0x)] = int(k);
+    auto find_pt = [&](int x, int y, int z) -> const Pt* {
+        if (x < v0x || x > v1x || y < v0y || y > v1y || z < v0z || z > v1z) return nullptr;
+        const int k = at[(size_t(z - v0z) * ny + size_t(y - v0y)) * nx + size_t(x - v0x)];
+        return k < 0 ? nullptr : &pts[size_t(k)];
+    };
+    // A dig that stops just short of the surface leaves a roof thinner than
+    // the lattice: rock carved on one side, air on the other, and no point
+    // left rock between them -- a hole in the ground the dig never reached.
+    // So before a rock point is carved, each neighbour that is air and
+    // OUTSIDE the sphere is asked: along the edge between them, does the
+    // sphere's boundary come before the surface's? Then rock remains there,
+    // and the point stays rock: the roof is drawn a voxel thick where it is
+    // thinner, never as a hole. A dig that does break through (the surface
+    // first) carves as before.
+    auto keeps_roof = [&](const Pt& p, float sd_p) {
+        static const int kN[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+        for (int n = 0; n < 6; ++n) {
+            const Pt* a = find_pt(p.x + kN[n][0], p.y + kN[n][1], p.z + kN[n][2]);
+            if (!a) continue;
+            const float sd_a = a->d - radius;
+            if (sd_a <= 0.0f || a->old >= 0.0f) continue;      // carved too, or rock
+            const float t_ground = p.old / (p.old - a->old);    // where the surface crosses, P to A
+            const float t_sphere = -sd_p / (sd_a - sd_p);       // where the sphere's boundary does
+            if (t_sphere < t_ground) return true;
+        }
+        return false;
+    };
+
     bool any = false;
     for (const Pt& p : pts) {
         const int vx = p.x, vy = p.y, vz = p.z;
@@ -129,6 +162,7 @@ bool BrickStore::edit_sphere(float cx, float cy, float cz, float radius,
             if (known && old <= sd) continue;
             v = sd;
             if (d < radius) v = std::min(v, -kRim);
+            if (known && old > 0.0f && v < 0.0f && keeps_roof(p, sd)) continue;
         } else {
             if (known && old >= -sd) continue;
             v = -sd;

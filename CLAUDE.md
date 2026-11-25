@@ -1417,6 +1417,16 @@ only points written as air: the band's rock stays rock. Cost
 at 8 m (asking the field everywhere, single-threaded: 30 ms). Saves load
 as before; old edits keep their steps.
 
+**A dig keeps a roof thinner than the lattice.** A dig that stops 1-40 cm
+under the surface leaves rock no lattice point holds -- carved on one side,
+air on the other -- and drew as a hole in the ground it never reached
+(`--flood-pit`'s rim). Before a rock point is carved, each neighbour that is
+air and outside the sphere is asked where, along the edge between them, the
+sphere's boundary and the ground's surface cross; if the sphere's comes
+first, rock remains there and the point stays rock, so the roof is drawn a
+voxel thick. A dig that does break through carves as before; so do the
+player's aimed digs, whose sphere holds the point they hit.
+
 - **Grass goes where an edit reaches the ground.** The edit store keeps a
   derived map (`BrickStore::column_top`, rebuilt on load, not saved): per
   0.5 m column, the highest edited lattice point that reaches it. Each
@@ -3568,11 +3578,25 @@ held no such cell and the water could not get down it.
   under water** (`under_len`), so a dug wall shows through its own first
   centimetres of water and the steps the grid leaves dissolve (0.4 m left
   them showing). Not on natural shores.
+- **A dig out across the coast takes its real depth.** The mask's fourth
+  plane holds, for DUG water columns of the sea and the shoreline (the
+  edit store's column map says which; land columns are the flood's), how
+  much deeper the water is than the generated bed, walking the flood's
+  labels down to the first rock. The vertex shader takes the larger of
+  the flood's depth and the generated one plus that (`flood_excess`,
+  beyond 0.3 m: the labels place a bed to a quarter metre), so waves do
+  not break, run up and foam along the old shoreline in the middle of a
+  dredged bay. Added before the flood's own depth, weighted off over the
+  land's first 25 cm, the depth dipped through the shallows there and a
+  thin line of foam crossed a channel where the coast had been.
 - **`--flood-pit`** (`build/flood_pit.bmp`, `_top.bmp`, `.txt`): from the
-  coast nearest spawn, a pit 4 m spheres wide dug from 16 m inland, an
+  coast nearest spawn, a pit 4 m spheres wide dug from 16 m inland (centres
+  half a metre over sea level, so it breaks through the beach), an
   undercut on one side and an inlet to the sea, viewed from 12 m up after
-  the fill. `BIOMES_PIT_UNDERCUT=<m>` the undercut's centre under sea
-  level (2.5, its roof tangent to the water); `BIOMES_PIT_PICK="px py
+  the fill. `BIOMES_PIT_DREDGE=1` also dredges a strip 18 m wide from 4 m
+  inland to 14 m out across the shoreline; `BIOMES_PIT_UNDERCUT=<m>` the
+  undercut's centre under sea level (2.5, its roof tangent to the water);
+  `BIOMES_PIT_PICK="px py
   ..."` names what a pixel shows, marched through the EDITED density
   (`--pick` reads the generated field). `--water-debug 11` (the filter's
   weight, inside the wall, land) and `12` (the same with every flood cut
@@ -3597,10 +3621,11 @@ held no such cell and the water could not get down it.
   (the shore foam's calm, depth and fade) are the instruments.
 - **Not done**: the surf's edge at a dug wall follows the water grid in
   steps of a few centimetres where the surf meets it (the straddling
-  triangles are dropped whole); a dig whose top comes within a voxel of
-  the surface leaves a skin the 0.5 m lattice cannot hold -- a small hole
-  in the ground (`--flood-pit`'s far rim); a filling shaft can show a
-  sliver of sheet at its rim for a few frames;
+  triangles are dropped whole); a filling shaft can show a sliver of
+  sheet at its rim for a few frames; a dredged sea's real depth is known
+  only in the flood's labelled blocks (near the camera, the player and
+  digs), and physics still tames the swimmer's waves by the generated
+  depth there;
   a pocket's own water surface below sea level
   is not drawn (physics has it); the underwater pass dims light down to sea
   level, not to a pocket's floor; the mask reaches 64 m round the camera,

@@ -756,7 +756,8 @@ bool Renderer::create_water_pipeline(std::string& error) {
         }
         // The flood's surface mask (ADR-006 stage 3): kFloodMask^2 bytes,
         // read as uints, one a frame in flight.
-        rd.Width = UINT64(kFloodMask) * kFloodMask * 3;   // the waves' share, the fill's level, the rim's density
+        // the waves' share, the fill's level, the rim's density, the dug excess
+        rd.Width = UINT64(kFloodMask) * kFloodMask * 4;
         for (UINT i = 0; i < kFrameCount; ++i) {
             const HRESULT ch = device_->CreateCommittedResource(
                 &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
@@ -764,7 +765,7 @@ bool Renderer::create_water_pipeline(std::string& error) {
             if (FAILED(ch)) { error = hr_text("CreateCommittedResource (flood mask)", ch); return false; }
             D3D12_RANGE none = {0, 0};
             flood_mask_[i]->Map(0, &none, &flood_mask_cpu_[i]);
-            std::memset(flood_mask_cpu_[i], 0, size_t(kFloodMask) * kFloodMask * 3);
+            std::memset(flood_mask_cpu_[i], 0, size_t(kFloodMask) * kFloodMask * 4);
         }
     }
 
@@ -6170,11 +6171,50 @@ void Renderer::fill_flood_mask(const float cam[3]) {
     // right up to the rim. Applied by the columns' filter instead, it fell
     // half a cell out on the beach and cut the surf round a filling shaft in
     // squares.
-    std::vector<uint8_t> buf(size_t(N) * N * 3, 0);
+    // The fourth: how much deeper the water really is than the generated
+    // bed says, in 0.1 m (0: no more), for DUG columns of the sea and the
+    // shoreline. Where a dig runs out across the coast the sheet took its
+    // depth from the generated shallows, and the surf broke and foamed along
+    // the old shoreline in the middle of deep water. Only columns the edit
+    // store says were dug are walked: elsewhere the generated bed is the bed.
+    std::vector<uint8_t> buf(size_t(N) * N * 4, 0);
     std::memset(buf.data() + size_t(N) * N * 2, 255, size_t(N) * N);
     std::vector<int> filling;   // mask indices of flooded columns the water has reached
     std::vector<int> open_sea;  // mask indices of the open sea's own columns (label 1)
     bool any = false;
+    if (flood_gen_h_.size() > 200000) flood_gen_h_.clear();
+    auto dug_excess = [&](const FloodBlock& top_block, int x, int z) -> uint8_t {
+        float etop = 0.0f;
+        if (!edits_.column_top(x, z, etop)) return 0;
+        const int64_t hk = fl_key(x, 0, z);
+        auto ih = flood_gen_h_.find(hk);
+        if (ih == flood_gen_h_.end()) ih = flood_gen_h_.emplace(hk, world_.height(float(x) * kFlC, float(z) * kFlC)).first;
+        const float gen = sea - ih->second;
+        if (gen < -0.25f) return 0;   // land: the flood's own depth stands there
+        // Down the column to the first rock (at most 15 m), the block below
+        // looked up once as the walk crosses into it.
+        const FloodBlock* blk = &top_block;
+        int bcur = by;
+        const int bxk = fl_floor_div(x, K), bzk = fl_floor_div(z, K);
+        int y = ys - 1;
+        for (; y > ys - 31; --y) {
+            const int byy = fl_floor_div(y, K);
+            if (byy != bcur) {
+                auto ib = flood_.find(fl_key(bxk, byy, bzk));
+                if (ib == flood_.end()) break;
+                blk = &ib->second;
+                bcur = byy;
+            }
+            const int idx = ((z - bzk * K) * K + (y - byy * K)) * K + (x - bxk * K);
+            if (blk->cell[idx] == SeaAccess::kSolid) break;
+        }
+        // The rock point's lattice height plus half a cell: where the mesher
+        // puts the surface between it and the air over it, to a quarter metre.
+        const float real = sea - (float(y) + 0.5f) * kFlC;
+        const float ex = real - gen;
+        if (ex <= 0.0f) return 0;
+        return uint8_t((std::min)(254, int(ex * 10.0f + 0.5f)));
+    };
     for (int bz = 0; bz < N / K; ++bz)
         for (int bx = 0; bx < N / K; ++bx) {
             auto it = flood_.find(fl_key(ox / K + bx, by, oz / K + bz));
@@ -6185,6 +6225,13 @@ void Renderer::fill_flood_mask(const float cam[3]) {
                     const uint8_t c = it->second.cell[ci];
                     const size_t mi = size_t(bz * K + k) * N + size_t(bx * K + i);
                     if (c == SeaAccess::kSolid) continue;
+                    if (c != SeaAccess::kDry) {
+                        const uint8_t ex = dug_excess(it->second, ox + bx * K + i, oz + bz * K + k);
+                        if (ex) {
+                            buf[size_t(N) * N * 3 + mi] = ex;
+                            any = true;
+                        }
+                    }
                     if (c == SeaAccess::kDry) {
                         // Only in a LAND column: a capped component leaves the
                         // sea's own cells dry, and marking those would cut

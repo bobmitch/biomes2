@@ -100,6 +100,8 @@ Texture2D<float> g_cloud_shadow : register(t6);   // clouds.hlsl cs_shadow
 // level the water stands there now, 0.1 m (255 none in yet). The third,
 // round flooded columns: the edited density at sea level (the sheet's own
 // height), 128 + 64 x density (rock positive; 255 rock where not computed).
+// The fourth: how much deeper a DUG column's water is than its generated bed,
+// 0.1 m (0 where it is not dug), for the sea and the shoreline.
 StructuredBuffer<uint> g_flood : register(t7);
 
 uint flood_byte(int2 c, uint plane) {
@@ -136,6 +138,22 @@ float4 flood_sample(float2 p) {
     if (w > 1e-4f) { calm /= w; drop /= w; } else calm = 1.0f;
     const float dry = flood_byte(int2(floor(g + 0.5f)), 0u) == 1u ? 1.0f : 0.0f;
     return float4(w, calm, drop, dry);
+}
+
+// How much deeper the water at p is than the generated bed says, in metres:
+// a dig out across the coast. Bilinear, columns not dug counting 0, so the
+// dug depth ramps in over a cell at the edge of the dig.
+float flood_excess(float2 p) {
+    if (flood_on < 0.5f) return 0.0f;
+    const float2 g = (p - flood_origin) / 0.5f;
+    const int2 c0 = int2(floor(g));
+    const float2 f = g - float2(c0);
+    float e = 0.0f;
+    [unroll] for (int k = 0; k < 4; ++k) {
+        const float wt = ((k & 1) ? f.x : 1.0f - f.x) * ((k >> 1) ? f.y : 1.0f - f.y);
+        e += wt * float(flood_byte(c0 + int2(k & 1, k >> 1), 3u)) * 0.1f;
+    }
+    return e;
 }
 
 // How far p is from a dug wall at sea level, sideways, in metres: negative
@@ -387,6 +405,16 @@ VSOut vs_main(uint vid : SV_VertexID) {
         fill_drop = fs.z * inside * land;
         drop_full = fs.z;
     }
+    // A dig out across the coast: the sea and the shoreline take the depth
+    // the water really has (the flood's labels, flood_excess, beyond 0.3 m:
+    // they place the bed to a quarter metre), so waves do not break, run up
+    // and foam along the OLD shoreline in the middle of deep water. The
+    // larger of that and the flood's own depth, after the flood: added
+    // before it, weighted off over the land's first 25 cm, the depth dipped
+    // through the shallows there, and a thin line of foam crossed a channel
+    // where the coast had been. The CPU leaves land columns out, where the
+    // flood's depth stands.
+    depth = max(depth, depth_gen + max(flood_excess(rest) - 0.3f, 0.0f));
 
     float3 nrm;
     const float3 p = ww_surface(rest.x, rest.y, time, frame_sea(), depth, fade_w, minwl, nrm);

@@ -5145,11 +5145,18 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_physics.place_character(p[0], Spawn::above(p[0], p[1]), p[1]);
             for (int i = 0; i < 120; ++i) frame();
         }
-        // The pit: 4 m spheres from 16 m inland to 4 m, two rows, centres a
-        // metre under sea level; an undercut under its inland side; an inlet
-        // out through the beach into the sea.
+        // The pit: 4 m spheres from 16 m inland to 4 m, three rows, centres
+        // half a metre over sea level, so their tops break through the beach
+        // (at a metre under it, they stopped 10-20 cm short: a roof the
+        // lattice kept as a voxel once edit_sphere learned to keep roofs);
+        // an undercut under its inland side; an inlet out through the beach
+        // into the sea. BIOMES_PIT_DREDGE=1 also dredges a strip 18 m wide
+        // from 4 m inland to 14 m out, 3 m deep across the old shoreline.
         for (float s = -16.0f; s <= -4.0f; s += 2.0f)
-            for (float side = -3.0f; side <= 3.0f; side += 3.0f) dig_at(s, side, sea - 1.0f, 4.0f);
+            for (float side = -3.0f; side <= 3.0f; side += 3.0f) dig_at(s, side, sea + 0.5f, 4.0f);
+        if (std::getenv("BIOMES_PIT_DREDGE"))
+            for (float s = -4.0f; s <= 14.0f; s += 2.0f)
+                for (float side = -8.0f; side <= 8.0f; side += 2.0f) dig_at(s, side, sea - 0.5f, 2.5f);
         // BIOMES_PIT_UNDERCUT=<m>: the undercut's centre under sea level (2.5
         // by default, its ceiling tangent to the water -- the worst case for
         // the waterline, which runs along rock barely crossing it).
