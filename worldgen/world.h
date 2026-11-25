@@ -414,6 +414,10 @@ struct SeedWorld {
     // Per biome: candidate cells whose centre stands on its dry land, and
     // how many of those hold a cave. The guarantee validate asserts.
     std::vector<int> cave_cells, cave_filled;
+    // Why tried spots failed, summed over the cells that owed a cave and
+    // ended with none: outside, biome, sea, slope, river, flat, shape.
+    int cave_reject[7] = {0, 0, 0, 0, 0, 0, 0};
+    std::vector<int> cave_unfilled;   // per biome: cells that owed a cave and ended with none
     float cave_wall_amp = 0.0f, cave_wall_freq = 0.2f;   // 0 amp: no wall noise
     int   egrid_n = 0;
     float egrid_cell = 0.0f;

@@ -2304,6 +2304,83 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_renderer.set_post_dt_override(-1.0f);
         }
 
+        // --cave-walk <k>: the k-th placed cave nearest the still's camera,
+        // walked into as play would -- never settled. From 50 m outside the
+        // mouth, along the capsules' axis to the chamber's middle at 3 m/s,
+        // every frame a simulated 1/30 s. build/cave_walk.txt logs where,
+        // the meter's 10th/90th percentiles in nits and the adapted EV100
+        // every frame; build/cavewalk_NN.bmp is a raw frame every 1.5 s.
+        {
+            const std::string cl = cmdline ? cmdline : "";
+            const size_t cw = cl.find("--cave-walk ");
+            const worldgen::SeedWorld& sw = g_renderer.world().world();
+            if (ok && cw != std::string::npos && !sw.caves.empty()) {
+                const int want = std::atoi(cl.c_str() + cw + 12);
+                std::vector<std::pair<float, size_t> > order;
+                for (size_t i = 0; i < sw.caves.size(); ++i) {
+                    const float dx = sw.caves[i].x - g_camera.x, dz = sw.caves[i].z - g_camera.z;
+                    order.push_back(std::make_pair(dx * dx + dz * dz, i));
+                }
+                std::sort(order.begin(), order.end());
+                const worldgen::SeedWorld::Cave& c = sw.caves[order[size_t(want) % order.size()].second];
+                // The path: outside, the mouth at eye height, then every
+                // tunnel capsule's far end (the last three capsules are the
+                // chamber's own), then the chamber's middle.
+                std::vector<float> px, py, pz;
+                auto add = [&](float x, float y, float z) { px.push_back(x); py.push_back(y); pz.push_back(z); };
+                const float ox = c.x - c.hx * 50.0f, oz = c.z - c.hz * 50.0f;
+                add(ox, g_renderer.world().height(ox, oz) + 1.6f, oz);
+                add(c.x, c.y + 1.6f, c.z);
+                for (int k = 1; k < c.seg_count - 3; ++k) {
+                    const worldgen::SeedWorld::EntranceSeg& e = sw.entrances[size_t(c.seg_begin + k)];
+                    add(e.bx, e.by, e.bz);
+                }
+                add(c.cx, c.floor_y + 1.6f, c.cz);
+                const float step = 1.0f / 30.0f, speed = 3.0f;
+                g_renderer.set_post_dt_override(step);
+                g_renderer.set_capture_raw(true);
+                FILE* wf = std::fopen("build/cave_walk.txt", "w");
+                if (wf) std::fprintf(wf, "cave %s, mouth (%.1f, %.1f, %.1f), floor %.1f m down, %zu path points\n"
+                                         "t_s  metres  x y z  target_EV100  adapted_EV100  p10_nits  p90_nits  frame\n",
+                                     g_renderer.world().table()[size_t(c.biome)].name.c_str(), c.x, c.y, c.z,
+                                     c.y - c.floor_y, px.size());
+                float t = 0.0f, walked = 0.0f, next_shot = 0.0f;
+                int shot = 0;
+                for (size_t k = 0; k + 1 < px.size() && ok; ++k) {
+                    const float dx = px[k + 1] - px[k], dy = py[k + 1] - py[k], dz = pz[k + 1] - pz[k];
+                    const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    const int n = (std::max)(1, int(len / (speed * step) + 0.5f));
+                    const float hl = std::sqrt(dx * dx + dz * dz);
+                    for (int i = 0; i < n && ok; ++i) {
+                        const float u = float(i + 1) / float(n);
+                        g_camera.x = px[k] + dx * u; g_camera.y = py[k] + dy * u; g_camera.z = pz[k] + dz * u;
+                        if (hl > 0.1f) g_camera.yaw = std::atan2(dx, dz);
+                        g_camera.pitch = hl > 0.1f ? 0.6f * std::atan2(dy, hl) : 0.0f;
+                        t += step;
+                        walked += len / float(n);
+                        fill_view(g_camera, g_res_w, g_res_h, t, v);
+                        int saved = -1;
+                        if (t >= next_shot) {
+                            char p[64];
+                            std::snprintf(p, sizeof p, "build/cavewalk_%02d.bmp", shot);
+                            ok = g_renderer.capture(v, p, error);
+                            saved = shot++;
+                            next_shot += 1.5f;
+                        } else {
+                            g_renderer.step_offscreen(v);
+                        }
+                        const float* ex = g_renderer.live_exposure();
+                        if (wf)
+                            std::fprintf(wf, "%6.2f %6.1f  %.1f %.1f %.1f  %6.2f %6.2f  %9.5f %9.5f  %d\n", t, walked,
+                                         g_camera.x, g_camera.y, g_camera.z, ex[3] + 3.0f, ex[2], ex[4], ex[5], saved);
+                    }
+                }
+                if (wf) std::fclose(wf);
+                g_renderer.set_capture_raw(false);
+                g_renderer.set_post_dt_override(-1.0f);
+            }
+        }
+
         // --clock-jump <hours> [seconds] [ramp]: how fast the light under the
         // ground follows the clock. After the still, 2 s at its hour, then the
         // clock jumps to <hours> -- or with [ramp] seconds, runs there

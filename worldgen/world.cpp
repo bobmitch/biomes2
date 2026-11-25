@@ -1242,9 +1242,23 @@ static bool shape_cave(const SeedWorld& w, const WorldParams& wp, const Archetyp
     auto height_at = [&](float px, float pz) {
         return terrain_height(w, wp, table, px, pz, std::sqrt(px * px + pz * pz) / R);
     };
-    // A path point is only kept with `cover` metres of rock over its top.
+    // A path point is only kept with `cover` metres of rock over its top --
+    // over the carve's real reach, which is the radius plus the feathering
+    // outside the wall and the wall noise. Measured from the radius alone a
+    // 3 m cover left 0.7 m of rock, which the near field's 1 m grid reads as
+    // open: the shallow stretch behind a mouth glowed with leaked daylight.
+    // Plus the overhang term's reach where the point is: layer 6 can drop the
+    // real surface up to strength x overhang_scale under the 2.5D height this
+    // measures from (3 m in forest), and a roof that thin let daylight
+    // through the near field's 1 m grid -- a lit stretch 70 m into a tunnel.
+    const float reach = wp.entrance_falloff + ct.wall_noise;
     auto covered = [&](float px, float py, float pz, float r) {
-        return height_at(px, pz) - (py + r) >= ct.cover;
+        int bio[8];
+        float bw[8];
+        const int nb = biome_mix(w, wp, px, pz, bio, bw);
+        float ov = 0.0f;
+        for (int k = 0; k < nb; ++k) ov = ov + bw[k] * table[bio[k]].overhang_strength;
+        return height_at(px, pz) - (py + r + reach + ov * wp.overhang_scale) >= ct.cover;
     };
 
     float hx = 0.0f, hz = 0.0f;
@@ -1283,16 +1297,43 @@ static bool shape_cave(const SeedWorld& w, const WorldParams& wp, const Archetyp
         if (n_grade > n) n = n_grade;
         if (n < 1) n = 1;
         const float dy = drop / static_cast<float>(n);
-        float run = ct.segment * ct.segment - dy * dy;
-        run = run > 0.25f ? std::sqrt(run) : 0.5f;
+        const float steepest = ct.max_grade * ct.segment * 0.85f;   // drop per segment at the walkable grade
         for (int k = 0; k < n; ++k) {
-            wander(rng, a.cave_turn, hx, hz);
-            const float nr = rt * (0.85f + 0.3f * rng.uniform());
-            const float nx = ex + hx * run, ny = ey - dy, nz = ez + hz * run;
+            // Up to six headings for this segment: one that would run out of
+            // the rock (a slope falling away, a coast) is tried again turned,
+            // so a tunnel bends round the hill instead of the spot failing.
+            // Every try draws from rng, so the cave stays a pure function of
+            // its cell.
+            bool placed = false;
+            float nx = ex, ny = ey, nz = ez, nr = rt;
+            const float base_hx = hx, base_hz = hz;
+            for (int attempt = 0; attempt < 6 && !placed; ++attempt) {
+                hx = base_hx; hz = base_hz;
+                wander(rng, a.cave_turn * (1.0f + static_cast<float>(attempt)), hx, hz);
+                nr = rt * (0.85f + 0.3f * rng.uniform());
+                // The even descent first; from the fourth try, as steep as can
+                // be walked -- under a rising hill or a thin edge, going down
+                // finds rock where turning does not. Never below the floor.
+                float dyk = attempt < 3 ? dy : steepest;
+                if (dyk > ey - end_y) dyk = ey - end_y;
+                if (dyk < 0.0f) dyk = 0.0f;
+                float run = ct.segment * ct.segment - dyk * dyk;
+                run = run > 0.25f ? std::sqrt(run) : 0.5f;
+                nx = ex + hx * run; ny = ey - dyk; nz = ez + hz * run;
+                placed = true;
+                // Every 2 m, not only at the vertices: a tunnel heading for
+                // the coast ran out under the seabed between two 8 m
+                // vertices, and the sunlit sea floor glowed at the end of it.
+                if (path + ct.segment > 2.0f * rm) {
+                    for (int q = 1; q <= 4 && placed; ++q) {
+                        const float u = 0.25f * static_cast<float>(q);
+                        if (!covered(ex + (nx - ex) * u, ey + (ny - ey) * u, ez + (nz - ez) * u,
+                                     er + (nr - er) * u)) placed = false;
+                    }
+                }
+            }
+            if (!placed) return false;
             path += ct.segment;
-            // Past the mouth's own reach the rock must close over the tunnel,
-            // or a hillside opens a trench rather than a cave.
-            if (path > 2.0f * rm && !covered(nx, ny, nz, nr)) return false;
             push_seg(segs, ex, ey, ez, er, nx, ny, nz, nr);
             ex = nx; ey = ny; ez = nz; er = nr;
         }
@@ -1307,26 +1348,57 @@ static bool shape_cave(const SeedWorld& w, const WorldParams& wp, const Archetyp
         const float wdt = lerp_range(a.cave_chamber, rng.uniform());
         const float hgt = lerp_range(a.cave_chamber_h, rng.uniform());
         const float rc = 0.5f * hgt;
-        const float cy = cfloor + rc;
+        const float rdome = rc * 1.2f;
+        const float dy_dome = 0.35f * rc;
+        const float top = rdome + dy_dome;   // the room's top over its axis
         float span = wdt - 2.0f * rc;
         if (span < 0.0f) span = 0.0f;
+        const float along_u = rng.uniform(), half_u = rng.uniform();
+        float half = 0.5f * wdt * (0.5f + 0.5f * half_u) - rc;
+        if (half < 0.0f) half = 0.0f;
+        const float qx = -hz, qz = hx;   // across
+        // Rock over the whole room: a 5 x 5 grid over its footprint (the main
+        // capsule's length by the cross capsule's), each point with the
+        // room's full height under it. A room short of rock is not given up
+        // at once: the tunnel goes on one more segment down and the room
+        // is tried there, up to three times and 10 m past the deepest the
+        // biome asks for -- a big cavern under rolling ground needs the
+        // depth, and failing the spot cost forest a fifth of its caves.
+        auto room_fits = [&](float rx, float rz, float rcy) {
+            const float rmx = rx + hx * (0.5f * rc + 0.5f * span), rmz = rz + hz * (0.5f * rc + 0.5f * span);
+            const float ext = 0.5f * span + rc, wide = half + 0.85f * rc;
+            for (int gu = -2; gu <= 2; ++gu) {
+                for (int gv = -2; gv <= 2; ++gv) {
+                    const float fa = 0.5f * ext * static_cast<float>(gu);
+                    const float fb = 0.5f * wide * static_cast<float>(gv);
+                    if (!covered(rmx + hx * fa + qx * fb, rcy, rmz + hz * fa + qz * fb, top)) return false;
+                }
+            }
+            return true;
+        };
+        int deeper = 0;
+        while (!room_fits(ex, ez, cfloor + rc)) {
+            const float drop = ct.max_grade * ct.segment * 0.85f;
+            if (deeper >= 5 || surf - (cfloor - drop) > a.cave_depth[1] + 10.0f) return false;
+            float run2 = ct.segment * ct.segment - drop * drop;
+            run2 = run2 > 0.25f ? std::sqrt(run2) : 0.5f;
+            const float nx = ex + hx * run2, ny = ey - drop, nz = ez + hz * run2;
+            for (int q = 1; q <= 4; ++q) {
+                const float u = 0.25f * static_cast<float>(q);
+                if (!covered(ex + (nx - ex) * u, ey + (ny - ey) * u, ez + (nz - ez) * u, er)) return false;
+            }
+            push_seg(segs, ex, ey, ez, er, nx, ny, nz, er);
+            ex = nx; ey = ny; ez = nz;
+            cfloor = ey - er;
+            path += ct.segment;
+            ++deeper;
+        }
+        const float cy = cfloor + rc;
         const float p0x = ex + hx * 0.5f * rc, p0z = ez + hz * 0.5f * rc;
         const float p1x = p0x + hx * span, p1z = p0z + hz * span;
         const float mx = 0.5f * (p0x + p1x), mz = 0.5f * (p0z + p1z);
-        const float qx = -hz, qz = hx;   // across
-        const float along = (rng.uniform() - 0.5f) * 0.5f * span;
-        float half = 0.5f * wdt * (0.5f + 0.5f * rng.uniform()) - rc;
-        if (half < 0.0f) half = 0.0f;
+        const float along = (along_u - 0.5f) * 0.5f * span;
         const float cxm = mx + hx * along, czm = mz + hz * along;
-        const float rdome = rc * 1.2f;
-        const float dy_dome = 0.35f * rc;
-        const float top = rdome + dy_dome;   // the room's top over cy
-        // Rock over the whole room: its middle, both ends, both sides.
-        const float pts[5][2] = {{mx, mz}, {p0x, p0z}, {p1x, p1z},
-                                 {cxm + qx * half, czm + qz * half}, {cxm - qx * half, czm - qz * half}};
-        for (int k = 0; k < 5; ++k) {
-            if (!covered(pts[k][0], cy, pts[k][1], top)) return false;
-        }
         // The tunnel drops into the room: join its end to the main capsule.
         if (!sealed || c > 0) push_seg(segs, ex, ey, ez, er, p0x, cy, p0z, rc);
         push_seg(segs, p0x, cy, p0z, rc, p1x, cy, p1z, rc);
@@ -1360,6 +1432,7 @@ void build_caves(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& tabl
     w.entrance_count = 0;
     w.cave_cells.assign(table.size(), 0);
     w.cave_filled.assign(table.size(), 0);
+    w.cave_unfilled.assign(table.size(), 0);
     bool any = false;
     for (size_t b = 0; b < table.size(); ++b) if (table[b].cave_per_km2 > 0.0f) any = true;
     if (!any || !table.caves.present) return;
@@ -1409,32 +1482,59 @@ void build_caves(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& tabl
                 }
                 if (candidate) ++w.cave_cells[bi];
 
+                int why[7] = {0, 0, 0, 0, 0, 0, 0};
+                bool got = false, owed = false;
+                float u0x = 0.5f, u0z = 0.5f;   // the first spot, in cell units
                 for (int t = 0; t < ct.tries; ++t) {
                     // Inside the middle 80% of the cell, so neighbours keep
                     // at least a fifth of a cell apart.
+                    // Every other retry stays within 0.15 cell of the first
+                    // spot, which is known to be the biome's dry land: a cell
+                    // owed for a thin coastal or border strip of the biome
+                    // otherwise spent its tries in the sea and the next biome.
+                    // The 80% jitter still bounds it, so neighbours keep apart.
                     const uint32_t k0 = static_cast<uint32_t>(t) * 4u;
-                    const float x = (static_cast<float>(i) + 0.1f + 0.8f * tree_unit(tree_hash(i, j, seed, k0))) * cell;
-                    const float z = (static_cast<float>(j) + 0.1f + 0.8f * tree_unit(tree_hash(i, j, seed, k0 + 1u))) * cell;
-                    if (x * x + z * z > 0.81f * R * R) continue;
+                    float ux = tree_unit(tree_hash(i, j, seed, k0));
+                    float uz = tree_unit(tree_hash(i, j, seed, k0 + 1u));
+                    if (t > 0 && (t & 1) == 1) {
+                        ux = u0x + (ux - 0.5f) * 0.375f;
+                        uz = u0z + (uz - 0.5f) * 0.375f;
+                        ux = ux < 0.0f ? 0.0f : (ux > 1.0f ? 1.0f : ux);
+                        uz = uz < 0.0f ? 0.0f : (uz > 1.0f ? 1.0f : uz);
+                    }
+                    if (t == 0) { u0x = ux; u0z = uz; }
+                    const float x = (static_cast<float>(i) + 0.1f + 0.8f * ux) * cell;
+                    const float z = (static_cast<float>(j) + 0.1f + 0.8f * uz) * cell;
+                    // The first spot decides whether the cell owes this
+                    // biome a cave at all: a uniform point of the cell lands
+                    // on its dry land with the chance that is its share of
+                    // the cell, so the density comes out at per_km2 over the
+                    // biome's land. The retries after it only find a spot
+                    // that works. (Letting any of them qualify the cell gave
+                    // meadows, patchy at this scale, 2.5 a km2 for 1.)
+                    if (x * x + z * z > 0.81f * R * R) { ++why[0]; if (t == 0) break; continue; }
                     float wt = 0.0f;
-                    if (dominant(x, z, wt) != b || wt < 0.5f) continue;
+                    const int dom = dominant(x, z, wt);
+                    if (t == 0 && dom != b) { ++why[1]; break; }
+                    if (dom != b) { ++why[1]; continue; }
                     const float surf = height_at(x, z);
-                    if (surf < sea + ct.shore) continue;
+                    if (surf < sea + ct.shore) { ++why[2]; if (t == 0) break; continue; }
+                    owed = true;
                     // Gentle enough at the mouth: the grade over 6 m each way.
                     const float sx = (height_at(x + 6.0f, z) - height_at(x - 6.0f, z)) / 12.0f;
                     const float sz = (height_at(x, z + 6.0f) - height_at(x, z - 6.0f)) / 12.0f;
-                    if (sx * sx + sz * sz > ct.max_slope * ct.max_slope) continue;
+                    if (sx * sx + sz * sz > ct.max_slope * ct.max_slope) { ++why[3]; continue; }
                     // Two statements: see the river exclusion in tree_at_cell.
                     float rw = 0.0f, rd = 0.0f;
                     const float river_d = nearest_river(w, wp, x, z, rw, rd);
-                    if (river_d < rw + ct.river_clear + a.cave_mouth[1]) continue;
-                    if (flat_site_at(w, x, z, a.cave_mouth[1] + 5.0f) >= 0) continue;
+                    if (river_d < rw + ct.river_clear + a.cave_mouth[1]) { ++why[4]; continue; }
+                    if (flat_site_at(w, x, z, a.cave_mouth[1] + 5.0f) >= 0) { ++why[5]; continue; }
 
                     Rng rng(static_cast<uint64_t>(tree_hash(i, j, seed, k0 + 2u)) |
                             (static_cast<uint64_t>(tree_hash(i, j, seed, k0 + 3u)) << 32));
                     const bool sealed = rng.uniform() < a.cave_sealed;
                     SeedWorld::Cave cave = {};
-                    if (!shape_cave(w, wp, table, a, rng, x, z, surf, sealed, cave, segs)) continue;
+                    if (!shape_cave(w, wp, table, a, rng, x, z, surf, sealed, cave, segs)) { ++why[6]; continue; }
 
                     cave.id = cave_id(b, i, j);
                     cave.biome = b;
@@ -1453,7 +1553,12 @@ void build_caves(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& tabl
                         w.entrance_mouths.push_back(em);
                     }
                     if (candidate) ++w.cave_filled[bi];
+                    got = true;
                     break;
+                }
+                if (owed && !got) {
+                    for (int k = 0; k < 7; ++k) w.cave_reject[k] += why[k];
+                    ++w.cave_unfilled[bi];
                 }
             }
         }
