@@ -87,19 +87,25 @@ Last gathered: 2026-11-21, after the exploration fog.
   coarse probes only, which took that to 0.26 ms; what is left is the fine
   probes' own rays. Priority by distance from the camera is next.
   [Near field; Sky access]
-- **The sky-access flood is on its own thread now, but it is still a CPU
-  flood**: a big sealed cave takes it ~0.1-0.8 s, during which its blocks
-  read dark (the "not labelled" rule) or keep their old marks after an
-  edit -- so breaking into a sealed cave lets the light in that much
-  later. Digging into a cave re-labels the whole cave each dig. And a
-  roof the player builds over open air is only seen by the bricks with
-  edits in them (`open_above` reads `column_top` per brick). Step 2 (on
-  the GPU, as regions stream in) answers all three. [Sky access]
-- **The air past the volume is judged by the camera alone**: sealed if
-  the camera stands in sealed air (exact: a line of sight cannot leave
-  it), otherwise the open-air rule -- so from inside a long cave that
-  opens to the sky a kilometre off, the haze past 64 m is lit as daylit
-  air. The flood's distance to an opening (step 2) is the answer.
+- **The sky-access flood is a CPU flood on its own thread**: answers
+  trail the camera and the edits. A dig forgets the distances of every
+  cell within the reach of it (~670k cells over the tunnel at spawn), so
+  digging steadily keeps the worker busy (840 ms over 40 digs, against
+  48 when it only labelled open or sealed) and its answers a second or
+  so behind; the GPU keeps the old ones meanwhile, so breaking into a
+  cave lets the light in that much later. Forgetting only the cells
+  whose path can pass through the edit (their distance plus the straight
+  distance to it within the reach) would cut it. A roof the player
+  builds over open air is only seen by the bricks with edits in them
+  (`open_above` reads `column_top` per brick); `sky_floor` reads it for
+  the column. [Sky access]
+- **The air past the volume is judged by the camera's own access** (step
+  2): from inside a cave whose mouth is in view, the far air is lit by the
+  camera's access, not by where along the cave it is -- the flood only
+  answers inside the volume. A distance volume larger than the near
+  field's, coarser, would carry it. The directional part of the plan
+  (light arriving from the mouth's side) was not built: inside the volume
+  the probes carry direction, and past it nothing was seen to need it.
   [Near field; Mist; Sky access]
 - **The live list has no priority**: past 8,192 covered probes (a big cave
   system, when caves come back) it is walked in longer turns, near and far
