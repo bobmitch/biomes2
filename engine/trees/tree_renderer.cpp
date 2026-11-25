@@ -1,4 +1,5 @@
 #include "engine/trees/tree_renderer.h"
+#include "engine/render/near_field.h"   // NearField::kSrvVis
 #include "engine/render/shader_compile.h"
 #include "engine/render/lighting_units.h"
 #include "engine/render/shader_heaps.h"
@@ -197,7 +198,12 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         range.BaseShaderRegister = 5;
         // The shadow table: the sun's map at heap [0], and since ADR-004 L3
         // the local lights' buffers and atlas at [24..28] (t20..t24).
-        D3D12_DESCRIPTOR_RANGE srange[8] = {};
+        D3D12_DESCRIPTOR_RANGE srange[9] = {};
+        // The near field's probe visibility volume (t30).
+        srange[8].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srange[8].NumDescriptors = 1;
+        srange[8].BaseShaderRegister = 30;
+        srange[8].OffsetInDescriptorsFromTableStart = NearField::kSrvVis;
         srange[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         srange[0].NumDescriptors = 1;
         srange[0].BaseShaderRegister = 8;
@@ -252,7 +258,7 @@ bool TreeRenderer::create_pipelines(std::string& error) {
         p[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[8].Descriptor.ShaderRegister = 2;
         p[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[9].DescriptorTable.NumDescriptorRanges = 8;
+        p[9].DescriptorTable.NumDescriptorRanges = 9;
         p[9].DescriptorTable.pDescriptorRanges = srange;
         // u0: the overdraw counter (overdraw_begin); bound only while it runs.
         p[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;

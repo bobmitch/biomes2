@@ -2,6 +2,7 @@
 #define NOMINMAX
 #endif
 #include "engine/foliage/foliage_renderer.h"
+#include "engine/render/near_field.h"   // NearField::kSrvVis
 #include "engine/field/world_gpu.h"
 #include "engine/svdag/brick_store.h"
 #include "engine/render/shader_compile.h"
@@ -188,7 +189,12 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         // segment count. 8 DWORDs.
         // The shadow table: the sun's map at heap [0], and since ADR-004 L3
         // the local lights' buffers and atlas at [24..28] (t20..t24).
-        D3D12_DESCRIPTOR_RANGE sr[7] = {};
+        D3D12_DESCRIPTOR_RANGE sr[8] = {};
+        // The near field's probe visibility volume (t30).
+        sr[7].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[7].NumDescriptors = 1;
+        sr[7].BaseShaderRegister = 30;
+        sr[7].OffsetInDescriptorsFromTableStart = NearField::kSrvVis;
         sr[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr[0].NumDescriptors = 1;
         sr[0].BaseShaderRegister = 8;
@@ -227,7 +233,7 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[2].Descriptor.ShaderRegister = 4;
         p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[3].DescriptorTable.NumDescriptorRanges = 7;
+        p[3].DescriptorTable.NumDescriptorRanges = 8;
         p[3].DescriptorTable.pDescriptorRanges = sr;
         p[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         p[4].Constants.ShaderRegister = 3;

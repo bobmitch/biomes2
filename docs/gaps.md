@@ -43,11 +43,12 @@ Last gathered: 2026-11-21, after the exploration fog.
   the eye is light-adapted. A real eye's rods take over only once it is
   dark-adapted. [Dark vision]
 
-- **The near field's per-pixel reader costs ~1 ms at 4K on a screen of
-  tunnel wall** (terrain 5.85 -> 4.83 ms with `BIOMES_NF_NOREAD`): eight
-  probes a pixel, each checked for rock in between by a 0.5 m march
-  (`nf_clear`). Cheaper visibility (a precomputed per-probe mask, or the
-  march at half rate) would win most of it back. [Near field]
+- **The near field's per-pixel reader is no longer a cost worth chasing**:
+  since the visibility volume took its march out, the terrain pass with
+  the reader is BELOW `BIOMES_NF_NOREAD`'s on every view measured (chamber
+  2.65 against 2.71 ms, dug tunnel 1.47 against 1.54) -- the heightfield's
+  covered fallback it replaces costs more. Left: eight probes' meta and
+  SH, 40 loads a pixel. [Near field]
 - **Three campfires in a pit at 4K cost ~1.6 ms**: terrain +0.9, grass +0.7
   (every lit pixel walks its cluster, each light with its shadow cube).
   Grass is the bigger share for its overdraw. [Local lights]
@@ -74,6 +75,30 @@ Last gathered: 2026-11-21, after the exploration fog.
   them. [Near field; Local lights]
 - **Fast lights are held fast for 60 frames**, not seconds: 0.4 s at 144
   fps; at most 8 a frame. [Near field]
+- **Caves cost the near field what their covered air is** (measured with
+  caves back on in a scratch biome table, 1440p): standing on the surface
+  over sealed caves 8,022 live probes and 0.58 ms; in a 42 m chamber
+  21,440 and 1.19 ms, of which the coarse level ~0.55 (its 48 m rays do not
+  stop in open cave air); a screen of cave wall costs the reader 0.6 ms.
+  Probes in sealed air with no light near no longer trace (`nf_gated`:
+  1.17 -> 0.11 ms in the chamber), but OPEN cave air -- a sinkhole floor,
+  a cave with any way out -- still traces every covered probe (the trench
+  floor 6,484 live, 0.44 ms). The merge's per-ray test now runs for open
+  coarse probes only, which took that to 0.26 ms; what is left is the fine
+  probes' own rays. Priority by distance from the camera is next.
+  [Near field; Sky access]
+- **The sky-access flood runs in `plan`, on the main thread** (sky_access.h):
+  a cave world's first still spends 0.2-0.8 s on it, and a 15 s walk did
+  not show it past the 99th percentile, but a big sealed cave met in play
+  is a hitch. And an edit forgets every label, so digging beside one
+  re-searches it each dig. A worker thread or the GPU, and a local
+  re-flood, are step 2. [Sky access]
+- **The air past the volume is judged by the camera alone**: sealed if
+  the camera stands in sealed air (exact: a line of sight cannot leave
+  it), otherwise the open-air rule -- so from inside a long cave that
+  opens to the sky a kilometre off, the haze past 64 m is lit as daylit
+  air. The flood's distance to an opening (step 2) is the answer.
+  [Near field; Mist; Sky access]
 - **The live list has no priority**: past 8,192 covered probes (a big cave
   system, when caves come back) it is walked in longer turns, near and far
   alike, and every probe's history covers its turn. The camera's
@@ -260,3 +285,45 @@ Last gathered: 2026-11-21, after the exploration fog.
   per-biome mist map, which is baked once. [UI and scripting]
 - Keys are fixed: the controls screen is a table in `menu.lua`, not a
   binding table. The engine's own hotkeys stay in `wnd_proc`. [UI and scripting]
+
+## Future design: NPC simulation by distance (nothing built)
+
+A note from 2026-11-23, before any NPC code exists, so the first NPC work
+does not simulate every NPC in the world. NPCs and player constructions
+will NOT edit voxels; constructions are expected to be their own layer
+(not the brick store, maybe not the tree/rock instance streamers either --
+undecided).
+
+- **Simulation tiers by distance, as the terrain has LODs.**
+  - *Full* (~0-200 m, about physics' LOD 0-2 reach): physics capsule,
+    animation, real pathing, perception, combat. A hard cap on how many.
+  - *Reduced* (~200 m-1 km): no physics or animation; moves along a coarse
+    nav graph, ticked a few times a second round robin under a fixed
+    per-frame budget (as the mesh queue's budget). Drawn cheaply if at all
+    -- the exploration fog hides most of this band.
+  - *Abstract* (the rest): no per-frame update. A zone holds a compact
+    record (who lives there, what they are doing, stocks, construction
+    progress) and the time it was last simulated.
+  - *Never visited*: no state. Population and layout are a pure function
+    of seed and zone, as trees and rocks are of their cell.
+- **Catch up, do not tick.** Waking a zone resolves the elapsed time in one
+  step -- the weather's and the wet world's trick (state from the clock,
+  nothing stored). Schedules (sleep, work, travel) make "where is NPC n at
+  time t" a function to evaluate on activation. Cap the catch-up (a day or
+  so) so a week away is not a burst of work.
+- **Boundaries**: hysteresis -- wake at ~1.2 km, sleep at ~1.5 km -- or a
+  walk along the line thrashes it (the LOD hold's problem). Promote NPCs
+  into plausible spots out of view. A traveller between sleeping zones is
+  an event with an arrival time, not a moving entity.
+- **What a zone is**: a fixed grid of a few hundred metres aligned to the
+  64 m tiles, or -- since v18's archipelago -- a landmass, where travel
+  between them is rare and slow and so easy to abstract; big landmasses
+  split by grid.
+- **Ambient vs persistent NPCs**: ambient ones (wildlife, generic
+  passers-by) spawn procedurally round the player and are dropped out of
+  range, like grass, never saved. Only persistent ones (named, owners of
+  constructions, anyone the player has dealt with) carry records through
+  the tiers. Keeping most of the population ambient keeps the persistent
+  set small.
+- **Constructions ride the same zones**: waking a zone loads its buildings
+  and its people together, and its catch-up advances construction too.

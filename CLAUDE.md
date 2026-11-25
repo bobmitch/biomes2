@@ -2282,7 +2282,29 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
     below the point -- any slope -- and lit that sealed tunnel to EV100 5.
     More than 4 m under its map it is now enclosed.
   The reader's probe visibility marches the occupancy every half metre
-  (`nf_clear`) instead of two samples, which could straddle a 1 m roof.
+  instead of two samples, which could straddle a 1 m roof -- and since
+  the visibility volume (below) it does so once per voxel, not per pixel.
+- **The visibility volume: the reader's march, once per voxel**
+  (`cs_nf_vis`, `g_nf_vis` t30 at heap `NearField::kSrvVis`). The per-pixel
+  march to eight probes (`nf_clear`, up to ~50 occupancy loads) WAS the
+  reader's cost -- with it removed for an A/B the terrain pass at 1440p
+  lost 0.66 ms in a cave chamber and 0.39 in a dug tunnel; the probe reads
+  themselves cost little. Now each 1 m voxel holds 27 bits, one per probe
+  floor(v / 2) + d (d in -1..1 each way: every cell a reader within half a
+  metre of v can fall in), set by the same half-metre march from the
+  voxel's point to the probe where `nf_probe_mode` places it; a voxel in
+  rock may climb a metre out first (the reader 0.4 m off the surface
+  rounds into rock as often as not). It is computed for the blocks filled
+  each frame and the held blocks round them, skipping buried rock and air
+  3 m over the top map. Terrain pass, march -> mask: sealed chamber 3.20 ->
+  2.65 ms, torch-lit 3.31 -> 2.73, torch-lit 4 m tunnel 1.70 -> 1.39, cave
+  mouth 2.23 -> 1.93, the shipping world's dug ramp tunnel 1.79 -> 1.47.
+  Stills match the march's to 1 level (the cave mouth's leaves aside), the
+  thin-roof tunnels (1-1.5 m of roof, `--dig-tunnel --tunnel-depth 3.5`)
+  on 0.06% of pixels, `--leak-test` 0.001 nits. Walking 6.14 / 6.36 ms
+  (shipping / caves) against the march's 6.17 / 6.38. 4 MB. Every table
+  that reads the probes declares t30: terrain (rocks, character), trees,
+  foliage, the heightfield GI, the mist.
 - **Two levels** (Split Radiance Cascades' idea, `docs/2607.20384v2.pdf`:
   a coarser level with more directions over the longer interval, merged
   into the finer; not its hash map, screen-space split or hardware rays).
@@ -2396,9 +2418,94 @@ A/B). The goal set for it: deep is DARK unless something down there emits.
   shallow cover test (above), and **HLSL's `&&` does not short-circuit**:
   `knf > 0 && nf_sample(...)` ran the eight probes on every terrain pixel
   and threw the result away. Call anything costly inside an `if`.
+- **Sky access: a ray that leaves the volume through SEALED air is dark**
+  (`engine/render/sky_access.{h,cpp}`, step 1 of the underground GI plan:
+  a flood over air as the base layer, the probes as detail). With caves
+  back on (a scratch biome table, `cave_density` 0.7), a 42 m chamber 750 m
+  from spawn -- sealed, by a flood fill -- metered 4 nits at noon and 0 at
+  23:00: a ray leaving the 128 m volume took the heightfield's sky
+  (`nf_escape`), and the chamber is longer than the volume. A CPU flood
+  over 1 m cells (the field at a 1 m voxel and the edits, as the GPU fill
+  has them) labels underground air open or sealed: air above the column's
+  height plus the overhang term's reach there is open by construction;
+  a search from an unlabelled cell goes highest-first through air, and
+  reaching open air labels everything it saw open, exhausting the
+  component labels it sealed (over 4 M cells: sealed). Per 8 m block a
+  mask goes to `cs_nf_mark`, which stores sealed air in the density
+  volume less 1000 (`kNfSealBias`: still air, occupancy still 0), and
+  `nf_march` returns dark when it leaves the volume from air the trilinear
+  weights call sealed. **The air followed**: a line of sight from sealed
+  air stays in it until it meets rock, so a camera in sealed air
+  (`NearField::camera_sealed`, `l_nf.w` 2) sees nothing else. Then the
+  mist takes no sun and no eye's sky share (only the probes' openness),
+  `nf_openness` is 0 past the volume, and the composite's haze no longer
+  ramps back to daylit air past 64 m (`storm.y`). With the probes fixed
+  alone the walls went black and the haze down the 146 m tunnel glowed
+  white against the dark-adapted eye; each of the three took a fixed-
+  exposure A/B to find. The chamber now meters 0 nits (the 1.5 floor) at
+  noon and at night, a torch in it -2 EV100; every open view (sinkholes,
+  the shipping world, `--leak-test` 0.001 nits) is unchanged.
+  `--leak-test` now searches for its site from the spawn: from (40, 40),
+  the pre-v16 centre, it found only sea on v18 and reported nothing. With no caves and no edits a block's mask is zero without
+  touching the field: the shipping world spends 0 ms, a dug tunnel 5 ms
+  once. A cave world's still spends 0.2-0.8 s of CPU on it.
+  **Synchronous in `plan`**, and an edit forgets every label (a dig beside
+  a big sealed cave re-searches it) -- see gaps.md.
+  The `sky access:` line of `--gpu-profile` counts bricks, searches and ms.
+- **Probes in sealed air with no light near do not trace** (`nf_gated`,
+  `BIOMES_NF_NOGATE` for A/B). Neither sun nor sky can reach sealed air,
+  so only the hits' local lights (the frame's first 32, shadowed) can: a
+  fine probe is gated past a light's range + 8 m (a hit's 6 m and the
+  probes round it), a coarse one past range + 48 m. Gated, a probe is held
+  VALID and black -- switched off, the reader would fall back to the
+  heightfield's covered branch, which can borrow light. `cs_nf_live`
+  checks the gate both ways every frame over every traced probe, so a
+  torch carried in wakes its probes that frame (fresh, from black).
+  Measured (1440p, play's schedule): the sealed 42 m chamber 21,440 fine
+  and 502 coarse live probes, 1.17 ms -> 3,501 and 0, 0.11 ms; standing
+  on the surface over caves 8,022 -> 2,712, 0.58 -> 0.10 ms; the tunnel
+  under spawn 9,250 -> 2,897, 0.63 -> 0.10 ms; the list pass +0.007 ms.
+  With a torch in the chamber 8,215 and 462 stay live (0.66 ms) and the
+  still is the ungated one's to 1 level in 255. Sinkholes and the shipping
+  world are unchanged (no sealed air). Walking the cave world 6.72 ->
+  6.38 ms against the shipping world's 6.15.
+- **The coarse level, A/B'd in caves** (`BIOMES_NF_NOCOARSE`; play's
+  schedule, fixed exposure, stills and `--shake 300` raw frames). It
+  carries daylight from past 6 m and is worth it there: a dug ramp
+  tunnel 10 m in is 40% darker without it (luma 9.4 -> 5.4) with a
+  1,494-pixel flicker frame, for 0.02 ms; under a sinkhole's overhang the
+  ceiling loses the sunlit floor's bounce (up to 51 levels). In SEALED air
+  it did nothing -- a torch in the 42 m chamber and in the 4 m tunnel
+  drew the same stills with it off, for 0.36 and 0.16 ms -- so coarse
+  probes in sealed air are gated with lights or without, and a sealed fine
+  probe takes no coarse bins (`merge`): finding which coarse probes it
+  sees cost more than its rays marching on themselves. Torch-lit tunnel
+  0.32 -> 0.19 ms, chamber 0.69 -> 0.38. Rejected, measured: coarse rays
+  stopping at 24 m (`BIOMES_NF_COARSE_REACH`) cost the same and darken
+  the dug tunnel 20 m in by a third; coarse probes every other frame
+  (`BIOMES_NF_COARSE_STRIDE`) saves 0.02 ms.
+- **The merge's per-ray test is for OPEN coarse probes only.** In open
+  cave air the coarse level's cost was the fine probes' merge, not the
+  coarse rays: per ray, a march from its 6 m point to each coarse probe's
+  6 m point along the same direction, up to 14 m to up to eight probes.
+  With that test removed (an A/B) the near field went 0.44 -> 0.23 ms in a
+  cave mouth, the coarse level then costing nothing, and every still
+  matched within run-to-run noise -- the dug ramp tunnel included. The
+  failure the test was built for is an OPEN coarse probe (meta 1: the
+  heightfield's daylight in every bin) over a tunnel's mouth lending a
+  ray down the tunnel the sunlit hillside, so only open ones are tested
+  now. Cave mouth 0.44 -> 0.25 ms, trench floor 0.46 -> 0.26, cave 0.49 ->
+  0.28; dug tunnels unchanged (their mouth's probes are open). Stills and
+  `--shake` raw frames match within noise in the shaft-and-tunnel, ramp
+  tunnel 10 and 20 m in, cave mouth and cave; the torch walk's 90th
+  percentile 0.234 / 0.235 nits, sd 0.0100 both. Two things tried that
+  did nothing, so nobody tries them again: nested ifs in place of the
+  `&&` chain (the compiler already skipped), and a march that jumps empty
+  4 m cells (beside a surface they are never empty).
 - Heap: [40..42] (t26..t28, the range every lit table kept from DDGI): the
-  probes, the occupancy, the top map; [112..119] the near field's own;
-  [120..122] the mist's openness volumes (t16 in post). The mist root and
+  probes, the occupancy, the top map; [112..121] the near field's own
+  (its visibility volume's SRV and UAV the last two); [122..124] the
+  mist's openness volumes (t16 in post). The mist root and
   the heightfield's camera pass declare the range too.
 - **Not done**: see gaps.md -- the walls' own material, emitters as a
   kind of light, and the volume's reach. How dark a deep tunnel LOOKS is

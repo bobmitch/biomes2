@@ -54,7 +54,7 @@ cbuffer PostConstants : register(b0) {
     float  ev_floor;     float cam_open;      // dark vision: how far down the eye adapts (EV100), by its open sky (0..1, geometry)
     float4 cloud_shadow; // ADR-005 C2: the cloud-shadow map's centre x, z (cloud-base plane), half extent m, base altitude m
     float4 wet;          // ADR-005 C4: the rain now, the ripples' clock (s), radians a pixel, w > 0.5 puddles to reflect
-    float4 storm;        // ADR-005 C5: x the storm deck's dimming of the sky's light, 1 none
+    float4 storm;        // ADR-005 C5: x the storm deck's dimming of the sky's light, 1 none; y the camera in sealed air (sky_access.h)
     float4 hfog_a;       // the exploration fog (haze.hlsli): ground sigma, scale height; valley sigma, scale height
     float4 hfog_b;       // ... deep sigma, scale height; base altitude; w on
     float4 hfog_c;       // ... greying, dimming, albedo, the eye's sky share
@@ -506,7 +506,11 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     // THIS ray (the near field, nf_openness; 1 in the open, so open air is
     // lit exactly as before): a tunnel seen from a sunlit shaft holds no
     // daylit haze.
-    float lit_air = lerp(cam_sky, 1.0f, saturate((dist - 64.0f) / 192.0f));
+    // storm.y: the camera stands in sealed air (sky_access.h). Then the
+    // air past 64 m is not "somewhere else": a line of sight from sealed air
+    // stays in it, and the ramp lit a sealed tunnel's far end with daylit
+    // haze.
+    float lit_air = storm.y > 0.5f ? cam_sky : lerp(cam_sky, 1.0f, saturate((dist - 64.0f) / 192.0f));
     if (fog_on > 0.5f) {
         const float vz = dot(P - cam_pos, cam_fwd);
         const float w = log(max(vz, fog_near) / fog_near) / fog_log_ratio * 128.0f;

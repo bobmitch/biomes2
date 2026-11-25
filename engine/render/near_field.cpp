@@ -27,7 +27,7 @@ struct NfConstants {
     float cloud[4];    // the clouds' shadow map
     uint32_t lights, coarse;   // local lights a near hit is lit by; entries in the coarse list
     float keep_coarse, keep_light;   // the coarse level's blend; probes a moving light reaches
-    uint32_t seed, dbg, pad_lap, settle; // the rays' jitter; BIOMES_NF_DBG; -; a still's updates so far (~0: play)
+    uint32_t seed, dbg, gate, settle;    // the rays' jitter; BIOMES_NF_DBG; the sealed-air gate; a still's updates so far (~0: play)
     float live[4];                   // the live pass's blends: fine, by a fast light, coarse; -
     uint32_t live2[4];               // fast lights, plans so far, fine and coarse strides
     float fast[8][4];                // fast lights: x, y, z, reach^2
@@ -90,6 +90,8 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
     dirty_.assign(kBlocks, 0);
     probe_dirty_.assign(kProbes, 0);
     stamp_.assign(kProbes, 0u);
+    held_mask_.assign(size_t(kBlocks) * SkyAccess::kMaskWords, 0u);
+    vis_stamp_.assign(kBlocks, 0u);
 
     D3D12_HEAP_PROPERTIES dh = {};
     dh.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -110,6 +112,22 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
                                                          IID_PPV_ARGS(&out)));
     };
     if (!vol(density_, 1) || !vol(occ_, UINT16(kMips))) { error = "near field volumes"; return false; }
+    {
+        D3D12_RESOURCE_DESC td = {};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        td.Width = kNx;
+        td.Height = kNy;
+        td.DepthOrArraySize = kNz;
+        td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R32_UINT;
+        td.SampleDesc.Count = 1;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(device->CreateCommittedResource(&dh, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                   nullptr, IID_PPV_ARGS(&vis_)))) {
+            error = "near field visibility volume";
+            return false;
+        }
+    }
     {
         D3D12_RESOURCE_DESC td = {};
         td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -179,7 +197,9 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
         if (!buffer(cb_[f], 512, up, false, gr) || !buffer(blocks_up_[f], UINT64(kBlocks) * 16, up, false, gr) ||
             !buffer(edits_up_[f], UINT64(kMaxEdits) * 16, up, false, gr) ||
             !buffer(probes_up_[f], UINT64(kProbes) * 4, up, false, gr) ||
-            !buffer(coarse_up_[f], UINT64(kCoarse) * 4, up, false, gr)) {
+            !buffer(coarse_up_[f], UINT64(kCoarse) * 4, up, false, gr) ||
+            !buffer(marks_up_[f], UINT64(kBlocks) * 20 * 4, up, false, gr) ||
+            !buffer(vis_up_[f], UINT64(kBlocks) * 16, up, false, gr)) {
             error = "near field uploads";
             return false;
         }
@@ -188,6 +208,8 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
         edits_up_[f]->Map(0, nullptr, &edits_cpu_[f]);
         probes_up_[f]->Map(0, nullptr, &probes_cpu_[f]);
         coarse_up_[f]->Map(0, nullptr, &coarse_cpu_[f]);
+        marks_up_[f]->Map(0, nullptr, &marks_cpu_[f]);
+        vis_up_[f]->Map(0, nullptr, &vis_cpu_[f]);
     }
 
     const UINT inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -238,13 +260,28 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
         device->CreateUnorderedAccessView(top_.Get(), nullptr, &ud, cpu(kUavTop));
     }
     for (int m = 0; m < kMips; ++m) uav3d(occ_.Get(), UINT(m), kUavOcc + UINT(m));
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = DXGI_FORMAT_R32_UINT;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture3D.MipLevels = 1;
+        device->CreateShaderResourceView(vis_.Get(), &sd, cpu(kSrvVis));
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = DXGI_FORMAT_R32_UINT;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        ud.Texture3D.WSize = UINT(kNz);
+        device->CreateUnorderedAccessView(vis_.Get(), nullptr, &ud, cpu(kUavVis));
+    }
 
     // Root: the update's constants, the world (the field's), the frame's
     // shadow constants (the heightfield's corner), the world's ten buffers,
     // one table (the density and occupancy UAVs, the occupancy and probes'
     // SRVs, the heightfield's maps), the three lists, the probes, the mip.
     {
-        D3D12_DESCRIPTOR_RANGE r[8] = {};
+        D3D12_DESCRIPTOR_RANGE r[9] = {};
+        r[8].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; r[8].NumDescriptors = 1; r[8].BaseShaderRegister = 21;
+        r[8].OffsetInDescriptorsFromTableStart = kUavVis;   // the visibility volume
         // A ray's hit is lit by the sun's cascades (t8 at [0]), the local
         // lights and their atlas (t20..t24 at [24..28]) and the clouds'
         // shadow (t60).
@@ -264,7 +301,7 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
         r[2].OffsetInDescriptorsFromTableStart = kSrvProbes;
         r[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r[3].NumDescriptors = 5; r[3].BaseShaderRegister = 38;
         r[3].OffsetInDescriptorsFromTableStart = 48;   // the heightfield GI (height_gi.h kSrvScene)
-        D3D12_ROOT_PARAMETER p[23] = {};
+        D3D12_ROOT_PARAMETER p[25] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 1;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[2].Descriptor.ShaderRegister = 2;
@@ -273,7 +310,7 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
             p[3 + k].Descriptor.ShaderRegister = UINT(11 + k);
         }
         p[13].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[13].DescriptorTable.NumDescriptorRanges = 8;
+        p[13].DescriptorTable.NumDescriptorRanges = 9;
         p[13].DescriptorTable.pDescriptorRanges = r;
         p[14].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[14].Descriptor.ShaderRegister = 2;
         p[15].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[15].Descriptor.ShaderRegister = 3;
@@ -288,7 +325,11 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
         // The live lists (u9) and the live passes' dispatch arguments (u10).
         p[21].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; p[21].Descriptor.ShaderRegister = 9;
         p[22].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; p[22].Descriptor.ShaderRegister = 10;
-        for (int k = 0; k < 23; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        // The sky-access marks (t6, sky_access.h).
+        p[23].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[23].Descriptor.ShaderRegister = 6;
+        // The visibility volume's block list (t7).
+        p[24].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[24].Descriptor.ShaderRegister = 7;
+        for (int k = 0; k < 25; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_STATIC_SAMPLER_DESC ss[3] = {};
         for (int k = 0; k < 2; ++k) {
             ss[k].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -308,7 +349,7 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
         ss[2].ShaderRegister = 1;
         ss[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 23;
+        rsd.NumParameters = 25;
         rsd.pParameters = p;
         rsd.NumStaticSamplers = 3;
         rsd.pStaticSamplers = ss;
@@ -322,13 +363,13 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
             return false;
         }
     }
-    const char* entries[13] = {"cs_nf_fill", "cs_nf_edits", "cs_nf_occ", "cs_nf_mip", "cs_nf_probe", "cs_nf_top",
+    const char* entries[15] = {"cs_nf_fill", "cs_nf_edits", "cs_nf_occ", "cs_nf_mip", "cs_nf_probe", "cs_nf_top",
                                "cs_nf_coarse", "cs_nf_probe_live", "cs_nf_coarse_live", "cs_nf_classify",
-                               "cs_nf_live", "cs_nf_live_args", "cs_nf_clear"};
-    ComPtr<ID3D12PipelineState>* outs[13] = {&fill_pso_, &edits_pso_, &occ_pso_, &mip_pso_, &probe_pso_, &top_pso_,
+                               "cs_nf_live", "cs_nf_live_args", "cs_nf_clear", "cs_nf_mark", "cs_nf_vis"};
+    ComPtr<ID3D12PipelineState>* outs[15] = {&fill_pso_, &edits_pso_, &occ_pso_, &mip_pso_, &probe_pso_, &top_pso_,
                                              &coarse_pso_, &probe_live_pso_, &coarse_live_pso_, &classify_pso_,
-                                             &live_pso_, &live_args_pso_, &clear_pso_};
-    for (int k = 0; k < 13; ++k) {
+                                             &live_pso_, &live_args_pso_, &clear_pso_, &mark_pso_, &vis_pso_};
+    for (int k = 0; k < 15; ++k) {
         ComPtr<ID3DBlob> cs;
         if (!compile_shader("engine/render/shaders/near_field.hlsl", entries[k], "cs_5_1", cs, error)) return false;
         D3D12_COMPUTE_PIPELINE_STATE_DESC cd = {};
@@ -345,6 +386,7 @@ bool NearField::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT clou
 
 void NearField::invalidate_box(const float lo[3], const float hi[3]) {
     if (held_.empty()) return;
+    sky_.invalidate_box(lo, hi);
     // The blocks holding the box, by a voxel of margin (the 1 m sample on a
     // block's face belongs to one block only).
     const int b0[3] = {floor_div(int(std::floor(lo[0])) - 1, kBlock), floor_div(int(std::floor(lo[1])) - 1, kBlock),
@@ -375,6 +417,7 @@ void NearField::invalidate_box(const float lo[3], const float hi[3]) {
 }
 
 void NearField::invalidate_all() {
+    sky_.invalidate_all();
     std::fill(dirty_.begin(), dirty_.end(), uint8_t(1));
 }
 
@@ -393,6 +436,7 @@ void NearField::plan(const float cam[3], const BrickStore* edits, bool settle, f
     blocks_.clear();
     edit_list_.clear();
     probe_list_.clear();
+    marks_.clear();
     if (held_.empty()) return;
     for (int k = 0; k < 3; ++k) {
         const int half = (k == 1 ? kNy : kNx) / 2;
@@ -420,6 +464,21 @@ void NearField::plan(const float cam[3], const BrickStore* edits, bool settle, f
     std::sort(want.begin(), want.end());
     const size_t budget = settle ? want.size() : (std::min)(want.size(), size_t(kBlocksPerFrame));
     std::vector<BrickKey> touched;
+    // Sky access: the mask of sealed air for a block, listed for cs_nf_mark
+    // when it differs from what the GPU holds (a filled block holds none).
+    const int kW = SkyAccess::kMaskWords;
+    auto mark_block = [&](int s, const int w[3], bool filled) {
+        uint32_t m[SkyAccess::kMaskWords];
+        sky_.block_mask(w[0], w[1], w[2], edits, m);
+        uint32_t* held = &held_mask_[size_t(s) * kW];
+        if (filled) std::fill(held, held + kW, 0u);
+        if (std::equal(m, m + kW, held)) return;
+        std::copy(m, m + kW, held);
+        marks_.push_back(uint32_t(w[0])); marks_.push_back(uint32_t(w[1])); marks_.push_back(uint32_t(w[2]));
+        marks_.push_back(0u);
+        marks_.insert(marks_.end(), m, m + kW);
+    };
+    std::vector<uint8_t> filled(size_t(kBlocks), 0);
     for (size_t i = 0; i < budget; ++i) {
         const int s = want[i].second;
         const int sx = s % kBx, sy = (s / kBx) % kBy, sz = s / (kBx * kBy);
@@ -428,6 +487,8 @@ void NearField::plan(const float cam[3], const BrickStore* edits, bool settle, f
         h[0] = w[0]; h[1] = w[1]; h[2] = w[2];
         dirty_[size_t(s)] = 0;
         blocks_.push_back(w[0]); blocks_.push_back(w[1]); blocks_.push_back(w[2]); blocks_.push_back(0);
+        mark_block(s, w, true);
+        filled[size_t(s)] = 1;
         // Its own probes are traced again this frame or soon.
         for (int pz = 0; pz < kBlock / 2; ++pz)
             for (int py = 0; py < kBlock / 2; ++py)
@@ -456,6 +517,37 @@ void NearField::plan(const float cam[3], const BrickStore* edits, bool settle, f
                     edit_list_.push_back(d);
                     edit_list_.push_back(0.0f);
                     edit_list_.push_back(0.0f);
+                }
+    }
+    // The flood forgot its labels (an edit): every block held is marked
+    // again -- after the fills, which marked their own, and never one of
+    // them: two entries for one block in the mark pass would race.
+    if (sky_.generation() != sky_gen_) {
+        sky_gen_ = sky_.generation();
+        for (int s = 0; s < kBlocks; ++s) {
+            const int* h = &held_[size_t(s) * 3];
+            if (h[0] == INT_MIN || filled[size_t(s)]) continue;
+            mark_block(s, h, false);
+        }
+    }
+    cam_sealed_ = sky_.sealed_at(cam[0], cam[1], cam[2], edits);
+    // The visibility volume: every filled block and the held blocks round it
+    // (a voxel's marches reach ~3.5 m, so a block's change reaches its
+    // neighbours'). A neighbour not filled yet is done when it is.
+    vis_blocks_.clear();
+    ++vis_plan_;
+    for (size_t i = 0; i + 3 < blocks_.size(); i += 4) {
+        for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int w[3] = {blocks_[i] + dx, blocks_[i + 1] + dy, blocks_[i + 2] + dz};
+                    const int s = (wrap(w[2], kBz) * kBy + wrap(w[1], kBy)) * kBx + wrap(w[0], kBx);
+                    const int* h = &held_[size_t(s) * 3];
+                    if (h[0] != w[0] || h[1] != w[1] || h[2] != w[2]) continue;
+                    if (vis_stamp_[size_t(s)] == vis_plan_) continue;
+                    vis_stamp_[size_t(s)] = vis_plan_;
+                    vis_blocks_.push_back(w[0]); vis_blocks_.push_back(w[1]); vis_blocks_.push_back(w[2]);
+                    vis_blocks_.push_back(0);
                 }
     }
     pending_ = int(want.size() - budget);
@@ -542,7 +634,7 @@ void NearField::plan(const float cam[3], const BrickStore* edits, bool settle, f
 void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGpu& world,
                        D3D12_GPU_VIRTUAL_ADDRESS shadow_cb, const float cloud[4], GpuProfiler* prof) {
     auto mark = [&](const char* name) { if (prof) prof->mark(cmd, name); };
-    if (!root_ || (blocks_.empty() && probe_list_.empty() && coarse_list_.empty())) return;
+    if (!root_ || (blocks_.empty() && probe_list_.empty() && coarse_list_.empty() && marks_.empty())) return;
     const UINT f = frame & 1u;
     // The live lists' lengths this slot copied two frames ago (its fence has
     // been waited for before the frame's allocator came back).
@@ -584,7 +676,9 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
     c.live[0] = keep_live_;
     c.live[1] = keep_live_light_;
     c.live[2] = keep_live_coarse_;
-    c.live[3] = 0.0f;
+    // BIOMES_NF_COARSE_REACH=<m>: the coarse rays stop there, not at 48 m (A/B).
+    static const char* reach_env = std::getenv("BIOMES_NF_COARSE_REACH");
+    c.live[3] = reach_env ? float(std::atof(reach_env)) : 0.0f;
     {
         const size_t nfast = (std::min)(fast_.size() / 4, size_t(8));
         c.live2[0] = uint32_t(nfast);
@@ -596,14 +690,22 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
     }
     c.live2[1] = uint32_t(plans_);
     c.live2[2] = uint32_t((std::max)(sched_.live_stride, 1));
-    c.live2[3] = uint32_t((std::max)(sched_.coarse_stride, 1));
+    // BIOMES_NF_COARSE_STRIDE=<frames>: the coarse live pass in turns (A/B).
+    static const char* cstride_env = std::getenv("BIOMES_NF_COARSE_STRIDE");
+    c.live2[3] = uint32_t((std::max)(cstride_env ? std::atoi(cstride_env) : sched_.coarse_stride, 1));
     static const char* dbg_env = std::getenv("BIOMES_NF_DBG");
     c.dbg = dbg_env ? uint32_t(std::atoi(dbg_env)) : 0u;
+    // BIOMES_NF_NOGATE: probes in sealed air trace even with no light near
+    // (near_field.hlsl nf_gated), for A/B.
+    static const bool no_gate = std::getenv("BIOMES_NF_NOGATE") != nullptr;
+    c.gate = no_gate ? 0u : 1u;
     std::memcpy(cb_cpu_[f], &c, sizeof c);
     if (!blocks_.empty()) std::memcpy(blocks_cpu_[f], blocks_.data(), blocks_.size() * 4);
     if (!edit_list_.empty()) std::memcpy(edits_cpu_[f], edit_list_.data(), edit_list_.size() * 4);
     if (!probe_list_.empty()) std::memcpy(probes_cpu_[f], probe_list_.data(), probe_list_.size() * 4);
     if (!coarse_list_.empty()) std::memcpy(coarse_cpu_[f], coarse_list_.data(), coarse_list_.size() * 4);
+    if (!marks_.empty()) std::memcpy(marks_cpu_[f], marks_.data(), marks_.size() * 4);
+    if (!vis_blocks_.empty()) std::memcpy(vis_cpu_[f], vis_blocks_.data(), vis_blocks_.size() * 4);
 
     bind_shader_heaps(cmd);
     cmd->SetComputeRootSignature(root_.Get());
@@ -624,6 +726,16 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
     cmd->SetComputeRootShaderResourceView(20, coarse_up_[f]->GetGPUVirtualAddress());
     cmd->SetComputeRootUnorderedAccessView(21, aux_->GetGPUVirtualAddress());
     cmd->SetComputeRootUnorderedAccessView(22, args_->GetGPUVirtualAddress());
+    cmd->SetComputeRootShaderResourceView(23, marks_up_[f]->GetGPUVirtualAddress());
+    cmd->SetComputeRootShaderResourceView(24, vis_up_[f]->GetGPUVirtualAddress());
+    // Sky access's marks: after the fill and the edits (which write plain
+    // density), before anything reads it.
+    auto apply_marks = [&]() {
+        if (marks_.empty()) return;
+        cmd->SetPipelineState(mark_pso_.Get());
+        cmd->Dispatch(UINT(marks_.size() / 20), 1, 1);
+        uav_barrier(cmd, density_.Get());
+    };
 
     if (!blocks_.empty()) {
         if (occ_is_srv_) { transition(cmd, occ_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); occ_is_srv_ = false; }
@@ -635,6 +747,7 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
             cmd->Dispatch(UINT((edit_list_.size() / 4 + 63) / 64), 1, 1);
             uav_barrier(cmd, density_.Get());
         }
+        apply_marks();
         if (top_is_srv_) { transition(cmd, top_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); top_is_srv_ = false; }
         cmd->SetPipelineState(top_pso_.Get());
         cmd->Dispatch(UINT(kNx / 8), UINT(kNz / 8), 1);
@@ -647,9 +760,19 @@ void NearField::record(ID3D12GraphicsCommandList* cmd, UINT frame, const WorldGp
             cmd->Dispatch(UINT(((kNx >> m) + 3) / 4), UINT(((kNy >> m) + 3) / 4), UINT(((kNz >> m) + 3) / 4));
             uav_barrier(cmd, occ_.Get());
         }
+        // Which probes each voxel sees, from the occupancy just made.
+        if (!vis_blocks_.empty()) {
+            if (vis_is_srv_) { transition(cmd, vis_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); vis_is_srv_ = false; }
+            uav_barrier(cmd, top_.Get());   // it reads the top map cs_nf_top wrote above
+            cmd->SetPipelineState(vis_pso_.Get());
+            cmd->Dispatch(UINT(vis_blocks_.size() / 4), 1, 1);
+        }
+    } else {
+        apply_marks();   // re-marks alone change neither occupancy nor the top
     }
     if (!occ_is_srv_) { transition(cmd, occ_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead); occ_is_srv_ = true; }
     if (!top_is_srv_) { transition(cmd, top_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead); top_is_srv_ = true; }
+    if (!vis_is_srv_) { transition(cmd, vis_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead); vis_is_srv_ = true; }
     if (probes_is_srv_) { transition(cmd, probes_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); probes_is_srv_ = false; }
     mark("near field: fill, occupancy");
     if (reset_) {
@@ -723,7 +846,8 @@ void NearField::constants(bool on, float out[4]) const {
     out[0] = float(origin_[0]);
     out[1] = float(origin_[1]);
     out[2] = float(origin_[2]);
-    out[3] = (on && ready_) ? 1.0f : 0.0f;
+    // 2: on, and the camera stands in sealed air (sky_access.h sealed_at).
+    out[3] = (on && ready_) ? (cam_sealed_ ? 2.0f : 1.0f) : 0.0f;
 }
 
 }  // namespace engine

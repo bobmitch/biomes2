@@ -819,7 +819,12 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         params[3].Descriptor.ShaderRegister = 2;
         // The shadow table: the sun's map at heap [0], and since ADR-004 L3
         // the local lights' buffers and atlas at [24..28] (t20..t24).
-        D3D12_DESCRIPTOR_RANGE sr[10] = {};
+        D3D12_DESCRIPTOR_RANGE sr[11] = {};
+        // The near field's probe visibility volume (t30).
+        sr[10].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        sr[10].NumDescriptors = 1;
+        sr[10].BaseShaderRegister = 30;
+        sr[10].OffsetInDescriptorsFromTableStart = NearField::kSrvVis;
         // The player character's two texture arrays at [110..111] (t49..t50).
         sr[9].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         sr[9].NumDescriptors = 2;
@@ -871,7 +876,7 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
         sr[6].OffsetInDescriptorsFromTableStart = 65;
         params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[4].DescriptorTable.NumDescriptorRanges = 10;
+        params[4].DescriptorTable.NumDescriptorRanges = 11;
         params[4].DescriptorTable.pDescriptorRanges = sr;
         // Each vertex's surface material (ADR-004 L1), parallel to t0.
         params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -1711,7 +1716,12 @@ bool Renderer::create_fog(std::string& error) {
     // and one-descriptor tables for the map, the history, this frame's
     // inject volume read and written, and the integrated volume.
     {
-        D3D12_DESCRIPTOR_RANGE shadow[5] = {};
+        D3D12_DESCRIPTOR_RANGE shadow[6] = {};
+        // The near field's probe visibility volume (t30).
+        shadow[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        shadow[5].NumDescriptors = 1;
+        shadow[5].BaseShaderRegister = 30;
+        shadow[5].OffsetInDescriptorsFromTableStart = NearField::kSrvVis;
         shadow[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         shadow[0].NumDescriptors = 1;
         shadow[0].BaseShaderRegister = 8;
@@ -1745,7 +1755,7 @@ bool Renderer::create_fog(std::string& error) {
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         p[1].Descriptor.ShaderRegister = 2;
         p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p[2].DescriptorTable.NumDescriptorRanges = 5;
+        p[2].DescriptorTable.NumDescriptorRanges = 6;
         p[2].DescriptorTable.pDescriptorRanges = shadow;
         for (int k = 0; k < 5; ++k) {
             one[k].RangeType = kinds[k];
@@ -2977,6 +2987,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         if (!hfgi_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         // The near field: the light under it.
         if (!near_.init(device_.Get(), srv_heap_.Get(), Clouds::kShadowSrv, error)) return false;
+        near_.set_world(&world_);   // the sky-access flood reads its field (sky_access.h)
         // The key light's shadow past the cascades.
         if (!far_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         canopy_.set_models(trees_.models(), trees_.looks());
@@ -3674,6 +3685,7 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
         pc.wet[3] = puddle_now > 0.0f ? 1.0f : 0.0f;
     }
     pc.storm[0] = storm_dim();
+    pc.storm[1] = (near_on_ && near_.camera_sealed()) ? 1.0f : 0.0f;   // post.hlsl: the haze past 64 m
     height_fog_constants(pc.hfog, !wire);
     pc.fog_near = kFogNear;
     pc.fog_log_ratio = std::log(kFogFar / kFogNear);
