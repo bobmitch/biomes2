@@ -33,6 +33,7 @@
 #include "engine/render/forest_map.h"
 #include "engine/rocks/rock_field.h"
 #include "engine/rocks/rock_renderer.h"
+#include "engine/props/glow_mushrooms.h"
 #include "engine/character/character_renderer.h"
 
 #include <functional>
@@ -292,6 +293,13 @@ public:
     RockField&             rock_field() { return rock_field_; }
     RockRenderer&          rocks() { return rocks_; }
     void set_rocks(bool on) { rocks_on_ = on; }
+    // Glowing mushrooms in the caves (engine/props/glow_mushrooms.h;
+    // --no-mushrooms): populated near the camera, a light per cluster.
+    GlowMushrooms&         mushrooms() { return mushrooms_; }
+    void set_mushrooms(bool on) { mushrooms_on_ = on; }
+    // Picks the mushroom nearest along the camera's ray within `reach` of
+    // `hand` and in front of the terrain the ray meets: true if one was.
+    bool pick_mushroom(const float eye[3], const float dir[3], const float hand[3], float reach);
     // The player's character (engine/character/): the pack is chosen before
     // init (--character), and the caller poses it every frame.
     void set_character_pack(const std::string& path) { character_pack_ = path; }
@@ -852,6 +860,7 @@ private:
         unsigned long long drawn = 0;     // post_frame_ when its faces were drawn
         int      faces = 6;
         unsigned long long fast_until = 0;   // the near field traces its probes on the timer until then
+        unsigned long long moving_until = 0; // moved (not just placed) within 60 frames: no far hits (near_field.hlsl nf_hit)
         uint32_t body_faces = 0;             // faces last drawn with the player's body in them
         unsigned long long body_serial = 0;  // the pose they were drawn with
     };
@@ -925,6 +934,8 @@ private:
     RockField        rock_field_;
     RockRenderer     rocks_;
     bool             rocks_on_ = true;
+    GlowMushrooms    mushrooms_;
+    bool             mushrooms_on_ = true;
     CharacterRenderer character_;
     std::string      character_pack_ = "assets/models/packed/male.chr";
     TreeRenderer     trees_;

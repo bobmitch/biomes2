@@ -46,7 +46,7 @@ cbuffer NfConstants : register(b0) {
     uint nf_edits;     // entries in g_edits
     uint nf_probes;    // entries in g_probe_list
     float nf_keep_box;   // a frame's blend at the fine memory (near_field.h Schedule): a still's base, a probe traced from the CPU's list
-    float nf_keep_rr;    // the same (unused)
+    float nf_far_lights; // 1: local lights at far hits too (BIOMES_NF_NOFARLIGHTS: 0)
     float4 nf_rot0, nf_rot1, nf_rot2;   // unused since the rays are octahedral bins (the layout keeps them)
     float4 nf_cloud;                    // the clouds' shadow map: centre x, z, half extent (0: none), base
     uint   nf_lights;                   // local lights to light a near hit with (the frame's first, most important)
@@ -89,6 +89,15 @@ static const float kNfCoarseSunFar = 24.0f;
 // A local light at a near hit is never nearer than this: the inverse square
 // at a flame a few centimetres from the rock lit a probe tenfold.
 static const float kNfLightNear = 0.5f;
+// Past kNfSplit (the coarse level's hits, and a fine ray that found no coarse
+// probe) a hit stands for the patch of wall the ray's share of the sphere
+// covers there -- 4 pi / rays steradians, a disc t sqrt(1 / (rays / 4)) in
+// radius -- so the light is held that far off: a fire's pool seen 30 m away
+// is its mean over the patch, not the inverse square at the one point a ray
+// happened to strike beside the flame. Unheld, one ray in 64 catching that
+// point lit its probe tenfold, as the sun's patches did (kNfCoarseSunFar).
+static const float kNfFootFine = 0.25f;     // 64 rays
+static const float kNfFootCoarse = 0.125f;  // 256 rays
 cbuffer NfLevel : register(b3) { uint nf_level; };
 
 StructuredBuffer<int4>   g_blocks     : register(t2);   // world block (8 m units) to fill
@@ -422,8 +431,10 @@ float nf_occ_lin(float3 wp) {
 // The radiance a wall sends back along -d from hit point p (in air, just
 // short of the rock), its normal from the occupancy's gradient. `sun_w`
 // scales the sun (1 but on the fine level's fallback past kNfSplit);
-// `lights`: the local lights too (the fine level's hits, within kNfSplit).
-float3 nf_hit(float3 p, float3 d, float sun_w, bool lights) {
+// `near`: how near a local light may count (kNfLightNear, or the ray's
+// footprint past kNfSplit); 0 lights none. `far`: a FAR hit, which skips the
+// fast lights (below).
+float3 nf_hit(float3 p, float3 d, float sun_w, float near, bool far) {
     const float e = 0.5f;
     const float3 g = float3(nf_occ_lin(p + float3(e, 0, 0)) - nf_occ_lin(p - float3(e, 0, 0)),
                             nf_occ_lin(p + float3(0, e, 0)) - nf_occ_lin(p - float3(0, e, 0)),
@@ -435,19 +446,28 @@ float3 nf_hit(float3 p, float3 d, float sun_w, bool lights) {
     // mesh, so the shadow is taken half a metre out along the normal.
     const float nl = dot(n, kSunDir);
     if (nl > 0.0f && sun_w > 0.0f) E += kSunLux * (nl * sun_w * nf_key_visibility(p + n * 0.5f));
-    // Local lights, at hits within kNfSplit only, and only those with a
-    // shadow (one past the 24th lights through rock). Before the coarse
-    // level and the light timer they came OUT: their bounce faded in
-    // through the probes' history, and a ray that struck rock beside a
-    // flame -- the inverse square at a few tens of centimetres -- lit its
-    // probe tenfold for a frame, and a torch-lit tunnel pulsed 2 stops.
-    // Now the distance is held to kNfLightNear, and the probes a moving
-    // light reaches keep a short memory (near_field.h light_memory).
-    if (lights && l_cluster.w > 0.5f) {
+    // Local lights, only those with a shadow (one past the 24th lights
+    // through rock). Before the coarse level and the light timer they came
+    // OUT: their bounce faded in through the probes' history, and a ray that
+    // struck rock beside a flame -- the inverse square at a few tens of
+    // centimetres -- lit its probe tenfold for a frame, and a torch-lit
+    // tunnel pulsed 2 stops. Now the distance is held to kNfLightNear (the
+    // footprint, far), and the probes a moving light reaches keep a short
+    // memory (near_field.h light_memory).
+    // At FAR hits too, since the coarse level: a fire 10 m down a tunnel had
+    // reached walls past 6 m from a probe only second-hand. A far hit skips
+    // a MOVING light (moved within 60 frames: the carried torch, always,
+    // its flame wanders) -- the probes that see it from there keep a long
+    // memory (the coarse level's 1 s) and would trail its old light; its
+    // bounce reaches them through the fine probes round it, as before. A
+    // light just placed is not moving: its far bounce fades in over that
+    // memory, and a still (which settles from nothing) shows it whole.
+    if (near > 0.0f && l_cluster.w > 0.5f) {
         const uint nlights = min(uint(l_cluster.w), nf_lights);
         [loop] for (uint i = 0u; i < nlights; ++i) {
             const LocalLightGpu Lg = g_lights[i];
             if (Lg.shadow < 0) continue;
+            if (far && Lg.moving > 0.5f) continue;
             const float3 v = Lg.pos - p;
             const float d2 = dot(v, v);
             const float r2 = Lg.range * Lg.range;
@@ -457,7 +477,7 @@ float3 nf_hit(float3 p, float3 d, float sun_w, bool lights) {
             if (ndl <= 0.0f) continue;
             const float x = d2 / r2;
             const float w = saturate(1.0f - x * x);
-            float3 El = Lg.intensity * (w * w / max(d2, kNfLightNear * kNfLightNear));
+            float3 El = Lg.intensity * (w * w / max(d2, near * near));
             if (Lg.type > 0.5f) El *= smoothstep(Lg.cos_outer, Lg.cos_inner, dot(-l, Lg.spot_dir));
             E += El * (ndl * local_shadow_taps(Lg, p + n * 0.5f, n, l, true));
         }
@@ -605,7 +625,8 @@ bool nf_merge(float3 o, float3 d, uint bin, out float vis, out float3 rad, out f
 // (nf_merge) and stops, or marches on to 48 m where there is none, its sun
 // faded with distance. Otherwise the coarse level's ray: `a` is 0 where it
 // meets rock before kNfSplit -- its interval starts in rock, and it has
-// nothing to say -- and its hits are lit by the sun in full, no lights.
+// nothing to say -- and its hits are lit by the sun (faded, kNfCoarseSunFar)
+// and the static local lights (nf_hit).
 void nf_march(float3 o, float3 d, uint bin, bool fine, bool merge, out float a, out float vis, out float3 rad) {
     a = 1.0f;
     vis = 0.0f;
@@ -681,7 +702,10 @@ void nf_march(float3 o, float3 d, uint bin, bool fine, bool merge, out float a, 
         const float sun_w = (fine && near_hit) ? 1.0f
                           : fine ? 1.0f - smoothstep(kNfSunNear, kNfSunFar, t_air)
                                  : 1.0f - smoothstep(kNfSplit, kNfCoarseSunFar, t_air);
-        rad = nf_hit(o + d * t_air, d, sun_w, fine && near_hit);
+        const float near = near_hit ? kNfLightNear
+                         : nf_far_lights < 0.5f ? 0.0f
+                         : max(kNfLightNear, t_air * (fine ? kNfFootFine : kNfFootCoarse));
+        rad = nf_hit(o + d * t_air, d, sun_w, near, !near_hit);
     }
 }
 
@@ -1160,8 +1184,10 @@ void cs_nf_live(uint3 id : SV_DispatchThreadID) {
                                 ci / uint(kNfCoarseDims.x * kNfCoarseDims.y));
             const int3 ob = nf_origin.xyz / 8;
             // A coarse probe in sealed air is gated with lights or without:
-            // its hits see no local light, and the fine probes round a light
-            // carry its bounce. A/B with the coarse level off: a torch in the
+            // the fine probes round a light carry its bounce -- a sealed fine
+            // probe takes no coarse bins and marches to 48 m itself, its far
+            // hits lit by the static lights (nf_hit). Measured when coarse
+            // hits saw no lights at all: A/B with the coarse level off: a torch in the
             // sealed 42 m chamber and in the 4 m tunnel under spawn drew the
             // same still to 1 level in 255, for 0.36 and 0.16 ms of coarse.
             gated = nf_gate != 0u &&

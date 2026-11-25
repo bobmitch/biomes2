@@ -225,6 +225,7 @@ if(BIOMES2_ENGINE)
     engine/rocks/rock_mesh.cpp
     engine/rocks/rock_field.cpp
     engine/rocks/rock_renderer.cpp
+    engine/props/glow_mushrooms.cpp
     engine/character/character_model.cpp
     engine/character/character_renderer.cpp
     engine/ui/ui.cpp
