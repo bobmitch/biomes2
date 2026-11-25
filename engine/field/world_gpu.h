@@ -96,8 +96,8 @@ struct WorldConstants {
 
     unsigned s_fine;
     unsigned s_regime;
-    float    l0_pad0;
-    float    l0_pad1;
+    float    cave_wall_amp;    // placed caves' wall noise (layer 7), metres
+    float    cave_wall_freq;
 };
 
 class WorldGpu {
@@ -180,7 +180,7 @@ public:
     ID3D12Resource* world_cb() const { return world_cb_.Get(); }
 
 private:
-    struct ColumnSpan { float mn, mx; };   // sampled surface min/max
+    struct ColumnSpan { float mn, mx, cave; };   // sampled surface min/max; lowest cave (or 3.4e38)
     mutable std::unordered_map<unsigned long long, ColumnSpan> column_cache_;
     // worldgen::caves_enabled at load. Off, the band drops the 64 m it kept
     // under the surface for the shallow caves an entrance reaches.

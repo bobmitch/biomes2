@@ -203,6 +203,7 @@ int apply_param_spec(WorldParams& p, const char* spec) {
         else if (k == "knee_k") p.knee_k = v;
         else if (k == "knee_c") p.knee_c = v;
         else if (k == "danger_w") p.danger_w = v;
+        else if (k == "caves") p.placed_caves = v != 0.0f;
         else if (k == "danger_feat") p.danger_freq = 1.0f / size;
         else continue;
         ++applied;
@@ -353,6 +354,17 @@ float terrain_height(const SeedWorld& w, const WorldParams& wp,
     return h;
 }
 
+bool cave_mouth_near(const SeedWorld& w, float x, float z, float margin) {
+    for (size_t m = 0; m < w.caves.size(); ++m) {
+        const SeedWorld::Cave& c = w.caves[m];
+        if (c.sealed) continue;
+        const float r = w.entrances[static_cast<size_t>(c.seg_begin)].ra * 1.6f + margin;
+        const float dx = x - c.x, dz = z - c.z;
+        if (dx * dx + dz * dz < r * r) return true;
+    }
+    return false;
+}
+
 int flat_site_at(const SeedWorld& w, float x, float z, float margin) {
     if (w.flats.empty() || w.fgrid.empty()) return -1;
     // The disc's radius from the river grid's own geometry, as build_flats
@@ -432,7 +444,9 @@ float terrain_density(const SeedWorld& w, const WorldParams& wp,
     // Layer 7 last, and outside cave_depth_mask entirely. Every other carve in
     // this function is forbidden to reach the surface; this one exists to.
     if (!w.entrances.empty()) {
-        const float sd = nearest_entrance(w, wp, x, y, z);
+        const float sd = cave_wall_sd(nearest_entrance(w, wp, x, y, z), x, y, z,
+                                      w.cave_wall_amp, w.cave_wall_freq, w.s_entrance, voxel,
+                                      wp.entrance_falloff);
         if (sd < 0.0f) {
             d = entrance_carve(d, sd, wp.entrance_falloff, wp.cave_carve);
         }
@@ -561,6 +575,9 @@ bool tree_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTabl
     if (u_keep >= density) TREE_NO(TREE_ROLL);
     // A flat site is a glade: kept clear, with room past its shoulder.
     if (flat_site_at(w, x, z, table.flats.tree_clear) >= 0) TREE_NO(TREE_FLAT);
+    // A cave mouth is kept clear like a glade (counted with them): a tree in
+    // the bowl hid it, and a meadows mouth is meant to be seen from afar.
+    if (cave_mouth_near(w, x, z, 4.0f)) TREE_NO(TREE_FLAT);
 
     // The ground. Shore, slope and river first: they need only heights.
     const float r = std::sqrt(x * x + z * z) / wp.radius;
@@ -709,6 +726,7 @@ bool rock_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTabl
     const float rad = 0.45f * size;
 
     if (flat_site_at(w, x, z, table.flats.tree_clear + rad) >= 0) ROCK_NO(ROCK_FLAT);
+    if (cave_mouth_near(w, x, z, 2.0f + rad)) ROCK_NO(ROCK_FLAT);
     const float r = std::sqrt(x * x + z * z) / wp.radius;
     const float h = terrain_height(w, wp, table, x, z, r);
     if (h < table.sea_level + rt.shore) ROCK_NO(ROCK_SHORE);
@@ -1076,6 +1094,8 @@ bool caves_enabled(const ArchetypeTable& table) {
     return false;
 }
 
+static void bin_entrances(SeedWorld& w, const WorldParams& wp, int n);
+
 void build_entrances(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table) {
     // No caves, no shafts. The bin grid stays empty (egrid_n 0), which both
     // nearest_entrance and the engine's real_nearest_entrance read as "none".
@@ -1149,14 +1169,20 @@ void build_entrances(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& 
     w.entrance_count = found;
     w.entrance_tries_used = tries;
 
-    // Bin in XZ, padded by the widest radius the segment reaches so the 3x3
-    // lookup cannot miss a chamber that bulges across a cell line.
-    w.egrid_n = 128;
+    bin_entrances(w, wp, 128);
+}
+
+// Bin in XZ, padded by the widest radius the segment reaches (and the wall
+// noise) so the 3x3 lookup cannot miss a chamber that bulges across a cell
+// line.
+static void bin_entrances(SeedWorld& w, const WorldParams& wp, int n) {
+    const float R = wp.radius;
+    w.egrid_n = n;
     w.egrid_cell = 2.0f * R / w.egrid_n;
     w.egrid.assign(static_cast<size_t>(w.egrid_n) * w.egrid_n, std::vector<int>());
     for (size_t sg = 0; sg < w.entrances.size(); ++sg) {
         const SeedWorld::EntranceSeg& e = w.entrances[sg];
-        const float pad = std::max(e.ra, e.rb) + wp.entrance_falloff;
+        const float pad = std::max(e.ra, e.rb) + wp.entrance_falloff + w.cave_wall_amp;
         const int i0 = std::max(0, static_cast<int>((std::min(e.ax, e.bx) - pad + R) / w.egrid_cell));
         const int i1 = std::min(w.egrid_n - 1, static_cast<int>((std::max(e.ax, e.bx) + pad + R) / w.egrid_cell));
         const int j0 = std::max(0, static_cast<int>((std::min(e.az, e.bz) - pad + R) / w.egrid_cell));
@@ -1167,6 +1193,300 @@ void build_entrances(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& 
             }
         }
     }
+}
+
+// --- layer 7 since v19: placed caves --------------------------------------
+// docs/worldgen-design.md, "Layer 7 -- placed caves". Each biome with
+// caves.per_km2 > 0 has its own jittered candidate grid of 1 km /
+// sqrt(per_km2) cells. A cell whose spot passes holds one cave, a pure
+// function of (biome, i, j): the spot, the heading, every length and radius.
+// A spot that fails (sea, river, steep, another biome, too little rock over
+// the path) is retried at up to `tries` other spots in the same cell, which
+// is what turns a density into a guarantee. The shape is capsules -- a bowl
+// at the mouth, a descending tunnel that wanders, chambers of overlapping
+// horizontal capsules -- carried in the entrance buffers the shafts used, so
+// the carve, the GPU path and the hash are layer 7's own.
+//
+// Invariant 9 throughout: directions by rejection sampling normalised with
+// sqrt, no trigonometry.
+
+static inline float lerp_range(const float* r, float u) { return r[0] + (r[1] - r[0]) * u; }
+
+static void push_seg(std::vector<SeedWorld::EntranceSeg>& out, float ax, float ay, float az, float ra,
+                     float bx, float by, float bz, float rb) {
+    SeedWorld::EntranceSeg e;
+    e.ax = ax; e.ay = ay; e.az = az; e.ra = ra;
+    e.bx = bx; e.by = by; e.bz = bz; e.rb = rb;
+    out.push_back(e);
+}
+
+static void wander(Rng& rng, float turn, float& hx, float& hz) {
+    hx += (rng.uniform() * 2.0f - 1.0f) * turn;
+    hz += (rng.uniform() * 2.0f - 1.0f) * turn;
+    const float hd = hx * hx + hz * hz;
+    if (hd > 1.0e-8f) {
+        const float hinv = 1.0f / std::sqrt(hd);
+        hx *= hinv;
+        hz *= hinv;
+    }
+}
+
+// Builds one cave at (x, z) of biome a, or returns false if the rock over it
+// is too thin anywhere past the mouth. rng carries the shape's rolls.
+static bool shape_cave(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
+                       const BiomeArchetype& a, Rng& rng, float x, float z, float surf,
+                       bool sealed, SeedWorld::Cave& cave,
+                       std::vector<SeedWorld::EntranceSeg>& segs) {
+    const CaveTable& ct = table.caves;
+    const float R = wp.radius;
+    auto height_at = [&](float px, float pz) {
+        return terrain_height(w, wp, table, px, pz, std::sqrt(px * px + pz * pz) / R);
+    };
+    // A path point is only kept with `cover` metres of rock over its top.
+    auto covered = [&](float px, float py, float pz, float r) {
+        return height_at(px, pz) - (py + r) >= ct.cover;
+    };
+
+    float hx = 0.0f, hz = 0.0f;
+    if (!unit_heading(rng, hx, hz)) return false;
+    const float rm  = lerp_range(a.cave_mouth, rng.uniform());
+    const float rt  = lerp_range(a.cave_radius, rng.uniform());
+    const float len = lerp_range(a.cave_tunnel, rng.uniform());
+    const float dep = lerp_range(a.cave_depth, rng.uniform());
+    const float floor_y = surf - dep;
+    segs.clear();
+    cave.hx = hx;
+    cave.hz = hz;
+
+    float ex = x, ey = floor_y + rt, ez = z;   // the tunnel's end so far
+    float er = rt;
+    float path = 0.0f;
+    if (!sealed) {
+        // The mouth: a bowl centred a little above the ground, sloping into
+        // the ground along the heading -- wide enough to be seen from a
+        // distance, and a ramp, not a pit.
+        const float m0x = x - hx * 0.3f * rm, m0y = surf + 0.25f * rm, m0z = z - hz * 0.3f * rm;
+        const float m1x = x + hx * 0.9f * rm, m1y = surf - 0.8f * rm, m1z = z + hz * 0.9f * rm;
+        const float rmid = 0.5f * (rm + rt);
+        push_seg(segs, m0x, m0y, m0z, rm, m1x, m1y, m1z, rmid);
+        // The throat, down to tunnel size.
+        const float tx = m1x + hx * rm, ty = m1y - 0.4f * rm, tz = m1z + hz * rm;
+        push_seg(segs, m1x, m1y, m1z, rmid, tx, ty, tz, rt);
+        ex = tx; ey = ty; ez = tz;
+
+        // The tunnel: centre line from the throat down to a radius over the
+        // chamber floor, in `segment` steps, never steeper than max_grade.
+        const float end_y = floor_y + rt;
+        const float drop = ey - end_y;
+        int n = static_cast<int>(std::ceil(len / ct.segment));
+        const int n_grade = static_cast<int>(std::ceil(drop / (ct.max_grade * ct.segment)));
+        if (n_grade > n) n = n_grade;
+        if (n < 1) n = 1;
+        const float dy = drop / static_cast<float>(n);
+        float run = ct.segment * ct.segment - dy * dy;
+        run = run > 0.25f ? std::sqrt(run) : 0.5f;
+        for (int k = 0; k < n; ++k) {
+            wander(rng, a.cave_turn, hx, hz);
+            const float nr = rt * (0.85f + 0.3f * rng.uniform());
+            const float nx = ex + hx * run, ny = ey - dy, nz = ez + hz * run;
+            path += ct.segment;
+            // Past the mouth's own reach the rock must close over the tunnel,
+            // or a hillside opens a trench rather than a cave.
+            if (path > 2.0f * rm && !covered(nx, ny, nz, nr)) return false;
+            push_seg(segs, ex, ey, ez, er, nx, ny, nz, nr);
+            ex = nx; ey = ny; ez = nz; er = nr;
+        }
+    }
+
+    // The chambers: a main horizontal capsule along the heading, a second
+    // across it off centre, and a raised dome over the middle. Overlapping
+    // radii give an irregular room with a rounded floor; its height is the
+    // capsules' diameter, so a wide room stays a cavern, not a ball.
+    float cfloor = ey - er;
+    for (int c = 0; c < a.cave_chambers; ++c) {
+        const float wdt = lerp_range(a.cave_chamber, rng.uniform());
+        const float hgt = lerp_range(a.cave_chamber_h, rng.uniform());
+        const float rc = 0.5f * hgt;
+        const float cy = cfloor + rc;
+        float span = wdt - 2.0f * rc;
+        if (span < 0.0f) span = 0.0f;
+        const float p0x = ex + hx * 0.5f * rc, p0z = ez + hz * 0.5f * rc;
+        const float p1x = p0x + hx * span, p1z = p0z + hz * span;
+        const float mx = 0.5f * (p0x + p1x), mz = 0.5f * (p0z + p1z);
+        const float qx = -hz, qz = hx;   // across
+        const float along = (rng.uniform() - 0.5f) * 0.5f * span;
+        float half = 0.5f * wdt * (0.5f + 0.5f * rng.uniform()) - rc;
+        if (half < 0.0f) half = 0.0f;
+        const float cxm = mx + hx * along, czm = mz + hz * along;
+        const float rdome = rc * 1.2f;
+        const float dy_dome = 0.35f * rc;
+        const float top = rdome + dy_dome;   // the room's top over cy
+        // Rock over the whole room: its middle, both ends, both sides.
+        const float pts[5][2] = {{mx, mz}, {p0x, p0z}, {p1x, p1z},
+                                 {cxm + qx * half, czm + qz * half}, {cxm - qx * half, czm - qz * half}};
+        for (int k = 0; k < 5; ++k) {
+            if (!covered(pts[k][0], cy, pts[k][1], top)) return false;
+        }
+        // The tunnel drops into the room: join its end to the main capsule.
+        if (!sealed || c > 0) push_seg(segs, ex, ey, ez, er, p0x, cy, p0z, rc);
+        push_seg(segs, p0x, cy, p0z, rc, p1x, cy, p1z, rc);
+        push_seg(segs, cxm + qx * half, cy, czm + qz * half, 0.85f * rc,
+                 cxm - qx * half, cy, czm - qz * half, 0.85f * rc);
+        push_seg(segs, mx, cy + dy_dome, mz, rdome, mx, cy + dy_dome, mz, rdome);
+        cave.cx = mx; cave.cy = cy; cave.cz = mz;
+        cave.floor_y = cfloor;
+
+        // A further chamber: a short passage on from the far end.
+        if (c + 1 < a.cave_chambers) {
+            wander(rng, a.cave_turn, hx, hz);
+            const float sx = p1x, sz = p1z, sy = cfloor + rt;
+            const float nx = sx + hx * 3.0f * ct.segment, nz = sz + hz * 3.0f * ct.segment;
+            const float ny = sy - 0.3f * 3.0f * ct.segment;
+            if (!covered(nx, ny, nz, rt)) return false;
+            push_seg(segs, sx, sy, sz, rt, nx, ny, nz, rt);
+            ex = nx; ey = ny; ez = nz; er = rt;
+            cfloor = ny - rt;
+            path += 3.0f * ct.segment;
+        }
+    }
+    cave.length = path;
+    return true;
+}
+
+void build_caves(SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table) {
+    w.entrances.clear();
+    w.entrance_mouths.clear();
+    w.caves.clear();
+    w.entrance_count = 0;
+    w.cave_cells.assign(table.size(), 0);
+    w.cave_filled.assign(table.size(), 0);
+    bool any = false;
+    for (size_t b = 0; b < table.size(); ++b) if (table[b].cave_per_km2 > 0.0f) any = true;
+    if (!any || !table.caves.present) return;
+
+    const CaveTable& ct = table.caves;
+    const float R = wp.radius;
+    const float sea = table.sea_level;
+    w.cave_wall_amp = ct.wall_noise;
+    w.cave_wall_freq = 1.0f / ct.wall_period;
+
+    auto height_at = [&](float px, float pz) {
+        return terrain_height(w, wp, table, px, pz, std::sqrt(px * px + pz * pz) / R);
+    };
+    auto dominant = [&](float px, float pz, float& weight) {
+        int bio[8];
+        float bw[8];
+        const int nb = biome_mix(w, wp, px, pz, bio, bw);
+        int best = -1;
+        weight = 0.0f;
+        for (int k = 0; k < nb; ++k) {
+            if (bw[k] > weight) { weight = bw[k]; best = bio[k]; }
+        }
+        return best;
+    };
+
+    std::vector<SeedWorld::EntranceSeg> segs;
+    for (size_t bi = 0; bi < table.size(); ++bi) {
+        const BiomeArchetype& a = table[bi];
+        if (a.cave_per_km2 <= 0.0f) continue;
+        const int b = static_cast<int>(bi);
+        const float cell = 1000.0f / std::sqrt(a.cave_per_km2);
+        // Each biome its own grid and its own seed: retuning one never moves
+        // another's caves (invariant 4's reasoning, inside a layer).
+        const uint32_t seed = w.s_caves ^ (0x9E3779B9u * static_cast<uint32_t>(b + 1));
+        const int n = static_cast<int>(std::ceil(R / cell));
+        for (int j = -n; j < n; ++j) {
+            for (int i = -n; i < n; ++i) {
+                // The cell counts towards the biome's guarantee if its centre
+                // stands on the biome's dry land.
+                const float ccx = (static_cast<float>(i) + 0.5f) * cell;
+                const float ccz = (static_cast<float>(j) + 0.5f) * cell;
+                bool candidate = false;
+                if (ccx * ccx + ccz * ccz <= 0.81f * R * R) {
+                    float wt = 0.0f;
+                    if (dominant(ccx, ccz, wt) == b && height_at(ccx, ccz) > sea + ct.shore)
+                        candidate = true;
+                }
+                if (candidate) ++w.cave_cells[bi];
+
+                for (int t = 0; t < ct.tries; ++t) {
+                    // Inside the middle 80% of the cell, so neighbours keep
+                    // at least a fifth of a cell apart.
+                    const uint32_t k0 = static_cast<uint32_t>(t) * 4u;
+                    const float x = (static_cast<float>(i) + 0.1f + 0.8f * tree_unit(tree_hash(i, j, seed, k0))) * cell;
+                    const float z = (static_cast<float>(j) + 0.1f + 0.8f * tree_unit(tree_hash(i, j, seed, k0 + 1u))) * cell;
+                    if (x * x + z * z > 0.81f * R * R) continue;
+                    float wt = 0.0f;
+                    if (dominant(x, z, wt) != b || wt < 0.5f) continue;
+                    const float surf = height_at(x, z);
+                    if (surf < sea + ct.shore) continue;
+                    // Gentle enough at the mouth: the grade over 6 m each way.
+                    const float sx = (height_at(x + 6.0f, z) - height_at(x - 6.0f, z)) / 12.0f;
+                    const float sz = (height_at(x, z + 6.0f) - height_at(x, z - 6.0f)) / 12.0f;
+                    if (sx * sx + sz * sz > ct.max_slope * ct.max_slope) continue;
+                    // Two statements: see the river exclusion in tree_at_cell.
+                    float rw = 0.0f, rd = 0.0f;
+                    const float river_d = nearest_river(w, wp, x, z, rw, rd);
+                    if (river_d < rw + ct.river_clear + a.cave_mouth[1]) continue;
+                    if (flat_site_at(w, x, z, a.cave_mouth[1] + 5.0f) >= 0) continue;
+
+                    Rng rng(static_cast<uint64_t>(tree_hash(i, j, seed, k0 + 2u)) |
+                            (static_cast<uint64_t>(tree_hash(i, j, seed, k0 + 3u)) << 32));
+                    const bool sealed = rng.uniform() < a.cave_sealed;
+                    SeedWorld::Cave cave = {};
+                    if (!shape_cave(w, wp, table, a, rng, x, z, surf, sealed, cave, segs)) continue;
+
+                    cave.id = cave_id(b, i, j);
+                    cave.biome = b;
+                    cave.x = x; cave.y = surf; cave.z = z;
+                    cave.sealed = sealed;
+                    cave.seg_begin = static_cast<int>(w.entrances.size());
+                    cave.seg_count = static_cast<int>(segs.size());
+                    w.entrances.insert(w.entrances.end(), segs.begin(), segs.end());
+                    w.caves.push_back(cave);
+                    if (!sealed) {
+                        SeedWorld::EntranceMouth em;
+                        em.x = x; em.y = surf; em.z = z;
+                        em.reach = surf - cave.floor_y;
+                        em.seg_begin = cave.seg_begin;
+                        em.seg_count = cave.seg_count;
+                        w.entrance_mouths.push_back(em);
+                    }
+                    if (candidate) ++w.cave_filled[bi];
+                    break;
+                }
+            }
+        }
+    }
+    w.entrance_count = static_cast<int>(w.entrance_mouths.size());
+    // 78 m bins: a forest cave runs to ~30 capsules, and the 3x3 lookup reads
+    // only those near a sample rather than every cave within 470 m.
+    bin_entrances(w, wp, 256);
+}
+
+float cave_bottom_in_box(const SeedWorld& w, float x0, float z0, float x1, float z1, float pad) {
+    float best = 3.4e38f;
+    if (w.egrid_n <= 0 || w.entrances.empty()) return best;
+    const float R = 0.5f * w.egrid_cell * static_cast<float>(w.egrid_n);
+    const int N = w.egrid_n;
+    const int i0 = std::max(0, static_cast<int>((x0 + R) / w.egrid_cell));
+    const int i1 = std::min(N - 1, static_cast<int>((x1 + R) / w.egrid_cell));
+    const int j0 = std::max(0, static_cast<int>((z0 + R) / w.egrid_cell));
+    const int j1 = std::min(N - 1, static_cast<int>((z1 + R) / w.egrid_cell));
+    for (int j = j0; j <= j1; ++j) {
+        for (int i = i0; i <= i1; ++i) {
+            const std::vector<int>& bin = w.egrid[static_cast<size_t>(j) * N + i];
+            for (size_t m = 0; m < bin.size(); ++m) {
+                const SeedWorld::EntranceSeg& e = w.entrances[bin[m]];
+                const float r = std::max(e.ra, e.rb) + w.cave_wall_amp + 1.5f + pad;   // + entrance_falloff
+                if (std::max(e.ax, e.bx) + r < x0 || std::min(e.ax, e.bx) - r > x1) continue;
+                if (std::max(e.az, e.bz) + r < z0 || std::min(e.az, e.bz) - r > z1) continue;
+                const float lo = std::min(e.ay, e.by) - r;
+                if (lo < best) best = lo;
+            }
+        }
+    }
+    return best;
 }
 
 SeedWorld build_world(uint64_t world_seed,
@@ -1183,6 +1503,7 @@ SeedWorld build_world(uint64_t world_seed,
     w.s_overhang = feature_seed(world_seed, FEATURE_OVERHANG);
     w.s_cave = feature_seed(world_seed, FEATURE_CAVE);
     w.s_entrance = feature_seed(world_seed, FEATURE_ENTRANCE);
+    w.s_caves    = feature_seed(world_seed, FEATURE_CAVES);
     w.s_trees = feature_seed(world_seed, FEATURE_TREES);
     w.s_tree_patch = feature_seed(world_seed, FEATURE_TREE_PATCH);
     w.s_rocks = feature_seed(world_seed, FEATURE_ROCKS);
@@ -1300,7 +1621,8 @@ SeedWorld build_world(uint64_t world_seed,
 
     // Layer 7 after that again: the descent walks against the finished
     // density, which needs the carved heightfield under it.
-    build_entrances(w, wp, table);
+    if (wp.placed_caves) build_caves(w, wp, table);
+    else build_entrances(w, wp, table);
     return w;
 }
 

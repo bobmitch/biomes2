@@ -40,6 +40,21 @@ struct BiomeArchetype {
     float    cave_depth_min    = 0.0f;
     float    cave_depth_max    = 0.0f;
 
+    // --- placed caves (layer 7, docs/worldgen-design.md) ---
+    // per_km2 is the GUARANTEED density: the biome's candidate grid has cells
+    // of 1 km / sqrt(per_km2), and every cell inside the biome holds one cave
+    // unless every retry inside it fails. 0 = none. The rest is the shape.
+    float cave_per_km2      = 0.0f;
+    float cave_mouth[2]     = {0.0f, 0.0f};   // mouth radius, metres
+    float cave_tunnel[2]    = {0.0f, 0.0f};   // tunnel path length, metres
+    float cave_radius[2]    = {0.0f, 0.0f};   // tunnel radius, metres
+    float cave_turn         = 0.0f;           // heading wander per segment
+    float cave_depth[2]     = {0.0f, 0.0f};   // chamber floor below the mouth's ground, metres
+    int   cave_chambers     = 1;
+    float cave_chamber[2]   = {0.0f, 0.0f};   // chamber width, metres
+    float cave_chamber_h[2] = {0.0f, 0.0f};   // chamber height, metres
+    float cave_sealed       = 0.0f;           // chance of no mouth: a pocket only digging finds
+
     // --- surface ---
     uint32_t material_id        = 0u;
     float    water_level_offset = 0.0f;
@@ -129,6 +144,20 @@ struct RockTable {
     bool  present       = false;   // the table had a rocks block
 };
 
+// Placed caves, the shared part (each biome's shape is in BiomeArchetype).
+struct CaveTable {
+    int   tries       = 12;     // spots tried inside a cell before it holds none
+    float cover       = 3.0f;   // metres of rock kept over everything past the mouth
+    float max_slope   = 0.6f;   // rise over run at the mouth
+    float shore       = 3.0f;   // metres above sea level the mouth needs
+    float river_clear = 10.0f;  // metres between the mouth and a channel's edge
+    float segment     = 8.0f;   // metres per tunnel segment
+    float wall_noise  = 0.8f;   // metres of wall roughness
+    float wall_period = 5.0f;   // metres
+    float max_grade   = 0.6f;   // drop over run of the tunnel, so it can be walked
+    bool  present     = false;
+};
+
 struct ArchetypeTable {
     std::vector<BiomeArchetype> biomes;
     float sea_level = 0.0f;
@@ -136,6 +165,7 @@ struct ArchetypeTable {
     RockTable rocks;
     DetailTable detail;
     FlatTable flats;
+    CaveTable caves;
 
     size_t size() const { return biomes.size(); }
     const BiomeArchetype& operator[](size_t i) const { return biomes[i]; }

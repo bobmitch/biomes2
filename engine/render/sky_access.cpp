@@ -53,6 +53,8 @@ void SkyAccess::init(const WorldGpu* world, const BrickStore* edits) {
     // The entrances' shafts end in cave air, inside the band; a margin for
     // the mask's own edge.
     if (caves_) cave_depth_ += 4.0f;
+    // Placed caves pad per column (Column::cave_lo), not by a global depth.
+    placed_ = !world->world().caves.empty();
     thread_ = std::thread([this]() { run(); });
 }
 
@@ -93,7 +95,7 @@ void SkyAccess::invalidate_all() {
 
 bool SkyAccess::may_seal_cheap(int bx, int by, int bz) const {
     if (!world_) return false;
-    if (caves_) return true;
+    if (caves_ || placed_) return true;
     if (!edits_ || edits_->brick_count() == 0) return false;
     std::vector<BrickKey> touched;
     const float lo[3] = {float(bx * kBrick) - 0.5f, float(by * kBrick) - 0.5f, float(bz * kBrick) - 0.5f};
@@ -303,6 +305,10 @@ const SkyAccess::Column& SkyAccess::column(int bx, int bz) {
             if (wt[j] > 0.0f && b[j] >= 0) strength = (std::max)(strength, t.biomes[size_t(b[j])].overhang_strength);
     }
     c.reach = strength * wp.overhang_scale + 1.0f;
+    if (placed_)
+        c.cave_lo = worldgen::cave_bottom_in_box(w, float(bx * kBrick) - 1.0f, float(bz * kBrick) - 1.0f,
+                                                 float(bx * kBrick + kBrick) + 1.0f,
+                                                 float(bz * kBrick + kBrick) + 1.0f, 1.0f);
     return columns_.emplace(k, c).first->second;
 }
 
@@ -336,7 +342,10 @@ void SkyAccess::evaluate_batch(const std::vector<int>& bxyz) {
                     const int y = by * kBrick + j;
                     const int idx = (k2 * kBrick + j) * kBrick + i;   // x + 8 y + 64 z
                     if (float(y) > open_above) { b.st[idx] = kOpenFixed; continue; }
-                    if (!has_edits && float(y) < h - c.reach - deep - 1.0f) { b.st[idx] = kRock; continue; }
+                    if (!has_edits && float(y) < h - c.reach - deep - 1.0f && float(y) < c.cave_lo) {
+                        b.st[idx] = kRock;
+                        continue;
+                    }
                     b.st[idx] = kUnknown;   // decided below
                     jobs.push_back({&b, idx, x, y, z});
                 }
@@ -417,12 +426,15 @@ bool SkyAccess::may_seal(int bx, int by, int bz) {
         std::shared_lock<std::shared_mutex> lk(edits_mutex_);
         has_edits = has_edits_locked(bx, by, bz);
     }
-    if (!caves_ && !has_edits) return false;
+    if (!caves_ && !placed_ && !has_edits) return false;
     if (!has_edits) {
         // Wholly in the open, or wholly below where any cave reaches.
         const Column& c = column(bx, bz);
         if (float(by * kBrick) > c.hmax + c.reach) return false;
-        if (float(by * kBrick + kBrick - 1) < c.hmin - c.reach - cave_depth_ - 1.0f) return false;
+        if (float(by * kBrick + kBrick - 1) < c.hmin - c.reach - cave_depth_ - 1.0f &&
+            float(by * kBrick + kBrick - 1) < c.cave_lo) return false;
+        if (!caves_ && float(by * kBrick + kBrick - 1) < c.hmin - c.reach - 1.0f &&
+            float(by * kBrick + kBrick - 1) < c.cave_lo) return false;
     }
     return true;
 }

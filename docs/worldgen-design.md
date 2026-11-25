@@ -282,6 +282,37 @@ The polyline is stored with a radius at each vertex: a wide bowl at the mouth, a
 
 Branches are dead ends on purpose. One side passage per trunk, sometimes, kept whether or not it reaches anything: the connectivity guarantee is carried by the trunk, and a passage that goes nowhere is a feature.
 
+### Layer 7 — placed caves (v19, replacing the shafts)
+
+The ridged tunnels and their shafts above were never reachable in play: the shafts met cave air ~86 m down, residency stopped at 64 m, and a 64 m padding under every column in the world cost 393 chunks of empty rock to keep them. Since v11 every `cave_density` is 0 and both are off. Their code stays, unused.
+
+Caves come back as **placed features**, one at a time, the way trees and rocks are placed rather than the way a noise is thresholded. They exist for shelter, resources found only in them, danger and exploration, so they are somewhat rare and each one is a place.
+
+**Placement: a guaranteed density.** Each biome's `caves.per_km2` in `archetypes.json` (0 or no block = none) sets its own jittered candidate grid of `1 km / sqrt(per_km2)` cells, with its own seed (`FEATURE_CAVES` xor the biome). A cell holds at most one cave, a pure function of (biome, i, j); its identity is `cave_id(biome, i, j)`, as `tree_id` and `rock_id` are. A spot is tried inside the middle 80% of the cell and kept if:
+
+- the biome dominates there (blend weight >= 0.5),
+- the ground is dry (`shore` m over sea level) and gentle (`max_slope` over 6 m each way),
+- it is clear of rivers (`river_clear` m past the channel and the mouth) and flat sites,
+- the shape built from it has `cover` metres of rock over everything past the mouth.
+
+A spot that fails is retried at up to `tries` other spots in the same cell. That retry is what turns a density into a **guarantee**: every cell whose centre stands on the biome's dry land is counted, and validate asserts the share of those that hold a cave. Shipping start: meadows 1/km², forest 2/km², the rest 0.
+
+**Shape: capsules.** Everything is a list of capsules (a segment with a radius at each end; a sphere is a capsule of length 0), which is exactly what layer 7's shaft buffers already held, so the CPU carve (`nearest_entrance`), the GPU's `real_nearest_entrance`, the binning and the golden hash's buffer pin carry over unchanged -- no new GPU binding (the mesher's root signature is at 60 of 64 DWORDs). In order:
+
+1. **The mouth**: a bowl of radius `mouth` centred a quarter radius above the ground and sloping into it along the cave's heading, then a throat down to tunnel size. A ramp, not a pit, and wide enough to be seen from a distance.
+2. **The tunnel**: `tunnel` metres of `segment`-metre capsules of `radius` (each vertex 85-115%), the heading wandered by `turn` per segment (nudge and renormalise with sqrt, as the shafts did -- invariant 9), descending evenly to a radius over the chamber floor, never steeper than `max_grade`: a steeper drop lengthens the tunnel instead.
+3. **The chambers** (`chambers` of them): a horizontal capsule of radius `chamber_height / 2` along the heading spanning `chamber` metres, a second across it off centre, and a dome over the middle 1.2x as wide, raised. A wide, low room rather than a ball. A further chamber hangs off the last by a short passage.
+
+`depth` is the chamber floor below the mouth's ground. Meadows: mouth 5-7 m, tunnel 12-24 m, floor 8-13 m down, a chamber 10-15 m across and 4-6 m high. Forest: mouth 3-4.5 m, tunnel 60-150 m winding (`turn` 0.45), floor 15-35 m down, a cavern 25-40 m across and 9-14 m high.
+
+**Walls** are roughened by one octave of 3D simplex (`wall_noise` metres at `wall_period`, `cave_wall_sd` in `field.h`), evaluated only within `wall_noise` of a wall and faded by voxel like any octave. The carve is the shafts' `entrance_carve`: a blend towards air, never a subtraction.
+
+**Hidden pockets.** `sealed` is the chance a cave has no mouth or tunnel, only its chambers: a pocket digging can find. The primitive is built and 0 everywhere; a pocket is not a game mechanic until something (a locator item) can find one.
+
+**Streaming.** No global padding. `cave_bottom_in_box` returns the lowest capsule under a footprint, and `column_band` (cached per column) and the sky-access flood pad only the columns that hold a cave.
+
+**Not done.** Two caves from different biomes' grids can overlap (rare: cells are 700-1000 m apart); a floor is the capsules' rounded bottom, not levelled; nothing places resources or danger in them yet.
+
 ## Area budget and the equal-measure problem
 
 Disc area grows as r², so radial bands of equal *width* have wildly unequal *area*. With five linear bands the innermost gets 4% of the world and the outermost 36% — a ninefold difference, and the calm starting biomes are the ones that lose.

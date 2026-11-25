@@ -886,6 +886,34 @@ void draw_overlays(HDC dc) {
         DeleteObject(sh);
     }
 
+    // Placed caves (BIOMES_L0 caves=1 until v19), with the flat sites: the
+    // mouth as a circle, every capsule's axis as a line, chambers as circles.
+    if (checked(g.ov_flats) && !g.world.caves.empty()) {
+        HPEN axis = CreatePen(PS_SOLID, 2, RGB(255, 90, 200));
+        HPEN mouth = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+        HGDIOBJ old = SelectObject(dc, axis);
+        for (size_t i = 0; i < g.world.caves.size(); ++i) {
+            const SeedWorld::Cave& c = g.world.caves[i];
+            for (int k = 0; k < c.seg_count; ++k) {
+                const SeedWorld::EntranceSeg& e = g.world.entrances[static_cast<size_t>(c.seg_begin + k)];
+                int ax, ay, bx, by;
+                to_screen(e.ax, e.az, ax, ay);
+                to_screen(e.bx, e.bz, bx, by);
+                MoveToEx(dc, ax, ay, nullptr);
+                LineTo(dc, bx, by);
+                if (e.ax == e.bx && e.az == e.bz) circle(dc, e.ax, e.az, e.ra, 2.0f);
+            }
+            if (!c.sealed) {
+                SelectObject(dc, mouth);
+                circle(dc, c.x, c.z, g.world.entrances[static_cast<size_t>(c.seg_begin)].ra, 3.0f);
+                SelectObject(dc, axis);
+            }
+        }
+        SelectObject(dc, old);
+        DeleteObject(axis);
+        DeleteObject(mouth);
+    }
+
     if (checked(g.ov_rings)) {
         HPEN p = CreatePen(PS_DOT, 1, RGB(235, 235, 235));
         HGDIOBJ old = SelectObject(dc, p);
@@ -1417,6 +1445,7 @@ std::string l0_env() {
         e += fmt(",shelf_width=%.3f,shelf_depth=%.2f,shelf_regime=%.2f",
                  p.shelf_width, p.shelf_depth, p.shelf_regime);
     if (p.knee) e += fmt(",knee=1,knee_k=%.3f,knee_c=%.3f", p.knee_k, p.knee_c);
+    if (p.placed_caves) e += ",caves=1";
     return e;
 }
 

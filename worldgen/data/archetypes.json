@@ -52,6 +52,8 @@
   "ground_look": {"variation": 1.0, "detail_fade": [350.0, 700.0], "hex": 1, "far_detail": 1.2, "far_scale": 5.3},
   "weather": {"period_s": 480.0, "wind_min": 0.5, "wind_max": 24.0, "veer_period_s": 900.0, "veer": 1.75, "sea_lag_s": 90.0, "fetch_km": 150.0, "peak_shift": 1.4, "swell_min": 0.25, "swell_max": 3.0, "swell_wavelength": 110.0, "swell_lag_s": 600.0, "mist_drift": 0.5, "rain_storm": [0.55, 0.9], "dry_s": 900.0, "leaf_dry_s": 300.0, "soak_s": 120.0, "puddle_s": [240.0, 600.0], "lightning": {"storm": [0.78, 1.0], "per_minute": 14.0, "candela": 5e10, "range_m": 6000.0, "ground_share": 0.4}},
   "sea_level": 0.0,
+  "_note_placed_caves": "Placed caves (layer 7 since v19, docs/worldgen-design.md): each biome's caves.per_km2 is a GUARANTEED density -- a jittered candidate grid of 1 km / sqrt(per_km2) cells, one cave per cell, retried at up to `tries` spots. 0 or no block = none. Built only with WorldParams::placed_caves (BIOMES_L0 caves=1) until the bump.",
+  "caves": {"tries": 12, "cover": 3.0, "max_slope": 0.6, "shore": 3.0, "river_clear": 10.0, "segment": 8.0, "wall_noise": 0.8, "wall_period": 5.0, "max_grade": 0.6},
   "biomes": [
     {
       "name": "meadows",
@@ -62,7 +64,8 @@
       "fog": {"density": 0.0012, "height": 90.0}, "material_id": 0, "water_level_offset": 0.0,
       "rocks": {"boulders": 0.04, "outcrops": 0.05, "cover": 0.25},
       "ground": {"grass": 1.00, "cover": 0.85, "height": [0.25, 0.60], "color": [0.28, 0.44, 0.11], "dry_color": [0.58, 0.52, 0.26], "dry": 0.15, "narrow": 0, "flowers": 0.10, "bushes": 0.012},
-      "trees": {"density": 0.30, "cover": 0.85, "species": {"oak": 3, "birch": 2, "maple": 1}}
+      "trees": {"density": 0.30, "cover": 0.85, "species": {"oak": 3, "birch": 2, "maple": 1}},
+      "caves": {"per_km2": 1.0, "mouth": [5.0, 7.0], "tunnel": [12.0, 24.0], "radius": [1.8, 2.4], "turn": 0.30, "depth": [8.0, 13.0], "chambers": 1, "chamber": [10.0, 15.0], "chamber_height": [4.0, 6.0], "sealed": 0.0}
     },
     {
       "name": "forest",
@@ -73,7 +76,8 @@
       "fog": {"density": 0.0009, "height": 60.0}, "material_id": 1, "water_level_offset": 0.0,
       "rocks": {"boulders": 0.06, "outcrops": 0.05, "cover": 0.35},
       "ground": {"grass": 0.55, "cover": 0.70, "height": [0.15, 0.40], "color": [0.20, 0.35, 0.09], "dry_color": [0.45, 0.42, 0.20], "dry": 0.10, "narrow": 0, "flowers": 0.015, "bushes": 0.09},
-      "trees": {"density": 0.55, "cover": 0.80, "species": {"oak": 3, "maple": 2.5, "beech": 2.5, "birch": 2, "pine": 0.6, "fir": 0.4}}
+      "trees": {"density": 0.55, "cover": 0.80, "species": {"oak": 3, "maple": 2.5, "beech": 2.5, "birch": 2, "pine": 0.6, "fir": 0.4}},
+      "caves": {"per_km2": 2.0, "mouth": [3.0, 4.5], "tunnel": [60.0, 150.0], "radius": [1.6, 2.2], "turn": 0.45, "depth": [15.0, 35.0], "chambers": 1, "chamber": [25.0, 40.0], "chamber_height": [9.0, 14.0], "sealed": 0.0}
     },
     {
       "name": "wetland",

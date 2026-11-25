@@ -171,6 +171,23 @@ ArchetypeTable load_archetypes(const std::string& path) {
               t.detail.gain > 0.0f && t.detail.gain < 1.0f))
             throw std::runtime_error("archetypes: detail needs period > 0, octaves 1..8, 0 < gain < 1");
     }
+    if (root.has("caves")) {
+        const jsonlite::Value& c = root.obj.at("caves");
+        CaveTable& ct = t.caves;
+        ct.present     = true;
+        ct.tries       = static_cast<int>(c.number("tries"));
+        ct.cover       = static_cast<float>(c.number("cover"));
+        ct.max_slope   = static_cast<float>(c.number("max_slope"));
+        ct.shore       = static_cast<float>(c.number("shore"));
+        ct.river_clear = static_cast<float>(c.number("river_clear"));
+        ct.segment     = static_cast<float>(c.number("segment"));
+        ct.wall_noise  = static_cast<float>(c.number("wall_noise"));
+        ct.wall_period = static_cast<float>(c.number("wall_period"));
+        ct.max_grade   = static_cast<float>(c.number("max_grade"));
+        if (ct.tries < 1 || ct.segment <= 0.0f || ct.wall_period <= 0.0f || ct.wall_noise <= 0.0f ||
+            ct.max_grade <= 0.0f)
+            throw std::runtime_error("archetypes: caves needs tries >= 1, segment, wall_period, max_grade and wall_noise > 0");
+    }
     if (root.has("flats")) {
         const jsonlite::Value& f = root.obj.at("flats");
         FlatTable& ft = t.flats;
@@ -234,6 +251,34 @@ ArchetypeTable load_archetypes(const std::string& path) {
             throw std::runtime_error("archetypes: " + b.name + " cave_depth_band needs exactly 2 entries");
         b.cave_depth_min = static_cast<float>(depth[0].num);
         b.cave_depth_max = static_cast<float>(depth[1].num);
+
+        if (e.has("caves")) {
+            const jsonlite::Value& cb = e.obj.at("caves");
+            auto pair = [&](const char* k, float* out) {
+                const jsonlite::Array& a = cb.array(k);
+                if (a.size() != 2 || a[0].num < 0.0 || a[1].num < a[0].num)
+                    throw std::runtime_error("archetypes: " + b.name + " caves." + k + " needs [lo, hi], 0 <= lo <= hi");
+                out[0] = static_cast<float>(a[0].num);
+                out[1] = static_cast<float>(a[1].num);
+            };
+            b.cave_per_km2 = static_cast<float>(cb.number("per_km2"));
+            if (b.cave_per_km2 < 0.0f)
+                throw std::runtime_error("archetypes: " + b.name + " caves.per_km2 must be >= 0");
+            if (b.cave_per_km2 > 0.0f) {
+                pair("mouth", b.cave_mouth);
+                pair("tunnel", b.cave_tunnel);
+                pair("radius", b.cave_radius);
+                pair("depth", b.cave_depth);
+                pair("chamber", b.cave_chamber);
+                pair("chamber_height", b.cave_chamber_h);
+                b.cave_turn = static_cast<float>(cb.number("turn"));
+                b.cave_chambers = static_cast<int>(cb.number("chambers"));
+                b.cave_sealed = cb.has("sealed") ? static_cast<float>(cb.number("sealed")) : 0.0f;
+                if (b.cave_chambers < 1 || b.cave_chambers > 4 || b.cave_radius[0] <= 0.0f ||
+                    b.cave_chamber_h[0] <= 0.0f || b.cave_sealed < 0.0f || b.cave_sealed > 1.0f)
+                    throw std::runtime_error("archetypes: " + b.name + " caves needs 1-4 chambers, radius and chamber_height > 0, sealed in [0, 1]");
+            }
+        }
 
         b.material_id        = static_cast<uint32_t>(e.number("material_id"));
         b.water_level_offset = static_cast<float>(e.number("water_level_offset"));
