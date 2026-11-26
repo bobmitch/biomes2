@@ -134,11 +134,11 @@ measured in this file is seed 0), `--character male|female` (which pack; male by
 `--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), the weather's `--sea-state <0..1>`, `--wind <m/s>`,
 `--wind-dir <deg>` and `--swell <m>` (automatic weather otherwise), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
-`--fog-density <k>` (a multiplier on the authored mist), `--no-far-shadow`, `--no-pom`,
+`--fog-density <k>` (a multiplier on the authored mist, 1.3 by default), `--no-far-shadow`, `--no-pom`,
 `--aniso <1|2|4|8|16>` (the scans' filtering), `--no-terrain-prepass`, `--no-rocks`,
 `--no-forest-shell`, `--no-clouds`, `--no-rain`, `--rain <0..1>`, `--wet <0..1>`,
-`--no-lightning`, `--no-height-fog` and `--height-fog <k>` (a multiplier on the
-exploration fog); `--shot` also
+`--no-lightning`, `--no-height-fog` and `--height-fog <k>` (turns the
+exploration fog on, off by default, at that multiplier); `--shot` also
 takes `--lights <n>` (campfires round the camera), `--lightning <dist m>
 <bearing deg> [1]` (a strike for the still, at the peak of its first stroke,
 the bearing from the camera's forward; 1 in the cloud) and `--ground` (the
@@ -2098,6 +2098,16 @@ to go to. `haze.hlsli`'s `height_fog`, applied in `cs_composite` to every
 surface and to the sky (to infinity), and by the sea over itself and its sky
 reflection. archetypes.json `fog.layers`; `--no-height-fog`,
 `--height-fog <k>`.
+
+**OFF by default since 2026-11-26.** At dawn and dusk it blew out: its
+colour is the horizon's in that azimuth, and towards a low sun that is the
+Mie glow, so a sight line through the dense layer drew a glaring orange
+column over the scene (`--time 18.5` at spawn). Fine by day. In its place
+the froxel mist's density defaults to 1.3x (`fog_density_`). With it off the
+mist also stops thinning above 60 m (`mist_top` is tied to it), so hills
+are as misty as the plain. The tuning panel's Fog group turns it back on
+(its layers also take the mist multiplier); `--height-fog <k>` does too.
+Fixing the colour at low sun is the way back.
 
 - **Extinction falls off with ALTITUDE above sea level, not with height
   above the ground.** Three layers, sigma at sea level x exp(-h / H):
