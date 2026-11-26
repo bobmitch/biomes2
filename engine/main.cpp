@@ -1003,6 +1003,19 @@ void register_tunables() {
           [&gl] { return gl.far_detail; }, [&gl](float v) { gl.far_detail = v; });
     range("ground_far_scale", GL, "Ground: far detail scale", 2.0f, 20.0f, 0.1f, "x tile",
           [&gl] { return gl.far_scale; }, [&gl](float v) { gl.far_scale = v; });
+    // Rock (scan_library.h RockLook): archetypes.json's rock_look.
+    engine::RockLook& rl = R.rock_look();
+    toggle("rock_hex", GL, "Rock: hex-tiling", [&rl] { return rl.hex; }, [&rl](bool b) { rl.hex = b; });
+    range("rock_hex_turn", GL, "Rock: hex turns up to", 0.0f, 180.0f, 1.0f, "deg",
+          [&rl] { return rl.hex_turn_deg; }, [&rl](float v) { rl.hex_turn_deg = v; });
+    range("rock_far", GL, "Rock: far layer", 0.0f, 1.0f, 0.05f, "x",
+          [&rl] { return rl.far_share; }, [&rl](float v) { rl.far_share = v; });
+    range("rock_far_scale", GL, "Rock: far layer scale", 2.0f, 12.0f, 0.1f, "x tile",
+          [&rl] { return rl.far_scale; }, [&rl](float v) { rl.far_scale = v; });
+    range("rock_far_from", GL, "Rock: far layer from", 0.0f, 200.0f, 1.0f, "m",
+          [&rl] { return rl.far_fade[0]; }, [&rl](float v) { rl.far_fade[0] = v; });
+    range("rock_far_to", GL, "Rock: far layer whole by", 1.0f, 400.0f, 1.0f, "m",
+          [&rl] { return rl.far_fade[1]; }, [&rl](float v) { rl.far_fade[1] = v; });
 
     const char* F = "Fog";
     toggle("mist", F, "Mist (near, patchy)", [&] { return R.fog(); }, [&](bool b) { R.set_fog(b); });
@@ -1934,6 +1947,21 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 gl.fade[0] = std::strtof(c2.c_str() + gf + 14, &e);
                 gl.fade[1] = std::strtof(e, nullptr);
             }
+        }
+        // Rock (RockLook): --no-rock-look is the rock scans as they were.
+        {
+            engine::RockLook& rl = g_renderer.rock_look();
+            if (c2.find("--no-rock-look") != std::string::npos) {
+                rl.hex = false;
+                rl.far_share = 0.0f;
+            }
+            if (c2.find("--no-rock-hex") != std::string::npos) rl.hex = false;
+            const size_t rf = c2.find("--rock-far ");
+            if (rf != std::string::npos) rl.far_share = float(std::atof(c2.c_str() + rf + 11));
+            const size_t rs = c2.find("--rock-scale ");
+            if (rs != std::string::npos) rl.far_scale = float(std::atof(c2.c_str() + rs + 13));
+            const size_t rt = c2.find("--rock-turn ");
+            if (rt != std::string::npos) rl.hex_turn_deg = float(std::atof(c2.c_str() + rt + 12));
         }
         if (c2.find("--no-forest-shell") != std::string::npos) g_renderer.set_forest_shell(false);
         const size_t fdn = c2.find("--fog-density");

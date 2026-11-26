@@ -135,11 +135,12 @@ struct ShadowConstants {
     float wet[4];          // ADR-005 C4: wetness, puddles, rain, the ripples' clock (wet.hlsli)
     float flash[4];        // ADR-005 C5: a lightning flash's point and intensity, cd (flash.hlsli)
     float flash_col[4];
-    float look[4];         // bare ground (GroundLook): variation, detail fade start, end; unused
+    float look[4];         // bare ground (GroundLook): variation, detail fade start, end; the most a rock hex turns (tan)
     float near_field[4];   // the near field (near_field.h): the volume's min world voxel xyz; w ready
-    float look3[4];        // ... hex-tiling on, far detail strength, far detail scale; unused
+    float look3[4];        // ... hex-tiling on, far detail strength, far detail scale; rock hex-tiling on (RockLook)
+    float look4[4];        // rock (RockLook): far layer's strength, its scale, the fade's start and end, metres
 };
-static_assert(sizeof(ShadowConstants) == 816, "ShadowConstants must match shadow.hlsli");
+static_assert(sizeof(ShadowConstants) == 832, "ShadowConstants must match shadow.hlsli");
 
 // Matches cbuffer ClusterConstants in lights.hlsl.
 struct ClusterConstants {
@@ -1322,6 +1323,13 @@ void Renderer::record_shadows(const ViewConstants& view) {
     sc.look3[0] = ground_look_.hex ? 1.0f : 0.0f;
     sc.look3[1] = ground_look_.far_detail;
     sc.look3[2] = (std::max)(ground_look_.far_scale, 1.0f);
+    // Rock (RockLook, mesh.hlsl).
+    sc.look[3] = float(std::tan((std::min)((std::max)(rock_look_.hex_turn_deg, 0.0f), 89.0f) * 3.14159265 / 180.0));
+    sc.look3[3] = rock_look_.hex ? 1.0f : 0.0f;
+    sc.look4[0] = (std::max)(rock_look_.far_share, 0.0f);
+    sc.look4[1] = (std::max)(rock_look_.far_scale, 1.0f);
+    sc.look4[2] = rock_look_.far_fade[0];
+    sc.look4[3] = (std::max)(rock_look_.far_fade[1], rock_look_.far_fade[0] + 1.0f);
     // Lightning (C5).
     if (strike_.active) {
         for (int k = 0; k < 3; ++k) sc.flash[k] = strike_.flash_pt[k];
@@ -2986,6 +2994,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
             for (const TreeLook& l : looks) if (!l.bark_scan.empty()) bark.push_back(l.bark_scan);
             if (!scans_.init(device_.Get(), queue_.Get(), srv_heap_.Get(), mids, bark, error)) return false;
             ground_look_ = scans_.ground_look();
+            rock_look_ = scans_.rock_look();
             for (TreeLook& l : looks)
                 if (!l.bark_scan.empty()) scans_.lookup(l.bark_scan, l.bark, l.bark_layer, l.bark_inv_tile, l.bark_tint, l.bark_depth);
             startup_log().push_back(std::make_pair("phase: scans -- " + scans_.note(), startup_now_ms() - ts));

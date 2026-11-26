@@ -66,12 +66,16 @@ cbuffer ShadowConstants : register(b2) {
     float4 l_flash;
     float4 l_flash_col;
     // Bare ground (mesh.hlsl, GroundLook): macro variation's strength, the
-    // scan's fade to its mean (start, end, metres), unused; unused; the
-    // ground scan hex-tiled (x > 0.5), far detail's strength and its scale
-    // over the tile, unused.
+    // scan's fade to its mean (start, end, metres), and (RockLook) the most
+    // a rock hex turns, as a tangent; the ground scan hex-tiled (x > 0.5),
+    // far detail's strength and its scale over the tile, rock hex-tiled
+    // (w > 0.5).
     float4 l_look;
     float4 l_nf;        // the near field (near_field.h): the volume's min world voxel xyz; w ready
     float4 l_look3;
+    // Rock (RockLook): the far layer's strength at full distance, its scale
+    // over the tile, the distances it fades in over (metres).
+    float4 l_look4;
 };
 
 Texture2DArray<float>  g_shadow     : register(t8);

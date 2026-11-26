@@ -731,8 +731,8 @@ confirmed it twice.
   UI's own heap, drawn last, is the one exception. Every
   `SetGraphicsRootSignature` of the terrain's or the trees' root sets the
   table next to it.
-- **Not done**: anti-tiling on rock (see the next section for the ground),
-  BC compression -- 247 MB of scans at 1K would be ~62 MB, and the BC7
+- **Not done**: anti-tiling on the placed rocks (terrain rock has it: see
+  "Cliffs" below), BC compression -- 247 MB of scans at 1K would be ~62 MB, and the BC7
   proxy (no fetch reading the top mip, a quarter of the bytes) took
   0.35-0.4 ms off the 4K terrain pass: worth it for memory, not the frame --
   scans for the grass, leaves and placed rocks, silhouettes.
@@ -783,6 +783,48 @@ wallpaper grid over a clearing. Three parts (`scan.hlsli`, `mesh.hlsl`):
   `--detail-fade a b`. Not `--ground-...`: `--ground` is a flag and
   `find()` matches it inside one -- an A/B still was taken at eye height
   for that.
+
+**Cliffs: rock hex-tiling and a far rock layer** (archetypes.json
+`rock_look`, the Terrain group's "Rock:" knobs, `--no-rock-look` for A/B).
+A 5 m rock scan along a cliff read as evenly spaced vertical streaks from
+~20 m out, and as stripes at 140 m. Both parts are `scan_rock`
+(`scan.hlsli`), for the HEAVIEST rock candidate only (`mesh.hlsl`):
+
+- **Hex-tiling in EVERY triplanar plane**, not just the dominant one: a
+  slope near 45 degrees weighs two planes alike and the dominant one swaps
+  across it, so hex in one plane would draw a seam there. Each hex turns
+  at most `hex_turn_deg` (15) either way, not at random: rock's streaks and
+  beds follow gravity. Parallax follows the hexes (`scan_pom_shift`'s
+  `hexed`): it marches in the frame of the hex the point is most in.
+- **The far layer**: the same scan at `far_scale` (5) x its tile, always
+  hex-tiled, offset in the world, one mip coarser than its footprint --
+  cross-faded in over `far_fade` (15-60 m) to a `far` share of 0.7, then to
+  all of it by 4 x 60 m, where the near scale is not sampled at all.
+  Colour, height and NORMAL: past ~40 m the near normal map has gone to its
+  mips, and the far layer's ledges and cracks are what a cliff reads by. It
+  goes in before the height blend, so rock breaks through ground at the far
+  scale too.
+- **Code size was the cost, not the fetches.** Written as hexed
+  `scan_triplanar` calls at three sites (two rock candidates and the far
+  layer) it cost +0.55 ms on a cliff filling half a 1440p frame; the same
+  samples with the far site's hex code removed came in UNDER the baseline.
+  One `[loop]` over (scale, plane), so `hex_sample` is written once: +0.38.
+  Rock fetches a hex corner only from 10% of the heaviest weight
+  (`kRockHexCut`; ground 1%): -0.06.
+- **Measured** on the F8 snapshot `build/snapshots/20261126-083030` (a
+  ~47 degree coastal bank, Rock060), from 20, 60 and 140 m along its normal:
+  the high-passed autocorrelation at one tile's lag along the wall went
+  0.347 -> 0.043 (baseline 0.04), 0.390 -> 0.230 (baseline ~0.26), 0.632 ->
+  0.320 (baseline ~0.39) -- the excess at the tile is gone at every
+  distance. **Cost** at 2560 x 1440, terrain pass: the snapshot's own view
+  0.96 -> 1.02 ms; the bank filling half the frame at 20-40 m, the worst
+  case, 1.69 -> 2.07. `--no-rock-look` matches the pre-change still within
+  run-to-run noise (tree shadows).
+- **Flags**: `--no-rock-look`, `--no-rock-hex`, `--rock-far <k>`,
+  `--rock-scale <x>`, `--rock-turn <deg>`.
+- **Not done**: the placed rocks (`rocks.hlsl`, outcrops to 10 m) keep the
+  plain scan; strata and streaking as procedural colour over a cliff (a
+  look pass, unique per cliff by construction).
 
 **Parallax occlusion** (`engine/render/shaders/pom.hlsli`; `P`, `--no-pom`)
 on the scans' height channel, terrain and bark. No silhouettes and no depth
