@@ -258,6 +258,11 @@ ScanResult scan_surface(VSOut i, float3 n, float level, float3 v, float3 dpx, fl
     w2 = w2 < 0.005f ? 0.0f : w2;
     w3 = w3 < 0.005f ? 0.0f : w3;
     const bool hex = l_look3.x > 0.5f;
+    // Rock (RockLook): the heaviest rock candidate through the hex lattice
+    // in every plane, each hex turned at most by l_look.w (a tangent).
+    const bool rhex = l_look3.w > 0.5f;
+    const float rrot = l_look.w;
+    const bool r_second = w3 > w1;
 
     // Parallax (pom.hlsli): the heaviest candidate's height map, in the
     // plane the normal faces most; its shift moves every candidate's sample
@@ -275,7 +280,7 @@ ScanResult scan_surface(VSOut i, float3 n, float level, float3 v, float3 dpx, fl
         if (d_second) MD = M1;
         p += scan_pom_shift(d_rock ? MD.rock_layer : MD.ground_layer, d_rock ? MD.rock_inv_tile : MD.ground_inv_tile,
                             d_rock ? MD.rock_depth : MD.ground_depth, p, n, v, bw, dpx, dpy,
-                            length(cam_pos - i.world), psh);
+                            length(cam_pos - i.world), psh, d_rock && rhex, rrot);
     }
     // Hex-tiling for the heaviest GROUND candidate only: the second biome's
     // share at a boundary and the rock on a slope show no grid worth three
@@ -283,9 +288,26 @@ ScanResult scan_surface(VSOut i, float3 n, float level, float3 v, float3 dpx, fl
     const bool g_second = w2 > w0;
     ScanSample s0 = (ScanSample)0, s1 = (ScanSample)0, s2 = (ScanSample)0, s3 = (ScanSample)0;
     if (w0 > 0.0f) s0 = scan_triplanar(M0.ground_layer, M0.ground_inv_tile, p, n, bw, dpx, dpy, hex && !g_second);
-    if (w1 > 0.0f) s1 = scan_triplanar(M0.rock_layer, M0.rock_inv_tile, p, n, bw, dpx, dpy, false);
     if (w2 > 0.0f) s2 = scan_triplanar(M1.ground_layer, M1.ground_inv_tile, p, n, bw, dpx, dpy, hex && g_second);
-    if (w3 > 0.0f) s3 = scan_triplanar(M1.rock_layer, M1.rock_inv_tile, p, n, bw, dpx, dpy, false);
+    // Rock: the heaviest rock candidate through scan_rock -- hex-tiled in
+    // every plane and cross-faded with distance into its own scan at
+    // l_look4.y x its tile (RockLook) -- the other straight. Before the
+    // height blend, so rock breaks through ground at the far scale too.
+    ScanMaterial MR = M0, MO = M1;   // FXC takes no ternary on a struct
+    if (r_second) { MR = M1; MO = M0; }
+    const float wr = r_second ? w3 : w1, wo = r_second ? w1 : w3;
+    // The far layer's share rises to l_look4.x over (z, w) metres, then to
+    // all of it by 4w: past that the near scan's grain is under a pixel and
+    // its samples are not taken at all (scan_rock skips a scale at 0 or 1).
+    const float dcam = length(cam_pos - i.world);
+    const float frock = l_look4.x <= 0.0f ? 0.0f
+                      : lerp(l_look4.x * smoothstep(l_look4.z, l_look4.w, dcam), 1.0f,
+                             smoothstep(l_look4.w, 4.0f * l_look4.w, dcam));
+    ScanSample sr = (ScanSample)0, so = (ScanSample)0;
+    if (wr > 0.0f) sr = scan_rock(MR.rock_layer, MR.rock_inv_tile, l_look4.y, frock, p, n, bw, dpx, dpy, rhex, rrot);
+    if (wo > 0.0f) so = scan_triplanar(MO.rock_layer, MO.rock_inv_tile, p, n, bw, dpx, dpy, false);
+    if (r_second) { s3 = sr; s1 = so; }
+    else          { s1 = sr; s3 = so; }
 
     float top = -1e9f;
     if (w0 > 0.0f) top = max(top, s0.height * kScanHeightGain + w0);

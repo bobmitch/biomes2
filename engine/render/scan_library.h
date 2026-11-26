@@ -52,6 +52,19 @@ struct GroundLook {
     float far_scale = 5.3f;
 };
 
+// How rock looks (archetypes.json `rock_look`, presentation only; live in
+// the tuning panel's Terrain group). Against the 5 m rock scans repeating
+// along a cliff: the heaviest rock candidate hex-tiled in every triplanar
+// plane, and cross-faded with distance into the same scan at far_scale x
+// its tile.
+struct RockLook {   // not "far": a Windows macro
+    bool  hex = true;            // rock through the hex lattice (scan.hlsli)
+    float hex_turn_deg = 15.0f;  // the most a hex turns either way; 0 offsets only
+    float far_share = 0.7f;      // the far layer's share at full distance, 0 off
+    float far_scale = 5.0f;      // its tile over the scan's
+    float far_fade[2] = {15.0f, 60.0f};   // metres from the camera it fades in over
+};
+
 class ScanLibrary {
 public:
     // Heap: [67] A, [68] B, [69] the per-biome table (t44..t46 in the
@@ -74,6 +87,7 @@ public:
     const std::vector<float>& rock_albedo() const { return rock_albedo_; }
     // archetypes.json's ground_look, read at init (defaults when absent).
     const GroundLook& ground_look() const { return look_; }
+    const RockLook& rock_look() const { return rock_look_; }
     UINT layers() const { return layers_; }
     // What init found, for startup.txt: sets loaded, missing, MB uploaded.
     const std::string& note() const { return note_; }
@@ -86,6 +100,7 @@ private:
     std::map<std::string, Info> info_;
     std::vector<float> rock_albedo_;
     GroundLook look_;
+    RockLook rock_look_;
     ComPtr<ID3D12Resource> albedo_, nra_, table_;
 };
 

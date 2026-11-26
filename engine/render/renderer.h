@@ -480,6 +480,8 @@ public:
     void set_fog_density(float k) { fog_density_ = k; }
     // Bare ground past the near field (scan_library.h GroundLook): live.
     GroundLook& ground_look() { return ground_look_; }
+    // Rock (scan_library.h RockLook): live.
+    RockLook& rock_look() { return rock_look_; }
     float fog_density() const { return fog_density_; }
     const FogMap& fog_map() const { return fog_map_; }
     // The fog's authored settings, live: the layers and the mist's top are
@@ -849,6 +851,7 @@ private:
     bool   fog_on_ = true, fog_hist_valid_ = false, fog_uploaded_ = false;
     float  fog_density_ = 1.0f;
     GroundLook ground_look_;
+    RockLook rock_look_;
     UINT   fog_cur_ = 0;
     ComPtr<ID3D12Resource> fog_map_tex_, fog_map_up_, fog_inject_[2], fog_integrated_;
     // Each froxel's share of open air's light (hfgi.hlsli nf_openness), and its

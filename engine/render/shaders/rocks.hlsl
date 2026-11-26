@@ -104,7 +104,7 @@ SceneOut ps_rock(VSOut i) {
         bw = bw * bw * bw * bw;
         bw /= (bw.x + bw.y + bw.z);
         const float3 p = i.world + scan_pom_shift(M.rock_layer, M.rock_inv_tile, M.rock_depth, i.world, n, v,
-                                                  bw, dpx, dpy, dist, psh);
+                                                  bw, dpx, dpy, dist, psh, false, -1.0f);
         const ScanSample s = scan_triplanar(M.rock_layer, M.rock_inv_tile, p, n, bw, dpx, dpy);
         albedo = s.albedo * M.rock_tint;
         rough = saturate(s.rough * M.rock_rough / M.rock_scan_rough);

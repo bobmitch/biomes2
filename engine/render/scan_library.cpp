@@ -103,6 +103,14 @@ bool ScanLibrary::init(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12De
             if (l.has("far_detail")) look_.far_detail = float(l.number("far_detail"));
             if (l.has("far_scale")) look_.far_scale = float(l.number("far_scale"));
         }
+        if (root.has("rock_look")) {
+            const jsonlite::Value& l = root.at("rock_look");
+            if (l.has("hex")) rock_look_.hex = l.number("hex") > 0.5;
+            if (l.has("hex_turn_deg")) rock_look_.hex_turn_deg = float(l.number("hex_turn_deg"));
+            if (l.has("far")) rock_look_.far_share = float(l.number("far"));
+            if (l.has("far_scale")) rock_look_.far_scale = float(l.number("far_scale"));
+            if (l.has("far_fade")) for (int k = 0; k < 2; ++k) rock_look_.far_fade[k] = float(l.array("far_fade")[k].num);
+        }
     } catch (const std::exception& e) {
         error = std::string("scan library: archetypes.json materials: ") + e.what();
         return false;
