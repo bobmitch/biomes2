@@ -254,14 +254,17 @@ Last gathered: 2026-11-21, after the exploration fog.
   the grass's clump cards fade against the blades the same way. [Trees]
 - The rocks' LOD switch pops (no cross-fade); no GPU far cards for single
   trees on a skyline from the air. [Rocks; Far forest]
-- Surface scans: hex-tiling is on the dominant ground candidate's
-  dominant plane only -- rock faces and steep ground still tile -- and
-  turns directional scans at random (the seabed's sand ripples); ground has
-  no parallax under it. No second ground material per biome; no BC
+- Surface scans: ground hex-tiling is on the dominant ground candidate's
+  dominant plane only -- steep ground still tiles -- and turns directional
+  scans at random (the seabed's sand ripples); ground has no parallax under
+  it. Terrain rock is hex-tiled with a far layer (Cliffs), but only the
+  heaviest rock candidate, and the placed rocks not at all; cliffs have no
+  procedural strata or streaking yet, and the worst case (a cliff filling
+  half a 1440p frame at 20-40 m) costs +0.38 ms. No second ground material per biome; no BC
   compression, none for grass, leaves or rocks; parallax has no
   silhouettes. The heightfield GI's top-down albedo (`ps_top`) does not
   see the macro variation or far detail. [Surface texture; Bare ground:
-  hex-tiling and far detail]
+  hex-tiling and far detail; Cliffs]
 
 ## Terrain
 
