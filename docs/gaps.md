@@ -160,6 +160,13 @@ Last gathered: 2026-11-21, after the exploration fog.
   where SSR finds no wall on screen; light in a flooded tunnel is the near
   field's air (no light through water). Air pockets, seepage and filling
   were dropped on purpose (ADR-006, superseded). [Water is a half-space]
+- **A dark band on a swell's back near the shore in a gale**, at a grazing
+  view from just over the water (`--cam 604 1.6 -310 3.2 -0.25 --sea-state
+  0.8`, seed 0): a straight-edged dark slab across the water, round at one
+  end. Not the foam, not dug water, not SSR (`--no-ssr` keeps it), and the
+  displacement and normals there are smooth: most likely the "reflection
+  closed by the next wave" term (`open` in water.hlsl), which shades a back
+  slope with the water's own dark colour. To fix. [The sea]
 - A faint strip just under the horizon where the sea's SSR misses land.
   [The sea]
 - **Puddle reflections are screen space** (nothing off screen or behind a
