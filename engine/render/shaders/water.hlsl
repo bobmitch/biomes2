@@ -75,7 +75,6 @@ cbuffer WaterConstants : register(b0) {
     float4 hfog_a;        // the exploration fog (haze.hlsli), as post.hlsl
     float4 hfog_b;
     float4 hfog_c;
-    float4 bed;           // the sea's bed map (record_water_bed): corner x, z in metres, on, unused
 };
 
 // The lit scene and its depth as the composite left them -- copies, because
@@ -93,62 +92,6 @@ SamplerState g_wrap_u : register(s2);
 Texture2DArray<float4> g_detail : register(t5);
 SamplerState g_wrap : register(s3);
 Texture2D<float> g_cloud_shadow : register(t6);   // clouds.hlsl cs_shadow
-// The sea's bed (renderer.cpp record_water_bed): the resident terrain drawn
-// from just over sea level down, the height of the first surface under each
-// 0.25 m texel, 512 a side round the camera -- digs and all, since it is the
-// mesh. -1e4: nothing drawn (solid under the top, or not streamed in), so the
-// generated field stands. 1e4: a ceiling seen first, so the sea-level point
-// is in rock.
-Texture2D<float> g_bed : register(t7);
-
-// The water's depth at p from the bed: bilinear over the four texels round
-// p, each read as its own depth (nothing drawn: the generated field's, which
-// on land is the land; a ceiling: rock at sea level, so the generated land, or
-// the waterline where the field says sea), faded to the generated field over
-// the map's last 2 m. A ceiling read as half a metre of rock dried a beach's
-// swash zone in the shape of the tunnels dug under it: its surf's edge ran in
-// a sawtooth. Not filled from the valid taps instead: a beach vertex
-// beside the waterline took the seabed's depth, read as dug, and the cuts for
-// dug walls (ps_main) ran in a sawtooth along a natural shore.
-float bed_depth(float2 p, float gen) {
-    if (bed.z < 0.5f) return gen;
-    const float kSize = 512.0f, kTexel = 0.25f;
-    const float2 g = float2((p.x - bed.x) / kTexel - 0.5f, (bed.y + kSize * kTexel - p.y) / kTexel - 0.5f);
-    const float edge = min(min(g.x, g.y), min(kSize - 1.0f - g.x, kSize - 1.0f - g.y));
-    if (edge < 0.0f) return gen;
-    const int2 c0 = int2(floor(g));
-    const float2 f = g - float2(c0);
-    float d = 0.0f;
-    [unroll] for (int k = 0; k < 4; ++k) {
-        const int2 c = clamp(c0 + int2(k & 1, k >> 1), 0, int(kSize) - 1);
-        const float wt = ((k & 1) ? f.x : 1.0f - f.x) * ((k >> 1) ? f.y : 1.0f - f.y);
-        const float h = g_bed.Load(int3(c, 0));
-        d += wt * (h < -1.0e3f ? gen : (h > 1.0e3f ? min(gen, 0.0f) : sea_level - h));
-    }
-    return lerp(gen, d, saturate(edge / 8.0f));
-}
-
-// Whether dug water lies within a metre of p (0..1): the bed a metre away
-// each way, against p's own generated depth. For rock standing over a dug
-// hole's wall, whose calm only blends into the water beside it. The bed a
-// metre off must lie 1.3 m and more under p's ground, a drop no beach makes:
-// at 0.3 m a natural beach's own slope read as dug, its vertices half a metre
-// up lost their swash, and the surf's edge ran in a sawtooth.
-float bed_dug_near(float2 p, float gen) {
-    if (bed.z < 0.5f) return 0.0f;
-    const float kSize = 512.0f, kTexel = 0.25f;
-    float dug = 0.0f;
-    [unroll] for (int k = 0; k < 4; ++k) {
-        const float2 q = p + float2(k == 0 ? 1.0f : (k == 1 ? -1.0f : 0.0f), k == 2 ? 1.0f : (k == 3 ? -1.0f : 0.0f));
-        const int2 c = int2(floor(float2((q.x - bed.x) / kTexel, (bed.y + kSize * kTexel - q.y) / kTexel)));
-        if (any(c < 0) || any(c >= int(kSize))) continue;
-        const float h = g_bed.Load(int3(c, 0));
-        if (h < -1.0e3f || h > 1.0e3f) continue;
-        dug = max(dug, saturate((sea_level - h - gen - 1.3f) / 0.3f));
-    }
-    return dug;
-}
-
 #include "engine/render/shaders/lighting.hlsli"
 #include "engine/render/atmosphere.h"
 #include "engine/render/shaders/haze.hlsli"
@@ -179,7 +122,7 @@ struct VSOut {
     float  minwl  : TEXCOORD5;   // shortest wave this spacing can carry
     float  hs     : TEXCOORD6;   // significant height the grid carries here (the foam's yardstick)
     float2 cap_q  : TEXCOORD7;   // ww_local's breaking scale and Q, for the pixel's own normal
-    float3 rim    : TEXCOORD8;   // the open sea's share of the waves (1 open sea, 0 dug water's calm); 1 on the land side; the water is dug (0..1)
+    float  gen    : TEXCOORD8;   // the GENERATED column's water here (sea level less real_terrain_height; negative on land)
 };
 
 // A PROJECTED grid: the vertices are laid out on the SCREEN and dropped onto
@@ -288,77 +231,47 @@ VSOut vs_main(uint vid : SV_VertexID) {
     const float r = sqrt(rest.x * rest.x + rest.y * rest.y) / w_radius;
     const float ground = real_terrain_height(rest.x, rest.y, r, 0.0f);
     const float depth_gen = sea_level - ground;
-    // The water's REAL depth (bed_depth: the terrain mesh as drawn, digs and
-    // all, round the camera; the generated field beyond). Water is a
-    // HALF-SPACE: wherever that bed lies under sea level there is water -- the
-    // sea's own columns, a channel dug in from the coast, a pit dug inland, a
-    // cave whose air reaches sea level. Past the bed map's 64 m only the
-    // generated depth is known, so a pit further off draws dry.
-    const float real = bed_depth(rest, depth_gen);
-    const float depth = real;
-    // The water here is DUG, by the bed itself: its floor well under the
-    // generated ground. Dug water is CALM -- no waves, swash or surf -- and
-    // the natural sea keeps its waves. On the beach outside a hole's wall the
-    // bed IS the generated ground, and the surf, swash and foam stay the
-    // beach's right up to the rim.
-    const float dug = saturate((real - depth_gen - 0.3f) / 0.3f);
-    // Where the ground stands well over the water (0.5-1.5 m and more) no
-    // swash is ever seen, so beside dug water the calm reaches into the rock
-    // (bed_dug_near: dug water within a metre), and the grid's triangles
-    // across a pit's wall stay calm end to end: falling back to the open
-    // sea's waves and foam there drew a white sawtooth along the wall.
-    const float high = saturate((-depth - 0.5f) / 1.0f);
-    const float near_dug = high > 0.0f ? bed_dug_near(rest, depth_gen) : 0.0f;
-    const float calm_f = 1.0f - max(dug, high * near_dug);   // the share of the open sea's waves here
-    const float fade_w = fade * calm_f;
-
+    // The sea is two layers. The BASE is the same everywhere -- the sea, a
+    // dug pit, a tunnel, a channel: flat at sea level, with the wind's
+    // ripples in the pixel shader (normals, not height). The TOP is the deep
+    // sea's trains and swell, weighted by the GENERATED depth: none on land,
+    // rising over the shelf, full in deep water, under the breaking cap
+    // (water_wave.h: ww_depth_factor, WW_BREAK_HS); storms scale this layer
+    // only. Where the sheet is drawn is the depth test's business alone:
+    // terrain over sea level hides it, so any air under sea level shows water
+    // at any distance. Inland pits and caves are calm by construction, a
+    // channel dug across a beach gets almost nothing (its generated depth is
+    // shallow), and a dredged harbour stays calm.
     float3 nrm;
-    const float3 p = ww_surface(rest.x, rest.y, time, frame_sea(), depth, fade_w, minwl, nrm);
+    const float3 p = ww_surface(rest.x, rest.y, time, frame_sea(), depth_gen, fade, minwl, nrm);
     // The swash (water_wave.h): within a metre and a half of the still-water
     // line the sheet rises and falls with each arriving set, so the water
     // runs up the beach and back; the terrain in front hides it where the
-    // beach is higher. Where it is wet it never sinks below the bed: a storm
-    // trough over half a metre of water fell under the seabed and bared it.
-    const float reach = ww_swash_reach(depth);
-    // The run-up is the surf's: dug water's calm takes it with the waves. In a
-    // dug hole the bed beside a wall blends to shallow over a texel, and the
-    // open sea's swash there ran the sheet up the wall in teeth.
-    const float swash = reach > 0.0f ? ww_swash(rest.x, rest.y, time, frame_swash()) * reach * calm_f : 0.0f;
+    // beach is higher. Only on the LOW beach (ww_swash_band): an inland
+    // pit's column carried the run-up's height too. Where the ground behind a
+    // pixel is dug the pixel shader takes it away again.
+    const float reach = ww_swash_reach(depth_gen) * ww_swash_band(depth_gen, swash_runup);
+    const float swash = reach > 0.0f ? ww_swash(rest.x, rest.y, time, frame_swash()) * reach : 0.0f;
     float y = p.y + swash;
-    // A little past the edge too, 12 cm over the ground out to 30 cm beyond
-    // it: the edge is cut per pixel (edge_fade, in the pixel shader), which
-    // can only cut away water that was drawn.
-    // Not in dug water (a dug wall, not a beach): the bed blends from the
-    // hole's floor to the rock's over a texel, crossing zero AT the wall, and
-    // lifted there the sheet stood in front of the rock -- the ray past it
-    // still met the wall under water, so the per-pixel edge kept it -- in a
-    // row of bumps along the waterline.
-    if (depth + swash > -0.3f && dug < 0.5f) y = max(y, 0.12f - depth);
+    // A little past the edge too, 12 cm over the generated ground out to
+    // 30 cm beyond it: the edge is made per pixel (edge_fade, in the pixel
+    // shader), which can only fade away water that was drawn. Where it is wet
+    // it never sinks below the bed either: a storm trough over half a metre of
+    // water fell under the seabed and bared it.
+    if (reach > 0.0f && depth_gen + swash > -0.3f) y = max(y, 0.12f - depth_gen);
     const float3 world = float3(p.x, sea_level + y, p.z);
 
     o.world = world;
     o.clip = mul(float4(world, 1.0f), view_proj);
     o.nrm = nrm;
-    o.depth = depth + swash;   // the water actually over the bed here, for the clip and the shading
+    o.depth = depth_gen + swash;   // the water over the generated bed here, for the waves' normal
     o.dist = d;
-    o.fade = fade_w;
+    o.fade = fade;
     o.minwl = minwl;
-    const float3 loc = ww_local(frame_sea(), depth, fade_w, minwl);
-    o.hs = loc.z / max(fade_w, 1e-4f);
+    const float3 loc = ww_local(frame_sea(), depth_gen, fade, minwl);
+    o.hs = loc.z / max(fade, 1e-4f);
     o.cap_q = loc.xy;
-    o.rim = float3(calm_f, depth_gen < 0.0f ? 1.0f : 0.0f, dug);
-    // 15: the bed against the generated field -- red where the bed is deeper
-    // (0.5 m full), green where shallower, blue the generated depth's
-    // shoreline band (0 to -1 m) -- in place of the cut weights it debugs.
-    if (debug_mode > 14.5f) o.rim = float3(saturate((real - depth_gen) * 2.0f), saturate((depth_gen - real) * 2.0f),
-                                           saturate(-depth_gen));
-    // 16: what the bed's nearest texel holds -- red a floor, green a ceiling
-    // (rock), blue nothing drawn.
-    if (debug_mode > 15.5f) {
-        const float2 g = float2((rest.x - bed.x) / 0.25f, (bed.y + 128.0f - rest.y) / 0.25f);
-        const float h = g_bed.Load(int3(clamp(int2(floor(g)), 0, 511), 0));
-        o.rim = h < -1.0e3f ? float3(0, 0, 1) : (h > 1.0e3f ? float3(0, 1, 0) : float3(1, 0, 0));
-    }
+    o.gen = depth_gen;
     return o;
 }
 
@@ -497,20 +410,42 @@ float3 sky_reflection(float3 R) {
 }
 
 float4 ps_main(VSOut i) : SV_Target0 {
-    // Inland. The terrain in front of this already won the depth test almost
-    // everywhere, but the shoreline is where the two surfaces meet at a
-    // grazing angle and a vertex can land a little the wrong side of it.
-    // Only a coarse cut: depth interpolated from the grid's vertices steps
-    // with the grid. The edge itself is made per pixel, below (edge_fade).
-    // Not in dug water, nor on a triangle that crosses its wall (i.rim.z,
-    // from the sea's bed, bed_depth): water under a roof is drawn, and the
-    // rock hides it where it is covered, so its edge is the terrain's.
-    // 14: the real shading, but every cut PAINTS its pixel instead of cutting
-    // it -- red the coarse land cut, yellow a straddling triangle's -- so a
-    // straight edge in the water can be traced to the cut that made it.
-    uint cut_by = 0xffffffffu;
-#define CUT(x, id) { if ((x) < 0.0f) { if (debug_mode > 13.5f) { if (cut_by == 0xffffffffu) cut_by = (id); } else clip(-1.0f); } }
-    if (i.rim.z < 0.02f) CUT(i.depth + 0.3f, 0);
+    // Where water is, is the depth test's: the sheet lies at sea level
+    // everywhere and terrain over sea level hides it. What a pixel still needs
+    // is the GROUND behind it (the depth copy): it makes the edge, decides
+    // whether the water here is dug, and sets the contact foam.
+    const float2 px = i.clip.xy;
+    const float2 uv = px * inv_size;
+    const float3 v = normalize(cam_pos - i.world);
+    const float zb0 = g_depth_in[int2(px)];
+    float3 P = i.world;   // the point shaded
+    float dist = length(P - cam_pos);
+    float vz = max(dot(P - cam_pos, cam_fwd), near_plane);
+    float under_len = zb0 < 1.0f ? max(linear_depth(zb0) - vz, 0.0f) * dist / vz : 1e6f;
+    const float3 gp = cam_pos - v * (dist + min(under_len, 1e4f));
+    // DUG: the ground behind lies well under the GENERATED ground here (a pit,
+    // a channel, a tunnel's mouth). There the beach's swash and its 12 cm lift
+    // do not apply -- the water is calm at sea level -- so a pixel of sheet
+    // they raised is shaded where its ray meets sea level instead, and the
+    // ground behind decides whether any water shows (edge_fade).
+    const float dug = zb0 < 1.0f ? saturate((sea_level - i.gen - gp.y - 0.3f) / 0.3f) : 0.0f;
+    if (dug > 0.0f && P.y > sea_level + 1e-3f && v.y > 1e-3f) {
+        P = lerp(P, cam_pos - v * ((cam_pos.y - sea_level) / v.y), dug);
+        dist = length(P - cam_pos);
+        vz = max(dot(P - cam_pos, cam_fwd), near_plane);
+        under_len = zb0 < 1.0f ? max(linear_depth(zb0) - vz, 0.0f) * dist / vz : 1e6f;
+    }
+    // The water over the ground behind, VERTICALLY (to the swash's surface on
+    // the beach): the edge fades over its last 8 cm, and the contact foam lies
+    // in its first 10-30 cm.
+    const float gdepth = sea_level - gp.y;
+    float thick = 1e4f;
+    if (zb0 < 1.0f) {
+        thick = gdepth;
+        if (gdepth < 1.6f)
+            thick += ww_swash(gp.x, gp.z, time, frame_swash()) * ww_swash_reach(gdepth) *
+                     ww_swash_band(i.gen, swash_runup) * (1.0f - dug);
+    }
 
     // The normal is recomputed HERE rather than interpolated from the
     // vertices. A grid cell in the mid-ground is tens of metres across, so an
@@ -523,16 +458,11 @@ float4 ps_main(VSOut i) : SV_Target0 {
     const WwSea sea = frame_sea();
     float3 pn;
     float jac_g;
-    ww_surface_with(i.world.x, i.world.z, time, sea, i.depth, i.fade,
+    ww_surface_with(P.x, P.z, time, sea, i.depth, i.fade,
                     max(i.minwl * 0.5f, 0.35f), i.cap_q.x, i.cap_q.y, pn, jac_g);
     float3 gn = normalize(i.nrm);
     const float3 base = normalize(lerp(pn, gn, 0.25f));
-    const float3 v = normalize(cam_pos - i.world);
     const float3 l = normalize(sun_dir);
-    const float2 px = i.clip.xy;
-    const float2 uv = px * inv_size;
-    const float dist = length(i.world - cam_pos);
-    const float vz = max(dot(i.world - cam_pos, cam_fwd), near_plane);
 
     // --- the ripples (ocean_detail.h) --------------------------------------
     // Each tile's band is kept only while a pixel can resolve it: the 31 m
@@ -546,8 +476,8 @@ float4 ps_main(VSOut i) : SV_Target0 {
     const float fp = sqrt(lateral * lateral / max(abs(dot(v, gn)), 0.02f));
     const float f0 = detail_on * saturate(2.0f - fp / 0.15f);
     const float f1 = detail_on * saturate(2.0f - fp / 0.015f);
-    const float4 d0 = f0 > 0.0f ? g_detail.SampleLevel(g_wrap, float3(i.world.xz / od_tile[0], 0.0f), 0) : float4(0, 0, 0, 0);
-    const float4 d1 = f1 > 0.0f ? g_detail.SampleLevel(g_wrap, float3(i.world.xz / od_tile[1], 1.0f), 0) : float4(0, 0, 0, 0);
+    const float4 d0 = f0 > 0.0f ? g_detail.SampleLevel(g_wrap, float3(P.xz / od_tile[0], 0.0f), 0) : float4(0, 0, 0, 0);
+    const float4 d1 = f1 > 0.0f ? g_detail.SampleLevel(g_wrap, float3(P.xz / od_tile[1], 1.0f), 0) : float4(0, 0, 0, 0);
     // --- the wind on the water --------------------------------------------
     // Ripples answer the wind in seconds, so the gust field the grass and
     // trees bend in (wind.hlsli: carried by the air, at p - drift) also
@@ -560,7 +490,7 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // tile's longer ripples, which take longer to grow, by 60%. The trains --
     // waves metres long, built over minutes -- do not answer gusts.
     const float u_mean = max(wind_v.z, 0.1f);
-    const float u_here = wind_v.z * wind_gust(i.world.xz, wind_v, wind_drift, time);
+    const float u_here = wind_v.z * wind_gust(P.xz, wind_v, wind_drift, time);
     const float e_mean = od_cox_munk(u_mean) * smoothstep(1.2f, 3.8f, u_mean);
     const float e_here = od_cox_munk(u_here) * smoothstep(1.2f, 3.8f, u_here);
     const float gs = clamp(sqrt(e_here / max(e_mean, 1e-5f)), 0.0f, 2.0f);
@@ -578,7 +508,7 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // Under the clouds' shadow (ADR-005 C2) the sun leaves the sea's body and
     // its glint, as it leaves the land in the composite: under a storm deck
     // the sea went on sparkling.
-    const float cls = clouds_on > 0.5f ? cloud_shadow_at(g_cloud_shadow, g_linear, cloud_shadow, l, i.world) : 1.0f;
+    const float cls = clouds_on > 0.5f ? cloud_shadow_at(g_cloud_shadow, g_linear, cloud_shadow, l, P) : 1.0f;
     const float diffuse = 0.25f + 0.75f * saturate(dot(n, l));
     const float3 light_in = (kSunLux * (max(kSunDir.y, 0.0f) * diffuse * cls) + kPi * kSkyMean) / kPi;
     // What deep water sends back: the light scattered up out of the body.
@@ -591,55 +521,27 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // the more water there is to bend through, and a shift that lands on
     // something IN FRONT of the water (a rock standing out of it) is refused:
     // that is the classic leak of the foreground into the water.
-    float zb = g_depth_in[int2(px)];
-    float under_len = zb < 1.0f ? max(linear_depth(zb) - vz, 0.0f) * dist / vz : 1e6f;
-    // The water's edge, per pixel, from the GROUND behind this pixel (the
-    // depth copy) and the swash evaluated right there (water_wave.h): water is
-    // present where that ground lies under sea level plus the swash, and fades
-    // into the scene over its last 8 cm of depth. Both are smooth per pixel,
-    // so the edge follows a true contour of the beach.
-    //
-    // Two attempts drew a staircase. On the beach the sheet sits a few
-    // centimetres over the ground, nearly coplanar with it, and where two such
-    // surfaces cross follows the triangles of both meshes; the vertex-
-    // interpolated clip stepped with the grid too. Fading by the thickness
-    // between the SHEET and the ground only softened the steps: near the shore
-    // the sheet's height is itself interpolated across grid cells, clamped to
-    // the ground at its vertices, so the fade inherited the grid's shape.
+    float zb = zb0;
+    const float under0 = under_len;   // before the refraction's shift, for the foam
+    // The water's edge, per pixel, from the GROUND behind this pixel and the
+    // swash evaluated right there: water is present where that ground lies
+    // under sea level plus the swash, and fades into the scene over its last
+    // 8 cm of depth (thick). Both are smooth per pixel, so the edge follows a
+    // true contour of the beach. (Two attempts by the sheet's own geometry drew
+    // a staircase: on the beach the sheet sits a few centimetres over the
+    // ground, nearly coplanar with it, and its height is interpolated across
+    // grid cells.)
     float edge_fade = 1.0f;
-    {
-        const float3 gp = cam_pos - v * (dist + min(under_len, 1e4f));
-        const float gdepth = sea_level - gp.y;
-        // The grid's triangles that straddle a dug wall on a LOW beach run
-        // from the dug water's calm to the open surf: their outer end has
-        // waves and foam, and drawn they were a row of white teeth up a
-        // channel's walls, so they are not drawn and the rock shows. The cost:
-        // the surf's edge at a dug wall follows the water grid, steps of a few
-        // centimetres. On high ground the calm reaches into the rock
-        // (bed_dug_near, the vertex shader) and the triangle is calm end to
-        // end: kept, the wall makes the edge.
-        if (i.rim.y > 0.5f && i.rim.z > 0.02f && i.rim.z < 0.98f && i.rim.x > 0.02f) CUT(-1.0f, 3);
-        if (zb < 1.0f && gdepth < 1.6f) {
-            // The run-up is the surf's, so dug water's calm takes it as the
-            // vertex shader's does: unscaled, the sheet lifted over a dug
-            // wall's foot stood in a sawtooth a few centimetres up the wall.
-            const float sw = ww_swash(gp.x, gp.z, time, frame_swash()) * ww_swash_reach(gdepth) *
-                             saturate(i.rim.x);
-            edge_fade = saturate((gdepth + sw) / 0.08f);
-        }
+    if (zb0 < 1.0f) {
+        edge_fade = saturate(thick / 0.08f);
         // In dug water the edge is a dug WALL, steep, and the water meets it
         // along the mesh's half-metre facets -- the real waterline, toothed
-        // where a wall stands near vertical at sea level -- and wherever the
-        // grid's triangles and the straddle cut (below) leave it. There the
-        // last 1.2 m of the view ray under water fades out, so the wall shows
-        // through its own first few centimetres of water and the teeth and
-        // steps dissolve into it (0.4 m left them showing on a dug pit's far
-        // wall). Only in dug water (i.rim.z, from the bed): from above, a
-        // natural beach would clear over its shallows. Weighted by the
-        // calm instead, it was half strength on the vertices just
-        // inside a wall.
-        if (zb < 1.0f)
-            edge_fade = min(edge_fade, lerp(1.0f, smoothstep(0.0f, 1.2f, under_len), saturate(i.rim.z)));
+        // where a wall stands near vertical at sea level. There the last 1.2 m
+        // of the view ray under water fades out, so the wall shows through its
+        // own first few centimetres of water and the teeth dissolve into it.
+        // Only in dug water: from above, a natural beach would clear over its
+        // shallows.
+        edge_fade = min(edge_fade, lerp(1.0f, smoothstep(0.0f, 1.2f, under_len), dug));
     }
     const float2 tilt = float2(dot(n, cam_right), -dot(n, cam_up));
     float2 ruv = uv + tilt * (refraction * saturate(under_len / 3.0f));
@@ -706,7 +608,7 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // swimmer's trough reflected the beach like polished glass.
     const float calm = saturate(1.2f - 1.2f * u_here / 20.0f);   // the local wind: a reflection survives in a lull
     float4 hit = (below || fres < 0.06f || open < 0.01f || calm <= 0.0f) ? float4(0, 0, 0, 0)
-                                                                         : ssr(i.world + gn * 0.05f, rr, px);
+                                                                         : ssr(P + gn * 0.05f, rr, px);
     hit.a *= calm;
     // The sky as it is seen through the mist, which the composite has already
     // worked out for every pixel of sky on screen: where the reflected
@@ -737,24 +639,29 @@ float4 ps_main(VSOut i) : SV_Target0 {
                    saturate(dot(n, l))) * f_schlick(float3(0.02f, 0.02f, 0.02f), saturate(dot(v, h))) *
         ((1.0f - hit.a) * cls);
 
-    // Foam where the water is shallow enough to break, and on the crests once
-    // the sea is rough. Both are gated on `fade` so the far field does not
-    // sprout foam from a normal that is not being displaced any more.
-    // At the shore: a drifting lace that thickens towards the waterline,
-    // whole at the edge and in patches by two metres. It was a smooth function
-    // of depth, which with the shallows now clear read as a white smear.
-    // The last 0.6 m of water, not 2.2: with the swash a sheet runs up the
-    // beach over a few tens of centimetres, and a band keyed to 2.2 m turned
-    // the whole sheet white. Foam at its leading edge, clear water behind.
-    const float shallow = saturate(1.0f - i.depth / 0.6f);
-    const float lace = 0.6f * wnoise(i.world.xz * 0.45f + float2(time * 0.13f, time * 0.07f)) +
-                       0.4f * wnoise(i.world.xz * 1.7f - float2(time * 0.21f, -time * 0.11f));
-    // Surf needs breaking waves: where dug water calms it (a channel, a
-    // flooded hole) shore foam goes faster than the waves (calm squared,
-    // i.fade carries one), so a channel's mouth has some and its calm inner
-    // reach none -- at the waves' own rate its walls wore a band of white
-    // fifteen metres in.
-    const float shore_foam = smoothstep(1.0f - shallow, 1.25f - shallow, lace) * shallow * i.fade * i.rim.x;
+    // Contact foam, one rule for every shore: where the water over the ground
+    // behind the pixel is THIN, VERTICALLY (thick: 10-30 cm), broken up by a
+    // drifting lace -- at a beach's edge, round a rock or a trunk standing in
+    // the water, at the foot of a dug wall. Faint scum on calm water, surf
+    // where the natural sea reaches (sea_w: the generated column is sea or
+    // its beach, and not dug) as the weather roughens. Faded where the ray
+    // under water is long, which is an occluder (an overhang's underside)
+    // rather than a shallow. It replaced a shore foam keyed to the vertices'
+    // generated depth, which could not see a dug edge.
+    const float lace = 0.6f * wnoise(P.xz * 0.45f + float2(time * 0.13f, time * 0.07f)) +
+                       0.4f * wnoise(P.xz * 1.7f - float2(time * 0.21f, -time * 0.11f));
+    // At most 0.7 of the lace's threshold, so even the thinnest water keeps
+    // holes in it: whole, the swash's thin sheet on a gentle beach drew a
+    // solid white ribbon metres wide at a grazing view.
+    // Where the natural sea reaches, the band widens with the weather too, to
+    // ~0.8 m of water in a gale: surf breaks over a wider strip than calm
+    // water's scum.
+    const float sea_w = saturate(i.gen + 1.0f) * (1.0f - dug);
+    const float rough_w = sea_w * saturate(2.0f * sea_state);
+    const float contact = 0.7f * (1.0f - smoothstep(0.1f, 0.3f + 0.5f * rough_w, thick)) *
+                          (1.0f - smoothstep(2.0f, 6.0f, under0));
+    const float surf = lerp(0.15f, 1.0f, sea_w * saturate(0.35f + 2.0f * sea_state));
+    const float shore_foam = smoothstep(1.0f - contact, 1.25f - contact, lace) * contact * surf * i.fade;
     // Whitecaps where the surface FOLDS: the Jacobian of the trains' throw
     // (ww_surface_with) and the ripples' (ocean_fft.hlsl) together, 1 on
     // still water and 0 where a crest comes to a point and breaks. The wind
@@ -778,22 +685,21 @@ float4 ps_main(VSOut i) : SV_Target0 {
     const float jt = 0.527f + 0.0279f * U - 0.000623f * U * U;
     const float breaking = saturate((jt - jac) / 0.06f) * saturate((U - 3.0f) / 3.0f) * i.fade;
     const float trail = d0.w * f0 * saturate((U - 10.0f) / 10.0f);
-    const float crest_foam = saturate(breaking * (0.55f + 0.9f * d0.w) + 0.25f * trail);
+    // The deep sea's layer only: weighted by the generated depth's first metre
+    // and never in dug water. The ripples' folding and the wind's streaks are
+    // in the base layer everywhere, and unweighted they laid gale whitecaps on
+    // a pit dug into a beach.
+    const float crest_foam = saturate(breaking * (0.55f + 0.9f * d0.w) + 0.25f * trail) * saturate(i.gen) * (1.0f - dug);
     const float foam = saturate(max(shore_foam, crest_foam));
 
     // 7: the folding measure, white at 1 (still), black at 0 (folding).
-    // 9: red the open sea's share of the waves (0 dug water's calm), green
-    // dug water, blue the land side.
-    // 10: the shore foam's inputs -- red the calm, green the depth (0-1 m), blue the fade.
-    // 13: the edge's fade, the view ray's length under water over 2 m, dug water.
-    if (debug_mode > 14.5f) return float4(i.rim, 0.0f);
-    if (debug_mode > 13.5f && cut_by != 0xffffffffu) {
-        const float3 cc[4] = {float3(1, 0, 0), float3(0, 1, 0), float3(0, 0, 1), float3(1, 1, 0)};
-        return float4(cc[min(cut_by, 3u)], 0.0f);
-    }
-    if (debug_mode > 12.5f && debug_mode < 13.5f) return float4(edge_fade, saturate(under_len / 2.0f), saturate(i.rim.z), 0.0f);
-    if (debug_mode > 9.5f && debug_mode < 10.5f) return float4(saturate(i.rim.x), saturate(i.depth), saturate(i.fade), 0.0f);
-    if (debug_mode > 8.5f && debug_mode < 9.5f) return float4(saturate(i.rim.x), saturate(i.rim.z), i.rim.y, 0.0f);
+    // 9: red dug, green the natural sea's reach (sea_w), blue the land side.
+    // 10: the contact foam's inputs -- red the water's vertical thickness
+    // (0-0.3 m), green the foam, blue the ray under water (0-6 m).
+    // 13: the edge's fade, the view ray's length under water over 2 m, dug.
+    if (debug_mode > 12.5f && debug_mode < 13.5f) return float4(edge_fade, saturate(under_len / 2.0f), dug, 0.0f);
+    if (debug_mode > 9.5f && debug_mode < 10.5f) return float4(saturate(thick / 0.3f), shore_foam, saturate(under0 / 6.0f), 0.0f);
+    if (debug_mode > 8.5f && debug_mode < 9.5f) return float4(dug, sea_w, i.gen < 0.0f ? 1.0f : 0.0f, 0.0f);
     if (debug_mode > 7.5f && debug_mode < 13.5f) return float4(saturate(gs * 0.5f).xxx, 0.0f);   // 8: the gusts' ripple strength, grey = mean
     if (debug_mode > 6.5f && debug_mode < 13.5f) return float4(saturate(jac).xxx, 0.0f);
     const float4 dbg = debug_view(i, n, foam, hit.a);
@@ -819,10 +725,10 @@ float4 ps_main(VSOut i) : SV_Target0 {
         // water's own glow along that ray (cs_underwater's closed form). A
         // flat deep colour here drew a navy ceiling over bright sand.
         const float3 r = reflect(-v, n);
-        const float bed_d = max(i.depth, 0.0f);
+        const float bed_d = max(i.depth, cam_water - cam_pos.y);   // a pit's generated depth is none
         const float lr = bed_d / max(-r.y, 0.15f);
         const float rup = 1.0f - r.y;
-        const float4 bh = ssr(i.world + gn * 0.05f, r, px);
+        const float4 bh = ssr(P + gn * 0.05f, r, px);
         const float3 glow_r = s0 * (1.0f - exp(-ext * rup * lr)) / rup;
         // Where SSR finds nothing (the reflected ray leaves the screen, as it
         // does looking steeply up), the seabed's own authored colour, lit as

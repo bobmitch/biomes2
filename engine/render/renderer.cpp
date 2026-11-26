@@ -91,9 +91,8 @@ struct WaterConstants {
     float wind_drift[2];  float swash_runup; float clouds_on;
     float cloud_shadow[4]; // ADR-005 C2
     float hfog[3][4];      // the exploration fog (haze.hlsli)
-    float bed[4];          // the sea's bed map: corner x, z (metres), on, unused
 };
-static_assert(sizeof(WaterConstants) == 688, "WaterConstants must match water.hlsl");
+static_assert(sizeof(WaterConstants) == 672, "WaterConstants must match water.hlsl");
 
 // Heap slots past the RT denoiser's: the sea's copies of the lit scene and of
 // depth, which it reads while it draws into the one and tests against the
@@ -105,8 +104,7 @@ static_assert(sizeof(WaterConstants) == 688, "WaterConstants must match water.hl
 // range every lit table has declared since DDGI.
 const UINT kWaterSceneSrv = 79, kWaterDepthSrv = 80, kPuddleSrv = Clouds::kHeapEnd,
            kFogOpenUav = NearField::kHeapEnd, kFogOpenAvgUav = kFogOpenUav + 1, kFogOpenAvgSrv = kFogOpenUav + 2,
-           kWaterBedSrv = kFogOpenUav + 3,   // the sea's bed (record_water_bed), t8 in the sea's table
-           kHeapSlots = kFogOpenUav + 4;
+           kHeapSlots = kFogOpenUav + 3;
 static_assert(NearField::kFirst == CharacterRenderer::kSrvB + 1, "the near field follows the character's textures");
 static_assert(CharacterRenderer::kSrvA == kPuddleSrv + 1, "the character's textures follow the puddle mask");
 
@@ -621,12 +619,10 @@ bool Renderer::create_water_pipeline(std::string& error) {
         // Since the sea draws after the composite: t0 the lit scene's copy,
         // t1 depth's copy, t2 the sky-view table, t3 the aerial perspective,
         // t4 the mist -- one table from heap [3], the post chain's base.
-        // t7 the sea's bed (record_water_bed), read by the VERTEX shader, so
-        // the table is visible to every stage.
-        D3D12_DESCRIPTOR_RANGE wr[8] = {};
-        const UINT w_heap[8] = {kWaterSceneSrv, kWaterDepthSrv, 10, 11, 32, OceanDetail::kSrvSlot, Clouds::kShadowSrv,
-                                kWaterBedSrv};
-        for (UINT k = 0; k < 8; ++k) {
+        // The table is visible to every stage.
+        D3D12_DESCRIPTOR_RANGE wr[7] = {};
+        const UINT w_heap[7] = {kWaterSceneSrv, kWaterDepthSrv, 10, 11, 32, OceanDetail::kSrvSlot, Clouds::kShadowSrv};
+        for (UINT k = 0; k < 7; ++k) {
             wr[k].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
             wr[k].NumDescriptors = 1;
             wr[k].BaseShaderRegister = k;
@@ -634,7 +630,7 @@ bool Renderer::create_water_pipeline(std::string& error) {
         }
         params[12].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[12].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[12].DescriptorTable.NumDescriptorRanges = 8;
+        params[12].DescriptorTable.NumDescriptorRanges = 7;
         params[12].DescriptorTable.pDescriptorRanges = wr;
         D3D12_STATIC_SAMPLER_DESC ss[4] = {};
         ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -1069,19 +1065,6 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
     hr = device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&top));
     if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (terrain top-down)", hr); return false; }
 
-    // The sea's bed (record_water_bed): the same vertex shader from above,
-    // the first surface's height into one R32F target, depth kept. No
-    // culling: the top-down matrix mirrors one axis, and a ceiling seen from
-    // inside the rock must be drawn to be recognised.
-    ComPtr<ID3DBlob> ps_bed;
-    if (!compile_shader(kMeshShaderPath, "ps_bed", "ps_5_1", ps_bed, error)) return false;
-    pd.PS.pShaderBytecode = ps_bed->GetBufferPointer();
-    pd.PS.BytecodeLength = ps_bed->GetBufferSize();
-    pd.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
-    ComPtr<ID3D12PipelineState> bed;
-    hr = device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&bed));
-    if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (sea bed)", hr); return false; }
-
     if (ready_) wait_for_gpu();
     mesh_pso_ = pso;
     mesh_eq_pso_ = eq;
@@ -1089,7 +1072,6 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
     mesh_wire_pso_ = wire;
     mesh_shadow_pso_ = shadow;
     mesh_top_pso_ = top;
-    mesh_bed_pso_ = bed;
     return true;
 }
 
@@ -1547,147 +1529,6 @@ void Renderer::record_hfgi(const float vp[16]) {
     hfgi_.record(cmd_.Get(), UINT(frame_), shadow_cb_[frame_]->GetGPUVirtualAddress());
 }
 
-// ---------------------------------------------------------------------------
-// The sea's bed: what the water really stands on, edits included.
-//
-// Water is a half-space at sea level, so where it stands is wherever this
-// bed lies under sea level (Crest's sea-floor depth cache): the resident
-// terrain drawn from above, its top just over sea level, so the first surface
-// under each texel is the bed the water lies on, digs and all -- not a roof
-// over it, which is above the top and never drawn. A ceiling seen first means
-// the sea-level point is in rock (ps_bed's marker); nothing drawn, the
-// generated field stands (water.hlsl bed_depth).
-// ---------------------------------------------------------------------------
-
-bool Renderer::create_water_bed(std::string& error) {
-    D3D12_HEAP_PROPERTIES hp = {};
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC rd = {};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = UINT64(kBedSize);
-    rd.Height = UINT(kBedSize);
-    rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1;
-    rd.SampleDesc.Count = 1;
-    rd.Format = DXGI_FORMAT_R32_FLOAT;
-    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    D3D12_CLEAR_VALUE cv = {};
-    cv.Format = DXGI_FORMAT_R32_FLOAT;
-    cv.Color[0] = -1.0e4f;   // nothing drawn: the generated field stands
-    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    HRESULT hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, read, &cv, IID_PPV_ARGS(&bed_tex_));
-    if (FAILED(hr)) { error = hr_text("CreateCommittedResource (sea bed)", hr); return false; }
-    rd.Format = DXGI_FORMAT_D32_FLOAT;
-    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-    D3D12_CLEAR_VALUE dv = {};
-    dv.Format = DXGI_FORMAT_D32_FLOAT;
-    dv.DepthStencil.Depth = 1.0f;
-    hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &dv,
-                                          IID_PPV_ARGS(&bed_depth_));
-    if (FAILED(hr)) { error = hr_text("CreateCommittedResource (sea bed depth)", hr); return false; }
-
-    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
-    hd.NumDescriptors = 1;
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&bed_rtv_heap_));
-    if (FAILED(hr)) { error = hr_text("CreateDescriptorHeap (sea bed rtv)", hr); return false; }
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&bed_dsv_heap_));
-    if (FAILED(hr)) { error = hr_text("CreateDescriptorHeap (sea bed dsv)", hr); return false; }
-    device_->CreateRenderTargetView(bed_tex_.Get(), nullptr, bed_rtv_heap_->GetCPUDescriptorHandleForHeapStart());
-    device_->CreateDepthStencilView(bed_depth_.Get(), nullptr, bed_dsv_heap_->GetCPUDescriptorHandleForHeapStart());
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
-    sd.Format = DXGI_FORMAT_R32_FLOAT;
-    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    sd.Texture2D.MipLevels = 1;
-    D3D12_CPU_DESCRIPTOR_HANDLE h = srv_heap_->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += SIZE_T(kWaterBedSrv) * device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    device_->CreateShaderResourceView(bed_tex_.Get(), &sd, h);
-    return true;
-}
-
-void Renderer::record_water_bed(const float cam[3]) {
-    // When: the camera 4 m from the last centre (the map reaches 64 m, the
-    // sea's mask as far), every frame for a second after an edit (its chunks
-    // are remeshed over the next few frames), and twice a second anyway for
-    // the chunks streaming in.
-    if (edits_.generation() != bed_gen_) {
-        bed_gen_ = edits_.generation();
-        bed_hot_ = 60;
-    }
-    const float dx = cam[0] - bed_centre_[0], dz = cam[2] - bed_centre_[1];
-    const bool due = !bed_built_ || bed_hot_ > 0 || dx * dx + dz * dz > 16.0f || post_frame_ - bed_frame_ >= 30;
-    if (bed_hot_ > 0) --bed_hot_;
-    if (!due) return;
-    bed_centre_[0] = cam[0];
-    bed_centre_[1] = cam[2];
-    bed_frame_ = post_frame_;
-    const float extent = float(kBedSize) * kBedTexel;
-    // Whole 2 m steps, so a texel always covers the same ground.
-    bed_origin_[0] = std::floor((cam[0] - 0.5f * extent) / 2.0f) * 2.0f;
-    bed_origin_[1] = std::floor((cam[2] - 0.5f * extent) / 2.0f) * 2.0f;
-    // From 2 cm over sea level down 80 m: the bed under the water, never a
-    // roof over it (above the top, so never drawn). Row-vector, as HeightGi.
-    const float sea = world_.params().sea_level;
-    const float y_top = sea + 0.02f, y_range = 80.0f;
-    float vp[16] = {};
-    vp[0 * 4 + 0] = 2.0f / extent;
-    vp[2 * 4 + 1] = 2.0f / extent;
-    vp[1 * 4 + 2] = -1.0f / y_range;
-    vp[3 * 4 + 0] = -2.0f * bed_origin_[0] / extent - 1.0f;
-    vp[3 * 4 + 1] = -2.0f * bed_origin_[1] / extent - 1.0f;
-    vp[3 * 4 + 2] = y_top / y_range;
-    vp[3 * 4 + 3] = 1.0f;
-
-    auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
-        D3D12_RESOURCE_BARRIER rb = {};
-        rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        rb.Transition.pResource = r;
-        rb.Transition.StateBefore = a;
-        rb.Transition.StateAfter = b;
-        rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        cmd_->ResourceBarrier(1, &rb);
-    };
-    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    tr(bed_tex_.Get(), read, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = bed_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
-    const D3D12_CPU_DESCRIPTOR_HANDLE dsv = bed_dsv_heap_->GetCPUDescriptorHandleForHeapStart();
-    const float clear[4] = {-1.0e4f, 0.0f, 0.0f, 0.0f};
-    cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-    cmd_->ClearRenderTargetView(rtv, clear, 0, nullptr);
-    cmd_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-    D3D12_VIEWPORT vpt = {};
-    vpt.Width = vpt.Height = float(kBedSize);
-    vpt.MaxDepth = 1.0f;
-    const D3D12_RECT sr = {0, 0, LONG(kBedSize), LONG(kBedSize)};
-    cmd_->RSSetViewports(1, &vpt);
-    cmd_->RSSetScissorRects(1, &sr);
-    cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    MeshConstants mc = {};
-    std::memcpy(mc.view_proj, vp, sizeof mc.view_proj);
-    mc.slot_vertices = static_cast<float>(kSlotVertices);
-    bind_shader_heaps(cmd_.Get());
-    cmd_->SetPipelineState(mesh_bed_pso_.Get());
-    cmd_->SetGraphicsRootSignature(mesh_root_.Get());
-    cmd_->SetGraphicsRootDescriptorTable(7, scan_sampler());
-    cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
-    cmd_->SetGraphicsRootShaderResourceView(1, mesher_.vertices()->GetGPUVirtualAddress());
-    cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
-    cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress());
-    cmd_->SetGraphicsRootShaderResourceView(6, mesher_.vertex_weights()->GetGPUVirtualAddress());
-    cmd_->SetGraphicsRootConstantBufferView(3, shadow_cb_[frame_]->GetGPUVirtualAddress());
-    cmd_->SetGraphicsRootDescriptorTable(4, srv_heap_->GetGPUDescriptorHandleForHeapStart());
-    D3D12_INDEX_BUFFER_VIEW ibv = {};
-    ibv.BufferLocation = mesher_.indices()->GetGPUVirtualAddress();
-    ibv.SizeInBytes = kSlots * kSlotIndices * 4;
-    ibv.Format = DXGI_FORMAT_R32_UINT;
-    cmd_->IASetIndexBuffer(&ibv);
-    cmd_->ExecuteIndirect(cmd_sig_.Get(), kSlots, mesher_.draw_args(), 0, nullptr, 0);
-    tr(bed_tex_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
-    bed_built_ = true;
-}
 
 // ---------------------------------------------------------------------------
 // Volumetric mist (ADR-004 L4): fog.h for where the mist is, fog.hlsl for the
@@ -3165,7 +3006,6 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         if (!near_.init(device_.Get(), srv_heap_.Get(), Clouds::kShadowSrv, error)) return false;
         if (!near_.load_config("worldgen/data/archetypes.json", error)) return false;
         near_.set_world(&world_, &edits_);   // the sky-access flood reads its field and the edits (sky_access.h)
-        if (!create_water_bed(error)) return false;                       // the sea's bed (record_water_bed)
         // The key light's shadow past the cascades.
         if (!far_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         canopy_.set_models(trees_.models(), trees_.looks());
@@ -4034,8 +3874,11 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     const bool rain = !cam_under_ && rain_.ready() && (rain_intensity() > 0.001f || drips() > 0.001f);
     const bool bolt = !cam_under_ && lightning_.ready() && strike_.active && strike_.ground &&
                       strike_.channel > 0.001f && !wire;
-    if (water_pending_) record_water();
-    else if (rain || bolt) tr(scene_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (water_pending_) {
+        prof_.mark(cmd_.Get(), "composite");
+        record_water();
+        prof_.mark(cmd_.Get(), "sea");
+    } else if (rain || bolt) tr(scene_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET);
     if (rain) record_rain();
     if (bolt) record_lightning();
     if (water_pending_ || rain || bolt) {
@@ -4267,8 +4110,6 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         if (hfgi_.begin(view.cam_pos, sky_frame_.hours, post_frame_, vp)) record_hfgi(vp);
     }
     prof_.mark(cmd_.Get(), "far shadow + heightfield GI");
-    if (bed_on_ && water_ && mode_ != Mode::Wireframe) record_water_bed(view.cam_pos);
-    prof_.mark(cmd_.Get(), "sea bed");
     // The near field plans here: its readiness goes into the shadow constants.
     // A still (exposure_snap_) settles it whole.
     const bool near_live = near_on_ && hfgi_on_ && hfgi_.ready() && mode_ != Mode::Wireframe;
@@ -4538,8 +4379,8 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         // the shader's idea of "is the eye above the water here" and the
         // swimmer's are one answer rather than two that usually agree. Water
         // is a half-space: the eye is under it wherever it is below the
-        // surface -- the open sea's waves over a generated sea column, still
-        // sea level in dug water (a pit, a tunnel, a cave) and on land.
+        // surface -- sea level plus the deep sea's waves by the generated
+        // depth, so still in a pit, a tunnel or a cave inland.
         {
             const float cx = view.cam_pos[0], cy = view.cam_pos[1], cz = view.cam_pos[2];
             const float ground = world_.height(cx, cz);
@@ -4547,9 +4388,6 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
             cam_under_ = cy < wc.cam_water;
             if (cam_under_) cam_under_depth_ = wc.cam_water - cy;
         }
-        wc.bed[0] = bed_origin_[0];
-        wc.bed[1] = bed_origin_[1];
-        wc.bed[2] = bed_on_ && bed_built_ ? 1.0f : 0.0f;
         // What the post chain knows, for the haze and the sky (haze.hlsli).
         wc.inv_size[0] = 1.0f / float(width_ ? width_ : 1);
         wc.inv_size[1] = 1.0f / float(height_ ? height_ : 1);

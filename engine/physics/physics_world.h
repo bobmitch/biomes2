@@ -131,10 +131,9 @@ public:
     // The sea. Set every frame, because time and sea state move.
     void set_sea(const SeaParams& s) { sea_ = s; }
     // The GENERATED terrain's column height. Water is a half-space -- every
-    // bit of air under sea level is water -- and this decides only what kind:
-    // the open sea's waves and swash over a generated sea column, still water
-    // in DUG ground (a point well under the generated ground: a pit, a
-    // tunnel, a cave), as water.hlsl draws them (water_wave.h ww_sea_at).
+    // bit of air under sea level is water -- and this only weights its waves:
+    // the deep sea's trains by the generated depth, and the beach's swash
+    // (water_wave.h ww_sea_at), as water.hlsl draws them.
     void set_column_height(std::function<float(float, float)> fn) {
         column_height_ = fn;
     }

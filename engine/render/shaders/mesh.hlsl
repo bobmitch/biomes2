@@ -432,18 +432,6 @@ float4 ps_top(VSOut i) : SV_Target0 {
     return float4(albedo, 1.0f);
 }
 
-// The sea's bed (renderer.cpp record_water_bed): the terrain from just over
-// sea level down, the first surface under each texel. A floor gives its
-// height. A CEILING seen first means the camera's column is inside rock at
-// sea level -- a tunnel's roof under the land, a dome -- and is marked 1e4,
-// rock: no water stands there. Skirts are not the surface: a curtain hangs a
-// metre into the rock under every chunk border, and from under a beach just
-// over the top it read as a bed below sea level.
-float ps_bed(VSOut i) : SV_Target0 {
-    if (i.skirt > 0.001f) discard;
-    return i.nrm.y < 0.0f ? 1.0e4f : i.world.y;
-}
-
 // A chunk cross-fading between LOD levels: the 4x4 dither it is drawn
 // through, complementary for the one coming in and the one going out.
 void lod_fade_clip(VSOut i) {

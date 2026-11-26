@@ -190,7 +190,6 @@ public:
     const WwSwash& swash() const { return swash_; }
     void  update_weather(double t);
     void  set_water(bool on) { water_ = on; }
-    void  set_water_bed(bool on) { bed_on_ = on; }   // --no-sea-bed: the sea's depth from the generated field
     // Screen-space reflections on the sea (F7, --no-ssr).
     void  set_ssr(bool on) { ssr_on_ = on; }
     bool  ssr() const { return ssr_on_; }
@@ -807,22 +806,6 @@ private:
     bool pom_on_ = true;
     float scan_aniso_ = 4.0f;
     ComPtr<ID3D12PipelineState> mesh_top_pso_;
-    // The sea's bed (record_water_bed): the resident terrain from just over
-    // sea level down, its first surface's height a texel, round the camera.
-    ComPtr<ID3D12PipelineState> mesh_bed_pso_;
-    ComPtr<ID3D12Resource> bed_tex_, bed_depth_;
-    ComPtr<ID3D12DescriptorHeap> bed_rtv_heap_, bed_dsv_heap_;
-    static const int kBedSize = 512;              // texels a side
-    static constexpr float kBedTexel = 0.25f;     // metres
-    float bed_origin_[2] = {0.0f, 0.0f};          // the map's (-x, -z) corner, metres
-    float bed_centre_[2] = {1e30f, 1e30f};        // where the camera stood at the last rebuild
-    bool bed_built_ = false;
-    bool bed_on_ = true;                          // --no-sea-bed: the generated field, as before
-    uint64_t bed_gen_ = ~0ull;                    // the edit generation last seen
-    int bed_hot_ = 0;                             // frames left to rebuild every frame after an edit
-    unsigned long long bed_frame_ = 0;            // post_frame_ at the last rebuild
-    bool create_water_bed(std::string& error);
-    void record_water_bed(const float cam[3]);
     void record_hfgi(const float vp[16]);
     static bool gi_dbg_hf_off() { return false; }
     bool ssgi_on_ = false, ssgi_valid_ = false;

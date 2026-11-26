@@ -1797,7 +1797,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     if (swell_hs >= 0.0f) g_renderer.weather().set_swell(swell_hs);
     g_renderer.set_water_debug(water_debug);
     if (no_water) g_renderer.set_water(false);
-    if (std::string(cmdline ? cmdline : "").find("--no-sea-bed") != std::string::npos) g_renderer.set_water_bed(false);
     if (cmdline && std::string(cmdline).find("--no-ssr") != std::string::npos) g_renderer.set_ssr(false);
     if (cmdline && std::string(cmdline).find("--no-wave-detail") != std::string::npos) g_renderer.set_wave_detail(false);
     if (cmdline && std::string(cmdline).find("--no-clouds") != std::string::npos) g_renderer.set_clouds(false);
@@ -5289,6 +5288,29 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_renderer.capture(cv, "build/dig_water.bmp", e3);
             std::fprintf(f, "still: build/dig_water.bmp -- --cam %.2f %.2f %.2f %.4f %.2f\n", c.x, c.y, c.z, c.yaw,
                          c.pitch);
+        }
+        // Along the channel from the sea, 3 m up; and an untouched stretch of
+        // the same beach at a grazing angle, where a flat sheet at sea level
+        // meets ground at sea level (z-fighting would show here).
+        {
+            float c0[2], aim[2];
+            pt(8.0f, 0.0f, c0);
+            c.x = c0[0]; c.z = c0[1]; c.y = sea + 3.0f;
+            c.yaw = std::atan2(-dx, -dz);
+            c.pitch = -0.35f;
+            fill_view(c, g_res_w, g_res_h, t, cv);
+            g_renderer.capture(cv, "build/dig_water_channel.bmp", e3);
+            std::fprintf(f, "still: build/dig_water_channel.bmp -- --cam %.2f %.2f %.2f %.4f %.2f\n", c.x, c.y, c.z,
+                         c.yaw, c.pitch);
+            pt(2.0f, 22.0f, c0);
+            pt(0.0f, 60.0f, aim);
+            c.x = c0[0]; c.z = c0[1]; c.y = sea + 1.6f;
+            c.yaw = std::atan2(aim[0] - c.x, aim[1] - c.z);
+            c.pitch = -0.12f;
+            fill_view(c, g_res_w, g_res_h, t, cv);
+            g_renderer.capture(cv, "build/dig_water_beach.bmp", e3);
+            std::fprintf(f, "still: build/dig_water_beach.bmp -- --cam %.2f %.2f %.2f %.4f %.2f\n", c.x, c.y, c.z,
+                         c.yaw, c.pitch);
         }
         if (const char* pk = std::getenv("BIOMES_PIT_PICK")) {
             float fwd[3], right[3], up[3];

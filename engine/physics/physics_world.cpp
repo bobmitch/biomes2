@@ -461,9 +461,10 @@ void PhysicsWorld::update(float dt, float vx, float vz, bool jump, float swim) {
         submerged_ = 0.0f;
         if (sea_.on && column_height_) {
             // One rule everywhere (water_wave.h ww_sea_at): the water's
-            // surface over the feet is the open sea's, waves and swash, over a
-            // generated sea column, and still sea level anywhere else -- dug
-            // ground, a cave, or land, where it is under the feet.
+            // surface over the feet is sea level plus the deep sea's waves
+            // weighted by the generated column's depth (none on land, so an
+            // inland pit or a cave is still), plus the swash on the low beach
+            // unless the feet are well under the generated ground (dug).
             const float ground = column_height_(fx, fz);
             const float depth = sea_.level - ground;
             water_y_ = sea_.level + ww_sea_at(fx, fz, sea_.time, sea_.sea, sea_.swash, depth, ground - fy);
