@@ -171,6 +171,8 @@ public:
     unsigned long long forced_retires() const { return forced_retires_; }
     // Frames in which a chunk was queued and no slot was free for it.
     unsigned long long starved_frames() const { return starved_frames_; }
+    // Frames whose planning stopped because the brick header table was full.
+    unsigned long long header_deferrals() const { return header_deferrals_; }
 
     // Per-slot (mode, v) for the draw: mode 0 drawn, 1 fading in (drawn where
     // the dither threshold is below v), 2 fading out (drawn where it is at or
@@ -511,6 +513,31 @@ public:
                 break;
             }
             const ChunkKey& k = queue_[i].key;
+            // Its bricks first. A frame's header table holds kMaxBrickHeaders;
+            // a chunk planned past it was given the table's start and meshed
+            // from the FIRST chunk's bricks -- its edits gone, for good. Coarse
+            // chunks take in every brick under them, so a capture's 64 chunks
+            // a pass over a few dozen dug bricks overflowed it: a channel dug
+            // through a beach was not there in the still. Now it waits a frame.
+            brick_keys_.clear();
+            if (ctx.store && ctx.pager && ctx.store->brick_count() > 0) {
+                const float S = lod_chunk_size(k.lod);
+                const float origin[3] = {float(k.x) * S, float(k.y) * S, float(k.z) * S};
+                // The span covers the ghost layer as well as the owned cells,
+                // or an edit in the last cell would be missed by the chunk
+                // that meshes it.
+                const float span = lod_voxel(k.lod) * float(kChunkCells);
+                const float lo[3] = {origin[0], origin[1], origin[2]};
+                const float hi[3] = {origin[0] + span, origin[1] + span, origin[2] + span};
+                ctx.store->bricks_in_box(lo, hi, brick_keys_);
+                const UINT room = mesher.brick_header_room();
+                if (brick_keys_.size() > room) {
+                    // More than a whole table can hold: a coarse chunk over a
+                    // vast dig. It keeps what fits rather than never meshing.
+                    if (room < kMaxBrickHeaders) { ++header_deferrals_; break; }
+                    brick_keys_.resize(room);
+                }
+            }
             const UINT slot = free_slots_.back();
             free_slots_.pop_back();
             // A chunk an edit threw away: the held old mesh of the SAME key
@@ -547,15 +574,6 @@ public:
             p.brick_count = 0;
 
             if (ctx.store && ctx.pager && ctx.store->brick_count() > 0) {
-                const float S = lod_chunk_size(k.lod);
-                const float origin[3] = {float(k.x) * S, float(k.y) * S, float(k.z) * S};
-                // The span covers the ghost layer as well as the owned cells,
-                // or an edit in the last cell would be missed by the chunk
-                // that meshes it.
-                const float span = lod_voxel(k.lod) * float(kChunkCells);
-                const float lo[3] = {origin[0], origin[1], origin[2]};
-                const float hi[3] = {origin[0] + span, origin[1] + span, origin[2] + span};
-                ctx.store->bricks_in_box(lo, hi, brick_keys_);
                 if (!brick_keys_.empty()) {
                     ctx.pager->acquire(brick_keys_, ctx.frame, brick_slots_,
                                        *ctx.uploads);
@@ -824,6 +842,7 @@ private:
     std::unordered_map<ChunkKey, int, ChunkKeyHash> queued_since_;
     unsigned long long forced_retires_ = 0;
     unsigned long long starved_frames_ = 0;
+    unsigned long long header_deferrals_ = 0;
     float cam_[3] = {0.0f, 0.0f, 0.0f};
 
     struct Pending {

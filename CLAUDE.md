@@ -118,7 +118,7 @@ that will be played -- per-pixel passes scale 4x from 720p to 1440p.
 The engine's headless modes all write a text file under `build/` and exit:
 `--shot`, `--flight <s>`, `--walk <s>`, `--overhang`, `--dig`, `--dig-save`,
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
-`--band-report`, `--sea-report`, `--swim`, `--blend-report`, `--tab-test`,
+`--band-report`, `--sea-report`, `--swim`, `--dig-water`, `--blend-report`, `--tab-test`,
 `--clock-jump` (with `--shot`: the light under the ground after the clock
 jumps or runs, `build/time_jump.txt`; see The near field),
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
@@ -271,6 +271,21 @@ last run's.
   absolute. Make indices absolute and pass base vertex 0, so the answer
   does not depend on the driver. `--tree-debug 2|3|4` isolated it to one
   level in one run.
+- **An upload heap the GPU reads when the frame RUNS needs one per frame in
+  flight.** The mesher's brick header table and brick staging were single
+  buffers with two frames in flight. A dig burst too big for one frame's 64
+  brick uploads spilled into the next, whose CPU then overwrote the staging
+  and the headers the previous frame had not executed yet: bricks copied
+  into the wrong pool slots and marked uploaded, chunks reading the wrong
+  brick lists -- a channel dug through a beach drawn as untouched sand,
+  for good, while physics and the edit store had it. Found by
+  a flood test (since removed) that dug 54 bricks at once; 16 at once never
+  showed it.
+  Both are halved by `begin_frame_bricks(ring)` now. Next to it,
+  `push_brick_headers` returned 0 when the table was full and the chunk read
+  the first chunk's bricks as its own; `plan_work` now checks the room first
+  and holds the chunk a frame (`header_deferrals`), and a capture throws
+  chunks away over a brick whose upload was deferred, as the frame loop did.
 - **Never read back from an upload heap.** It is write-combined, uncached
   memory. The impostor mip chain averaged each level by reading the one
   above out of the upload buffer it had just written: a 20 s startup for
@@ -1376,14 +1391,42 @@ marches `edited_density` -- the edit store at each lattice corner, else
 the field at the 0.5 m voxel, trilinear between: what LOD 0 meshes -- so a
 second click digs deeper into the first hole. It centres the sphere on the
 nearest SOLID lattice point half a voxel past the hit, so even the smallest
-dig removes rock. Under 1 ms a dig at any size. `--shot ... --dig-row` digs
+dig removes rock. `--shot ... --dig-row` digs
 one of each size across the view before the still and writes
-`<shot>.dig.txt` (hit, centre, voxels written, how far the ray now goes).
-Two edit-store fixes came with it: `edit_sphere` measured each voxel from
-its middle while the mesher reads it at the lattice POINT (every edit sat a
-quarter voxel towards +xyz), and it wrote exactly 0 on the rim and
-overwrote earlier edits -- now strictly inside, never past -5 cm of its
-sign, and the deeper of old and new wins.
+`<shot>.dig.txt` (hit, centre, voxels written, ms, how far the ray now
+goes). Two edit-store fixes came with it: `edit_sphere` measured each voxel
+from its middle while the mesher reads it at the lattice POINT (every edit
+sat a quarter voxel towards +xyz), and it wrote exactly 0 on the rim and
+overwrote earlier edits.
+
+**A dig writes a signed distance, not a fill value.** Every lattice point
+inside the sphere and within `kEditBand` (1 m) outside it becomes the union
+of what was there and the sphere: min(old, d - r) for a dig, the reverse
+for a fill; a point it does not change is not written. It used to write
+the inside only, as -strength x (1 - t^2) held under -5 cm, so the rock
+point beside it kept the FIELD's value -- metres, under ground -- and every
+surface vertex landed beside the air point: dug walls in half-metre steps,
+blocky rims, and a toothed waterline wherever the sea crossed a wall. Now
+the surface lies where the sphere's does, between lattice points. Signs are
+unchanged everywhere, so the flood, sky access, physics and the near field
+label exactly as before. `old` is the edit store's value, else the field
+(`base`, a batch callback, spread over every core past 256 points); a
+point more than kEditBand inside the sphere asks nothing, since no surface
+can cross an edge it ends. The column map (grass, settling trees) marks
+only points written as air: the band's rock stays rock. Cost
+(`--dig-row`): 0.3 ms at 0.5 m, under 1 ms to 3 m, 1.2 ms at 4 m, 3.7 ms
+at 8 m (asking the field everywhere, single-threaded: 30 ms). Saves load
+as before; old edits keep their steps.
+
+**A dig keeps a roof thinner than the lattice.** A dig that stops 1-40 cm
+under the surface leaves rock no lattice point holds -- carved on one side,
+air on the other -- and drew as a hole in the ground it never reached
+(a dug pit's rim on the beach). Before a rock point is carved, each neighbour that is
+air and outside the sphere is asked where, along the edge between them, the
+sphere's boundary and the ground's surface cross; if the sphere's comes
+first, rock remains there and the point stays rock, so the roof is drawn a
+voxel thick. A dig that does break through carves as before; so do the
+player's aimed digs, whose sphere holds the point they hit.
 
 - **Grass goes where an edit reaches the ground.** The edit store keeps a
   derived map (`BrickStore::column_top`, rebuilt on load, not saved): per
@@ -1827,7 +1870,6 @@ archetypes.json `clouds` block. F3 / `--no-clouds`.
     flash casts no shadows of its own; the sea's glint does not see it; no
     sheet lightning across the cloud tops seen from above.
 - **Not done (later phases)**: rain on the camera lens;
-  underwater the rain still draws;
   1/16-pixel-a-frame cloud rendering (Decima's cost path); the base can
   look like a flat ceiling from the ground -- tuning.
 - **"The sun through a gap in the storm" was the shadow's 10% FLOOR, not a
@@ -3122,8 +3164,7 @@ detectors historical.
 - **Cost** at 2560 x 1440, the sea filling the frame: 0.83 ms light wind
   (SSR 0.39 of it), ~1.0 ms gale; was 0.25 / 0.38. Walking where the sea is
   incidental: +0.25 ms (the two full-frame copies and the grid).
-- **Not done**: a faint strip just under the horizon where SSR misses land;
-  no underwater rendering.
+- **Not done**: a faint strip just under the horizon where SSR misses land.
 
 ### The shoreline: swash and wet ground
 
@@ -3132,11 +3173,12 @@ still-water line in every weather, the sand dry to it in a gale as in a calm.
 One function in `water_wave.h` now gives the water running up the beach and
 back -- `ww_swash` -- and three things read it, so they agree on where the
 water is: the sea's sheet (water.hlsl), the wet ground under it (mesh.hlsl)
-and the swimmer (`ww_water_at`, physics_world.cpp).
+and the swimmer (`ww_sea_at`, physics_world.cpp).
 
-- **The sheet**: within 1.5 m of water depth (`ww_swash_reach`) the sea's
-  vertices rise by the swash; the terrain in front hides it where the beach
-  is higher. Its height rides the eight longest trains' elevation at the
+- **The sheet**: within 1.5 m of water depth (`ww_swash_reach`) and only on
+  the LOW beach (`ww_swash_band`: gone 0.6 m over the run-up, so an inland
+  column never carries it) the sea's vertices rise by the swash; the terrain
+  in front hides it where the beach is higher. Its height rides the eight longest trains' elevation at the
   point over their rms, so the uprush comes in sets and varies along the
   shore, times ~7 m lobes of fixed noise (a single contour drew a
   straight-edged slab). Reach: Stockdon's gentle-beach run-up, 0.043
@@ -3149,16 +3191,18 @@ and the swimmer (`ww_water_at`, physics_world.cpp).
   the swash is evaluated right there, and the water fades into the scene
   over its last 8 cm of depth under sea level + swash -- a true contour of
   the beach. The sheet's geometry reaches 30 cm of depth past the edge,
-  riding 12 cm over the ground, so there is always water drawn for the
-  pixel test to cut; the clip is only a coarse cut (`i.depth + 0.3`).
+  riding 12 cm over the generated ground, so there is always water drawn for
+  the pixel test to fade. No clip: where the sheet is drawn is the depth
+  test's (below).
   Two attempts drew a staircase, worst looking along the shore: the sheet
   a few cm over the beach is nearly coplanar with it, so where they cross
   follows both meshes' triangles (and the vertex-interpolated clip stepped
   with the grid); then fading by the thickness between the SHEET and the
   ground only softened the steps, because near the shore the sheet's own
   height is interpolated across grid cells.
-- **Foam** keys to the last 0.6 m of water, not 2.2: at 2.2 the whole sheet
-  was white as snow; now foam at its leading edge, clear water behind.
+- **Foam** is the contact foam (below): the water's vertical thickness over
+  the ground behind the pixel. A band keyed to 2.2 m of water turned the
+  whole swash sheet white.
 - **Wet ground** (mesh.hlsl, before lighting; the swash rides in the shadow
   constants, `l_swash_a/b`, `l_swash`): damp from the waterline to the full
   run-up + 0.2 m, fading over 0.4 m -- albedo x 0.55, roughness to 0.35 --
@@ -3166,7 +3210,8 @@ and the swimmer (`ww_water_at`, physics_world.cpp).
   scan's normal flattened. At 0.85 of the run-up the damp band ended about
   where the sheet stood and barely showed. Grass shows it modestly; this
   session had no sandy beach to judge it on.
-- **Physics**: water is present where the running sheet covers the ground;
+- **Physics**: water is present where the running sheet covers the ground
+  (`ww_sea_at`, without the swash where the feet are dug);
   `--swim 40 --wind 20` PASS, eye under 2.3%, fewer frames wading (the sheet
   covers the shallows). The `--swim` turn still shows a strip of grass at the
   bottom edge, as it did before this change; not run down.
@@ -3325,18 +3370,63 @@ the block added.
 The water asks the SHARED FIELD FUNCTION how deep it is, so the shoreline is
 the real one at every LOD. That is M1 paying off somewhere other than terrain.
 
-**The sea is swimmable, and it is still not in residency.** Physics has no
-water body. The character asks `ww_height_at` in `water_wave.h` each step,
-the same function the shader draws, with the same level, sea state and
-clock. Whether there is sea in a column at all is the shader's own rule:
-`real_terrain_height` below sea level. `streamer.h` still contains no
-reference to the sea. Keep it that way: `--band-report`'s "worst miss"
-compares the band against `worldgen::terrain_height`, and a water surface
-feeding residency would leave that check passing while it measured something
-else. Adding swimming left the band report byte-identical.
+**Water is a HALF-SPACE at sea level: every bit of air below sea level is
+water** -- the sea, a channel dug in from the coast, a pit dug inland, a
+tunnel, a placed cave that descends below sea level (those flood and are
+swimmable; worldgen is untouched). No connectivity, no air pockets, no
+seepage, no fill, no water simulation of any kind, and no map of where water
+is: the sheet lies at sea level everywhere and the DEPTH TEST decides --
+terrain over sea level hides it, so any air under sea level shows water, at
+any distance. This replaced ADR-006's per-pocket machinery (a connectivity
+flood on the edit lattice, a timed fill, a surface mask, a roof test for
+physics, a top-down capture of the bed, and the cuts between them), which
+kept producing edge cases; `docs/adr-006-water-below-sea-level.md` is marked
+superseded.
 
-`--swim [s]` walks off the nearest gentle beach, swims out, turns and comes
-back. Its headline is **frames standing on the seabed in water too deep to
+**The surface is two layers** (`water_wave.h`, `water.hlsl`):
+- **The base, the same everywhere** -- the sea, pits, tunnels, channels:
+  flat at sea level, plus the wind's ripples (the FFT tiles and the gusts'
+  patches), which are normals in the pixel shader, not height.
+- **The top, the deep sea's**: the trains and swell, weighted by the
+  GENERATED depth (`real_terrain_height`, at the wave's rest point): none on
+  land columns, rising over the shelf (`ww_depth_factor`), full in deep
+  water, under the breaking cap (`WW_BREAK_HS` x depth). Storms scale this
+  layer only, and the whitecaps belong to it (weighted by the generated
+  depth's first metre, none in dug water).
+- So inland pits and caves are calm by construction, a channel dug across a
+  beach gets almost nothing (its generated depth is shallow), a dredged
+  harbour stays calm, and storm surf does not funnel into dug channels --
+  all accepted.
+- **The swash** rides on the low beach only (`ww_swash_band`), and is
+  suppressed per pixel where the pixel is DUG: the ground behind it (the
+  depth copy) lies 0.3-0.6 m and more under the generated ground. A sheet
+  pixel the swash or the beach's 12 cm lift raised over sea level is then
+  shaded where its view ray meets sea level instead (`P` in `ps_main`), so a
+  channel cut through a beach holds still water at sea level, not the
+  beach's moving sheet hanging over it. Physics does the same by the feet's
+  own depth under the generated ground.
+- **No z-fighting on low beaches**: on the beach band the sheet rides 12 cm
+  over the generated ground, and wherever it meets the ground the per-pixel
+  edge has faded it into the scene, so which surface wins the depth test
+  does not show. Raw frames (`--shake 30 --no-taa --sea-state 0`) at a
+  grazing view of an untouched beach change only in the wind-blown grass.
+
+**The sea is swimmable, and it is still not in residency.****The sea is swimmable, and it is still not in residency.** Physics has no
+water body. The character asks `ww_sea_at` in `water_wave.h` each step -- the
+same functions the shader draws, with the same level, sea state and clock:
+sea level, plus the deep sea's layer at the generated depth (a trough never
+under the generated bed), plus the swash on the low beach unless the feet are
+0.3-0.6 m and more under the generated ground. The character is in the water
+wherever its feet are below that surface. The eye uses the same call
+(`Renderer::camera_underwater()`). `streamer.h` still contains no reference to
+the sea. Keep it that way: `--band-report`'s "worst miss" compares the band
+against `worldgen::terrain_height`, and a water surface feeding residency would
+leave that check passing while it measured something else. Adding swimming
+left the band report byte-identical.
+
+`--swim [s]` walks off the gentle beach nearest SPAWN, swims out, turns and
+comes back (from the origin until v19: v18's archipelago put the origin in
+the sea, and every run found no beach and swam nothing). Its headline is **frames standing on the seabed in water too deep to
 stand in**, printed beside the number of deep-water frames it is out of. It
 also prints where the eye sat relative to the water when the shot was taken.
 
@@ -3359,8 +3449,134 @@ Three things that cost time here and will again:
   swimmer was never drawn: 1.1% of the bottom quarter of the frame was water,
   and 99.6% after the fix. A camera more than 0.5 m above sea level gets the
   old plane (A/B: 1 pixel in 921,600 differed, by 2 levels).
-  **A submerged camera has no underwater rendering:** the seabed is lit like
-  dry land, with the surface overhead.
+
+**Under the water.** The eye is under when it is below the water's surface
+over it (`cam_water`, `ww_sea_at` as physics asks it): in the sea, in a dug
+pit, in any tunnel or cave below sea level. `Renderer::camera_underwater()` /
+`camera_water_depth()`; every shot report has an `underwater:` line. Then:
+- **The composite lays no air over a surface** (no haze, height fog, mist or
+  cloud in front): the path is water.
+- **`cs_underwater`** (post.hlsl), after the sea draws and before TAA, over
+  every pixel by the depth the sea left: the view leg and the sunlight's leg
+  down to what is seen dim per channel (the sea's own `extinction`, murkier
+  with the roughness, as from above), and the water's body glows into the
+  gap -- its in-scatter at depth h is the surface's (`deep_colour` x level
+  water's light, the sun's part under the clouds' shadow) times
+  exp(-ext h), integrated along the ray in closed form, so looking down is
+  darker and bluer, looking up brighter, and a deeper eye sees a darker sea.
+  0.053 ms at 1440p; the whole underwater frame 4.0 ms.
+- **The surface from below** (water.hlsl, only while the eye is under, so
+  no view from the air changes): Snell's window -- the sky the refracted ray
+  meets (`sky_reflection`, the composited sky, clouds and all) and the sun
+  spread by the ripples' unresolved slope as the glint is -- and outside it,
+  total internal reflection of the water UNDER the surface: the seabed by
+  SSR through the reflected ray's water, or, where SSR finds nothing
+  (looking steeply up, the reflected rays leave the screen), the seabed's
+  authored colour (`g_arch`'s last row set) lit as level ground. A flat deep
+  colour there drew a navy ceiling over bright sand.
+- No rain, splashes or lightning bolt are drawn while the eye is under.
+- Stills: `--cam 575 -2.4 -288 -1.5708 0.25` (seed 0, 3 m of water west of
+  spawn), `--sea-state 0.8` for a storm; `--dig-water`'s eye in an inland pit.
+- **Not done**: the waterline across the lens -- the whole view switches at
+  once as the eye crosses the surface, so a swimmer's eye in a crest flips
+  it for a frame; caustics on the seabed; light shafts in the water; any
+  particles; in a shallow storm the sheet, clamped just over the bed in a
+  trough, shows from below as dark patches on the sand.
+
+**Edges and foam, per pixel.** Everything the sheet needs to know about the
+real (dug) ground comes from the ground point behind the pixel in the depth
+copy (`gp` in `ps_main`):
+- **The edge** fades the water into the scene over its last 8 cm of
+  vertical depth (to the swash's surface on the beach), and **over the last
+  1.2 m of the view ray under water where the water is dug**, so a dug wall
+  shows through its own first centimetres of water: the waterline on a wall
+  standing near vertical at sea level is the mesh's half-metre facets,
+  toothed, and 0.4 m left them showing.
+- **Contact foam**, one rule for every shore: where the water over the
+  ground behind the pixel is THIN, vertically (10-30 cm), broken up by a
+  drifting lace and never whole (0.7 of the lace's threshold: whole, a
+  gentle beach's swash drew a solid white ribbon metres wide at a grazing
+  view) -- at a beach's edge, round a trunk standing in a pit, at the foot of
+  a dug wall. Faint scum on calm water; surf where the natural sea reaches
+  (`sea_w`: the generated column is sea or its beach, and not dug) as the
+  weather roughens, its band widening to ~0.8 m of water in a gale. Faded
+  where the ray under water is long (2-6 m), which is an occluder rather
+  than a shallow. It replaced a shore foam keyed to the vertices' generated
+  depth, which could not see a dug edge. Whitecaps belong to the deep
+  sea's layer (weighted by the generated depth's first metre, none in dug
+  water): the ripples' folding is everywhere and laid gale whitecaps in pits.
+- **Foam's fine structure: bubbles, by the pixel's footprint.** The lace
+  has nothing under half a metre, and close to the water foam read as a
+  smooth smear. `engine/render/foam_pattern.{h,cpp}` bakes a tileable
+  512^2 RGBA8 texture with mips at startup (~20 ms; `startup.txt` prints
+  its mean): 16 x 16 cells, one jittered point each, the centre of a hole
+  of its own radius (0.45-0.9 of a cell) -- R the distance over radius,
+  saturated (0 a hole's centre, 1 the film), GB its gradient, A whether a
+  texel is a hole. The sea reads it at three octaves, 0.5 m, 12 cm and 3 cm
+  cells (heap `kFoamSrv`, t7), each turned its own way and drifting a little
+  faster than the one above. **Seamless by construction**: each octave is
+  whole while its cell spans 8 pixels of water (`fp`) and gone at 4, where
+  it is replaced by the pattern's MEAN (`foam_mean`, which the mip chain
+  also filters towards), so coverage -- and the far look -- does not move;
+  the threshold's softness goes from the lace's 0.25 to what antialiases
+  the finest visible octave. Up close **density** (how far over its
+  threshold) makes thin foam a translucent, greyer film and dense foam
+  opaque white, and the foam is lit by its own **relief** (the holes'
+  gradient; the finest octave's film rises to a honeycomb of ridges). The
+  crests' foam is eroded by the same bubbles, cross-faded in with the
+  coarse octave. Measured: the 12 m coast differs from before on 2% of
+  pixels (the nearest foam); a dolly from 1.2 m to 18 m over one patch
+  shows bubbles, then lace with holes, then the old lace, with no step.
+  Two traps on the way: holes of different radii straddle cell borders, so
+  the nearest point must be chosen by distance OVER radius (by distance, b
+  jumped and shaded straight-edged facets); and the film ridges of the
+  coarse octaves shaded as metre-wide facets, so only the finest has them.
+  **Cost**: the same pattern evaluated per pixel (nine points an octave)
+  cost +0.4 ms of the sea pass where foam filled the view -- most of it
+  execution, ~0.15 ms the bigger shader's registers -- the texture
+  +0.03-0.07 ms (sea pass at 1440p: open sea 1.022 -> 1.069 ms, the coast
+  0.570 -> 0.597, close over the swash ~0.98 -> 1.05). The reads are gated
+  to where foam can form.
+- **Two fixes close to the water**: the grid's first 12 rows reach far
+  below the screen (ndc -4) for an eye over the water: a vertex lifted over
+  a beach (the swash and its 12 cm) moves UP the screen near a low camera,
+  and at 1.2 m over the swash the grid's bottom row showed as a straight
+  edge across the water. And **dug** compares the ground behind a pixel
+  with the generated ground AT that ground point, extrapolated along the
+  generated depth's own screen-space gradient: compared with the ground
+  under the surface point, a seabed falling away offshore read as dug at a
+  grazing view, and storm crests were flattened to sea level in a slab.
+- **The terrain's shore wet band skips dug ground**: the swash's damp and
+  film (mesh.hlsl, `l_swash`) go by height alone, so the mesher flags a
+  vertex its edits put more than 0.3 m inside the generated rock (the lowest
+  bit of the rock roughness byte, `o.dug`) and the band leaves it -- a pit
+  dug to just over sea level wore surf on its floor.
+- **`--dig-water`** (`build/dig_water.txt`) is the look and the check: from
+  the coast nearest spawn, a pit dug into the beach, undercut on its inland
+  side, opened to the sea by a channel (`dig_water.bmp`, `_top.bmp`,
+  `_channel.bmp` along the channel from the sea, `_beach.bmp` a grazing view
+  of the untouched beach beside it); 42 m inland a pit dug 2.5 m under sea
+  level and walled off from the sea, and 54 m in one dug to 0.4 m over it
+  (`dig_water_inland.bmp`, trees off, `_wet.bmp`, `_dry.bmp`). It asserts the
+  inland pit and the channel are water to physics with a surface still at
+  sea level, the higher pit dry, and an eye a metre under sea level in the
+  inland pit drawn as underwater (`dig_water_under.bmp`).
+  `BIOMES_PIT_DREDGE=1` also dredges a strip 18 m wide across the
+  shoreline; `BIOMES_PIT_UNDERCUT=<m>` sets the undercut's centre under sea
+  level (2.5, its roof tangent to the water); `BIOMES_PIT_PICK="px py ..."`
+  names what the coast's still shows at a pixel, marched through the EDITED
+  density (`--pick` reads the generated field). The instruments,
+  `--water-debug` with `--tonemap 0`: `9` (red dug, green the natural sea's
+  reach, blue the land side), `10` (red the water's vertical thickness to
+  0.3 m, green the contact foam, blue the ray under water to 6 m), `13` (the
+  edge's fade, the ray under water, dug).
+- **Cost**, `--gpu-profile 120` at 2560 x 1440 (the sea pass now has its own
+  mark, "sea"): open sea 1.034 -> 1.022 ms, the coast 0.581 -> 0.570,
+  spawn 0.241 -> 0.245; the bed capture's 0.09 ms rebuilds are gone.
+- **Not done**: a deep narrow pit's water reflects the sky where SSR finds no
+  wall on screen, so it looks pale from above; light in a flooded tunnel is
+  still the near field's air (no light through water); a dredged harbour or
+  a beach channel never gets the sea's waves (by choice).
 
 `--overhang` has no landmark to aim at: it searches for a real ceiling
 (phase A), reports what it found and how the capsule left it, then digs a

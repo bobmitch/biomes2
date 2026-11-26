@@ -31,6 +31,7 @@
 #include "engine/render/far_shadow.h"
 #include "engine/render/scan_library.h"
 #include "engine/render/forest_map.h"
+#include "engine/render/foam_pattern.h"
 #include "engine/rocks/rock_field.h"
 #include "engine/rocks/rock_renderer.h"
 #include "engine/props/glow_mushrooms.h"
@@ -180,6 +181,10 @@ public:
     // physics sync) that needs this frame's sea before the frame is drawn.
     void  set_sea_state(float s) { weather_.set_storm(s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s)); }
     float sea_state() const { return weather_now_.storm; }
+    // Whether the last frame's eye was under the water (below the surface over
+    // it: water is everything under sea level), and how far under it.
+    bool  camera_underwater() const { return cam_under_; }
+    float camera_water_depth() const { return cam_under_depth_; }
     Weather& weather() { return weather_; }
     const WeatherState& weather_state() const { return weather_now_; }
     const WwSea& sea() const { return sea_; }
@@ -783,12 +788,18 @@ private:
     ComPtr<ID3D12Resource> puddle_;   // the scene's third target: the puddle mask (ADR-005 C4)
     ComPtr<ID3D12RootSignature> post_root_;
     ComPtr<ID3D12PipelineState> ao_pso_, composite_pso_, taa_pso_, final_pso_, ssgi_pso_;
+    // ADR-006 stage 2: the water between the eye and everything, while the
+    // eye is under the sea (post.hlsl cs_underwater; cam_under_ decides).
+    ComPtr<ID3D12PipelineState> underwater_pso_;
+    bool  cam_under_ = false;
+    float cam_under_depth_ = 0.0f;   // metres of water over the eye
     ComPtr<ID3D12Resource> ssgi_;              // the screen-space bounce (L6): irradiance, distance
     HeightGi hfgi_;
     NearField near_;
     FarShadow far_;
     ScanLibrary scans_;
     ForestMap forest_;
+    FoamPattern foam_;   // the sea's foam bubbles (foam_pattern.h), t7 in its table
     bool forest_on_ = true;
     bool far_on_ = true;
     void record_far(const float vp[16]);

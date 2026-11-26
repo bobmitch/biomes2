@@ -461,4 +461,35 @@ WW_FN float ww_water_at(float x, float z, float t, WW_IN_SEA sea, WW_IN_SWASH sw
     return h;
 }
 
+// The swash's band: only the LOW beach can be reached by the uprush, so it is
+// whole up to the run-up and gone 0.6 m over it (`depth` is the generated
+// column's water, negative on land). Without it every land column, an inland
+// pit's included, carried the swash's height.
+WW_FN float ww_swash_band(float depth, float runup) {
+    return ww_saturate((depth + runup + 0.6f) / 0.3f);
+}
+
+// The water over a point, as physics and the eye ask it: its height over sea
+// level. Water is a HALF-SPACE -- every bit of air under sea level is water --
+// and its surface is two layers, as water.hlsl draws it:
+//  - the base, the same everywhere: flat at sea level (the shader adds only
+//    ripples, which are normals, not height);
+//  - the deep sea's trains and swell, weighted by the GENERATED column's depth
+//    `depth`: none on land, rising over the shelf, capped at WW_BREAK_HS x
+//    depth. Inland pits and caves are calm by construction, and a channel dug
+//    across a beach gets almost nothing, its generated depth being shallow.
+// Plus the swash on the low beach (ww_swash_band), except where the point is
+// DUG -- `under`, how far it lies under the generated ground, past 0.3-0.6 m
+// -- as water.hlsl suppresses it per pixel where the ground behind a pixel
+// lies well under the generated ground.
+WW_FN float ww_sea_at(float x, float z, float t, WW_IN_SEA sea, WW_IN_SWASH sw, float depth, float under) {
+    float h = 0.0f;
+    if (depth > 0.0f) {
+        h = ww_height_at(x, z, t, sea, depth);
+        if (h < 0.03f - depth) h = 0.03f - depth;   // a trough never bares the generated bed
+    }
+    const float dug = ww_saturate((under - 0.3f) / 0.3f);
+    return h + ww_swash(x, z, t, sw) * ww_swash_reach(depth) * ww_swash_band(depth, sw.runup) * (1.0f - dug);
+}
+
 #endif  // ENGINE_WATER_WAVE_H

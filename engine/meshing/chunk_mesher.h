@@ -155,9 +155,21 @@ public:
     // Reset the per-frame header cursor. The lists are rebuilt every frame
     // because which bricks a chunk overlaps is cheap to recompute and stale
     // entries would point at slots that have since been reused.
-    void begin_frame_bricks();
-    // Append one chunk's brick list; returns where it starts.
+    //
+    // `ring` is the frame's slot among those in flight: the header table and
+    // the brick staging are upload heaps the GPU reads when the frame RUNS,
+    // so each frame in flight has its own half. They were one buffer: a dig
+    // burst that spilled uploads into the next frame had that frame's CPU
+    // overwrite the staging and headers the previous one had not executed
+    // yet -- bricks copied into the wrong pool slots, marked uploaded, and
+    // never corrected; dug ground drawn as if never dug.
+    void begin_frame_bricks(UINT ring);
+    // Append one chunk's brick list; returns where it starts. The caller
+    // checks brick_header_room() first: past it this returns 0, and a chunk
+    // given 0 reads the first chunk's bricks as its own.
     UINT push_brick_headers(const int* origins, const UINT* slots, UINT n);
+    UINT brick_header_room() const { return kMaxBrickHeaders - brick_hdr_cursor_; }
+    static const UINT kBrickRings = 2;   // frames in flight (renderer.h kFrameCount)
     // Copy one brick's contents into the pool.
     // False when this frame has no staging room left: the caller must NOT
     // record the brick as uploaded, or the pool keeps stale contents that
@@ -263,6 +275,7 @@ private:
     ComPtr<ID3D12Resource> brick_den_, brick_mask_, brick_hdr_, brick_stage_;
     int*  brick_hdr_cpu_ = nullptr;     // persistently mapped, int4 per entry
     unsigned char* brick_stage_cpu_ = nullptr;
+    UINT  brick_ring_ = 0;          // which half of the header table and the staging this frame writes
     UINT  brick_hdr_cursor_ = 0;
     UINT  brick_uploads_ = 0;
 

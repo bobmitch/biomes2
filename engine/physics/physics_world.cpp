@@ -460,22 +460,21 @@ void PhysicsWorld::update(float dt, float vx, float vz, bool jump, float swim) {
         sea_here_ = false;
         submerged_ = 0.0f;
         if (sea_.on && column_height_) {
-            // water.hlsl's clip(depth + 0.02): drawn wherever the base column
-            // is below sea level, give or take its two centimetres.
+            // One rule everywhere (water_wave.h ww_sea_at): the water's
+            // surface over the feet is sea level plus the deep sea's waves
+            // weighted by the generated column's depth (none on land, so an
+            // inland pit or a cave is still), plus the swash on the low beach
+            // unless the feet are well under the generated ground (dug).
             const float ground = column_height_(fx, fz);
             const float depth = sea_.level - ground;
-            // The swash runs the water up the beach (water_wave.h), so the sea
-            // is here wherever the running sheet covers the ground, as drawn.
-            const float swash = ww_swash(fx, fz, sea_.time, sea_.swash) * ww_swash_reach(depth);
-            sea_here_ = depth + swash > -0.02f;
-            if (sea_here_) {
-                // The depth the shader reads at the rest point, read here at
-                // the asked point (water_wave.h, ww_rest_point).
-                water_y_ = sea_.level + ww_water_at(fx, fz, sea_.time, sea_.sea, sea_.swash, depth);
-                float sub = water_y_ - fy;
-                const float body = 2.0f * (half_height_ + radius_);
-                submerged_ = sub < 0.0f ? 0.0f : (sub > body ? body : sub);
-            }
+            water_y_ = sea_.level + ww_sea_at(fx, fz, sea_.time, sea_.sea, sea_.swash, depth, ground - fy);
+            // "Here" while the surface is within a body's height under the
+            // feet too: a swimmer a crest throws clear is still over water,
+            // and the surface's rate (below) must not restart.
+            const float body = 2.0f * (half_height_ + radius_);
+            const float sub = water_y_ - fy;
+            sea_here_ = sub > -body;
+            submerged_ = sub < 0.0f ? 0.0f : (sub > body ? body : sub);
         }
         // How fast the surface under the character is rising, ALONG ITS PATH
         // -- the wave's own motion and the swimmer crossing its slope, both of

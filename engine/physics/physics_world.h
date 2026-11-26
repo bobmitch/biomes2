@@ -130,11 +130,10 @@ public:
 
     // The sea. Set every frame, because time and sea state move.
     void set_sea(const SeaParams& s) { sea_ = s; }
-    // The BASE terrain's column height, which is the shader's rule for where
-    // sea exists at all: water.hlsl clips wherever real_terrain_height is
-    // above sea level. Using the same rule is what stops a pit dug on a beach
-    // filling with water nobody can see, or a cave under the sea floor being
-    // dry while the sea is drawn over it.
+    // The GENERATED terrain's column height. Water is a half-space -- every
+    // bit of air under sea level is water -- and this only weights its waves:
+    // the deep sea's trains by the generated depth, and the beach's swash
+    // (water_wave.h ww_sea_at), as water.hlsl draws them.
     void set_column_height(std::function<float(float, float)> fn) {
         column_height_ = fn;
     }
@@ -154,7 +153,7 @@ public:
     int chunk_shape(const ChunkKey& k) const;
 
     Medium medium() const { return medium_; }
-    // World y of the displaced surface above the character, last step. Only
+    // World y of the water's surface over the character, last step. Only
     // meaningful when sea_present().
     float  water_surface() const { return water_y_; }
     bool   sea_present() const { return sea_here_; }

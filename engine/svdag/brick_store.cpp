@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace engine {
 namespace {
@@ -49,14 +50,30 @@ Brick& BrickStore::touch(const BrickKey& k, bool& created) {
 
 bool BrickStore::edit_sphere(float cx, float cy, float cz, float radius,
                              float strength, uint8_t material,
+                             const std::function<void(const int*, size_t, float*)>& base,
                              float out_min[3], float out_max[3]) {
     if (radius <= 0.0f) return false;
 
-    const int v0x = voxel_of(cx - radius), v1x = voxel_of(cx + radius);
-    const int v0y = voxel_of(cy - radius), v1y = voxel_of(cy + radius);
-    const int v0z = voxel_of(cz - radius), v1z = voxel_of(cz + radius);
+    // The band past the rim: the rock points beside the new surface carry
+    // their distance to it. Without it the mesher interpolated between an
+    // air point and the field's rock value -- metres, under ground -- and
+    // every vertex landed beside the air point: dug walls in half-metre
+    // steps, a jagged waterline wherever one crossed the sea.
+    const float reach = radius + kEditBand;
+    const int v0x = voxel_of(cx - reach), v1x = voxel_of(cx + reach);
+    const int v0y = voxel_of(cy - reach), v1y = voxel_of(cy + reach);
+    const int v0z = voxel_of(cz - reach), v1z = voxel_of(cz + reach);
 
-    bool any = false;
+    // Gather first: the field is asked only where it can matter, all at
+    // once (`base` may spread a big batch over threads). A point more than
+    // kEditBand inside the sphere needs no answer: every lattice neighbour
+    // is inside too (the distance is 1-Lipschitz), so no surface crosses an
+    // edge it ends, and the sphere's distance alone stands there. Asked
+    // everywhere, an 8 m dig took 24 thousand field calls, 30 ms.
+    struct Pt { int x, y, z; float d, old; bool owned; };
+    std::vector<Pt> pts;
+    std::vector<int> need_xyz;
+    std::vector<size_t> need_at;
     for (int vz = v0z; vz <= v1z; ++vz) {
         for (int vy = v0y; vy <= v1y; ++vy) {
             for (int vx = v0x; vx <= v1x; ++vx) {
@@ -71,59 +88,118 @@ bool BrickStore::edit_sphere(float cx, float cy, float cz, float radius,
                 const float wz = float(vz) * kEditVoxel;
                 const float dx = wx - cx, dy = wy - cy, dz = wz - cz;
                 const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
-                // Strictly inside: a point ON the rim would be written as
-                // exactly zero, which is neither air nor rock.
-                if (d >= radius) continue;
-
-                BrickKey key;
-                key.x = floor_div(vx, kBrickSide);
-                key.y = floor_div(vy, kBrickSide);
-                key.z = floor_div(vz, kBrickSide);
-                bool created = false;
-                Brick& b = touch(key, created);
-                if (!created) {
-                    // Re-edited: the pool's copy is stale either way, and the
-                    // list is deduplicated when it is drained.
-                    dirty_.push_back(key);
+                if (d >= reach) continue;
+                Pt p = {vx, vy, vz, d, 0.0f, false};
+                p.owned = edited_at(vx, vy, vz, p.old);
+                if (!p.owned && d - radius > -kEditBand) {
+                    need_at.push_back(pts.size());
+                    need_xyz.push_back(vx);
+                    need_xyz.push_back(vy);
+                    need_xyz.push_back(vz);
                 }
-
-                const int lx = floor_mod(vx, kBrickSide);
-                const int ly = floor_mod(vy, kBrickSide);
-                const int lz = floor_mod(vz, kBrickSide);
-                const int li = (lz * kBrickSide + ly) * kBrickSide + lx;
-
-                // Absolute, and feathered to the rim so the carve does not end
-                // in a step one voxel wide. The sign is what matters: negative
-                // is air, positive is rock.
-                //
-                // Two guards make overlapping edits add up. The value never
-                // reaches zero at the rim (kept a hair on the edit's side),
-                // so a rim point that was air stays air instead of becoming
-                // a film of "surface". And a point an earlier edit already
-                // owns keeps whichever value goes further the same way:
-                // digging the rim of one hole into the middle of another
-                // must not shallow it.
-                const float t = d / radius;
-                float v = strength * (1.0f - t * t);
-                const float kRim = 0.05f;
-                if (strength < 0.0f) v = std::min(v, -kRim);
-                else                 v = std::max(v, kRim);
-                const bool owned = (b.edited[li >> 5] & (1u << (li & 31))) != 0;
-                if (owned) v = strength < 0.0f ? std::min(v, b.density[li]) : std::max(v, b.density[li]);
-                b.density[li] = v;
-                b.material[li] = material;
-                b.edited[li >> 5] |= (1u << (li & 31));
-                mark_column(vx, vy, vz);
-                any = true;
+                pts.push_back(p);
             }
         }
+    }
+    if (!need_at.empty()) {
+        std::vector<float> got(need_at.size());
+        base(need_xyz.data(), need_at.size(), got.data());
+        for (size_t k = 0; k < need_at.size(); ++k) pts[need_at[k]].old = got[k];
+    }
+
+    // Every gathered point by its lattice position, for the roof test below.
+    const int nx = v1x - v0x + 1, ny = v1y - v0y + 1, nz = v1z - v0z + 1;
+    std::vector<int> at(size_t(nx) * ny * nz, -1);
+    for (size_t k = 0; k < pts.size(); ++k)
+        at[(size_t(pts[k].z - v0z) * ny + size_t(pts[k].y - v0y)) * nx + size_t(pts[k].x - v0x)] = int(k);
+    auto find_pt = [&](int x, int y, int z) -> const Pt* {
+        if (x < v0x || x > v1x || y < v0y || y > v1y || z < v0z || z > v1z) return nullptr;
+        const int k = at[(size_t(z - v0z) * ny + size_t(y - v0y)) * nx + size_t(x - v0x)];
+        return k < 0 ? nullptr : &pts[size_t(k)];
+    };
+    // A dig that stops just short of the surface leaves a roof thinner than
+    // the lattice: rock carved on one side, air on the other, and no point
+    // left rock between them -- a hole in the ground the dig never reached.
+    // So before a rock point is carved, each neighbour that is air and
+    // OUTSIDE the sphere is asked: along the edge between them, does the
+    // sphere's boundary come before the surface's? Then rock remains there,
+    // and the point stays rock: the roof is drawn a voxel thick where it is
+    // thinner, never as a hole. A dig that does break through (the surface
+    // first) carves as before.
+    auto keeps_roof = [&](const Pt& p, float sd_p) {
+        static const int kN[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+        for (int n = 0; n < 6; ++n) {
+            const Pt* a = find_pt(p.x + kN[n][0], p.y + kN[n][1], p.z + kN[n][2]);
+            if (!a) continue;
+            const float sd_a = a->d - radius;
+            if (sd_a <= 0.0f || a->old >= 0.0f) continue;      // carved too, or rock
+            const float t_ground = p.old / (p.old - a->old);    // where the surface crosses, P to A
+            const float t_sphere = -sd_p / (sd_a - sd_p);       // where the sphere's boundary does
+            if (t_sphere < t_ground) return true;
+        }
+        return false;
+    };
+
+    bool any = false;
+    for (const Pt& p : pts) {
+        const int vx = p.x, vy = p.y, vz = p.z;
+        const float d = p.d;
+        // What is there now: an earlier edit's value, or the field (an
+        // unowned point deep inside has none, and needs none).
+        const bool known = p.owned || d - radius > -kEditBand;
+        const float old = p.old;
+
+        // The sphere's signed distance, positive outside: a dig is the rock
+        // that was there AND outside the sphere, min(old, d - r); a fill the
+        // reverse. Overlapping edits add up by the same rule, and nothing is
+        // written where the sphere changes nothing -- air a dig passes
+        // through, rock past its band. Never zero inside (neither air nor
+        // rock): a point on the rim is kept a hair on the edit's side.
+        const float sd = d - radius;
+        const float kRim = 1.0e-3f;
+        float v;
+        if (strength < 0.0f) {
+            if (known && old <= sd) continue;
+            v = sd;
+            if (d < radius) v = std::min(v, -kRim);
+            if (known && old > 0.0f && v < 0.0f && keeps_roof(p, sd)) continue;
+        } else {
+            if (known && old >= -sd) continue;
+            v = -sd;
+            if (d < radius) v = std::max(v, kRim);
+        }
+
+        BrickKey key;
+        key.x = floor_div(vx, kBrickSide);
+        key.y = floor_div(vy, kBrickSide);
+        key.z = floor_div(vz, kBrickSide);
+        bool created = false;
+        Brick& b = touch(key, created);
+        if (!created) {
+            // Re-edited: the pool's copy is stale either way, and the
+            // list is deduplicated when it is drained.
+            dirty_.push_back(key);
+        }
+
+        const int lx = floor_mod(vx, kBrickSide);
+        const int ly = floor_mod(vy, kBrickSide);
+        const int lz = floor_mod(vz, kBrickSide);
+        const int li = (lz * kBrickSide + ly) * kBrickSide + lx;
+        b.density[li] = v;
+        b.material[li] = material;
+        b.edited[li >> 5] |= (1u << (li & 31));
+        // The column map is for ground that MOVED (grass, settling trees):
+        // the band's rock stays rock, and marking it bared grass a metre
+        // round every hole and over tunnels a metre deeper than before.
+        if (v < 0.0f) mark_column(vx, vy, vz);
+        any = true;
     }
     if (!any) return false;
     ++generation_;
 
     // One voxel past the sphere: an edited point on a chunk's border is also
     // its neighbour's ghost corner, and that neighbour must re-mesh too.
-    const float pad = radius + kEditVoxel;
+    const float pad = reach + kEditVoxel;
     out_min[0] = cx - pad; out_min[1] = cy - pad; out_min[2] = cz - pad;
     out_max[0] = cx + pad; out_max[1] = cy + pad; out_max[2] = cz + pad;
     return true;
@@ -293,6 +369,7 @@ bool BrickStore::load(const std::string& path, uint32_t expect_field_id,
          it != bricks_.end(); ++it) {
         for (int i = 0; i < kBrickVoxels; ++i) {
             if ((it->second.edited[i >> 5] & (1u << (i & 31))) == 0) continue;
+            if (it->second.density[i] >= 0.0f) continue;   // as edit_sphere marks
             const int lx = i % kBrickSide, ly = (i / kBrickSide) % kBrickSide, lz = i / (kBrickSide * kBrickSide);
             mark_column(it->first.x * kBrickSide + lx, it->first.y * kBrickSide + ly, it->first.z * kBrickSide + lz);
         }

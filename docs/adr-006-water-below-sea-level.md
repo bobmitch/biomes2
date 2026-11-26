@@ -1,8 +1,26 @@
 # ADR-006: Water below sea level -- dug holes, tunnels and caves
 
-Status: proposed, 2026-11-25. Nothing built. This records the direction
-chosen in discussion and the corrections found while choosing it, so the
-first implementation starts from them.
+Status: **superseded**, 2026-11-25. Stages 1 (no sea under a roof, for
+physics), 2 (underwater rendering) and 3 (a connectivity flood on the edit
+lattice, with a timed fill) were built. The per-pocket machinery kept
+producing edge cases -- at every place its rules met (the flood's columns,
+the roof test, the fill's front, the sea's own columns) the sheet needed
+another cut or patch -- and the decision was made to drop it:
+
+**Water is a half-space at a constant sea level.** Every bit of air below sea
+level is water: dug pits and tunnels, and placed caves that descend below sea
+level (they flood and are swimmable; worldgen is unchanged). Dug water is
+calm -- no waves, swash or surf -- and the natural sea keeps its waves. No
+seepage, no material rules, no air pockets, no filling, no water simulation.
+Stage 2 stays (the eye is under water when it is below the surface over it).
+The sheet lies at sea level everywhere and the depth test decides where water
+shows; the deep sea's waves are weighted by the generated depth, so dug water
+is calm by construction (the bed capture built for stage 3 went too, a day
+later). The flood (`sea_access`), the roof test,
+`--flood-test` and `--seabed-tunnel` were removed; `--dig-water` checks the
+half-space. CLAUDE.md's "Water is a HALF-SPACE" section describes what is
+built. The rest of this document is the proposal as it stood, kept for its
+reasoning about what players expect.
 
 ## Context
 
@@ -176,16 +194,36 @@ for water.
    search: the character is in the sea only if nothing solid lies between
    the feet and sea level above them -- a short march up through the edited
    density at the feet. Under-sea tunnels become dry today; stage 3's
-   query replaces it.
+   query replaces it. **Done**: `PhysicsWorld::set_sea_cover` over
+   `Renderer::solid_between`, from 0.5 m over the feet, ~6 us a step;
+   `engine.exe --seabed-tunnel` tests it (a sealed tunnel under the
+   shallows dry and standing, open water and an open pit in the bed still
+   sea), and fails under `BIOMES_SEA_COLUMN_ONLY=1`, the old rule.
 2. **Underwater rendering (now, independent).** Extinction and in-scatter
    toward the water's colour, the surface seen from below, light dimming
    with depth. Already a gap for the open sea; flooding has nothing to show
-   without it.
+   without it. **Done** (first version): the eye under the sea by physics'
+   rule and stage 1's roof test; post.hlsl's `cs_underwater` (the view and
+   sunlight legs through the water, the body's glow in closed form, 0.053
+   ms at 1440p); the composite lays no air over surfaces; the surface from
+   below as Snell's window and total internal reflection of the seabed;
+   no rain or bolt underwater. `--seabed-tunnel` case D. Not done: the
+   waterline across the lens, caustics, light shafts (gaps.md).
 3. **The connectivity flood**: the search, the conservative cells, the
    mask and sheet, the shared point query for physics, wave damping by path
    distance, venting and air pockets, the shown fill. Water a function of
    geometry only. A placed cave that is sealed under the seabed stays dry
    from the same labels; one whose carve meets the sea floods.
+   **Done** (`engine/render/sea_access.{h,cpp}`, `--flood-test`), with one
+   change to this record: **not conservative 1 m cells but the 0.5 m edit
+   lattice itself**, each point air or rock as the LOD 0 mesher reads it.
+   The conservative cells were built and measured, and a 3 m shaft dug off
+   the grid held no fully open cell: the water could not get down it. On
+   the lattice a wall the mesh draws stops the water and a gap it shows
+   lets it through, which is the "solid blocks water completely" rule at
+   the resolution the player digs at. Not done: the shown fill (the water
+   appears when the worker answers), a pocket's own surface drawn, light
+   through water (CLAUDE.md, "The connectivity flood").
 4. **Stored volumes**: when anything can seal a pocket (a fill tool, or
    constructions that block water). Sealed flooded pockets keep their
    water, saved with the edits.

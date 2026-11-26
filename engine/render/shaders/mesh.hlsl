@@ -60,6 +60,7 @@ struct VSOut {
     float4 w1 : TEXCOORD7;
     float4 w2 : TEXCOORD8;
     float  shell : TEXCOORD9;  // the canopy shell's lift as a share of its full height (forest.hlsli)
+    float  dug   : TEXCOORD10; // 1 where the player's edits put the surface inside the generated rock
 };
 
 float4 unpack_weights(uint u) {
@@ -93,7 +94,8 @@ VSOut vs_main(uint vid : SV_VertexID) {
     o.skirt = dot(v.nrm, v.nrm) < 0.5f ? 1.0f : 0.0f;
     const uint2 m = g_vertex_mat[vid];
     o.ground = unpack_material(m.x);
-    o.rock = unpack_material(m.y);
+    o.rock = unpack_material(m.y & ~(1u << 24));   // its lowest bit is the dug flag (surface_nets.hlsl)
+    o.dug = (m.y >> 24) & 1u ? 1.0f : 0.0f;
     const uint3 w = g_vertex_wts[vid];
     o.w0 = unpack_weights(w.x);
     o.w1 = unpack_weights(w.y);
@@ -621,8 +623,13 @@ SceneOut ps_main(VSOut i) {
             // Damp to the highest run-up and a little over (spray, the
             // capillary rise in sand), fading over 40 cm: at 0.85 of it the
             // band ended about where the sheet already stood and barely showed.
-            const float damp = saturate((runup + 0.2f - above) / 0.4f);
-            const float film = above > now ? saturate(1.0f - (above - now) / 0.3f) : 1.0f;
+            // Not on DUG ground (the mesher's flag): the band goes by height
+            // alone, and a pit dug to just over sea level wore it on its
+            // floor, surf with no water. Dug water is calm (water.hlsl), so
+            // under sea level it has no swash either.
+            const float shore = 1.0f - saturate(i.dug);
+            const float damp = saturate((runup + 0.2f - above) / 0.4f) * shore;
+            const float film = (above > now ? saturate(1.0f - (above - now) / 0.3f) : 1.0f) * shore;
             const float wet = max(damp, film);
             albedo *= lerp(1.0f, 0.55f, wet);
             rough = lerp(rough, min(rough, 0.35f), damp);

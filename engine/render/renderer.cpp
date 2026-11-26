@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <thread>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -71,7 +72,8 @@ struct WaterConstants {
     float extent;
     float debug_mode;
     float cam_water;   // world y of the sea surface directly at the camera
-    float pad0[2];
+    float foam_mean;   // the foam pattern's mean (FoamPattern::mean)
+    float pad0;
     float light[7][4]; // the frame's light (ADR-004 L2): Renderer::fill_light
     float wave_amp[WW_WAVES];   // the weather's sea (water_wave.h)
     float wave_steep;
@@ -103,7 +105,8 @@ static_assert(sizeof(WaterConstants) == 672, "WaterConstants must match water.hl
 // range every lit table has declared since DDGI.
 const UINT kWaterSceneSrv = 79, kWaterDepthSrv = 80, kPuddleSrv = Clouds::kHeapEnd,
            kFogOpenUav = NearField::kHeapEnd, kFogOpenAvgUav = kFogOpenUav + 1, kFogOpenAvgSrv = kFogOpenUav + 2,
-           kHeapSlots = kFogOpenUav + 3;
+           kFoamSrv = kFogOpenUav + 3,   // the foam's bubbles (FoamPattern), t7 in the sea's table
+           kHeapSlots = kFogOpenUav + 4;
 static_assert(NearField::kFirst == CharacterRenderer::kSrvB + 1, "the near field follows the character's textures");
 static_assert(CharacterRenderer::kSrvA == kPuddleSrv + 1, "the character's textures follow the puddle mask");
 
@@ -247,8 +250,9 @@ struct PostConstants {
     float hfog[3][4];      // the exploration fog (haze.hlsli): layers, base and on, colour
     float adapt[4];        // dark vision: into the dark fast, slow (s); into the light (s); fast stops
     float dark[4];         // dark vision's display floor: lift, threshold nits, on; the player's brightness
+    float water[3][4];     // under the sea (cs_underwater): extinction + eye under; sun's in-scatter + sea level; sky's
 };
-static_assert(sizeof(PostConstants) == 544, "PostConstants must match post.hlsl");
+static_assert(sizeof(PostConstants) == 592, "PostConstants must match post.hlsl");
 
 // Matches cbuffer FogConstants in fog.hlsl.
 struct FogConstants {
@@ -617,17 +621,19 @@ bool Renderer::create_water_pipeline(std::string& error) {
         // Since the sea draws after the composite: t0 the lit scene's copy,
         // t1 depth's copy, t2 the sky-view table, t3 the aerial perspective,
         // t4 the mist -- one table from heap [3], the post chain's base.
-        D3D12_DESCRIPTOR_RANGE wr[7] = {};
-        const UINT w_heap[7] = {kWaterSceneSrv, kWaterDepthSrv, 10, 11, 32, OceanDetail::kSrvSlot, Clouds::kShadowSrv};
-        for (UINT k = 0; k < 7; ++k) {
+        // The table is visible to every stage.
+        D3D12_DESCRIPTOR_RANGE wr[8] = {};
+        const UINT w_heap[8] = {kWaterSceneSrv, kWaterDepthSrv, 10, 11, 32, OceanDetail::kSrvSlot, Clouds::kShadowSrv,
+                                kFoamSrv};
+        for (UINT k = 0; k < 8; ++k) {
             wr[k].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
             wr[k].NumDescriptors = 1;
             wr[k].BaseShaderRegister = k;
             wr[k].OffsetInDescriptorsFromTableStart = w_heap[k] - 3;
         }
         params[12].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[12].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        params[12].DescriptorTable.NumDescriptorRanges = 7;
+        params[12].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[12].DescriptorTable.NumDescriptorRanges = 8;
         params[12].DescriptorTable.pDescriptorRanges = wr;
         D3D12_STATIC_SAMPLER_DESC ss[4] = {};
         ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -1525,6 +1531,7 @@ void Renderer::record_hfgi(const float vp[16]) {
     if (rocks_on_ && rocks_.ready()) rocks_.record_top(cmd_.Get(), UINT(frame_));
     hfgi_.record(cmd_.Get(), UINT(frame_), shadow_cb_[frame_]->GetGPUVirtualAddress());
 }
+
 
 // ---------------------------------------------------------------------------
 // Volumetric mist (ADR-004 L4): fog.h for where the mist is, fog.hlsl for the
@@ -3002,6 +3009,13 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         if (!near_.init(device_.Get(), srv_heap_.Get(), Clouds::kShadowSrv, error)) return false;
         if (!near_.load_config("worldgen/data/archetypes.json", error)) return false;
         near_.set_world(&world_, &edits_);   // the sky-access flood reads its field and the edits (sky_access.h)
+        if (!foam_.init(device_.Get(), queue_.Get(), srv_heap_.Get(), kFoamSrv, error)) return false;
+        {
+            char line[160];
+            std::snprintf(line, sizeof line, "phase: foam pattern %dx%d, mean %.4f", FoamPattern::kSize,
+                          FoamPattern::kSize, foam_.mean());
+            startup_log().push_back(std::make_pair(std::string(line), foam_.bake_ms()));
+        }
         // The key light's shadow past the cascades.
         if (!far_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         canopy_.set_models(trees_.models(), trees_.looks());
@@ -3339,7 +3353,7 @@ bool Renderer::create_post_pipelines(std::string& error) {
             up.Type = D3D12_HEAP_TYPE_UPLOAD;
             D3D12_RESOURCE_DESC bd = {};
             bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            bd.Width = 768;   // PostConstants, 544 bytes
+            bd.Width = 768;   // PostConstants, 592 bytes
             bd.Height = 1;
             bd.DepthOrArraySize = 1;
             bd.MipLevels = 1;
@@ -3390,10 +3404,11 @@ bool Renderer::create_post_pipelines(std::string& error) {
         }
     }
     const char* kPost = "engine/render/shaders/post.hlsl";
-    const char* cs_e[7] = {"cs_ao", "cs_composite", "cs_taa", "cs_hist_clear", "cs_histogram", "cs_exposure", "cs_ssgi"};
-    ComPtr<ID3D12PipelineState>* cs_o[7] = {&ao_pso_, &composite_pso_, &taa_pso_,
-                                            &hist_clear_pso_, &hist_pso_, &expo_pso_, &ssgi_pso_};
-    for (int k = 0; k < 7; ++k) {
+    const char* cs_e[8] = {"cs_ao", "cs_composite", "cs_taa", "cs_hist_clear", "cs_histogram", "cs_exposure", "cs_ssgi",
+                           "cs_underwater"};
+    ComPtr<ID3D12PipelineState>* cs_o[8] = {&ao_pso_, &composite_pso_, &taa_pso_,
+                                            &hist_clear_pso_, &hist_pso_, &expo_pso_, &ssgi_pso_, &underwater_pso_};
+    for (int k = 0; k < 8; ++k) {
         ComPtr<ID3DBlob> cs;
         if (!compile_shader(kPost, cs_e[k], "cs_5_1", cs, error)) return false;
         D3D12_COMPUTE_PIPELINE_STATE_DESC cd = {};
@@ -3762,6 +3777,26 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     pc.dark[1] = dark_.threshold;
     pc.dark[2] = dark_.on ? 1.0f : 0.0f;
     pc.dark[3] = dark_.brightness;
+    // Under the sea (ADR-006 stage 2): the sea's own optics, as water.hlsl
+    // has them -- the extinction murkier with the sea's roughness, and the
+    // body's in-scatter, deep_colour x the light on level water under the
+    // surface (water.hlsl's deep_in), split so the shader can put the
+    // clouds' shadow on the sun's part.
+    {
+        const float rough = Weather::roughness(weather_now_);
+        const float turb = 1.0f + water_optics_.storm_turbidity * rough * rough;
+        float lt[7][4];
+        fill_light(lt);
+        const float sy = lt[0][1] > 0.0f ? lt[0][1] : 0.0f;
+        const float sun_k = sy * (0.25f + 0.75f * sy) / 3.14159265f;
+        for (int k = 0; k < 3; ++k) {
+            pc.water[0][k] = water_optics_.extinction[k] * turb;
+            pc.water[1][k] = water_optics_.deep_colour[k] * lt[1][k] * sun_k;
+            pc.water[2][k] = water_optics_.deep_colour[k] * lt[2][k];
+        }
+        pc.water[0][3] = cam_under_ ? 1.0f : 0.0f;
+        pc.water[1][3] = world_.params().sea_level;
+    }
     pc.ev_comp = ev_comp_;
     pc.ev100_fixed = ev100_fixed_;
     pc.tonemap = wire ? 0u : tonemap_;
@@ -3845,10 +3880,15 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
     cmd_->SetPipelineState(composite_pso_.Get());
     cmd_->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
     // The sea and the rain draw onto the scene as a render target.
-    const bool rain = rain_.ready() && (rain_intensity() > 0.001f || drips() > 0.001f);
-    const bool bolt = lightning_.ready() && strike_.active && strike_.ground && strike_.channel > 0.001f && !wire;
-    if (water_pending_) record_water();
-    else if (rain || bolt) tr(scene_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    // Under the sea neither the rain nor the bolt is seen: they are in the air.
+    const bool rain = !cam_under_ && rain_.ready() && (rain_intensity() > 0.001f || drips() > 0.001f);
+    const bool bolt = !cam_under_ && lightning_.ready() && strike_.active && strike_.ground &&
+                      strike_.channel > 0.001f && !wire;
+    if (water_pending_) {
+        prof_.mark(cmd_.Get(), "composite");
+        record_water();
+        prof_.mark(cmd_.Get(), "sea");
+    } else if (rain || bolt) tr(scene_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET);
     if (rain) record_rain();
     if (bolt) record_lightning();
     if (water_pending_ || rain || bolt) {
@@ -3861,7 +3901,19 @@ void Renderer::record_post(D3D12_CPU_DESCRIPTOR_HANDLE backbuffer) {
         cmd_->SetComputeRootUnorderedAccessView(3, lumhist_->GetGPUVirtualAddress());
         cmd_->SetComputeRootUnorderedAccessView(4, expo_->GetGPUVirtualAddress());
         cmd_->SetComputeRootDescriptorTable(5, ssgi_uav);
-        tr(scene_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
+        if (cam_under_) {
+            // The water between the eye and everything it sees, the sea's
+            // surface overhead included (its depth is in depth_ now).
+            tr(scene_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            prof_.mark(cmd_.Get(), "scene, composite and the sea");
+            cmd_->SetPipelineState(underwater_pso_.Get());
+            cmd_->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
+            prof_.mark(cmd_.Get(), "underwater");
+            uavb(scene_.Get());
+            tr(scene_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
+        } else {
+            tr(scene_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
+        }
     } else {
         tr(scene_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read);
     }
@@ -4299,6 +4351,8 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     // the lit scene: it needs that scene for what shows through it and for
     // what it reflects (record_water).
     water_pending_ = false;
+    cam_under_ = false;
+    cam_under_depth_ = 0.0f;
     if (water_ && water_pso_ && mode_ != Mode::Wireframe) {
         WaterConstants wc = {};
         std::memcpy(wc.view_proj, mc.view_proj, sizeof wc.view_proj);
@@ -4331,12 +4385,20 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         wc.grid_cells = static_cast<float>(kWaterCells);
         wc.extent = kFarPlane;
         wc.debug_mode = water_debug_;
-        // The same question physics asks of the same function, so the
-        // shader's idea of "is the eye above the water here" and the
-        // swimmer's are one answer rather than two that usually agree.
-        wc.cam_water = wc.sea_level + ww_water_at(view.cam_pos[0], view.cam_pos[2],
-                                                  view.time, sea_, swash_,
-                                                  wc.sea_level - world_.height(view.cam_pos[0], view.cam_pos[2]));
+        // The same question physics asks of the same function (ww_sea_at), so
+        // the shader's idea of "is the eye above the water here" and the
+        // swimmer's are one answer rather than two that usually agree. Water
+        // is a half-space: the eye is under it wherever it is below the
+        // surface -- sea level plus the deep sea's waves by the generated
+        // depth, so still in a pit, a tunnel or a cave inland.
+        {
+            const float cx = view.cam_pos[0], cy = view.cam_pos[1], cz = view.cam_pos[2];
+            const float ground = world_.height(cx, cz);
+            wc.cam_water = wc.sea_level + ww_sea_at(cx, cz, view.time, sea_, swash_, wc.sea_level - ground, ground - cy);
+            cam_under_ = cy < wc.cam_water;
+            wc.foam_mean = foam_.mean();
+            if (cam_under_) cam_under_depth_ = wc.cam_water - cy;
+        }
         // What the post chain knows, for the haze and the sky (haze.hlsli).
         wc.inv_size[0] = 1.0f / float(width_ ? width_ : 1);
         wc.inv_size[1] = 1.0f / float(height_ ? height_ : 1);
@@ -4609,7 +4671,7 @@ void Renderer::record_frame(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
     // runs before its bricks are in the pool meshes against whatever was
     // there, which looks correct for any brick that happened to be resident
     // already and so fails only for new edits.
-    mesher_.begin_frame_bricks();
+    mesher_.begin_frame_bricks(UINT(frame_));
     edits_.take_dirty(dirty_bricks_);
     for (size_t i = 0; i < dirty_bricks_.size(); ++i) pager_.invalidate(dirty_bricks_[i]);
 
@@ -4782,7 +4844,7 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
         allocators_[frame_]->Reset();
         cmd_->Reset(allocators_[frame_].Get(), nullptr);
         mesher_.record_to_compute(cmd_.Get());
-        mesher_.begin_frame_bricks();
+        mesher_.begin_frame_bricks(UINT(frame_));
         {
             brick_uploads_.clear();
             Streamer::EditContext cctx;
@@ -4802,6 +4864,17 @@ bool Renderer::capture(const ViewConstants& view, const char* path, std::string&
                 if (mesher_.record_brick_upload(cmd_.Get(), slots[0], b->density,
                                                 b->edited)) {
                     pager_.mark_uploaded(brick_uploads_[i]);
+                } else {
+                    // As the frame loop does (record_frame): the chunks over
+                    // a brick that found no staging room are meshed again
+                    // once it lands. Without this a capture over many fresh
+                    // edits drew some of them without the edit.
+                    const float s = float(kBrickSide) * kEditVoxel;
+                    const float lo[3] = {float(brick_uploads_[i].x) * s, float(brick_uploads_[i].y) * s,
+                                         float(brick_uploads_[i].z) * s};
+                    const float hi[3] = {lo[0] + s, lo[1] + s, lo[2] + s};
+                    streamer_.invalidate_box(lo, hi);
+                    ++stats_.brick_upload_deferrals;
                 }
             }
             streamer_.record_planned(cmd_.Get(), mesher_);
@@ -5572,7 +5645,7 @@ void Renderer::normal_check(const char* path) {
         allocators_[frame_]->Reset();
         cmd_->Reset(allocators_[frame_].Get(), nullptr);
         mesher_.record_to_compute(cmd_.Get());
-        mesher_.begin_frame_bricks();
+        mesher_.begin_frame_bricks(UINT(frame_));
         mesher_.record_mesh(cmd_.Get(), 0, origin, voxel, 0, 0);
         mesher_.record_counter_copy(cmd_.Get());
         mesher_.record_vertex_copy(cmd_.Get());
@@ -5667,7 +5740,7 @@ bool Renderer::probe_field(const float origin[3], float voxel, const char* path,
     allocators_[frame_]->Reset();
     cmd_->Reset(allocators_[frame_].Get(), nullptr);
     mesher_.record_to_compute(cmd_.Get());
-    mesher_.begin_frame_bricks();
+    mesher_.begin_frame_bricks(UINT(frame_));
     mesher_.record_mesh(cmd_.Get(), 0, origin, voxel, 0, 0);
     mesher_.record_density_copy(cmd_.Get());
     mesher_.record_counter_copy(cmd_.Get());
@@ -5772,7 +5845,31 @@ bool Renderer::dig(float x, float y, float z, float radius, float strength,
     float lo[3], hi[3];
     {
         auto lock = near_.sky_edit_lock();   // the flood's worker reads the edits
-        if (!edits_.edit_sphere(x, y, z, radius, strength, material, lo, hi)) return false;
+        // The field at the lattice points the edit asks about: on every core
+        // for a big dig (an 8 m one asks ~13 thousand), in place for a small
+        // one, where starting threads would cost more than it saves.
+        const std::function<void(const int*, size_t, float*)> base = [this](const int* xyz, size_t n,
+                                                                            float* out) {
+            auto run = [this, xyz, out](size_t a, size_t b) {
+                for (size_t k = a; k < b; ++k)
+                    out[k] = world_.density(float(xyz[3 * k]) * kEditVoxel, float(xyz[3 * k + 1]) * kEditVoxel,
+                                            float(xyz[3 * k + 2]) * kEditVoxel, kEditVoxel);
+            };
+            unsigned nt = std::thread::hardware_concurrency();
+            nt = nt ? nt : 4;
+            if (n < 256 || nt < 2) {
+                run(0, n);
+                return;
+            }
+            std::vector<std::thread> pool;
+            const size_t per = (n + nt - 1) / nt;
+            for (unsigned t = 0; t < nt; ++t) {
+                const size_t a = size_t(t) * per, b = (std::min)(n, a + per);
+                if (a < b) pool.emplace_back(run, a, b);
+            }
+            for (std::thread& t : pool) t.join();
+        };
+        if (!edits_.edit_sphere(x, y, z, radius, strength, material, base, lo, hi)) return false;
     }
     streamer_.invalidate_box(lo, hi);
     foliage_.invalidate_box(lo, hi);

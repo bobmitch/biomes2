@@ -1618,7 +1618,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     const bool dig_tree_mode = hl.find("--dig-settle") != std::string::npos;
     const bool lights_mode = hl.find("--lights-report") != std::string::npos;
     const bool leak_mode = hl.find("--leak-test") != std::string::npos;
+    const bool pit_mode = hl.find("--dig-water") != std::string::npos;
     const bool headless = report_mode || fell_mode || dig_tree_mode || lights_mode || leak_mode ||
+                          pit_mode ||
                           !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
@@ -3002,6 +3004,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                  w.wind_dir[0], w.wind_dir[1], w.gust, w.sea_wind, w.swell_hs, w.swell_dir[0],
                                  w.swell_dir[1], 4.0 * std::sqrt(m0), g_camera.x, g_camera.y, g_camera.z, depth,
                                  depth > 0.0f ? ww_significant_height_lod(sea, depth, 0.0f) : 0.0f);
+                    // ADR-006 stage 2: which side of the water the still was
+                    // taken from decides everything in it.
+                    if (g_renderer.camera_underwater())
+                        std::fprintf(f, "underwater: the eye is %.2f m under the surface (post.hlsl cs_underwater)\n",
+                                     g_renderer.camera_water_depth());
+                    else
+                        std::fprintf(f, "underwater: no\n");
                     {
                         const engine::Strike& st = g_renderer.strike();
                         if (st.active)
@@ -5047,6 +5056,322 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return fell ? 1 : 0;
     }
 
+    if (pit_mode) {
+        // --dig-water: water is a half-space -- every bit of air under sea
+        // level is water -- and this is its look and its check, on dug
+        // ground. From the coast nearest spawn:
+        //   a pit dug into the beach, undercut on its inland side, opened to
+        //   the sea by a channel through the beach (the coast's look:
+        //   build/dig_water.bmp, dig_water_top.bmp);
+        //   inland, a pit dug 2.5 m under sea level, walled off from the sea:
+        //   it must be water to physics, calm (still at sea level), and an eye
+        //   in it must be under water;
+        //   beside it a pit dug to 0.4 m OVER sea level: dry, and no shore's
+        //   wet band on its floor (build/dig_water_inland.bmp shows both).
+        // BIOMES_PIT_DREDGE=1 also dredges a strip across the shoreline;
+        // BIOMES_PIT_UNDERCUT=<m> sets the undercut's centre under sea level;
+        // BIOMES_PIT_PICK="px py ..." names what the coast's still shows at a
+        // pixel, through the EDITED density (--pick reads the generated field).
+        const engine::WorldGpu& wg = g_renderer.world();
+        const float sea = wg.params().sea_level;
+        g_renderer.set_vsync(true);
+        g_walk = true;
+        std::remove("build/dig_water.txt");
+        FILE* f = std::fopen("build/dig_water.txt", "w");
+        if (!f) return 1;
+        // The coast: along a spoke from spawn, land 20 m in, inland ground at
+        // least 2 m over sea level from 34 to 62 m in (the inland pits), and
+        // 20 m of sea out from the shore.
+        float best_rc = 1e9f, dx = 0.0f, dz = 1.0f;
+        for (int sp = 0; sp < 72; ++sp) {
+            const float a = 6.2831853f * float(sp) / 72.0f;
+            const float ux = std::sin(a), uz = std::cos(a);
+            auto at = [&](float r) { return wg.height(g_spawn.x + ux * r, g_spawn.z + uz * r); };
+            float rc = -1.0f;
+            for (float r = 10.0f; r < 4000.0f && r < best_rc; r += 2.0f)
+                if (at(r) < sea) { rc = r; break; }
+            if (rc < 70.0f || at(rc - 20.0f) < sea + 0.5f) continue;
+            bool ok = true;
+            for (float s = 3.0f; s <= 20.0f && ok; s += 1.0f) ok = at(rc + s) < sea - 0.3f;
+            for (float s = -62.0f; s <= -34.0f && ok; s += 2.0f) ok = at(rc + s) > sea + 2.0f;
+            if (!ok) continue;
+            best_rc = rc; dx = ux; dz = uz;
+        }
+        if (best_rc >= 1e9f) {
+            std::fprintf(f, "VOID RUN: no coast within 4 km of spawn with land 2 m high 34-62 m inland\n");
+            std::fclose(f);
+            g_renderer.shutdown();
+            g_physics.shutdown();
+            return 1;
+        }
+        auto pt = [&](float s, float side, float out[2]) {
+            out[0] = g_spawn.x + dx * (best_rc + s) - dz * side;
+            out[1] = g_spawn.z + dz * (best_rc + s) + dx * side;
+        };
+        auto hgt = [&](float s, float side) { float p[2]; pt(s, side, p); return wg.height(p[0], p[1]); };
+        auto dig_at = [&](float s, float side, float y, float r) {
+            float p[2];
+            pt(s, side, p);
+            g_renderer.dig(p[0], y, p[1], r, -4.0f, 1);
+        };
+        float t = 0.0f;
+        const float kDt = 1.0f / 60.0f;
+        int drawn = 0;
+        auto frame = [&]() {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+            sync_physics_terrain();
+            sync_sea(t);
+            g_physics.update(kDt, 0.0f, 0.0f, false);
+            g_physics.character_position(g_feet);
+            g_camera.x = g_feet[0]; g_camera.y = g_feet[1] + kEyeAboveFeet; g_camera.z = g_feet[2];
+            t += kDt;
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            if (cr.right - cr.left < 1 || cr.bottom - cr.top < 1) return;
+            engine::ViewConstants v = {};
+            fill_view(g_camera, float(cr.right - cr.left), float(cr.bottom - cr.top), t, v);
+            g_renderer.render(v);
+            ++drawn;
+        };
+        {
+            float p[2];
+            pt(-12.0f, 12.0f, p);
+            g_physics.place_character(p[0], Spawn::above(p[0], p[1]), p[1]);
+            for (int i = 0; i < 120; ++i) frame();
+        }
+        // The coastal pit: 4 m spheres from 16 m inland to 4 m, three rows,
+        // centres half a metre over sea level, so their tops break through
+        // the beach; an undercut under its inland side; a channel out through
+        // the beach into the sea.
+        for (float s = -16.0f; s <= -4.0f; s += 2.0f)
+            for (float side = -3.0f; side <= 3.0f; side += 3.0f) dig_at(s, side, sea + 0.5f, 4.0f);
+        if (std::getenv("BIOMES_PIT_DREDGE"))
+            for (float s = -4.0f; s <= 14.0f; s += 2.0f)
+                for (float side = -8.0f; side <= 8.0f; side += 2.0f) dig_at(s, side, sea - 0.5f, 2.5f);
+        float under_c = 2.5f;   // its ceiling tangent to the water: the waterline's worst case
+        if (const char* e = std::getenv("BIOMES_PIT_UNDERCUT")) under_c = float(std::atof(e));
+        for (float s = -16.0f; s <= -6.0f; s += 2.0f) dig_at(s, -7.0f, sea - under_c, 2.5f);
+        for (float s = -4.0f; s <= 6.0f; s += 1.0f) dig_at(s, 0.0f, sea - 1.5f, 2.0f);
+        // The inland pits, 3 m spheres stacked from the floor up through the
+        // ground so they are open to the sky: the wet one's floor 2.5 m under
+        // sea level at 42 m in, the dry one's 0.4 m over it at 54 m in.
+        const float kPR = 3.0f, kWetS = -42.0f, kDryS = -54.0f;
+        const float wet_floor = sea - 2.5f, dry_floor = sea + 0.4f;
+        auto pit = [&](float s0, float floor_y) {
+            for (float s = s0 - 1.5f; s <= s0 + 1.5f; s += 1.5f)
+                for (float side = -1.5f; side <= 1.5f; side += 1.5f)
+                    for (float y = floor_y + kPR; y <= hgt(s, side) + kPR; y += 1.5f) dig_at(s, side, y, kPR);
+        };
+        pit(kWetS, wet_floor);
+        pit(kDryS, dry_floor);
+        // Stand at the rim while the meshes settle.
+        {
+            float p[2];
+            pt(-10.0f, 9.0f, p);
+            g_physics.place_character(p[0], Spawn::above(p[0], p[1]) + 1.0f, p[1]);
+            for (int i = 0; i < 180; ++i) frame();
+        }
+        std::fprintf(f, "dig water: coast %.0f m from spawn (%.1f, %.1f) along (%.3f, %.3f); sea level %.2f\n",
+                     best_rc, g_spawn.x, g_spawn.z, dx, dz, sea);
+        std::fprintf(f, "inland pits: generated ground %.2f m (wet, floor %.2f) and %.2f m (dry, floor %.2f) over sea level\n\n",
+                     hgt(kWetS, 0.0f) - sea, wet_floor - sea, hgt(kDryS, 0.0f) - sea, dry_floor - sea);
+
+        // The character placed and stood for 1.5 s: what physics calls it, and
+        // how far its water's surface strays from sea level (dug water is still).
+        struct Stand { int dry = 0, wet = 0, frames = 0; float stray = 0.0f; };
+        auto stand = [&](float s, float side, float y) {
+            float p[2];
+            pt(s, side, p);
+            Stand st;
+            g_physics.place_character(p[0], y, p[1]);
+            for (int i = 0; i < 90; ++i) {
+                frame();
+                if (i < 15) continue;
+                ++st.frames;
+                if (g_physics.medium() == engine::Medium::Dry) ++st.dry; else ++st.wet;
+                if (g_physics.sea_present())
+                    st.stray = (std::max)(st.stray, std::fabs(g_physics.water_surface() - sea));
+            }
+            return st;
+        };
+        bool pass_wet = false, pass_dry = false, pass_chan = false, pass_eye = false;
+        {
+            const Stand st = stand(kWetS, 0.0f, wet_floor + 0.3f);
+            std::fprintf(f, "inland pit 2.5 m under sea level: dry %d, in the water %d of %d; its surface strays %.3f m "
+                            "from sea level\n", st.dry, st.wet, st.frames, st.stray);
+            pass_wet = st.frames > 0 && st.wet == st.frames && st.stray < 0.02f;
+        }
+        {
+            const Stand st = stand(kDryS, 0.0f, dry_floor + 0.3f);
+            std::fprintf(f, "inland pit 0.4 m over sea level: dry %d, in the water %d of %d\n", st.dry, st.wet, st.frames);
+            pass_dry = st.frames > 0 && st.dry == st.frames;
+        }
+        {
+            const Stand st = stand(-2.0f, 0.0f, sea - 3.2f);
+            std::fprintf(f, "the coastal channel 2 m inland: dry %d, in the water %d of %d; its surface strays %.3f m "
+                            "from sea level\n", st.dry, st.wet, st.frames, st.stray);
+            pass_chan = st.frames > 0 && st.wet == st.frames && st.stray < 0.02f;
+        }
+        // The eye a metre under sea level in the inland pit: drawn as under
+        // water, and a still looking up at the surface from below.
+        {
+            float p[2];
+            pt(kWetS, 0.0f, p);
+            engine::Camera c = g_camera;
+            c.x = p[0]; c.z = p[1]; c.y = sea - 1.0f;
+            c.yaw = std::atan2(dx, dz);
+            c.pitch = 0.5f;
+            int under = 0;
+            for (int i = 0; i < 8; ++i) {
+                sync_sea(t);
+                engine::ViewConstants cv = {};
+                fill_view(c, g_res_w, g_res_h, t, cv);
+                g_renderer.render(cv);
+                t += kDt;
+                if (g_renderer.camera_underwater()) ++under;
+            }
+            pass_eye = under == 8;
+            std::fprintf(f, "an eye 1 m under sea level in the inland pit: drawn as under water %d of 8 frames, "
+                            "%.2f m under the surface\n", under, g_renderer.camera_water_depth());
+            engine::ViewConstants cv = {};
+            fill_view(c, g_res_w, g_res_h, t, cv);
+            std::string e3;
+            g_renderer.capture(cv, "build/dig_water_under.bmp", e3);
+            std::fprintf(f, "  still: build/dig_water_under.bmp -- --cam %.2f %.2f %.2f %.4f %.2f\n", c.x, c.y, c.z,
+                         c.yaw, c.pitch);
+        }
+
+        std::string e3;
+        engine::ViewConstants cv = {};
+        engine::Camera c = g_camera;
+        // The inland pits from straight above, clear of the crowns: water
+        // standing in the one, a dry floor with no wet band in the other.
+        {
+            float c0[2];
+            pt(0.5f * (kWetS + kDryS), 0.0f, c0);
+            c.x = c0[0]; c.z = c0[1];
+            c.y = (std::max)(hgt(kWetS, 0.0f), hgt(kDryS, 0.0f)) + 30.0f;
+            c.yaw = std::atan2(dx, dz);
+            c.pitch = -1.5f;
+            const bool trees = g_renderer.trees_on();
+            g_renderer.set_trees(false);   // a wood stands over them on the default seed
+            fill_view(c, g_res_w, g_res_h, t, cv);
+            g_renderer.capture(cv, "build/dig_water_inland.bmp", e3);
+            g_renderer.set_trees(trees);
+            std::fprintf(f, "\nstill: build/dig_water_inland.bmp (no trees; the wet pit at the top) -- --cam %.2f %.2f "
+                            "%.2f %.4f %.2f\n", c.x, c.y, c.z, c.yaw, c.pitch);
+            // And inside each, 2 m over its water or its floor, looking down
+            // past the far wall's foot.
+            const float ss[2] = {kWetS, kDryS};
+            const float ys[2] = {sea + 2.0f, dry_floor + 2.0f};
+            const char* names[2] = {"build/dig_water_wet.bmp", "build/dig_water_dry.bmp"};
+            for (int k = 0; k < 2; ++k) {
+                pt(ss[k] - 1.5f, 0.0f, c0);
+                c.x = c0[0]; c.z = c0[1]; c.y = ys[k];
+                c.pitch = -0.75f;
+                fill_view(c, g_res_w, g_res_h, t, cv);
+                g_renderer.capture(cv, names[k], e3);
+                std::fprintf(f, "still: %s -- --cam %.2f %.2f %.2f %.4f %.2f\n", names[k], c.x, c.y, c.z, c.yaw,
+                             c.pitch);
+            }
+        }
+        // The coastal pit and its channel.
+        {
+            float c0[2], aim[2];
+            pt(4.0f, 14.0f, c0);
+            pt(-10.0f, -2.0f, aim);
+            c.x = c0[0]; c.z = c0[1]; c.y = sea + 12.0f;
+            c.yaw = std::atan2(aim[0] - c.x, aim[1] - c.z);
+            c.pitch = -0.55f;
+            fill_view(c, g_res_w, g_res_h, t, cv);
+            g_renderer.capture(cv, "build/dig_water.bmp", e3);
+            std::fprintf(f, "still: build/dig_water.bmp -- --cam %.2f %.2f %.2f %.4f %.2f\n", c.x, c.y, c.z, c.yaw,
+                         c.pitch);
+        }
+        // Along the channel from the sea, 3 m up; and an untouched stretch of
+        // the same beach at a grazing angle, where a flat sheet at sea level
+        // meets ground at sea level (z-fighting would show here).
+        {
+            float c0[2], aim[2];
+            pt(8.0f, 0.0f, c0);
+            c.x = c0[0]; c.z = c0[1]; c.y = sea + 3.0f;
+            c.yaw = std::atan2(-dx, -dz);
+            c.pitch = -0.35f;
+            fill_view(c, g_res_w, g_res_h, t, cv);
+            g_renderer.capture(cv, "build/dig_water_channel.bmp", e3);
+            std::fprintf(f, "still: build/dig_water_channel.bmp -- --cam %.2f %.2f %.2f %.4f %.2f\n", c.x, c.y, c.z,
+                         c.yaw, c.pitch);
+            pt(2.0f, 22.0f, c0);
+            pt(0.0f, 60.0f, aim);
+            c.x = c0[0]; c.z = c0[1]; c.y = sea + 1.6f;
+            c.yaw = std::atan2(aim[0] - c.x, aim[1] - c.z);
+            c.pitch = -0.12f;
+            fill_view(c, g_res_w, g_res_h, t, cv);
+            g_renderer.capture(cv, "build/dig_water_beach.bmp", e3);
+            std::fprintf(f, "still: build/dig_water_beach.bmp -- --cam %.2f %.2f %.2f %.4f %.2f\n", c.x, c.y, c.z,
+                         c.yaw, c.pitch);
+        }
+        if (const char* pk = std::getenv("BIOMES_PIT_PICK")) {
+            float fwd[3], right[3], up[3];
+            c.basis(fwd, right, up);
+            const char* s2 = pk;
+            float px = 0.0f, py = 0.0f;
+            int used = 0;
+            while (std::sscanf(s2, "%f %f%n", &px, &py, &used) == 2) {
+                s2 += used;
+                const float nx = ((px + 0.5f) / g_res_w) * 2.0f - 1.0f;
+                const float ny = 1.0f - ((py + 0.5f) / g_res_h) * 2.0f;
+                float d[3];
+                for (int k = 0; k < 3; ++k)
+                    d[k] = fwd[k] + right[k] * nx * cv.tan_half_fov * cv.aspect + up[k] * ny * cv.tan_half_fov;
+                const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                for (int k = 0; k < 3; ++k) d[k] /= dl;
+                float t0 = 0.0f, t1 = -1.0f;
+                for (float tt = 0.0f; tt < 200.0f; tt += 0.05f) {
+                    if (g_renderer.edited_density(c.x + d[0] * tt, c.y + d[1] * tt, c.z + d[2] * tt) > 0.0f) {
+                        t1 = tt;
+                        break;
+                    }
+                    t0 = tt;
+                }
+                if (t1 < 0.0f) { std::fprintf(f, "pick (%.0f, %.0f): no hit\n", px, py); continue; }
+                for (int it = 0; it < 30; ++it) {
+                    const float tm = 0.5f * (t0 + t1);
+                    if (g_renderer.edited_density(c.x + d[0] * tm, c.y + d[1] * tm, c.z + d[2] * tm) > 0.0f) t1 = tm;
+                    else t0 = tm;
+                }
+                const float hx = c.x + d[0] * t1, hy = c.y + d[1] * t1, hz = c.z + d[2] * t1;
+                const float S = engine::lod_chunk_size(0);
+                const float fx = hx / S - std::floor(hx / S), fz = hz / S - std::floor(hz / S);
+                const float fy = hy / S - std::floor(hy / S);
+                std::fprintf(f, "pick (%.0f, %.0f): hit (%.2f, %.2f, %.2f) at %.1f m, %.2f m over sea level; "
+                             "in its LOD 0 chunk x %.2f y %.2f z %.2f m (of %.0f); generated height %.2f\n",
+                             px, py, hx, hy, hz, t1, hy - sea, fx * S, fy * S, fz * S, S, wg.height(hx, hz));
+            }
+        }
+        {
+            float top[2];
+            pt(-10.0f, -2.0f, top);
+            c.x = top[0]; c.z = top[1]; c.y = sea + 22.0f; c.pitch = -1.5f;
+            fill_view(c, g_res_w, g_res_h, t, cv);
+            g_renderer.capture(cv, "build/dig_water_top.bmp", e3);
+        }
+        const engine::FrameStats st = g_renderer.stats();
+        if (drawn == 0 || st.chunks_classified == 0)
+            std::fprintf(f, "\nVOID RUN: %d frames drawn, %llu chunks classified\n", drawn, st.chunks_classified);
+        std::fprintf(f, "\ninland pit under sea level is water, still: %s\ninland pit over sea level is dry: %s\n"
+                        "coastal channel is water, still: %s\nan eye in the inland pit is under water: %s\n",
+                     pass_wet ? "PASS" : "FAIL", pass_dry ? "PASS" : "FAIL", pass_chan ? "PASS" : "FAIL",
+                     pass_eye ? "PASS" : "FAIL");
+        const bool pass = pass_wet && pass_dry && pass_chan && pass_eye && drawn > 0;
+        std::fprintf(f, "%s\n", pass ? "PASS" : "FAIL");
+        std::fclose(f);
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return pass ? 0 : 1;
+    }
+
     if (swim_seconds > 0.0) {
         // --swim: walk off a beach, swim out, turn round, swim back and walk
         // out. The thing being measured is the bug this replaces -- a
@@ -5071,33 +5396,37 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const float deep = engine::PhysicsWorld::kFloatDepth +
                            ww_total_amplitude(wsea) + 1.0f;
 
-        // A beach: the nearest coast to the origin along any of 72 spokes
-        // where the land side is low enough to walk down (under 6 m, 20 m
-        // in) and the sea side stays sea and gets deep within 40 m.
+        // A beach: the nearest coast to SPAWN along any of 72 spokes where
+        // the land side is low enough to walk down (under 6 m, 20 m in) and
+        // the sea side stays sea and gets deep within 40 m. From the origin
+        // until v19: v18's archipelago put the origin in the sea, and every
+        // run since found no beach and swam nothing.
+        const float ox = g_spawn.x, oz = g_spawn.z;
+        auto hgt = [&](float dx, float dz, float r) { return wg.height(ox + dx * r, oz + dz * r); };
         float best_rc = 1e9f, dir_x = 0.0f, dir_z = 1.0f;
         for (int sp = 0; sp < 72; ++sp) {
             const float a = 6.2831853f * float(sp) / 72.0f;
             const float dx = std::sin(a), dz = std::cos(a);
             float rc = -1.0f;
             for (float r = 20.0f; r < 6000.0f && r < best_rc; r += 5.0f) {
-                if (wg.height(dx * r, dz * r) < sea) { rc = r; break; }
+                if (hgt(dx, dz, r) < sea) { rc = r; break; }
             }
             if (rc < 0.0f) continue;
-            const float land = wg.height(dx * (rc - 20.0f), dz * (rc - 20.0f));
+            const float land = hgt(dx, dz, rc - 20.0f);
             if (land < sea || land > sea + 6.0f) continue;
             bool open = true;
             for (float r = rc; r <= rc + 70.0f; r += 5.0f) {
-                if (wg.height(dx * r, dz * r) >= sea) { open = false; break; }
+                if (hgt(dx, dz, r) >= sea) { open = false; break; }
             }
             if (!open) continue;
-            if (sea - wg.height(dx * (rc + 40.0f), dz * (rc + 40.0f)) < deep) continue;
+            if (sea - hgt(dx, dz, rc + 40.0f) < deep) continue;
             best_rc = rc; dir_x = dx; dir_z = dz;
         }
 
         FILE* f = std::fopen("build/swim.txt", "w");
         if (best_rc >= 1e9f) {
             if (f) {
-                std::fprintf(f, "no beach found within 6 km of the origin that is walkable on\n"
+                std::fprintf(f, "no beach found within 6 km of spawn that is walkable on\n"
                                 "the land side and deeper than %.2f m 40 m out. Nothing was swum.\n",
                              deep);
                 std::fclose(f);
@@ -5109,7 +5438,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
 
         g_renderer.set_vsync(true);
         g_walk = true;
-        const float sx = dir_x * (best_rc - 20.0f), sz = dir_z * (best_rc - 20.0f);
+        const float sx = ox + dir_x * (best_rc - 20.0f), sz = oz + dir_z * (best_rc - 20.0f);
         g_physics.place_character(sx, Spawn::above(sx, sz), sz);
         g_physics.character_position(g_feet);
         const float yaw_out = std::atan2(dir_x, dir_z);
@@ -5193,7 +5522,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                   (g_feet[2] - pz) * (g_feet[2] - pz));
             }
 
-            const double along = double(g_feet[0]) * dir_x + double(g_feet[2]) * dir_z;
+            const double along = double(g_feet[0] - ox) * dir_x + double(g_feet[2] - oz) * dir_z;
             if (along - best_rc > out_max) out_max = along - best_rc;
 
             const float column = sea - wg.height(g_feet[0], g_feet[2]);
@@ -5289,7 +5618,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             }
             std::fprintf(f, "swim off a beach and back, %.1f s, sea state %.2f\n",
                          swim_seconds, state);
-            std::fprintf(f, "beach: coast %.0f m from the origin along (%.3f, %.3f), "
+            std::fprintf(f, "beach: coast %.0f m from spawn along (%.3f, %.3f), "
                             "start 20 m inland\n", best_rc, dir_x, dir_z);
             std::fprintf(f, "frames %llu, judged %llu (after 1.5 s of streaming)\n",
                          frames, judged);

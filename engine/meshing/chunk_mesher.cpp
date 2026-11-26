@@ -208,9 +208,9 @@ bool ChunkMesher::init(ID3D12Device* device, UINT64 timestamp_freq, std::string&
                      brick_mask_, error, "brick mask pool")) return false;
     // The header list is small and rewritten every frame, so it is read
     // straight out of an upload heap rather than copied into one more buffer.
-    if (!make_upload(device, UINT64(kMaxBrickHeaders) * 16, brick_hdr_, error,
+    if (!make_upload(device, UINT64(kBrickRings) * kMaxBrickHeaders * 16, brick_hdr_, error,
                      "brick headers")) return false;
-    if (!make_upload(device, UINT64(kBrickUploadsPerFrame) * kBrickStageBytes,
+    if (!make_upload(device, UINT64(kBrickRings) * kBrickUploadsPerFrame * kBrickStageBytes,
                      brick_stage_, error, "brick staging")) return false;
     {
         void* p = nullptr;
@@ -309,7 +309,8 @@ void bind_world(ID3D12GraphicsCommandList* cmd, const WorldGpu* w) {
 }
 }  // namespace
 
-void ChunkMesher::begin_frame_bricks() {
+void ChunkMesher::begin_frame_bricks(UINT ring) {
+    brick_ring_ = ring % kBrickRings;
     brick_hdr_cursor_ = 0;
     brick_uploads_ = 0;
 }
@@ -317,7 +318,8 @@ void ChunkMesher::begin_frame_bricks() {
 UINT ChunkMesher::push_brick_headers(const int* origins, const UINT* slots, UINT n) {
     if (n == 0) return 0;
     if (brick_hdr_cursor_ + n > kMaxBrickHeaders) return 0;
-    const UINT first = brick_hdr_cursor_;
+    // Indices into the whole table: this frame's half starts at ring x max.
+    const UINT first = brick_ring_ * kMaxBrickHeaders + brick_hdr_cursor_;
     for (UINT i = 0; i < n; ++i) {
         int* e = brick_hdr_cpu_ + size_t(first + i) * 4;
         e[0] = origins[i * 3 + 0];
@@ -332,7 +334,7 @@ UINT ChunkMesher::push_brick_headers(const int* origins, const UINT* slots, UINT
 bool ChunkMesher::record_brick_upload(ID3D12GraphicsCommandList* cmd, UINT slot,
                                       const float* density, const UINT* mask) {
     if (slot >= kMaxBricks || brick_uploads_ >= kBrickUploadsPerFrame) return false;
-    const UINT i = brick_uploads_++;
+    const UINT i = brick_ring_ * kBrickUploadsPerFrame + brick_uploads_++;
     unsigned char* dst = brick_stage_cpu_ + size_t(i) * kBrickStageBytes;
     std::memcpy(dst, density, kBrickVoxelsGpu * 4);
     std::memcpy(dst + kBrickVoxelsGpu * 4, mask, kBrickMaskWordsGpu * 4);

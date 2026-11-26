@@ -147,15 +147,26 @@ Last gathered: 2026-11-21, after the exploration fog.
 
 ## Weather, water and wet
 
-- **Rain draws under the sea**, and there are no drops on the camera lens.
-  [Volumetric clouds ... not done]
-- **No underwater rendering**: a submerged camera sees the seabed lit like
-  dry land. [The sea]
-- **The sea ignores edits.** Drawing and swimming both decide "sea here"
-  from the GENERATED column height: a sealed tunnel under the seabed is
-  swum in, a hole dug below sea level stays dry, a channel dug in from the
-  coast meets a wall of water at the old shoreline. The plan is
-  `docs/adr-006-water-below-sea-level.md`. [The sea]
+- **No drops on the camera lens.** [Volumetric clouds ... not done]
+- **Underwater is a first version**: no waterline across the lens (the
+  view switches whole as the eye crosses the surface, so a swimmer's eye in
+  a crest flips it for a frame), no caustics, no light shafts, no
+  particles; in a shallow storm the sheet clamped over the bed in a trough
+  shows from below as dark patches on the sand. [Under the water]
+- **Water is a half-space** (everything under sea level), drawn by the
+  depth test alone, with the sea's waves weighted by the GENERATED depth: a
+  dredged harbour or a channel dug across a beach stays calm and never gets
+  the sea's waves (by choice); a deep narrow pit's water reflects the sky
+  where SSR finds no wall on screen; light in a flooded tunnel is the near
+  field's air (no light through water). Air pockets, seepage and filling
+  were dropped on purpose (ADR-006, superseded). [Water is a half-space]
+- **A dark band on a swell's back near the shore in a gale**, at a grazing
+  view from just over the water (`--cam 604 1.6 -310 3.2 -0.25 --sea-state
+  0.8`, seed 0): a straight-edged dark slab across the water, round at one
+  end. Not the foam, not dug water, not SSR (`--no-ssr` keeps it), and the
+  displacement and normals there are smooth: most likely the "reflection
+  closed by the next wave" term (`open` in water.hlsl), which shades a back
+  slope with the water's own dark colour. To fix. [The sea]
 - A faint strip just under the horizon where the sea's SSR misses land.
   [The sea]
 - **Puddle reflections are screen space** (nothing off screen or behind a

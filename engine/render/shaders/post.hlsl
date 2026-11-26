@@ -60,6 +60,14 @@ cbuffer PostConstants : register(b0) {
     float4 hfog_c;       // ... greying, dimming, albedo, the eye's sky share
     float4 adapt;        // dark vision: into the dark (s); light presence 0..1; into the light (s); lit key (stops)
     float4 dark;         // dark vision's display floor: lift, threshold nits, on; the player's brightness (gamma)
+    // Under the sea (ADR-006 stage 2, cs_underwater). water_ext: the water's
+    // extinction per metre (rgb, the sea's own, turbidity included), w 1 when
+    // the EYE is under the sea. water_sun / water_sky: the light the water's
+    // body scatters to the eye just under the surface, from the sun (before
+    // the clouds' shadow) and from the sky (rgb, nits); water_sun.w sea level.
+    float4 water_ext;
+    float4 water_sun;
+    float4 water_sky;
 };
 
 Texture2D<float>  g_depth   : register(t0);
@@ -493,6 +501,12 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
         const float4 pm = g_puddle[p];
         if (pm.a > 1e-4f) c += puddle_reflection(P, pm, pdbg);
     }
+    // Under the sea the eye looks through water, not air: no haze, no mist,
+    // no cloud in front. cs_underwater lays the water over this afterwards.
+    if (water_ext.w > 0.5f) {
+        u_scene[p] = float4(c, 1.0f);
+        return;
+    }
     // The atmosphere between the eye and the surface.
     // The haze assumes sunlit, sky-lit air the whole way. Near the camera
     // the air is lit as the camera is -- in a sealed chamber, not at all --
@@ -564,6 +578,42 @@ void cs_composite(uint3 id : SV_DispatchThreadID) {
     // Lambertian surface would send back: exposed like the scene.
     if (debug > 2.5f && debug < 3.5f) c = g_ssgi_view[min(p / 2, int2((width + 1) / 2 - 1, (height + 1) / 2 - 1))].rgb / 3.14159265f;
     u_scene[p] = float4(c, mark);
+}
+
+// --- under the sea (ADR-006 stage 2) -----------------------------------------
+// Only while the eye is under the sea, after the sea has drawn (its surface,
+// seen from below, is in the depth now) and before TAA. Every pixel's view
+// ray is in water from the eye to what it meets -- the seabed, a rock, the
+// surface overhead -- so what it shows is dimmed along that path, and along
+// the path the light took DOWN to it from the surface, as water.hlsl dims the
+// seabed seen from above (Beer-Lambert per channel: red goes first). The
+// water's own body glows into the gap: its in-scatter at depth h is the
+// surface's times exp(-ext h), and along a ray from depth D0 with direction
+// d it integrates in closed form,
+//     S exp(-ext D0) (1 - exp(-ext (1 - d.y) L)) / (1 - d.y),
+// so the water darkens and blues looking down and brightens looking up, and
+// a deeper eye sees a darker sea. A ray that meets nothing runs on forever.
+[numthreads(8, 8, 1)]
+void cs_underwater(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= width || id.y >= height) return;
+    const int2 p = int2(id.xy);
+    const float4 c = u_scene[p];
+    if (c.a < 0.5f) return;   // a debug colour, as is
+    const float2 uv = (float2(p) + 0.5f) * inv_size;
+    const float z = g_depth[p];
+    const float3 d = normalize(world_at(uv, 1.0f) - cam_pos);
+    const float L = z < 1.0f ? min(length(world_at(uv, z) - cam_pos), 1e4f) : 1e4f;
+    const float3 P = cam_pos + d * L;
+    const float3 ext = water_ext.rgb;
+    const float sea = water_sun.w;
+    const float3 t_view = exp(-ext * L);
+    const float3 t_down = exp(-ext * clamp(sea - P.y, 0.0f, 1e4f));
+    const float cls = clouds_on > 0.5f ? cloud_shadow_at(g_cloud_shadow, g_linear, cloud_shadow, sun_dir, cam_pos) : 1.0f;
+    const float3 S = (water_sun.rgb * cls + water_sky.rgb) * exp(-ext * max(sea - cam_pos.y, 0.0f));
+    const float up = 1.0f - d.y;   // 0 looking straight up
+    const float3 k = ext * up;
+    const float3 glow = S * (up > 1e-4f ? (1.0f - exp(-k * L)) / up : ext * L);
+    u_scene[p] = float4(c.rgb * t_view * t_down + glow, c.a);
 }
 
 // --- TAA ----------------------------------------------------------------------
