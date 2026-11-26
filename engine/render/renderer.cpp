@@ -92,8 +92,9 @@ struct WaterConstants {
     float wind_drift[2];  float swash_runup; float clouds_on;
     float cloud_shadow[4]; // ADR-005 C2
     float hfog[3][4];      // the exploration fog (haze.hlsli)
+    float bed[4];          // the sea's bed map: corner x, z (metres), on, unused
 };
-static_assert(sizeof(WaterConstants) == 672, "WaterConstants must match water.hlsl");
+static_assert(sizeof(WaterConstants) == 688, "WaterConstants must match water.hlsl");
 
 // Heap slots past the RT denoiser's: the sea's copies of the lit scene and of
 // depth, which it reads while it draws into the one and tests against the
@@ -105,7 +106,8 @@ static_assert(sizeof(WaterConstants) == 672, "WaterConstants must match water.hl
 // range every lit table has declared since DDGI.
 const UINT kWaterSceneSrv = 79, kWaterDepthSrv = 80, kPuddleSrv = Clouds::kHeapEnd,
            kFogOpenUav = NearField::kHeapEnd, kFogOpenAvgUav = kFogOpenUav + 1, kFogOpenAvgSrv = kFogOpenUav + 2,
-           kHeapSlots = kFogOpenUav + 3;
+           kWaterBedSrv = kFogOpenUav + 3,   // the sea's bed (record_water_bed), t8 in the sea's table
+           kHeapSlots = kFogOpenUav + 4;
 static_assert(NearField::kFirst == CharacterRenderer::kSrvB + 1, "the near field follows the character's textures");
 static_assert(CharacterRenderer::kSrvA == kPuddleSrv + 1, "the character's textures follow the puddle mask");
 
@@ -620,17 +622,20 @@ bool Renderer::create_water_pipeline(std::string& error) {
         // Since the sea draws after the composite: t0 the lit scene's copy,
         // t1 depth's copy, t2 the sky-view table, t3 the aerial perspective,
         // t4 the mist -- one table from heap [3], the post chain's base.
-        D3D12_DESCRIPTOR_RANGE wr[7] = {};
-        const UINT w_heap[7] = {kWaterSceneSrv, kWaterDepthSrv, 10, 11, 32, OceanDetail::kSrvSlot, Clouds::kShadowSrv};
-        for (UINT k = 0; k < 7; ++k) {
+        // t8 the sea's bed (record_water_bed), read by the VERTEX shader, so
+        // the table is visible to every stage.
+        D3D12_DESCRIPTOR_RANGE wr[8] = {};
+        const UINT w_heap[8] = {kWaterSceneSrv, kWaterDepthSrv, 10, 11, 32, OceanDetail::kSrvSlot, Clouds::kShadowSrv,
+                                kWaterBedSrv};
+        for (UINT k = 0; k < 8; ++k) {
             wr[k].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
             wr[k].NumDescriptors = 1;
-            wr[k].BaseShaderRegister = k;
+            wr[k].BaseShaderRegister = k < 7 ? k : 8;   // t7 is the flood mask's root SRV
             wr[k].OffsetInDescriptorsFromTableStart = w_heap[k] - 3;
         }
         params[12].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[12].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        params[12].DescriptorTable.NumDescriptorRanges = 7;
+        params[12].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[12].DescriptorTable.NumDescriptorRanges = 8;
         params[12].DescriptorTable.pDescriptorRanges = wr;
         // ADR-006 stage 3: the flood's surface mask round the camera, a byte
         // a 1 m column, read by both stages (water.hlsl g_flood, t7).
@@ -756,8 +761,7 @@ bool Renderer::create_water_pipeline(std::string& error) {
         }
         // The flood's surface mask (ADR-006 stage 3): kFloodMask^2 bytes,
         // read as uints, one a frame in flight.
-        // the waves' share, the fill's level, the rim's density, the dug excess
-        rd.Width = UINT64(kFloodMask) * kFloodMask * 4;
+        rd.Width = UINT64(kFloodMask) * kFloodMask * 2;   // the waves' share, the fill's level
         for (UINT i = 0; i < kFrameCount; ++i) {
             const HRESULT ch = device_->CreateCommittedResource(
                 &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
@@ -765,7 +769,7 @@ bool Renderer::create_water_pipeline(std::string& error) {
             if (FAILED(ch)) { error = hr_text("CreateCommittedResource (flood mask)", ch); return false; }
             D3D12_RANGE none = {0, 0};
             flood_mask_[i]->Map(0, &none, &flood_mask_cpu_[i]);
-            std::memset(flood_mask_cpu_[i], 0, size_t(kFloodMask) * kFloodMask * 4);
+            std::memset(flood_mask_cpu_[i], 0, size_t(kFloodMask) * kFloodMask * 2);
         }
     }
 
@@ -1083,6 +1087,19 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
     hr = device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&top));
     if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (terrain top-down)", hr); return false; }
 
+    // The sea's bed (record_water_bed): the same vertex shader from above,
+    // the first surface's height into one R32F target, depth kept. No
+    // culling: the top-down matrix mirrors one axis, and a ceiling seen from
+    // inside the rock must be drawn to be recognised.
+    ComPtr<ID3DBlob> ps_bed;
+    if (!compile_shader(kMeshShaderPath, "ps_bed", "ps_5_1", ps_bed, error)) return false;
+    pd.PS.pShaderBytecode = ps_bed->GetBufferPointer();
+    pd.PS.BytecodeLength = ps_bed->GetBufferSize();
+    pd.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
+    ComPtr<ID3D12PipelineState> bed;
+    hr = device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&bed));
+    if (FAILED(hr)) { error = hr_text("CreateGraphicsPipelineState (sea bed)", hr); return false; }
+
     if (ready_) wait_for_gpu();
     mesh_pso_ = pso;
     mesh_eq_pso_ = eq;
@@ -1090,6 +1107,7 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
     mesh_wire_pso_ = wire;
     mesh_shadow_pso_ = shadow;
     mesh_top_pso_ = top;
+    mesh_bed_pso_ = bed;
     return true;
 }
 
@@ -1545,6 +1563,151 @@ void Renderer::record_hfgi(const float vp[16]) {
     // Rocks on the map too: an outcrop shades and bounces like terrain.
     if (rocks_on_ && rocks_.ready()) rocks_.record_top(cmd_.Get(), UINT(frame_));
     hfgi_.record(cmd_.Get(), UINT(frame_), shadow_cb_[frame_]->GetGPUVirtualAddress());
+}
+
+// ---------------------------------------------------------------------------
+// The sea's bed: what the water really stands on, edits included.
+//
+// The sea's vertex shader used to take its depth from the GENERATED field,
+// which knows nothing of digs, and a layer of patches grew to correct it where
+// the ground had been dug (a forced depth in flooded columns, the dug wall's
+// density at sea level, the dug excess over the generated bed, cuts for the
+// triangles where those rules met). This is the common alternative (Crest's
+// sea-floor depth cache): the resident terrain drawn from above, its top just
+// over sea level, so the first surface under each texel is the bed the water
+// lies on -- not a roof over it, which is above the top and never drawn. A
+// ceiling seen first means the sea-level point is in rock (ps_bed's marker);
+// nothing drawn, the generated field stands (water.hlsl bed_depth).
+// ---------------------------------------------------------------------------
+
+bool Renderer::create_water_bed(std::string& error) {
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = UINT64(kBedSize);
+    rd.Height = UINT(kBedSize);
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Format = DXGI_FORMAT_R32_FLOAT;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cv = {};
+    cv.Format = DXGI_FORMAT_R32_FLOAT;
+    cv.Color[0] = -1.0e4f;   // nothing drawn: the generated field stands
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    HRESULT hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, read, &cv, IID_PPV_ARGS(&bed_tex_));
+    if (FAILED(hr)) { error = hr_text("CreateCommittedResource (sea bed)", hr); return false; }
+    rd.Format = DXGI_FORMAT_D32_FLOAT;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE dv = {};
+    dv.Format = DXGI_FORMAT_D32_FLOAT;
+    dv.DepthStencil.Depth = 1.0f;
+    hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &dv,
+                                          IID_PPV_ARGS(&bed_depth_));
+    if (FAILED(hr)) { error = hr_text("CreateCommittedResource (sea bed depth)", hr); return false; }
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.NumDescriptors = 1;
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&bed_rtv_heap_));
+    if (FAILED(hr)) { error = hr_text("CreateDescriptorHeap (sea bed rtv)", hr); return false; }
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&bed_dsv_heap_));
+    if (FAILED(hr)) { error = hr_text("CreateDescriptorHeap (sea bed dsv)", hr); return false; }
+    device_->CreateRenderTargetView(bed_tex_.Get(), nullptr, bed_rtv_heap_->GetCPUDescriptorHandleForHeapStart());
+    device_->CreateDepthStencilView(bed_depth_.Get(), nullptr, bed_dsv_heap_->GetCPUDescriptorHandleForHeapStart());
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Format = DXGI_FORMAT_R32_FLOAT;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE h = srv_heap_->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += SIZE_T(kWaterBedSrv) * device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    device_->CreateShaderResourceView(bed_tex_.Get(), &sd, h);
+    return true;
+}
+
+void Renderer::record_water_bed(const float cam[3]) {
+    // When: the camera 4 m from the last centre (the map reaches 64 m, the
+    // sea's mask as far), every frame for a second after an edit (its chunks
+    // are remeshed over the next few frames), and twice a second anyway for
+    // the chunks streaming in.
+    if (edits_.generation() != bed_gen_) {
+        bed_gen_ = edits_.generation();
+        bed_hot_ = 60;
+    }
+    const float dx = cam[0] - bed_centre_[0], dz = cam[2] - bed_centre_[1];
+    const bool due = !bed_built_ || bed_hot_ > 0 || dx * dx + dz * dz > 16.0f || post_frame_ - bed_frame_ >= 30;
+    if (bed_hot_ > 0) --bed_hot_;
+    if (!due) return;
+    bed_centre_[0] = cam[0];
+    bed_centre_[1] = cam[2];
+    bed_frame_ = post_frame_;
+    const float extent = float(kBedSize) * kBedTexel;
+    // Whole 2 m steps, so a texel always covers the same ground.
+    bed_origin_[0] = std::floor((cam[0] - 0.5f * extent) / 2.0f) * 2.0f;
+    bed_origin_[1] = std::floor((cam[2] - 0.5f * extent) / 2.0f) * 2.0f;
+    // From 2 cm over sea level down 80 m: the bed under the water, never a
+    // roof over it (above the top, so never drawn). Row-vector, as HeightGi.
+    const float sea = world_.params().sea_level;
+    const float y_top = sea + 0.02f, y_range = 80.0f;
+    float vp[16] = {};
+    vp[0 * 4 + 0] = 2.0f / extent;
+    vp[2 * 4 + 1] = 2.0f / extent;
+    vp[1 * 4 + 2] = -1.0f / y_range;
+    vp[3 * 4 + 0] = -2.0f * bed_origin_[0] / extent - 1.0f;
+    vp[3 * 4 + 1] = -2.0f * bed_origin_[1] / extent - 1.0f;
+    vp[3 * 4 + 2] = y_top / y_range;
+    vp[3 * 4 + 3] = 1.0f;
+
+    auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+        D3D12_RESOURCE_BARRIER rb = {};
+        rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        rb.Transition.pResource = r;
+        rb.Transition.StateBefore = a;
+        rb.Transition.StateAfter = b;
+        rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd_->ResourceBarrier(1, &rb);
+    };
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    tr(bed_tex_.Get(), read, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = bed_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE dsv = bed_dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+    const float clear[4] = {-1.0e4f, 0.0f, 0.0f, 0.0f};
+    cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    cmd_->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    cmd_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    D3D12_VIEWPORT vpt = {};
+    vpt.Width = vpt.Height = float(kBedSize);
+    vpt.MaxDepth = 1.0f;
+    const D3D12_RECT sr = {0, 0, LONG(kBedSize), LONG(kBedSize)};
+    cmd_->RSSetViewports(1, &vpt);
+    cmd_->RSSetScissorRects(1, &sr);
+    cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    MeshConstants mc = {};
+    std::memcpy(mc.view_proj, vp, sizeof mc.view_proj);
+    mc.slot_vertices = static_cast<float>(kSlotVertices);
+    bind_shader_heaps(cmd_.Get());
+    cmd_->SetPipelineState(mesh_bed_pso_.Get());
+    cmd_->SetGraphicsRootSignature(mesh_root_.Get());
+    cmd_->SetGraphicsRootDescriptorTable(7, scan_sampler());
+    cmd_->SetGraphicsRoot32BitConstants(0, sizeof(MeshConstants) / 4, &mc, 0);
+    cmd_->SetGraphicsRootShaderResourceView(1, mesher_.vertices()->GetGPUVirtualAddress());
+    cmd_->SetGraphicsRootShaderResourceView(2, fade_buf_[frame_]->GetGPUVirtualAddress());
+    cmd_->SetGraphicsRootShaderResourceView(5, mesher_.vertex_materials()->GetGPUVirtualAddress());
+    cmd_->SetGraphicsRootShaderResourceView(6, mesher_.vertex_weights()->GetGPUVirtualAddress());
+    cmd_->SetGraphicsRootConstantBufferView(3, shadow_cb_[frame_]->GetGPUVirtualAddress());
+    cmd_->SetGraphicsRootDescriptorTable(4, srv_heap_->GetGPUDescriptorHandleForHeapStart());
+    D3D12_INDEX_BUFFER_VIEW ibv = {};
+    ibv.BufferLocation = mesher_.indices()->GetGPUVirtualAddress();
+    ibv.SizeInBytes = kSlots * kSlotIndices * 4;
+    ibv.Format = DXGI_FORMAT_R32_UINT;
+    cmd_->IASetIndexBuffer(&ibv);
+    cmd_->ExecuteIndirect(cmd_sig_.Get(), kSlots, mesher_.draw_args(), 0, nullptr, 0);
+    tr(bed_tex_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, read);
+    bed_built_ = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -3024,6 +3187,7 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         if (!near_.load_config("worldgen/data/archetypes.json", error)) return false;
         near_.set_world(&world_, &edits_);   // the sky-access flood reads its field and the edits (sky_access.h)
         sea_access_.init(&world_, &edits_, world_.params().sea_level);   // ADR-006 stage 3 (sea_access.h)
+        if (!create_water_bed(error)) return false;                       // the sea's bed (record_water_bed)
         // The key light's shadow past the cascades.
         if (!far_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         canopy_.set_models(trees_.models(), trees_.looks());
@@ -4126,6 +4290,8 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         if (hfgi_.begin(view.cam_pos, sky_frame_.hours, post_frame_, vp)) record_hfgi(vp);
     }
     prof_.mark(cmd_.Get(), "far shadow + heightfield GI");
+    if (bed_on_ && water_ && mode_ != Mode::Wireframe) record_water_bed(view.cam_pos);
+    prof_.mark(cmd_.Get(), "sea bed");
     // The near field plans here: its readiness goes into the shadow constants.
     // A still (exposure_snap_) settles it whole.
     const bool near_live = near_on_ && hfgi_on_ && hfgi_.ready() && mode_ != Mode::Wireframe;
@@ -4410,6 +4576,9 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         update_flood(view.cam_pos);
         fill_flood_mask(view.cam_pos);
         wc.flood_on = flood_mask_on_ ? 1.0f : 0.0f;
+        wc.bed[0] = bed_origin_[0];
+        wc.bed[1] = bed_origin_[1];
+        wc.bed[2] = bed_on_ && bed_built_ ? 1.0f : 0.0f;
         wc.flood_origin[0] = float(flood_mask_origin_[0]) * SeaAccess::kCellM;   // metres
         wc.flood_origin[1] = float(flood_mask_origin_[1]) * SeaAccess::kCellM;
         {
@@ -6160,61 +6329,12 @@ void Renderer::fill_flood_mask(const float cam[3]) {
     // 2 + the waves' share x 253 where the column's top cell under sea level
     // will be water. The second (the fill): how far under sea level the
     // water stands there NOW, in 0.1 m (255: none in yet) -- the sheet drops
-    // to it.
-    // The third plane: round every flooded column the water has reached,
-    // the edited density at sea level, 128 + 64 x density
-    // (rock positive), 255 (rock) where not computed. Its bilinear zero line
-    // is where the dug wall stands at that height, between the lattice
-    // points as the mesher puts it, and water.hlsl applies the flood (its
-    // calm, the forced depth, the rising level's drop) on the land side
-    // only inside it: the beach's surf keeps its height, swash and foam
-    // right up to the rim. Applied by the columns' filter instead, it fell
-    // half a cell out on the beach and cut the surf round a filling shaft in
-    // squares.
-    // The fourth: how much deeper the water really is than the generated
-    // bed says, in 0.1 m (0: no more), for DUG columns of the sea and the
-    // shoreline. Where a dig runs out across the coast the sheet took its
-    // depth from the generated shallows, and the surf broke and foamed along
-    // the old shoreline in the middle of deep water. Only columns the edit
-    // store says were dug are walked: elsewhere the generated bed is the bed.
-    std::vector<uint8_t> buf(size_t(N) * N * 4, 0);
-    std::memset(buf.data() + size_t(N) * N * 2, 255, size_t(N) * N);
-    std::vector<int> filling;   // mask indices of flooded columns the water has reached
-    std::vector<int> open_sea;  // mask indices of the open sea's own columns (label 1)
+    // to it. Where the water's wall is, and how deep it is, the sea reads
+    // from its bed (record_water_bed), the terrain as drawn: two more planes
+    // here did that before, the edited density at sea level round flooded
+    // columns and a dug column's depth past the generated bed.
+    std::vector<uint8_t> buf(size_t(N) * N * 2, 0);
     bool any = false;
-    if (flood_gen_h_.size() > 200000) flood_gen_h_.clear();
-    auto dug_excess = [&](const FloodBlock& top_block, int x, int z) -> uint8_t {
-        float etop = 0.0f;
-        if (!edits_.column_top(x, z, etop)) return 0;
-        const int64_t hk = fl_key(x, 0, z);
-        auto ih = flood_gen_h_.find(hk);
-        if (ih == flood_gen_h_.end()) ih = flood_gen_h_.emplace(hk, world_.height(float(x) * kFlC, float(z) * kFlC)).first;
-        const float gen = sea - ih->second;
-        if (gen < -0.25f) return 0;   // land: the flood's own depth stands there
-        // Down the column to the first rock (at most 15 m), the block below
-        // looked up once as the walk crosses into it.
-        const FloodBlock* blk = &top_block;
-        int bcur = by;
-        const int bxk = fl_floor_div(x, K), bzk = fl_floor_div(z, K);
-        int y = ys - 1;
-        for (; y > ys - 31; --y) {
-            const int byy = fl_floor_div(y, K);
-            if (byy != bcur) {
-                auto ib = flood_.find(fl_key(bxk, byy, bzk));
-                if (ib == flood_.end()) break;
-                blk = &ib->second;
-                bcur = byy;
-            }
-            const int idx = ((z - bzk * K) * K + (y - byy * K)) * K + (x - bxk * K);
-            if (blk->cell[idx] == SeaAccess::kSolid) break;
-        }
-        // The rock point's lattice height plus half a cell: where the mesher
-        // puts the surface between it and the air over it, to a quarter metre.
-        const float real = sea - (float(y) + 0.5f) * kFlC;
-        const float ex = real - gen;
-        if (ex <= 0.0f) return 0;
-        return uint8_t((std::min)(254, int(ex * 10.0f + 0.5f)));
-    };
     for (int bz = 0; bz < N / K; ++bz)
         for (int bx = 0; bx < N / K; ++bx) {
             auto it = flood_.find(fl_key(ox / K + bx, by, oz / K + bz));
@@ -6225,13 +6345,6 @@ void Renderer::fill_flood_mask(const float cam[3]) {
                     const uint8_t c = it->second.cell[ci];
                     const size_t mi = size_t(bz * K + k) * N + size_t(bx * K + i);
                     if (c == SeaAccess::kSolid) continue;
-                    if (c != SeaAccess::kDry) {
-                        const uint8_t ex = dug_excess(it->second, ox + bx * K + i, oz + bz * K + k);
-                        if (ex) {
-                            buf[size_t(N) * N * 3 + mi] = ex;
-                            any = true;
-                        }
-                    }
                     if (c == SeaAccess::kDry) {
                         // Only in a LAND column: a capped component leaves the
                         // sea's own cells dry, and marking those would cut
@@ -6244,7 +6357,7 @@ void Renderer::fill_flood_mask(const float cam[3]) {
                     // the column rule, which already calls it sea: marked, it
                     // took the flood's treatment only inside labelled blocks,
                     // and the surf showed the blocks' straight edges.
-                    if (c == 1) { open_sea.push_back(int(mi)); continue; }
+                    if (c == 1) continue;
                     const float w = std::exp(-float(c - 1) * kFlC / kFloodWaveFalloff);
                     buf[mi] = uint8_t(2 + int(w * 253.0f + 0.5f));
                     any = true;
@@ -6265,55 +6378,8 @@ void Renderer::fill_flood_mask(const float cam[3]) {
                         }
                     }
                     buf[size_t(N) * N + mi] = lv;
-                    if (lv != 255) filling.push_back(int(mi));
                 }
         }
-    if (!filling.empty()) {
-        if (edits_.generation() != flood_rim_gen_) {
-            flood_rim_.clear();
-            flood_rim_gen_ = edits_.generation();
-        }
-        // At SEA LEVEL, the sheet's own height: at the cell under it (0.5 m
-        // down) a shaft dug from stacked spheres was narrower than where the
-        // sheet lies, and a ring of sea-level sheet showed inside the rim.
-        const float y = sea;
-        for (int mi : filling) {
-            const int i0 = mi % N, k0 = mi / N;
-            // Four rings (2 m): a shaft dug from stacked spheres is wider at
-            // sea level than at the cell under it the flood labels by, and a
-            // patch of two rings ended inside its air, a straight edge in the
-            // water. A blend touching a column not computed (255) is far from
-            // any wall.
-            for (int dk = -4; dk <= 4; ++dk)
-                for (int di = -4; di <= 4; ++di) {
-                    const int i = i0 + di, k = k0 + dk;
-                    if (i < 0 || k < 0 || i >= N || k >= N) continue;
-                    const size_t ri = size_t(N) * N * 2 + size_t(k) * N + size_t(i);
-                    if (buf[ri] != 255) continue;   // done
-                    const int x = ox + i, z = oz + k;
-                    const int64_t key = fl_key(x, 0, z);
-                    auto it = flood_rim_.find(key);
-                    if (it == flood_rim_.end())
-                        it = flood_rim_.emplace(key, edited_density(float(x) * kFlC, y, float(z) * kFlC)).first;
-                    const float d = (std::max)(-2.0f, (std::min)(1.98f, it->second));
-                    buf[ri] = uint8_t(int(128.0f + d * 64.0f + 0.5f));
-                }
-        }
-        if (flood_rim_.size() > 200000) flood_rim_.clear();
-        // The open sea's own columns INSIDE that patch are marked after all,
-        // as open water (the waves whole, none to come): where a channel
-        // runs out through the shallows, the flood calls a column the open
-        // sea while the shader's generated height calls it land, and with
-        // no word there the land side's sheet over the deep channel was cut
-        // (the clip for sheet hanging over dug ground). Only near flooded
-        // columns, and only the land side reads it, so the open sea keeps
-        // no block edges.
-        for (int mi : open_sea) {
-            if (buf[size_t(N) * N * 2 + size_t(mi)] == 255) continue;
-            buf[size_t(mi)] = 255;
-            buf[size_t(N) * N + size_t(mi)] = 0;
-        }
-    }
     std::memcpy(m, buf.data(), buf.size());
     flood_mask_on_ = any;
 }

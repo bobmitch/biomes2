@@ -3542,53 +3542,62 @@ held no such cell and the water could not get down it.
   real (dug) ground at the water's OWN level (`edge_fade` against
   sea level less the fill's drop), and the shore's foam takes its depth
   from that ground too, so it follows the dug edge.
-- **The flood applies only inside the dug wall, and only on the land
-  side.** The mask's third plane holds the EDITED DENSITY AT SEA LEVEL
-  (the sheet's own height) for 4 rings of columns round every flooded
-  column (cached per edit generation); `flood_rim` turns it into metres
-  from the wall, and the calm, the forced depth and a filling hole's drop
-  switch within +-2 cm of its zero line -- the rim itself, not a column's
-  edge -- times how much the vertex is land (the generated depth's first
-  25 cm). On the sea side the flood changes nothing: open sea is the
-  column rule's. The open sea's own columns (label 1) stay out of the
-  mask, except inside a flooded patch, where a channel runs out through
-  shallows the shader's height calls land. Four per-pixel cuts finish it:
-  sheet still at sea level over ground deeper than a filling hole's water;
-  the column rule's sheet on land over ground more than 1.6 m down (dug
-  ground no swash reaches); sheet over a dry-air column where the ground
-  is well under it; and the grid triangles that straddle the switch (they
-  slope between the two sheets, on the wall itself) -- only while a hole
-  fills, or where the triangle runs from the flood's calm to open surf
-  (a low beach): cut whole on high ground, where both ends are calm, they
-  took stair-shaped bites out of a pit's edge. The coarse land cut
-  (`i.depth + 0.3`) skips vertices inside the wall and triangles crossing
-  it; gated on the flood's FILTER instead, whose reach ends on column
-  edges, it left a straight-edged notch in the surf beside a shaft.
-  Columns flooded only under a lid are NOT left to the column rule any
-  more: that rule stopped the water under an undercut in steps.
-- **High ground keeps the calm, the wall keeps the depth.** Where the
-  generated ground stands 0.5-1.5 m and more over sea level, no swash is
-  ever seen, so the calm reaches past the wall into the rock (by the
-  filter's weight): falling back to the open sea's waves and foam there
-  drew a white sawtooth along a pit's wall. The FORCED depth still switches
-  at the wall: a vertex in the rock given a depth between the beach's and
-  the hole's lands just under sea level, where the 12 cm lift and the
-  swash raised grid triangles up the wall in teeth.
-- **Inside the flood the edge fades over the last 1.2 m of the view ray
-  under water** (`under_len`), so a dug wall shows through its own first
-  centimetres of water and the steps the grid leaves dissolve (0.4 m left
-  them showing). Not on natural shores.
-- **A dig out across the coast takes its real depth.** The mask's fourth
-  plane holds, for DUG water columns of the sea and the shoreline (the
-  edit store's column map says which; land columns are the flood's), how
-  much deeper the water is than the generated bed, walking the flood's
-  labels down to the first rock. The vertex shader takes the larger of
-  the flood's depth and the generated one plus that (`flood_excess`,
-  beyond 0.3 m: the labels place a bed to a quarter metre), so waves do
-  not break, run up and foam along the old shoreline in the middle of a
-  dredged bay. Added before the flood's own depth, weighted off over the
-  land's first 25 cm, the depth dipped through the shallows there and a
-  thin line of foam crossed a channel where the coast had been.
+- **The sea stands on its real bed** (`Renderer::record_water_bed`,
+  `ps_bed` in mesh.hlsl, `bed_depth` in water.hlsl; `--no-sea-bed` for
+  A/B). The common technique (Crest's sea-floor depth cache): the resident
+  terrain drawn from above into a 512^2 R32F map of 0.25 m texels round the
+  camera (the flood mask's 64 m), its top 2 cm over sea level, so the
+  first surface under each texel is the bed the water lies on -- digs and
+  all, since it is the mesh -- and never a roof over it, which is above the
+  top. A ceiling seen first means the sea-level point is in rock: the
+  generated land, or the waterline where the field says sea (read as half
+  a metre of rock, a beach's swash zone dried in the shape of the tunnels
+  dug under it). Nothing drawn: the generated field. Skirts are left out
+  (a curtain under a beach read as a bed below sea level). Rebuilt when
+  the camera moves 4 m, every 30 frames, and every frame for a second after
+  an edit: ~0.09 ms a rebuild at any resolution (`--gpu-profile`'s "sea
+  bed"). A vertex's depth is the bed's wherever water stands -- the sea's
+  own columns (the generated depth's first 25 cm counted in) and, outright,
+  wherever the flood's filter reaches -- and the generated depth elsewhere,
+  so a dry pit is land however deep.
+  **It replaced a layer of patches** over the generated depth alone, each
+  mending a dig shape the last had missed: a forced 2 m in flooded columns,
+  a third mask plane of the edited density at sea level round flooded
+  columns (`flood_rim`, where the dug wall was), a fourth of a dug column's
+  depth past the generated bed (the surf on an old shoreline), and the
+  rules for where they met. The mask is two planes again: flooded or dry,
+  with the waves' share, and the fill.
+  - **Dug water** (`i.rim.z`) is the bed's own floor 0.3-0.6 m and more
+    under the generated ground, wherever it is -- taken from flooded
+    columns only, it dropped to nothing where a dredged hole met the sea's
+    own columns, and the cut for triangles across a dug wall cut a dotted
+    line along the old shoreline. On a beach outside a hole's wall the bed
+    IS the generated ground, so the surf, swash and foam stay the beach's
+    right up to the rim. The flood's calm and the fill's drop apply in dug
+    water.
+  - **Rock over dug water keeps the calm**: a vertex standing 0.5 m and
+    more over the water within a metre of dug water (`bed_dug_near`: the
+    bed a metre off 1.3 m and more under its ground, a drop no beach makes)
+    or within the flood filter's reach takes the calm whole, so the grid's
+    triangles across a pit's wall are calm end to end: by the filter's
+    weight, which reaches half a column, their outer ends kept the open
+    sea's surf and carried its foam into the hole in white blobs.
+  - **No lift on a dug wall**: the 12 cm the sheet stands over the ground
+    near a shore is for beaches. On a wall the bed blends from floor to
+    rock over a texel, crossing zero at the wall, and the lifted sheet stood
+    in front of the rock in a row of bumps. The surf's run-up is scaled by
+    the calm in both stages.
+  - **The edge fades over the last 1.2 m of the view ray under water in
+    dug water** (`under_len`), so a dug wall shows through its own first
+    centimetres of water: the waterline on a wall standing near vertical at
+    sea level is the mesh's half-metre facets, toothed, and 0.4 m left them
+    showing. Weighted by the calm instead, it was half strength on the
+    vertices just inside a wall.
+  - Per-pixel cuts kept: sheet still at sea level over ground deeper than
+    a filling hole's water; sheet on land over ground more than 1.6 m down
+    where the flood has no word; sheet over a dry-air column; triangles
+    crossing a dug wall while a hole fills, or where calm meets open surf
+    (a low beach); the coarse land cut (`i.depth + 0.3`) outside dug water.
 - **`--flood-pit`** (`build/flood_pit.bmp`, `_top.bmp`, `.txt`): from the
   coast nearest spawn, a pit 4 m spheres wide dug from 16 m inland (centres
   half a metre over sea level, so it breaks through the beach), an
@@ -3596,36 +3605,28 @@ held no such cell and the water could not get down it.
   the fill. `BIOMES_PIT_DREDGE=1` also dredges a strip 18 m wide from 4 m
   inland to 14 m out across the shoreline; `BIOMES_PIT_UNDERCUT=<m>` the
   undercut's centre under sea level (2.5, its roof tangent to the water);
-  `BIOMES_PIT_PICK="px py
-  ..."` names what a pixel shows, marched through the EDITED density
-  (`--pick` reads the generated field). `--water-debug 11` (the filter's
-  weight, inside the wall, land) and `12` (the same with every flood cut
-  off), `13` (the edge's fade, the ray under water, how much the flood
-  applies) and `14` (the real shading, every flood cut painting its pixel
-  instead: red the coarse land cut, green a filling hole's, blue a dry
-  column's, yellow a straddling triangle's, magenta "no word") are the
-  instruments; 14 is what traced the notch.
-  What each step fixed, in `--flood-test`'s stills (`flood_fill_10s`,
-  `_13s`, `_rising` while the shaft is still filling): the surf round a
-  shaft cut in squares (the calm and forced depth taken whole by beach
-  columns the filter reached); squares of bare beach (columns flooded
-  under a lid); a ring of sheet inside the rim (the density read 0.5 m
-  down, where a shaft of stacked spheres is narrower); a band cut out of a
-  channel where it crossed the old shoreline (the triangle cut tested the
-  land factor too). Tried and dropped: a soft 30 cm band outside the wall
-  by density over its gradient -- next to a dig every cell reads "at a
-  steep wall" -- and keeping the surf side of straddling triangles by a
-  per-pixel test (they are on the slope too: a sawtooth). Shore foam also
-  falls with the calm squared (surf needs breaking waves). `--water-debug
-  9` (how much the flood applies, a filling drop, the land side) and `10`
-  (the shore foam's calm, depth and fade) are the instruments.
+  `BIOMES_PIT_PICK="px py ..."` names what a pixel shows, marched through
+  the EDITED density (`--pick` reads the generated field). The
+  instruments, `--water-debug` with `--tonemap 0`: `9` (the calm's weight,
+  a filling drop, the land side), `10` (the shore foam's calm, depth and
+  fade), `11` (the filter's weight, dug water, land), `12` (the same with
+  every flood cut off), `13` (the edge's fade, the ray under water, how
+  much the flood's calm applies), `14` (the real shading, every flood cut
+  painting its pixel instead: red the coarse land cut, green a filling
+  hole's, blue a dry column's, yellow a straddling triangle's, magenta "no
+  word"), `15` (the bed against the generated field: red deeper, green
+  shallower) and `16` (what the bed's texel holds: red a floor, green a
+  ceiling, blue nothing). 14 traced the notch and the dotted shoreline, 16
+  the dried swash zone. `--no-sea-bed` is a diagnostic, not the old
+  behaviour: without the bed a flooded hole has no depth and draws wrong.
+  Shore foam falls with the calm squared (surf needs breaking waves).
 - **Not done**: the surf's edge at a dug wall follows the water grid in
   steps of a few centimetres where the surf meets it (the straddling
   triangles are dropped whole); a filling shaft can show a sliver of
-  sheet at its rim for a few frames; a dredged sea's real depth is known
-  only in the flood's labelled blocks (near the camera, the player and
-  digs), and physics still tames the swimmer's waves by the generated
-  depth there;
+  sheet at its rim for a few frames; the bed reaches 64 m round the camera
+  (the generated depth beyond, so a dredged coast further off keeps its
+  old surf line), and physics still tames the swimmer's waves by the
+  generated depth;
   a pocket's own water surface below sea level
   is not drawn (physics has it); the underwater pass dims light down to sea
   level, not to a pocket's floor; the mask reaches 64 m round the camera,

@@ -1805,6 +1805,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     if (swell_hs >= 0.0f) g_renderer.weather().set_swell(swell_hs);
     g_renderer.set_water_debug(water_debug);
     if (no_water) g_renderer.set_water(false);
+    if (std::string(cmdline ? cmdline : "").find("--no-sea-bed") != std::string::npos) g_renderer.set_water_bed(false);
     if (cmdline && std::string(cmdline).find("--no-ssr") != std::string::npos) g_renderer.set_ssr(false);
     if (cmdline && std::string(cmdline).find("--no-wave-detail") != std::string::npos) g_renderer.set_wave_detail(false);
     if (cmdline && std::string(cmdline).find("--no-clouds") != std::string::npos) g_renderer.set_clouds(false);
