@@ -3502,7 +3502,50 @@ copy (`gp` in `ps_main`):
   weather roughens, its band widening to ~0.8 m of water in a gale. Faded
   where the ray under water is long (2-6 m), which is an occluder rather
   than a shallow. It replaced a shore foam keyed to the vertices' generated
-  depth, which could not see a dug edge.
+  depth, which could not see a dug edge. Whitecaps belong to the deep
+  sea's layer (weighted by the generated depth's first metre, none in dug
+  water): the ripples' folding is everywhere and laid gale whitecaps in pits.
+- **Foam's fine structure: bubbles, by the pixel's footprint.** The lace
+  has nothing under half a metre, and close to the water foam read as a
+  smooth smear. `engine/render/foam_pattern.{h,cpp}` bakes a tileable
+  512^2 RGBA8 texture with mips at startup (~20 ms; `startup.txt` prints
+  its mean): 16 x 16 cells, one jittered point each, the centre of a hole
+  of its own radius (0.45-0.9 of a cell) -- R the distance over radius,
+  saturated (0 a hole's centre, 1 the film), GB its gradient, A whether a
+  texel is a hole. The sea reads it at three octaves, 0.5 m, 12 cm and 3 cm
+  cells (heap `kFoamSrv`, t7), each turned its own way and drifting a little
+  faster than the one above. **Seamless by construction**: each octave is
+  whole while its cell spans 8 pixels of water (`fp`) and gone at 4, where
+  it is replaced by the pattern's MEAN (`foam_mean`, which the mip chain
+  also filters towards), so coverage -- and the far look -- does not move;
+  the threshold's softness goes from the lace's 0.25 to what antialiases
+  the finest visible octave. Up close **density** (how far over its
+  threshold) makes thin foam a translucent, greyer film and dense foam
+  opaque white, and the foam is lit by its own **relief** (the holes'
+  gradient; the finest octave's film rises to a honeycomb of ridges). The
+  crests' foam is eroded by the same bubbles, cross-faded in with the
+  coarse octave. Measured: the 12 m coast differs from before on 2% of
+  pixels (the nearest foam); a dolly from 1.2 m to 18 m over one patch
+  shows bubbles, then lace with holes, then the old lace, with no step.
+  Two traps on the way: holes of different radii straddle cell borders, so
+  the nearest point must be chosen by distance OVER radius (by distance, b
+  jumped and shaded straight-edged facets); and the film ridges of the
+  coarse octaves shaded as metre-wide facets, so only the finest has them.
+  **Cost**: the same pattern evaluated per pixel (nine points an octave)
+  cost +0.4 ms of the sea pass where foam filled the view -- most of it
+  execution, ~0.15 ms the bigger shader's registers -- the texture
+  +0.03-0.07 ms (sea pass at 1440p: open sea 1.022 -> 1.069 ms, the coast
+  0.570 -> 0.597, close over the swash ~0.98 -> 1.05). The reads are gated
+  to where foam can form.
+- **Two fixes close to the water**: the grid's first 12 rows reach far
+  below the screen (ndc -4) for an eye over the water: a vertex lifted over
+  a beach (the swash and its 12 cm) moves UP the screen near a low camera,
+  and at 1.2 m over the swash the grid's bottom row showed as a straight
+  edge across the water. And **dug** compares the ground behind a pixel
+  with the generated ground AT that ground point, extrapolated along the
+  generated depth's own screen-space gradient: compared with the ground
+  under the surface point, a seabed falling away offshore read as dug at a
+  grazing view, and storm crests were flattened to sea level in a slab.
 - **The terrain's shore wet band skips dug ground**: the swash's damp and
   film (mesh.hlsl, `l_swash`) go by height alone, so the mesher flags a
   vertex its edits put more than 0.3 m inside the generated rock (the lowest
