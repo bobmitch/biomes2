@@ -1819,7 +1819,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     if (cmdline) {
         const std::string c4 = cmdline;
         const size_t hk = c4.find("--height-fog ");
-        if (hk != std::string::npos) g_renderer.set_height_fog_scale(float(std::atof(c4.c_str() + hk + 13)));
+        if (hk != std::string::npos) {
+            g_renderer.set_height_fog(true);
+            g_renderer.set_height_fog_scale(float(std::atof(c4.c_str() + hk + 13)));
+        }
     }
     if (cmdline) {
         const std::string c3 = cmdline;
@@ -3059,6 +3062,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                             const float s = g_renderer.height_fog_sigma(y);
                             return s > 0.0f ? 3.912f / s : 0.0f;
                         };
+                        if (!g_renderer.height_fog())
+                            std::fprintf(f, "  height fog: off (the default; --height-fog <k> turns it on)\n");
+                        else
                         std::fprintf(f, "  height fog: valley %.2f; level visibility at the eye (%.0f m) %.0f m, at 20 m "
                                         "%.0f m, at 300 m %.0f m, at 600 m %.0f m\n",
                                      g_renderer.height_fog_valley(), g_camera.y - sl, vis(g_camera.y), vis(sl + 20.0f),
