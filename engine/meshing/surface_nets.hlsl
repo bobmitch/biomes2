@@ -397,7 +397,15 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
         }
     }
     float3 nrm;
+    // DUG ground: a vertex the player's edits put more than 0.3 m inside the
+    // generated rock. The terrain shader leaves it out of the sea's
+    // shoreline (mesh.hlsl's wet band): that band goes by height alone, and a
+    // dry pit dug down to sea level wore the swash's damp and its sliding
+    // film on its floor -- surf at the bottom of a hole with no water in it.
+    // One field call, for edited cells only.
+    bool dug = false;
     if (edited) {
+        dug = real_terrain_density(world.x, world.y, world.z, voxel) > 0.3f;
         const float3 t = local;
         const float3 g = float3(
             lerp(lerp(d[1] - d[0], d[3] - d[2], t.y), lerp(d[5] - d[4], d[7] - d[6], t.y), t.z),
@@ -453,7 +461,10 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
     v.nrm = nrm;
     g_vertices[vbase + local_slot] = v;
     uint3 wts;
-    const uint2 mat = terrain_material(world.x, world.z, wts);
+    uint2 mat = terrain_material(world.x, world.z, wts);
+    // The flag rides in the rock roughness byte's lowest bit (mesh.hlsl
+    // vs_main masks it off): 1/127 of roughness is not a visible step.
+    mat.y = (mat.y & ~(1u << 24)) | (dug ? (1u << 24) : 0u);
     g_vertex_mat[vbase + local_slot] = mat;
     g_vertex_wts[vbase + local_slot] = wts;
     // Slot-relative, so the draw's BaseVertexLocation does the rebasing and an
