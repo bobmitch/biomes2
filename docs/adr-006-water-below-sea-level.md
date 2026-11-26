@@ -1,10 +1,24 @@
 # ADR-006: Water below sea level -- dug holes, tunnels and caves
 
-Status: proposed, 2026-11-25. Stages 1 (no sea under a roof, for physics),
-2 (underwater rendering) and 3 (the connectivity flood) built, first
-versions; stages 4-5 wait for something that can seal a pocket. This records the direction chosen in discussion and
-the corrections found while choosing it, so the first implementation starts
-from them.
+Status: **superseded**, 2026-11-25. Stages 1 (no sea under a roof, for
+physics), 2 (underwater rendering) and 3 (a connectivity flood on the edit
+lattice, with a timed fill) were built. The per-pocket machinery kept
+producing edge cases -- at every place its rules met (the flood's columns,
+the roof test, the fill's front, the sea's own columns) the sheet needed
+another cut or patch -- and the decision was made to drop it:
+
+**Water is a half-space at a constant sea level.** Every bit of air below sea
+level is water: dug pits and tunnels, and placed caves that descend below sea
+level (they flood and are swimmable; worldgen is unchanged). Dug water is
+calm -- no waves, swash or surf -- and the natural sea keeps its waves. No
+seepage, no material rules, no air pockets, no filling, no water simulation.
+Stage 2 stays (the eye is under water when it is below the surface over it),
+and so does the sea's bed capture (`record_water_bed`), which is what now
+decides where the sheet is drawn. The flood (`sea_access`), the roof test,
+`--flood-test` and `--seabed-tunnel` were removed; `--dig-water` checks the
+half-space. CLAUDE.md's "Water is a HALF-SPACE" section describes what is
+built. The rest of this document is the proposal as it stood, kept for its
+reasoning about what players expect.
 
 ## Context
 

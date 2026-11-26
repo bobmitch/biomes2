@@ -148,27 +148,21 @@ Last gathered: 2026-11-21, after the exploration fog.
 ## Weather, water and wet
 
 - **No drops on the camera lens.** [Volumetric clouds ... not done]
-- **Underwater is a first version** (ADR-006 stage 2): no waterline across
-  the lens (the view switches whole as the eye crosses the surface, so a
-  swimmer's eye in a crest flips it for a frame), no caustics, no light
-  shafts, no particles; in a shallow storm the sheet clamped over the bed
-  in a trough shows from below as dark patches on the sand. [The sea]
-- **The connectivity flood is a first version** (ADR-006 stage 3): the
-  fill is a prototype (a gravity-weighted arrival per cell: it steps in
-  0.5 m blocks at the front, takes a sideways
-  breach at the reference speed, and pools by a slow step up rather than
-  by volume); a
-  pocket's own water surface below sea level is not drawn (physics has
-  it), and the underwater pass dims light down to sea level, not to a
-  pocket's floor; the sheet's mask reaches 64 m round the camera, so a
-  flooded channel further off draws dry; the surf's edge at a dug wall
-  follows the water grid in steps of a few centimetres where the surf
-  meets it; the sea's bed (record_water_bed) reaches 64 m round the
-  camera, the generated depth beyond, and physics tames the swimmer's
-  waves by the generated depth; light in a flooded tunnel is the near
-  field's air (no light through water); a component over 1 M cells is left
-  dry; nothing can seal a pocket yet (stages 4-5). [The connectivity
-  flood]
+- **Underwater is a first version**: no waterline across the lens (the
+  view switches whole as the eye crosses the surface, so a swimmer's eye in
+  a crest flips it for a frame), no caustics, no light shafts, no
+  particles; in a shallow storm the sheet clamped over the bed in a trough
+  shows from below as dark patches on the sand. [Under the water]
+- **Water is a half-space** (everything under sea level), drawn where the
+  sea's bed (record_water_bed) lies under sea level: the bed reaches 64 m
+  round the camera, the generated depth beyond, so a pit dug or a coast
+  dredged further off draws dry or keeps its old surf line (physics is
+  right everywhere); the surf's edge at a dug wall follows the water grid
+  in steps of a few centimetres where the surf meets it; a deep narrow
+  pit's water reflects the sky where SSR finds no wall on screen; light in
+  a flooded tunnel is the near field's air (no light through water). Air
+  pockets, seepage and filling were dropped on purpose (ADR-006,
+  superseded). [Water is a half-space]
 - A faint strip just under the horizon where the sea's SSR misses land.
   [The sea]
 - **Puddle reflections are screen space** (nothing off screen or behind a
