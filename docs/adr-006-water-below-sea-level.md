@@ -12,9 +12,11 @@ level is water: dug pits and tunnels, and placed caves that descend below sea
 level (they flood and are swimmable; worldgen is unchanged). Dug water is
 calm -- no waves, swash or surf -- and the natural sea keeps its waves. No
 seepage, no material rules, no air pockets, no filling, no water simulation.
-Stage 2 stays (the eye is under water when it is below the surface over it),
-and so does the sea's bed capture (`record_water_bed`), which is what now
-decides where the sheet is drawn. The flood (`sea_access`), the roof test,
+Stage 2 stays (the eye is under water when it is below the surface over it).
+The sheet lies at sea level everywhere and the depth test decides where water
+shows; the deep sea's waves are weighted by the generated depth, so dug water
+is calm by construction (the bed capture built for stage 3 went too, a day
+later). The flood (`sea_access`), the roof test,
 `--flood-test` and `--seabed-tunnel` were removed; `--dig-water` checks the
 half-space. CLAUDE.md's "Water is a HALF-SPACE" section describes what is
 built. The rest of this document is the proposal as it stood, kept for its

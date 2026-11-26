@@ -153,16 +153,13 @@ Last gathered: 2026-11-21, after the exploration fog.
   a crest flips it for a frame), no caustics, no light shafts, no
   particles; in a shallow storm the sheet clamped over the bed in a trough
   shows from below as dark patches on the sand. [Under the water]
-- **Water is a half-space** (everything under sea level), drawn where the
-  sea's bed (record_water_bed) lies under sea level: the bed reaches 64 m
-  round the camera, the generated depth beyond, so a pit dug or a coast
-  dredged further off draws dry or keeps its old surf line (physics is
-  right everywhere); the surf's edge at a dug wall follows the water grid
-  in steps of a few centimetres where the surf meets it; a deep narrow
-  pit's water reflects the sky where SSR finds no wall on screen; light in
-  a flooded tunnel is the near field's air (no light through water). Air
-  pockets, seepage and filling were dropped on purpose (ADR-006,
-  superseded). [Water is a half-space]
+- **Water is a half-space** (everything under sea level), drawn by the
+  depth test alone, with the sea's waves weighted by the GENERATED depth: a
+  dredged harbour or a channel dug across a beach stays calm and never gets
+  the sea's waves (by choice); a deep narrow pit's water reflects the sky
+  where SSR finds no wall on screen; light in a flooded tunnel is the near
+  field's air (no light through water). Air pockets, seepage and filling
+  were dropped on purpose (ADR-006, superseded). [Water is a half-space]
 - A faint strip just under the horizon where the sea's SSR misses land.
   [The sea]
 - **Puddle reflections are screen space** (nothing off screen or behind a

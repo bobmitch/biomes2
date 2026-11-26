@@ -3175,9 +3175,10 @@ back -- `ww_swash` -- and three things read it, so they agree on where the
 water is: the sea's sheet (water.hlsl), the wet ground under it (mesh.hlsl)
 and the swimmer (`ww_sea_at`, physics_world.cpp).
 
-- **The sheet**: within 1.5 m of water depth (`ww_swash_reach`) the sea's
-  vertices rise by the swash; the terrain in front hides it where the beach
-  is higher. Its height rides the eight longest trains' elevation at the
+- **The sheet**: within 1.5 m of water depth (`ww_swash_reach`) and only on
+  the LOW beach (`ww_swash_band`: gone 0.6 m over the run-up, so an inland
+  column never carries it) the sea's vertices rise by the swash; the terrain
+  in front hides it where the beach is higher. Its height rides the eight longest trains' elevation at the
   point over their rms, so the uprush comes in sets and varies along the
   shore, times ~7 m lobes of fixed noise (a single contour drew a
   straight-edged slab). Reach: Stockdon's gentle-beach run-up, 0.043
@@ -3190,16 +3191,18 @@ and the swimmer (`ww_sea_at`, physics_world.cpp).
   the swash is evaluated right there, and the water fades into the scene
   over its last 8 cm of depth under sea level + swash -- a true contour of
   the beach. The sheet's geometry reaches 30 cm of depth past the edge,
-  riding 12 cm over the ground, so there is always water drawn for the
-  pixel test to cut; the clip is only a coarse cut (`i.depth + 0.3`).
+  riding 12 cm over the generated ground, so there is always water drawn for
+  the pixel test to fade. No clip: where the sheet is drawn is the depth
+  test's (below).
   Two attempts drew a staircase, worst looking along the shore: the sheet
   a few cm over the beach is nearly coplanar with it, so where they cross
   follows both meshes' triangles (and the vertex-interpolated clip stepped
   with the grid); then fading by the thickness between the SHEET and the
   ground only softened the steps, because near the shore the sheet's own
   height is interpolated across grid cells.
-- **Foam** keys to the last 0.6 m of water, not 2.2: at 2.2 the whole sheet
-  was white as snow; now foam at its leading edge, clear water behind.
+- **Foam** is the contact foam (below): the water's vertical thickness over
+  the ground behind the pixel. A band keyed to 2.2 m of water turned the
+  whole swash sheet white.
 - **Wet ground** (mesh.hlsl, before lighting; the swash rides in the shadow
   constants, `l_swash_a/b`, `l_swash`): damp from the waterline to the full
   run-up + 0.2 m, fading over 0.4 m -- albedo x 0.55, roughness to 0.35 --
@@ -3207,7 +3210,8 @@ and the swimmer (`ww_sea_at`, physics_world.cpp).
   scan's normal flattened. At 0.85 of the run-up the damp band ended about
   where the sheet stood and barely showed. Grass shows it modestly; this
   session had no sandy beach to judge it on.
-- **Physics**: water is present where the running sheet covers the ground;
+- **Physics**: water is present where the running sheet covers the ground
+  (`ww_sea_at`, without the swash where the feet are dug);
   `--swim 40 --wind 20` PASS, eye under 2.3%, fewer frames wading (the sheet
   covers the shallows). The `--swim` turn still shows a strip of grass at the
   bottom edge, as it did before this change; not run down.
@@ -3370,21 +3374,50 @@ the real one at every LOD. That is M1 paying off somewhere other than terrain.
 water** -- the sea, a channel dug in from the coast, a pit dug inland, a
 tunnel, a placed cave that descends below sea level (those flood and are
 swimmable; worldgen is untouched). No connectivity, no air pockets, no
-seepage, no fill, no water simulation of any kind. Only what KIND of water
-varies: the open sea's waves, swash and surf over a generated sea column, and
-still water at sea level wherever the water is DUG (the point or the bed well
-under the generated ground). This replaced ADR-006's per-pocket machinery (a
-connectivity flood on the edit lattice, a timed fill, a surface mask, a roof
-test for physics, and the cuts between them), which kept producing edge cases;
-`docs/adr-006-water-below-sea-level.md` is marked superseded.
+seepage, no fill, no water simulation of any kind, and no map of where water
+is: the sheet lies at sea level everywhere and the DEPTH TEST decides --
+terrain over sea level hides it, so any air under sea level shows water, at
+any distance. This replaced ADR-006's per-pocket machinery (a connectivity
+flood on the edit lattice, a timed fill, a surface mask, a roof test for
+physics, a top-down capture of the bed, and the cuts between them), which
+kept producing edge cases; `docs/adr-006-water-below-sea-level.md` is marked
+superseded.
 
-**The sea is swimmable, and it is still not in residency.** Physics has no
+**The surface is two layers** (`water_wave.h`, `water.hlsl`):
+- **The base, the same everywhere** -- the sea, pits, tunnels, channels:
+  flat at sea level, plus the wind's ripples (the FFT tiles and the gusts'
+  patches), which are normals in the pixel shader, not height.
+- **The top, the deep sea's**: the trains and swell, weighted by the
+  GENERATED depth (`real_terrain_height`, at the wave's rest point): none on
+  land columns, rising over the shelf (`ww_depth_factor`), full in deep
+  water, under the breaking cap (`WW_BREAK_HS` x depth). Storms scale this
+  layer only, and the whitecaps belong to it (weighted by the generated
+  depth's first metre, none in dug water).
+- So inland pits and caves are calm by construction, a channel dug across a
+  beach gets almost nothing (its generated depth is shallow), a dredged
+  harbour stays calm, and storm surf does not funnel into dug channels --
+  all accepted.
+- **The swash** rides on the low beach only (`ww_swash_band`), and is
+  suppressed per pixel where the pixel is DUG: the ground behind it (the
+  depth copy) lies 0.3-0.6 m and more under the generated ground. A sheet
+  pixel the swash or the beach's 12 cm lift raised over sea level is then
+  shaded where its view ray meets sea level instead (`P` in `ps_main`), so a
+  channel cut through a beach holds still water at sea level, not the
+  beach's moving sheet hanging over it. Physics does the same by the feet's
+  own depth under the generated ground.
+- **No z-fighting on low beaches**: on the beach band the sheet rides 12 cm
+  over the generated ground, and wherever it meets the ground the per-pixel
+  edge has faded it into the scene, so which surface wins the depth test
+  does not show. Raw frames (`--shake 30 --no-taa --sea-state 0`) at a
+  grazing view of an untouched beach change only in the wind-blown grass.
+
+**The sea is swimmable, and it is still not in residency.****The sea is swimmable, and it is still not in residency.** Physics has no
 water body. The character asks `ww_sea_at` in `water_wave.h` each step -- the
 same functions the shader draws, with the same level, sea state and clock:
-over a generated sea column (`real_terrain_height` below sea level, the swash
-included) the waves' surface, scaled to nothing as the feet go 0.3-0.6 m under
-the generated ground (dug); anywhere else sea level. The character is in the
-water wherever its feet are below that surface. The eye uses the same call
+sea level, plus the deep sea's layer at the generated depth (a trough never
+under the generated bed), plus the swash on the low beach unless the feet are
+0.3-0.6 m and more under the generated ground. The character is in the water
+wherever its feet are below that surface. The eye uses the same call
 (`Renderer::camera_underwater()`). `streamer.h` still contains no reference to
 the sea. Keep it that way: `--band-report`'s "worst miss" compares the band
 against `worldgen::terrain_height`, and a water surface feeding residency would
@@ -3450,50 +3483,26 @@ pit, in any tunnel or cave below sea level. `Renderer::camera_underwater()` /
   particles; in a shallow storm the sheet, clamped just over the bed in a
   trough, shows from below as dark patches on the sand.
 
-**Where the sheet is drawn: the sea's real bed** (`Renderer::record_water_bed`,
-`ps_bed` in mesh.hlsl, `bed_depth` in water.hlsl; `--no-sea-bed` for A/B).
-The common technique (Crest's sea-floor depth cache): the resident terrain
-drawn from above into a 512^2 R32F map of 0.25 m texels round the camera
-(64 m), its top 2 cm over sea level, so the first surface under each texel is
-the bed the water lies on -- digs and all, since it is the mesh -- and never a
-roof over it, which is above the top. A ceiling seen first means the
-sea-level point is in rock: the generated land, or the waterline where the
-field says sea (read as half a metre of rock, or a beach's swash zone dried
-in the shape of the tunnels dug under it). Nothing drawn: the generated
-field. Skirts are left out (a curtain under a beach read as a bed below sea
-level). Rebuilt when the camera moves 4 m, every 30 frames, and every frame
-for a second after an edit: ~0.09 ms a rebuild at any resolution
-(`--gpu-profile`'s "sea bed"). A vertex's depth IS the bed's: water stands
-wherever it lies under sea level. Past the map the generated depth stands, so
-a pit dug more than 64 m from the camera draws dry (physics is right
-everywhere). A tunnel whose roof is below sea level has no surface to draw;
-its water is seen from inside, as underwater.
-- **Dug water** (`i.rim.z`) is the bed's own floor 0.3-0.6 m and more under
-  the generated ground, wherever it is, and it is CALM: no waves, swash,
-  surf or shore foam (`calm_f`, `i.rim.x`). On a beach outside a hole's wall
-  the bed IS the generated ground, so the surf, swash and foam stay the
-  beach's right up to the rim.
-- **Rock over dug water keeps the calm**: a vertex standing 0.5 m and more
-  over the water within a metre of dug water (`bed_dug_near`: the bed a metre
-  off 1.3 m and more under its ground, a drop no beach makes) takes the calm
-  whole, so the grid's triangles across a pit's wall are calm end to end:
-  with the open sea's waves at their outer ends they carried its foam into
-  the hole in white blobs.
-- **No lift on a dug wall**: the 12 cm the sheet stands over the ground near
-  a shore is for beaches. On a wall the bed blends from floor to rock over a
-  texel, crossing zero at the wall, and the lifted sheet stood in front of
-  the rock in a row of bumps. The surf's run-up is scaled by the calm in both
-  stages.
-- **The edge** is per pixel, from the ground behind the pixel (the depth
-  copy) under sea level plus the swash there (`edge_fade`), and **fades over
-  the last 1.2 m of the view ray under water in dug water** (`under_len`), so
-  a dug wall shows through its own first centimetres of water: the waterline
-  on a wall standing near vertical at sea level is the mesh's half-metre
-  facets, toothed, and 0.4 m left them showing.
-- Two cuts: the coarse land cut (`i.depth + 0.3`) outside dug water, and on
-  the land side the grid's triangles that straddle a dug wall from its calm
-  to open surf (a low beach), which drew a row of white teeth up a channel's
-  walls; the surf's edge there follows the water grid in steps of a few cm.
+**Edges and foam, per pixel.** Everything the sheet needs to know about the
+real (dug) ground comes from the ground point behind the pixel in the depth
+copy (`gp` in `ps_main`):
+- **The edge** fades the water into the scene over its last 8 cm of
+  vertical depth (to the swash's surface on the beach), and **over the last
+  1.2 m of the view ray under water where the water is dug**, so a dug wall
+  shows through its own first centimetres of water: the waterline on a wall
+  standing near vertical at sea level is the mesh's half-metre facets,
+  toothed, and 0.4 m left them showing.
+- **Contact foam**, one rule for every shore: where the water over the
+  ground behind the pixel is THIN, vertically (10-30 cm), broken up by a
+  drifting lace and never whole (0.7 of the lace's threshold: whole, a
+  gentle beach's swash drew a solid white ribbon metres wide at a grazing
+  view) -- at a beach's edge, round a trunk standing in a pit, at the foot of
+  a dug wall. Faint scum on calm water; surf where the natural sea reaches
+  (`sea_w`: the generated column is sea or its beach, and not dug) as the
+  weather roughens, its band widening to ~0.8 m of water in a gale. Faded
+  where the ray under water is long (2-6 m), which is an occluder rather
+  than a shallow. It replaced a shore foam keyed to the vertices' generated
+  depth, which could not see a dug edge.
 - **The terrain's shore wet band skips dug ground**: the swash's damp and
   film (mesh.hlsl, `l_swash`) go by height alone, so the mesher flags a
   vertex its edits put more than 0.3 m inside the generated rock (the lowest
@@ -3501,30 +3510,30 @@ its water is seen from inside, as underwater.
   dug to just over sea level wore surf on its floor.
 - **`--dig-water`** (`build/dig_water.txt`) is the look and the check: from
   the coast nearest spawn, a pit dug into the beach, undercut on its inland
-  side, opened to the sea by a channel (`dig_water.bmp`, `_top.bmp`); 42 m
-  inland a pit dug 2.5 m under sea level and walled off from the sea, and
-  54 m in one dug to 0.4 m over it (`dig_water_inland.bmp`, trees off,
-  `_wet.bmp`, `_dry.bmp`). It asserts the inland pit and the channel are
-  water to physics with a surface still at sea level, the higher pit dry,
-  and an eye a metre under sea level in the inland pit drawn as underwater
-  (`dig_water_under.bmp`). `BIOMES_PIT_DREDGE=1` also dredges a strip 18 m
-  wide across the shoreline; `BIOMES_PIT_UNDERCUT=<m>` sets the undercut's
-  centre under sea level (2.5, its roof tangent to the water);
-  `BIOMES_PIT_PICK="px py ..."` names what the coast's still shows at a
-  pixel, marched through the EDITED density (`--pick` reads the generated
-  field). The instruments, `--water-debug` with `--tonemap 0`: `9` (red the
-  open sea's share of the waves, green dug water, blue the land side), `10`
-  (the shore foam's calm, depth and fade), `13` (the edge's fade, the ray
-  under water, dug water), `14` (the real shading, each cut painting its
-  pixel instead: red the coarse land cut, yellow a straddling triangle's),
-  `15` (the bed against the generated field: red deeper, green shallower)
-  and `16` (what the bed's texel holds: red a floor, green a ceiling, blue
-  nothing).
-- **Not done**: the bed reaches 64 m round the camera (a dug pit or dredged
-  coast further off draws dry, or keeps its old surf line); a dug shaft's
-  water reflects the sky where SSR finds no wall on screen, so a deep narrow
-  pit's water looks pale from above; light in a flooded tunnel is still the
-  near field's air (no light through water).
+  side, opened to the sea by a channel (`dig_water.bmp`, `_top.bmp`,
+  `_channel.bmp` along the channel from the sea, `_beach.bmp` a grazing view
+  of the untouched beach beside it); 42 m inland a pit dug 2.5 m under sea
+  level and walled off from the sea, and 54 m in one dug to 0.4 m over it
+  (`dig_water_inland.bmp`, trees off, `_wet.bmp`, `_dry.bmp`). It asserts the
+  inland pit and the channel are water to physics with a surface still at
+  sea level, the higher pit dry, and an eye a metre under sea level in the
+  inland pit drawn as underwater (`dig_water_under.bmp`).
+  `BIOMES_PIT_DREDGE=1` also dredges a strip 18 m wide across the
+  shoreline; `BIOMES_PIT_UNDERCUT=<m>` sets the undercut's centre under sea
+  level (2.5, its roof tangent to the water); `BIOMES_PIT_PICK="px py ..."`
+  names what the coast's still shows at a pixel, marched through the EDITED
+  density (`--pick` reads the generated field). The instruments,
+  `--water-debug` with `--tonemap 0`: `9` (red dug, green the natural sea's
+  reach, blue the land side), `10` (red the water's vertical thickness to
+  0.3 m, green the contact foam, blue the ray under water to 6 m), `13` (the
+  edge's fade, the ray under water, dug).
+- **Cost**, `--gpu-profile 120` at 2560 x 1440 (the sea pass now has its own
+  mark, "sea"): open sea 1.034 -> 1.022 ms, the coast 0.581 -> 0.570,
+  spawn 0.241 -> 0.245; the bed capture's 0.09 ms rebuilds are gone.
+- **Not done**: a deep narrow pit's water reflects the sky where SSR finds no
+  wall on screen, so it looks pale from above; light in a flooded tunnel is
+  still the near field's air (no light through water); a dredged harbour or
+  a beach channel never gets the sea's waves (by choice).
 
 `--overhang` has no landmark to aim at: it searches for a real ceiling
 (phase A), reports what it found and how the capsule left it, then digs a
