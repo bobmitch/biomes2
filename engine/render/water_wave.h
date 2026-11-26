@@ -461,4 +461,20 @@ WW_FN float ww_water_at(float x, float z, float t, WW_IN_SEA sea, WW_IN_SWASH sw
     return h;
 }
 
+// The water over a point, as physics and the eye ask it: its height over sea
+// level. Water is a HALF-SPACE -- every bit of air under sea level is water,
+// dug or generated, open to the sea or not. `depth` is the GENERATED column's
+// water (sea level less the generated ground, negative on land) and `under`
+// how far the point is below that generated ground. The open sea's waves and
+// swash stand where the generated column holds sea and the point is not DUG;
+// a point 0.3-0.6 m and more under the generated ground -- a pit, a dredged
+// channel, a tunnel, a cave -- is in calm water at sea level, as water.hlsl
+// draws it (its `dug`, from the sea's bed against the generated depth). A
+// land column holds no sea over sea level.
+WW_FN float ww_sea_at(float x, float z, float t, WW_IN_SEA sea, WW_IN_SWASH sw, float depth, float under) {
+    if (depth + ww_swash(x, z, t, sw) * ww_swash_reach(depth) <= -0.02f) return 0.0f;
+    const float calm = ww_saturate((under - 0.3f) / 0.3f);
+    return (1.0f - calm) * ww_water_at(x, z, t, sea, sw, depth);
+}
+
 #endif  // ENGINE_WATER_WAVE_H

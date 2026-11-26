@@ -364,9 +364,6 @@ void sync_physics_terrain() {
     for (size_t i = 0; i < gone.size(); ++i) g_physics.remove_chunk(gone[i]);
 }
 
-// The sea cover's cost (PhysicsWorld::set_sea_cover), for --seabed-tunnel.
-unsigned long long g_cover_calls = 0, g_cover_ticks = 0;
-
 // Hand physics the sea the renderer is about to draw: same level, same sea
 // state, same clock. `t` must be the time this frame passes to fill_view, or
 // the swimmer bobs on a swell that is somewhere else on screen. --no-water
@@ -384,9 +381,6 @@ void sync_sea(float t) {
     s.swash = g_renderer.swash();
     s.time = t;
     g_physics.set_sea(s);
-    // The flood is asked about the blocks round the player too (ADR-006
-    // stage 3): a third-person camera can be metres from the feet.
-    g_renderer.set_flood_focus(g_feet[0], g_feet[1], g_feet[2]);
 }
 
 // One frame of physics for the window loop. --tab-test drives this same
@@ -1624,11 +1618,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     const bool dig_tree_mode = hl.find("--dig-settle") != std::string::npos;
     const bool lights_mode = hl.find("--lights-report") != std::string::npos;
     const bool leak_mode = hl.find("--leak-test") != std::string::npos;
-    const bool seabed_mode = hl.find("--seabed-tunnel") != std::string::npos;
-    const bool flood_mode = hl.find("--flood-test") != std::string::npos;
-    const bool pit_mode = hl.find("--flood-pit") != std::string::npos;
+    const bool pit_mode = hl.find("--dig-water") != std::string::npos;
     const bool headless = report_mode || fell_mode || dig_tree_mode || lights_mode || leak_mode ||
-                          seabed_mode || flood_mode || pit_mode ||
+                          pit_mode ||
                           !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
@@ -1981,26 +1973,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     g_physics.set_column_height([](float x, float z) {
         return g_renderer.world().height(x, z);
     });
-    // The connectivity flood's word, where it has one (ADR-006 stage 3).
-    // BIOMES_NO_FLOOD=1 leaves the column rule and the cover test alone.
-    if (!std::getenv("BIOMES_NO_FLOOD") && !std::getenv("BIOMES_SEA_COLUMN_ONLY")) {
-        g_physics.set_water_query([](float x, float y, float z, float& surface, float& waves) {
-            return g_renderer.water_at(x, y, z, surface, waves);
-        });
-    }
-    // No sea under a roof (ADR-006 stage 1). BIOMES_SEA_COLUMN_ONLY=1 leaves
-    // the column rule alone: the old behaviour, --seabed-tunnel's mutant.
-    if (!std::getenv("BIOMES_SEA_COLUMN_ONLY")) {
-        g_physics.set_sea_cover([](float x, float z, float lo, float hi) {
-            LARGE_INTEGER a, b;
-            QueryPerformanceCounter(&a);
-            const bool solid = g_renderer.solid_between(x, z, lo, hi);
-            QueryPerformanceCounter(&b);
-            ++g_cover_calls;
-            g_cover_ticks += (unsigned long long)(b.QuadPart - a.QuadPart);
-            return solid;
-        });
-    }
 
     if (sea_shot) {
         // Waves are metres tall and the world is twenty kilometres wide,
@@ -5086,18 +5058,31 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     }
 
     if (pit_mode) {
-        // --flood-pit: a look, not a test. A big pit dug into the beach
-        // nearest spawn, open to the sea through an inlet, one side undercut
-        // under the beach; the water let in, then stills from up and to the
-        // side (build/flood_pit.bmp, flood_pit_top.bmp) -- the view that
-        // showed the water's edge stepping in cells and the dug rim's
-        // notches. build/flood_pit.txt says where.
+        // --dig-water: water is a half-space -- every bit of air under sea
+        // level is water -- and this is its look and its check, on dug
+        // ground. From the coast nearest spawn:
+        //   a pit dug into the beach, undercut on its inland side, opened to
+        //   the sea by a channel through the beach (the coast's look:
+        //   build/dig_water.bmp, dig_water_top.bmp);
+        //   inland, a pit dug 2.5 m under sea level, walled off from the sea:
+        //   it must be water to physics, calm (still at sea level), and an eye
+        //   in it must be under water;
+        //   beside it a pit dug to 0.4 m OVER sea level: dry, and no shore's
+        //   wet band on its floor (build/dig_water_inland.bmp shows both).
+        // BIOMES_PIT_DREDGE=1 also dredges a strip across the shoreline;
+        // BIOMES_PIT_UNDERCUT=<m> sets the undercut's centre under sea level;
+        // BIOMES_PIT_PICK="px py ..." names what the coast's still shows at a
+        // pixel, through the EDITED density (--pick reads the generated field).
         const engine::WorldGpu& wg = g_renderer.world();
         const float sea = wg.params().sea_level;
         g_renderer.set_vsync(true);
         g_walk = true;
-        FILE* f = std::fopen("build/flood_pit.txt", "w");
+        std::remove("build/dig_water.txt");
+        FILE* f = std::fopen("build/dig_water.txt", "w");
         if (!f) return 1;
+        // The coast: along a spoke from spawn, land 20 m in, inland ground at
+        // least 2 m over sea level from 34 to 62 m in (the inland pits), and
+        // 20 m of sea out from the shore.
         float best_rc = 1e9f, dx = 0.0f, dz = 1.0f;
         for (int sp = 0; sp < 72; ++sp) {
             const float a = 6.2831853f * float(sp) / 72.0f;
@@ -5106,17 +5091,25 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             float rc = -1.0f;
             for (float r = 10.0f; r < 4000.0f && r < best_rc; r += 2.0f)
                 if (at(r) < sea) { rc = r; break; }
-            if (rc < 0.0f || at(rc - 20.0f) < sea + 0.5f) continue;
+            if (rc < 70.0f || at(rc - 20.0f) < sea + 0.5f) continue;
             bool ok = true;
             for (float s = 3.0f; s <= 20.0f && ok; s += 1.0f) ok = at(rc + s) < sea - 0.3f;
+            for (float s = -62.0f; s <= -34.0f && ok; s += 2.0f) ok = at(rc + s) > sea + 2.0f;
             if (!ok) continue;
             best_rc = rc; dx = ux; dz = uz;
         }
-        if (best_rc >= 1e9f) { std::fprintf(f, "VOID RUN: no coast\n"); std::fclose(f); return 1; }
+        if (best_rc >= 1e9f) {
+            std::fprintf(f, "VOID RUN: no coast within 4 km of spawn with land 2 m high 34-62 m inland\n");
+            std::fclose(f);
+            g_renderer.shutdown();
+            g_physics.shutdown();
+            return 1;
+        }
         auto pt = [&](float s, float side, float out[2]) {
             out[0] = g_spawn.x + dx * (best_rc + s) - dz * side;
             out[1] = g_spawn.z + dz * (best_rc + s) + dx * side;
         };
+        auto hgt = [&](float s, float side) { float p[2]; pt(s, side, p); return wg.height(p[0], p[1]); };
         auto dig_at = [&](float s, float side, float y, float r) {
             float p[2];
             pt(s, side, p);
@@ -5124,6 +5117,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         };
         float t = 0.0f;
         const float kDt = 1.0f / 60.0f;
+        int drawn = 0;
         auto frame = [&]() {
             MSG m = {};
             while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
@@ -5139,6 +5133,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             engine::ViewConstants v = {};
             fill_view(g_camera, float(cr.right - cr.left), float(cr.bottom - cr.top), t, v);
             g_renderer.render(v);
+            ++drawn;
         };
         {
             float p[2];
@@ -5146,53 +5141,155 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_physics.place_character(p[0], Spawn::above(p[0], p[1]), p[1]);
             for (int i = 0; i < 120; ++i) frame();
         }
-        // The pit: 4 m spheres from 16 m inland to 4 m, three rows, centres
-        // half a metre over sea level, so their tops break through the beach
-        // (at a metre under it, they stopped 10-20 cm short: a roof the
-        // lattice kept as a voxel once edit_sphere learned to keep roofs);
-        // an undercut under its inland side; an inlet out through the beach
-        // into the sea. BIOMES_PIT_DREDGE=1 also dredges a strip 18 m wide
-        // from 4 m inland to 14 m out, 3 m deep across the old shoreline.
+        // The coastal pit: 4 m spheres from 16 m inland to 4 m, three rows,
+        // centres half a metre over sea level, so their tops break through
+        // the beach; an undercut under its inland side; a channel out through
+        // the beach into the sea.
         for (float s = -16.0f; s <= -4.0f; s += 2.0f)
             for (float side = -3.0f; side <= 3.0f; side += 3.0f) dig_at(s, side, sea + 0.5f, 4.0f);
         if (std::getenv("BIOMES_PIT_DREDGE"))
             for (float s = -4.0f; s <= 14.0f; s += 2.0f)
                 for (float side = -8.0f; side <= 8.0f; side += 2.0f) dig_at(s, side, sea - 0.5f, 2.5f);
-        // BIOMES_PIT_UNDERCUT=<m>: the undercut's centre under sea level (2.5
-        // by default, its ceiling tangent to the water -- the worst case for
-        // the waterline, which runs along rock barely crossing it).
-        float under_c = 2.5f;
+        float under_c = 2.5f;   // its ceiling tangent to the water: the waterline's worst case
         if (const char* e = std::getenv("BIOMES_PIT_UNDERCUT")) under_c = float(std::atof(e));
         for (float s = -16.0f; s <= -6.0f; s += 2.0f) dig_at(s, -7.0f, sea - under_c, 2.5f);
         for (float s = -4.0f; s <= 6.0f; s += 1.0f) dig_at(s, 0.0f, sea - 1.5f, 2.0f);
-        // Stand at the rim while the meshes and the flood settle, the water
-        // comes in, and the fill finishes.
+        // The inland pits, 3 m spheres stacked from the floor up through the
+        // ground so they are open to the sky: the wet one's floor 2.5 m under
+        // sea level at 42 m in, the dry one's 0.4 m over it at 54 m in.
+        const float kPR = 3.0f, kWetS = -42.0f, kDryS = -54.0f;
+        const float wet_floor = sea - 2.5f, dry_floor = sea + 0.4f;
+        auto pit = [&](float s0, float floor_y) {
+            for (float s = s0 - 1.5f; s <= s0 + 1.5f; s += 1.5f)
+                for (float side = -1.5f; side <= 1.5f; side += 1.5f)
+                    for (float y = floor_y + kPR; y <= hgt(s, side) + kPR; y += 1.5f) dig_at(s, side, y, kPR);
+        };
+        pit(kWetS, wet_floor);
+        pit(kDryS, dry_floor);
+        // Stand at the rim while the meshes settle.
         {
             float p[2];
             pt(-10.0f, 9.0f, p);
             g_physics.place_character(p[0], Spawn::above(p[0], p[1]) + 1.0f, p[1]);
-            for (int i = 0; i < 900; ++i) {
+            for (int i = 0; i < 180; ++i) frame();
+        }
+        std::fprintf(f, "dig water: coast %.0f m from spawn (%.1f, %.1f) along (%.3f, %.3f); sea level %.2f\n",
+                     best_rc, g_spawn.x, g_spawn.z, dx, dz, sea);
+        std::fprintf(f, "inland pits: generated ground %.2f m (wet, floor %.2f) and %.2f m (dry, floor %.2f) over sea level\n\n",
+                     hgt(kWetS, 0.0f) - sea, wet_floor - sea, hgt(kDryS, 0.0f) - sea, dry_floor - sea);
+
+        // The character placed and stood for 1.5 s: what physics calls it, and
+        // how far its water's surface strays from sea level (dug water is still).
+        struct Stand { int dry = 0, wet = 0, frames = 0; float stray = 0.0f; };
+        auto stand = [&](float s, float side, float y) {
+            float p[2];
+            pt(s, side, p);
+            Stand st;
+            g_physics.place_character(p[0], y, p[1]);
+            for (int i = 0; i < 90; ++i) {
                 frame();
-                if (i == 3) g_renderer.flood_settle();
+                if (i < 15) continue;
+                ++st.frames;
+                if (g_physics.medium() == engine::Medium::Dry) ++st.dry; else ++st.wet;
+                if (g_physics.sea_present())
+                    st.stray = (std::max)(st.stray, std::fabs(g_physics.water_surface() - sea));
+            }
+            return st;
+        };
+        bool pass_wet = false, pass_dry = false, pass_chan = false, pass_eye = false;
+        {
+            const Stand st = stand(kWetS, 0.0f, wet_floor + 0.3f);
+            std::fprintf(f, "inland pit 2.5 m under sea level: dry %d, in the water %d of %d; its surface strays %.3f m "
+                            "from sea level\n", st.dry, st.wet, st.frames, st.stray);
+            pass_wet = st.frames > 0 && st.wet == st.frames && st.stray < 0.02f;
+        }
+        {
+            const Stand st = stand(kDryS, 0.0f, dry_floor + 0.3f);
+            std::fprintf(f, "inland pit 0.4 m over sea level: dry %d, in the water %d of %d\n", st.dry, st.wet, st.frames);
+            pass_dry = st.frames > 0 && st.dry == st.frames;
+        }
+        {
+            const Stand st = stand(-2.0f, 0.0f, sea - 3.2f);
+            std::fprintf(f, "the coastal channel 2 m inland: dry %d, in the water %d of %d; its surface strays %.3f m "
+                            "from sea level\n", st.dry, st.wet, st.frames, st.stray);
+            pass_chan = st.frames > 0 && st.wet == st.frames && st.stray < 0.02f;
+        }
+        // The eye a metre under sea level in the inland pit: drawn as under
+        // water, and a still looking up at the surface from below.
+        {
+            float p[2];
+            pt(kWetS, 0.0f, p);
+            engine::Camera c = g_camera;
+            c.x = p[0]; c.z = p[1]; c.y = sea - 1.0f;
+            c.yaw = std::atan2(dx, dz);
+            c.pitch = 0.5f;
+            int under = 0;
+            for (int i = 0; i < 8; ++i) {
+                sync_sea(t);
+                engine::ViewConstants cv = {};
+                fill_view(c, g_res_w, g_res_h, t, cv);
+                g_renderer.render(cv);
+                t += kDt;
+                if (g_renderer.camera_underwater()) ++under;
+            }
+            pass_eye = under == 8;
+            std::fprintf(f, "an eye 1 m under sea level in the inland pit: drawn as under water %d of 8 frames, "
+                            "%.2f m under the surface\n", under, g_renderer.camera_water_depth());
+            engine::ViewConstants cv = {};
+            fill_view(c, g_res_w, g_res_h, t, cv);
+            std::string e3;
+            g_renderer.capture(cv, "build/dig_water_under.bmp", e3);
+            std::fprintf(f, "  still: build/dig_water_under.bmp -- --cam %.2f %.2f %.2f %.4f %.2f\n", c.x, c.y, c.z,
+                         c.yaw, c.pitch);
+        }
+
+        std::string e3;
+        engine::ViewConstants cv = {};
+        engine::Camera c = g_camera;
+        // The inland pits from straight above, clear of the crowns: water
+        // standing in the one, a dry floor with no wet band in the other.
+        {
+            float c0[2];
+            pt(0.5f * (kWetS + kDryS), 0.0f, c0);
+            c.x = c0[0]; c.z = c0[1];
+            c.y = (std::max)(hgt(kWetS, 0.0f), hgt(kDryS, 0.0f)) + 30.0f;
+            c.yaw = std::atan2(dx, dz);
+            c.pitch = -1.5f;
+            const bool trees = g_renderer.trees_on();
+            g_renderer.set_trees(false);   // a wood stands over them on the default seed
+            fill_view(c, g_res_w, g_res_h, t, cv);
+            g_renderer.capture(cv, "build/dig_water_inland.bmp", e3);
+            g_renderer.set_trees(trees);
+            std::fprintf(f, "\nstill: build/dig_water_inland.bmp (no trees; the wet pit at the top) -- --cam %.2f %.2f "
+                            "%.2f %.4f %.2f\n", c.x, c.y, c.z, c.yaw, c.pitch);
+            // And inside each, 2 m over its water or its floor, looking down
+            // past the far wall's foot.
+            const float ss[2] = {kWetS, kDryS};
+            const float ys[2] = {sea + 2.0f, dry_floor + 2.0f};
+            const char* names[2] = {"build/dig_water_wet.bmp", "build/dig_water_dry.bmp"};
+            for (int k = 0; k < 2; ++k) {
+                pt(ss[k] - 1.5f, 0.0f, c0);
+                c.x = c0[0]; c.z = c0[1]; c.y = ys[k];
+                c.pitch = -0.75f;
+                fill_view(c, g_res_w, g_res_h, t, cv);
+                g_renderer.capture(cv, names[k], e3);
+                std::fprintf(f, "still: %s -- --cam %.2f %.2f %.2f %.4f %.2f\n", names[k], c.x, c.y, c.z, c.yaw,
+                             c.pitch);
             }
         }
-        float c0[2];
-        pt(4.0f, 14.0f, c0);
-        float aim[2];
-        pt(-10.0f, -2.0f, aim);
-        engine::Camera c = g_camera;
-        c.x = c0[0]; c.z = c0[1]; c.y = sea + 12.0f;
-        c.yaw = std::atan2(aim[0] - c.x, aim[1] - c.z);
-        c.pitch = -0.55f;
-        engine::ViewConstants cv = {};
-        fill_view(c, g_res_w, g_res_h, t, cv);
-        std::string e3;
-        g_renderer.capture(cv, "build/flood_pit.bmp", e3);
-        std::fprintf(f, "pit: coast %.0f m from spawn along (%.3f, %.3f)\nstill: --cam %.2f %.2f %.2f %.4f %.2f\n",
-                     best_rc, dx, dz, c.x, c.y, c.z, c.yaw, c.pitch);
-        // BIOMES_PIT_PICK="px py [px py ...]": what the still shows at a pixel,
-        // marched through the EDITED density (--pick reads the generated
-        // field), with the LOD 0 chunk borders near the hit.
+        // The coastal pit and its channel.
+        {
+            float c0[2], aim[2];
+            pt(4.0f, 14.0f, c0);
+            pt(-10.0f, -2.0f, aim);
+            c.x = c0[0]; c.z = c0[1]; c.y = sea + 12.0f;
+            c.yaw = std::atan2(aim[0] - c.x, aim[1] - c.z);
+            c.pitch = -0.55f;
+            fill_view(c, g_res_w, g_res_h, t, cv);
+            g_renderer.capture(cv, "build/dig_water.bmp", e3);
+            std::fprintf(f, "still: build/dig_water.bmp -- --cam %.2f %.2f %.2f %.4f %.2f\n", c.x, c.y, c.z, c.yaw,
+                         c.pitch);
+        }
         if (const char* pk = std::getenv("BIOMES_PIT_PICK")) {
             float fwd[3], right[3], up[3];
             c.basis(fwd, right, up);
@@ -5231,615 +5328,21 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                              px, py, hx, hy, hz, t1, hy - sea, fx * S, fy * S, fz * S, S, wg.height(hx, hz));
             }
         }
-        float top[2];
-        pt(-10.0f, -2.0f, top);
-        c.x = top[0]; c.z = top[1]; c.y = sea + 22.0f; c.pitch = -1.5f;
-        fill_view(c, g_res_w, g_res_h, t, cv);
-        g_renderer.capture(cv, "build/flood_pit_top.bmp", e3);
-        std::fclose(f);
-        g_renderer.shutdown();
-        g_physics.shutdown();
-        return 0;
-    }
-
-    if (flood_mode) {
-        // --flood-test: ADR-006 stage 3, the connectivity flood. From the
-        // coast nearest spawn, three things dug side by side:
-        //   E. a channel from 25 m inland out into the sea, open to the sky:
-        //      it must fill (the old column rule left it dry inland);
-        //   F. a sealed tunnel under the shallows, vented by a shaft from the
-        //      land: dry; then breached from the seabed at its far end: it
-        //      must flood, up its shaft to sea level;
-        //   G. a dome under the seabed breached from BELOW (a riser down to a
-        //      passage that runs out under the sea and up to the seabed): the
-        //      passage floods, the dome keeps its air.
-        // BIOMES_NO_FLOOD=1 is the mutant (stages 1-2 only): E, F and G's
-        // passage must fail.
-        const engine::WorldGpu& wg = g_renderer.world();
-        const float sea = wg.params().sea_level;
-        g_renderer.set_vsync(true);
-        g_walk = true;
-        std::remove("build/flood_test.txt");
-        FILE* f = std::fopen("build/flood_test.txt", "w");
-        if (!f) return 1;
-        const bool mutant = std::getenv("BIOMES_NO_FLOOD") != nullptr;
-
-        float best_rc = 1e9f, dx = 0.0f, dz = 1.0f;
-        for (int sp = 0; sp < 72; ++sp) {
-            const float a = 6.2831853f * float(sp) / 72.0f;
-            const float ux = std::sin(a), uz = std::cos(a);
-            auto at = [&](float r, float side) {
-                return wg.height(g_spawn.x + ux * r - uz * side, g_spawn.z + uz * r + ux * side);
-            };
-            float rc = -1.0f;
-            for (float r = 10.0f; r < 4000.0f && r < best_rc; r += 2.0f)
-                if (at(r, 0.0f) < sea) { rc = r; break; }
-            if (rc < 0.0f) continue;
-            bool ok = true;
-            for (int si = -1; si <= 1 && ok; ++si) {
-                const float side = 20.0f * float(si);
-                ok = at(rc - 25.0f, side) > sea + 0.5f && at(rc - 12.0f, side) > sea;
-                for (float s = 3.0f; s <= 30.0f && ok; s += 1.0f) ok = at(rc + s, side) < sea - 0.5f;
-                ok = ok && at(rc + 25.0f, side) < sea - 1.5f;
-            }
-            if (!ok) continue;
-            best_rc = rc; dx = ux; dz = uz;
-        }
-        if (best_rc >= 1e9f) {
-            std::fprintf(f, "VOID RUN: no coast within 4 km of spawn with land and 30 m of sea on three lines 20 m apart\n");
-            std::fclose(f);
-            g_renderer.shutdown();
-            g_physics.shutdown();
-            return 1;
-        }
-        auto pt = [&](float s, float side, float out[2]) {
-            out[0] = g_spawn.x + dx * (best_rc + s) - dz * side;
-            out[1] = g_spawn.z + dz * (best_rc + s) + dx * side;
-        };
-        auto hgt = [&](float s, float side) { float p[2]; pt(s, side, p); return wg.height(p[0], p[1]); };
-        auto dig_at = [&](float s, float side, float y, float r) {
-            float p[2];
-            pt(s, side, p);
-            g_renderer.dig(p[0], y, p[1], r, -4.0f, 1);
-        };
-
-        float t = 0.0f;
-        const float kDt = 1.0f / 60.0f;
-        int drawn = 0;
-        auto frame = [&]() {
-            MSG m = {};
-            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
-            sync_physics_terrain();
-            sync_sea(t);
-            g_physics.update(kDt, 0.0f, 0.0f, false);
-            g_physics.character_position(g_feet);
-            g_camera.x = g_feet[0]; g_camera.y = g_feet[1] + kEyeAboveFeet; g_camera.z = g_feet[2];
-            t += kDt;
-            RECT cr;
-            GetClientRect(hwnd, &cr);
-            const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
-            if (w < 1.0f || h < 1.0f) return;
-            engine::ViewConstants v = {};
-            fill_view(g_camera, w, h, t, v);
-            g_renderer.render(v);
-            ++drawn;
-        };
-        // Frames until the flood has answered round the character, and the
-        // physics meshes have landed.
-        auto settle = [&](float x, float y, float z, int frames) {
-            g_physics.place_character(x, y, z);
-            for (int i = 0; i < frames; ++i) {
-                frame();
-                if (i == 2 || i == frames - 2) g_renderer.flood_settle();
-            }
-        };
-        struct Q { int q; float surface, waves; };
-        auto ask = [&](float s, float side, float y) {
-            float p[2];
-            pt(s, side, p);
-            Q r = {0, 0.0f, 0.0f};
-            r.q = g_renderer.water_at(p[0], y, p[1], r.surface, r.waves);
-            return r;
-        };
-        // The character placed and stood for 1.5 s: what physics calls it.
-        struct Stand { int dry = 0, wet = 0, frames = 0; };
-        auto stand = [&](float s, float side, float y) {
-            float p[2];
-            pt(s, side, p);
-            Stand st;
-            g_physics.place_character(p[0], y, p[1]);
-            for (int i = 0; i < 90; ++i) {
-                frame();
-                if (i == 3) g_renderer.flood_settle();
-                if (i < 15) continue;
-                ++st.frames;
-                if (g_physics.medium() == engine::Medium::Dry) ++st.dry; else ++st.wet;
-            }
-            return st;
-        };
-        auto qname = [](const Q& q) { return q.q < 0 ? "not labelled" : (q.q == 0 ? "DRY" : "WATER"); };
-
-        std::fprintf(f, "flood test%s\n", mutant ? " -- MUTANT: BIOMES_NO_FLOOD, stages 1-2 only" : "");
-        std::fprintf(f, "coast %.0f m from spawn (%.1f, %.1f) along (%.3f, %.3f); sea level %.2f\n\n",
-                     best_rc, g_spawn.x, g_spawn.z, dx, dz, sea);
         {
-            float p[2];
-            pt(-25.0f, 0.0f, p);
-            settle(p[0], Spawn::above(p[0], p[1]), p[1], 120);
-        }
-
-        // E. The channel: 3 m wide, floor 3 m under sea level, dug from 25 m
-        // inland to 6 m out, carved up through the land so it is open to the
-        // sky.
-        const float kChR = 1.6f, kChY = sea - 1.5f;
-        for (float s = -25.0f; s <= 6.0f; s += 1.0f) {
-            const float top = (std::max)(hgt(s, 0.0f), sea) + 0.5f;
-            for (float y = kChY; y <= top + 1e-3f; y += 1.0f) dig_at(s, 0.0f, y, kChR);
-        }
-        // F. The tunnel, 4 m across, its roof 2.5 m under the lowest seabed
-        // it passes, from 12 m inland to 28 m out; a shaft up to the land at
-        // its inland end.
-        const float kTR = 2.0f;
-        float hmin = 1e9f;
-        for (float s = -12.0f; s <= 28.0f; s += 1.0f) hmin = (std::min)(hmin, hgt(s, -20.0f));
-        const float yc = hmin - 2.5f - kTR;
-        for (float s = -12.0f; s <= 28.0f; s += 1.0f) dig_at(s, -20.0f, yc, kTR);
-        for (float y = yc; y <= hgt(-12.0f, -20.0f) + 0.5f; y += 1.0f) dig_at(-12.0f, -20.0f, y, 1.6f);
-        // G. The dome (3.5 m), its roof 2.5 m under the seabed; a riser from
-        // its floor near one side down to a passage 3 m high that runs out
-        // under the sea and up to the seabed.
-        const float kDR = 3.5f, hd = hgt(15.0f, 20.0f);
-        const float yd = hd - 2.5f - kDR;
-        const float yp = yd - 6.0f;
-        dig_at(15.0f, 20.0f, yd, kDR);
-        for (float y = yd - 2.0f; y >= yd - 5.6f; y -= 0.8f) dig_at(17.5f, 20.0f, y, 1.2f);
-        for (float s = 17.5f; s <= 26.0f; s += 1.0f) dig_at(s, 20.0f, yp, 1.5f);
-        for (float y = yp; y <= hgt(26.0f, 20.0f) + 0.5f; y += 1.0f) dig_at(26.0f, 20.0f, y, 1.5f);
-
-        // Stream it all in round the middle, and let the flood answer.
-        {
-            float p[2];
-            pt(0.0f, 0.0f, p);
-            settle(p[0], Spawn::above(p[0], p[1]), p[1], 180);
-        }
-
-        bool pass_e = true, pass_f1 = true, pass_f2 = true, pass_g = true;
-        // E: the channel 15 m inland, and 5 m in, at its floor.
-        for (float s : {-15.0f, -5.0f}) {
-            const Q q = ask(s, 0.0f, kChY - 1.0f);
-            const Stand st = stand(s, 0.0f, kChY - kChR + 0.3f);
-            std::fprintf(f, "E. channel %3.0f m inland: generated column %+.2f m; the flood: %s (surface %.2f, waves %.2f); "
-                            "physics: dry %d, in the water %d of %d\n",
-                         -s, hgt(s, 0.0f) - sea, qname(q), q.surface, q.waves, st.dry, st.wet, st.frames);
-            if (q.q != 1 || st.wet < st.frames) pass_e = false;
-        }
-        // F before the breach: dry under the sea and in the shaft.
-        for (float s : {10.0f, -12.0f}) {
-            const Q q = ask(s, -20.0f, yc - 1.0f);
-            const Stand st = stand(s, -20.0f, yc - kTR + 0.3f);
-            std::fprintf(f, "F. tunnel %+3.0f m, sealed from the sea, vented by its shaft: the flood: %s; physics: dry %d of %d\n",
-                         s, qname(q), st.dry, st.frames);
-            if (q.q == 1 || st.dry < st.frames) pass_f1 = false;
-        }
-        // The breach: a hole from the seabed down into the tunnel's far end.
-        // BIOMES_FLOOD_BREACH_R=<m>: the breach hole's radius (1.6 by
-        // default), to compare a pinhole's fill with a big hole's.
-        const char* br_env = std::getenv("BIOMES_FLOOD_BREACH_R");
-        const float br = br_env ? float(std::atof(br_env)) : 1.6f;
-        for (float y = hgt(28.0f, -20.0f) + 0.5f; y >= yc; y -= 0.5f) dig_at(28.0f, -20.0f, y, br);
-        // H. The fill: the water must ARRIVE, not appear. Frames until the
-        // flood has answered, then the tunnel 18 m from the breach and its
-        // shaft 40 m off are watched on the game clock: dry at first, wet
-        // later, the near point before the far one.
-        bool pass_h = true;
-        {
-            float p[2];
-            pt(10.0f, -20.0f, p);
-            g_physics.place_character(p[0], yc - kTR + 0.3f, p[1]);
-            frame();
-            g_renderer.flood_settle();
-            frame();
-            const float t_ans = t;
-            const float b_m2 = g_renderer.sea_access().last_breach_m2();
-            const float b_k = g_renderer.sea_access().last_breach_scale();
-            float t_near = -1.0f, t_far = -1.0f;
-            bool near0 = false, far0 = false;
-            bool rising_shot = false;
-            float rising_surface = 0.0f;
-            for (int i = 0; i < 4000 && (t_near < 0.0f || t_far < 0.0f || t - t_ans < 13.5f); ++i) {
-                const Q qn = ask(10.0f, -20.0f, yc - kTR + 0.25f);
-                const Q qf = ask(-12.0f, -20.0f, yc - kTR + 0.25f);
-                if (i == 0) { near0 = qn.q == 1; far0 = qf.q == 1; }
-                if (t_near < 0.0f && qn.q == 1) t_near = t - t_ans;
-                if (t_far < 0.0f && qf.q == 1) t_far = t - t_ans;
-                // Stills of the shaft from above as it fills, 10 s and 13 s in;
-                // and one while it is still RISING, half a second after the
-                // water reaches its foot -- the hole's level under the surf's,
-                // where the step between them has to fall on the rim.
-                const float since = t - t_ans;
-                if (!rising_shot && t_far > 0.0f && since >= t_far + 0.5f) {
-                    rising_shot = true;
-                    const Q qs = ask(-12.0f, -20.0f, yc - kTR + 0.25f);
-                    rising_surface = qs.surface;
-                    float q2[2];
-                    pt(-12.0f, -20.0f, q2);
-                    engine::Camera c = g_camera;
-                    c.x = q2[0] + 0.5f; c.z = q2[1]; c.y = hgt(-12.0f, -20.0f) + 4.0f;
-                    c.yaw = 0.0f; c.pitch = -1.45f;
-                    engine::ViewConstants cv = {};
-                    fill_view(c, g_res_w, g_res_h, t, cv);
-                    std::string e3;
-                    g_renderer.capture(cv, "build/flood_fill_rising.bmp", e3);
-                }
-                for (int si = 0; si < 2; ++si) {
-                    const float at_s = si == 0 ? 10.0f : 13.0f;
-                    if (since >= at_s && since < at_s + kDt) {
-                        float q2[2];
-                        pt(-12.0f, -20.0f, q2);
-                        engine::Camera c = g_camera;
-                        c.x = q2[0] + 0.5f; c.z = q2[1]; c.y = hgt(-12.0f, -20.0f) + 4.0f;
-                        c.yaw = 0.0f; c.pitch = -1.45f;
-                        engine::ViewConstants cv = {};
-                        fill_view(c, g_res_w, g_res_h, t, cv);
-                        std::string e3;
-                        g_renderer.capture(cv, si == 0 ? "build/flood_fill_10s.bmp" : "build/flood_fill_13s.bmp", e3);
-                    }
-                }
-                frame();
-            }
-            std::fprintf(f, "H. the fill after the breach: the tunnel floor 18 m from it wet after %.2f s, the shaft's "
-                            "foot 40 m from it after %.2f s (wet at once: %s, %s); %llu component(s) timed; "
-                            "breach %.2f m^2, time x%.2f\n",
-                         t_near, t_far, near0 ? "YES" : "no", far0 ? "YES" : "no",
-                         g_renderer.sea_access().animated(), b_m2, b_k);
-            std::fprintf(f, "   the shaft's water 0.5 s after it reached the foot: surface at %.2f "
-                            "(build/flood_fill_rising.bmp)\n", rising_surface);
-            pass_h = !near0 && !far0 && t_near > 0.0f && t_far > t_near && t_far < 60.0f;
-            // Then until the shaft has filled to a metre under sea level (a
-            // small breach takes a while), so F below judges the full flood.
-            for (int i = 0; i < 6000 && ask(-12.0f, -20.0f, sea - 1.0f).q != 1; ++i) frame();
-        }
-        for (float s : {10.0f, -12.0f}) {
-            const Q q = ask(s, -20.0f, yc - 1.0f);
-            const Stand st = stand(s, -20.0f, yc - kTR + 0.3f);
-            std::fprintf(f, "F. tunnel %+3.0f m, BREACHED at 28 m out: the flood: %s (surface %.2f, waves %.2f); "
-                            "physics: dry %d, in the water %d of %d\n",
-                         s, qname(q), q.surface, q.waves, st.dry, st.wet, st.frames);
-            if (q.q != 1 || st.wet < st.frames) pass_f2 = false;
-        }
-        // The shaft, a metre under sea level: the water rose up it.
-        {
-            const Q q = ask(-12.0f, -20.0f, sea - 1.0f);
-            std::fprintf(f, "F. the shaft 1 m under sea level (a land column): the flood: %s (surface %.2f)\n", qname(q),
-                         q.surface);
-            if (q.q != 1) pass_f2 = false;
-        }
-        // G: the passage floods; the dome keeps its air.
-        {
-            const Q qp = ask(21.0f, 20.0f, yp - 0.5f);
-            const Stand sp = stand(21.0f, 20.0f, yp - 1.5f + 0.3f);
-            std::fprintf(f, "G. passage under the dome: the flood: %s (surface %.2f); physics: dry %d, in the water %d of %d\n",
-                         qname(qp), qp.surface, sp.dry, sp.wet, sp.frames);
-            if (qp.q != 1 || sp.wet < sp.frames) pass_g = false;
-            const float floor_y = yd - std::sqrt(kDR * kDR - 2.5f * 2.5f);
-            const Q qd = ask(12.5f, 20.0f, floor_y + 1.0f);
-            const Stand sd = stand(12.5f, 20.0f, floor_y + 0.3f);
-            std::fprintf(f, "G. the dome, breached from below: the flood: %s; physics: dry %d of %d\n", qname(qd), sd.dry,
-                         sd.frames);
-            if (qd.q == 1 || sd.dry < sd.frames) pass_g = false;
-        }
-
-        // A still over the channel, looking along it inland from the sea --
-        // after standing in it, so its chunks are the finest level again.
-        {
-            float p[2];
-            pt(-5.0f, 0.0f, p);
-            settle(p[0], kChY - kChR + 0.3f, p[1], 90);
-            pt(4.0f, 0.0f, p);
-            engine::Camera c = g_camera;
-            c.x = p[0]; c.z = p[1]; c.y = sea + 3.0f;
-            c.yaw = std::atan2(-dx, -dz);
-            c.pitch = -0.35f;
-            engine::ViewConstants cv = {};
+            float top[2];
+            pt(-10.0f, -2.0f, top);
+            c.x = top[0]; c.z = top[1]; c.y = sea + 22.0f; c.pitch = -1.5f;
             fill_view(c, g_res_w, g_res_h, t, cv);
-            std::string e3;
-            g_renderer.capture(cv, "build/flood_channel.bmp", e3);
-            std::fprintf(f, "\nstill: build/flood_channel.bmp -- --cam %.2f %.2f %.2f %.4f %.2f\n", c.x, c.y, c.z, c.yaw,
-                         c.pitch);
-            // And straight down from 25 m over the channel's middle.
-            pt(-10.0f, 0.0f, p);
-            c.x = p[0]; c.z = p[1]; c.y = sea + 25.0f;
-            c.pitch = -1.55f;
-            fill_view(c, g_res_w, g_res_h, t, cv);
-            g_renderer.capture(cv, "build/flood_channel_top.bmp", e3);
+            g_renderer.capture(cv, "build/dig_water_top.bmp", e3);
         }
-        const engine::SeaAccess& sa = g_renderer.sea_access();
-        std::fprintf(f, "flood: %llu components searched (%llu capped), %llu cells, %llu lattice points evaluated, "
-                        "%.0f ms of worker time; %zu blocks labelled\n",
-                     sa.components(), sa.capped(), sa.cells_searched(), sa.points_evaluated(), sa.ms(),
-                     g_renderer.flood_blocks());
-        {
-            float p[2];
-            pt(-10.0f, 0.0f, p);
-            const float h = wg.height(p[0], p[1]);
-            std::fprintf(f, "channel 10 m inland at (%.2f, %.2f): generated height %.2f; edited density there %.2f "
-                            "(generated %.2f); ground under it with the edits %.2f\n",
-                         p[0], p[1], h, g_renderer.edited_density(p[0], h - 0.25f, p[1]),
-                         wg.density(p[0], h - 0.25f, p[1]), g_renderer.ground_below(p[0], p[1], h + 1.0f, true));
-        }
-        const engine::FrameStats st = g_renderer.stats();
-        std::fprintf(f, "edits: %zu bricks; GPU pool %zu resident, %llu evictions, %llu misses, %llu upload deferrals; "
-                        "%llu frames' planning stopped by a full brick header table\n",
-                     st.edit_bricks, st.bricks_resident, (unsigned long long)st.brick_evictions,
-                     (unsigned long long)st.brick_misses, (unsigned long long)st.brick_upload_deferrals,
-                     g_renderer.streamer().header_deferrals());
-        if (drawn == 0 || st.chunks_classified == 0)
-            std::fprintf(f, "\nVOID RUN: %d frames drawn, %llu chunks classified\n", drawn, st.chunks_classified);
-        std::fprintf(f, "\nE (a channel dug in from the coast fills): %s\nF (a vented tunnel is dry until breached): %s\n"
-                        "F (breached, it floods to sea level): %s\nG (a dome breached from below keeps its air): %s\n"
-                        "H (the water arrives, near before far): %s\n",
-                     pass_e ? "PASS" : "FAIL", pass_f1 ? "PASS" : "FAIL", pass_f2 ? "PASS" : "FAIL",
-                     pass_g ? "PASS" : "FAIL", pass_h ? "PASS" : "FAIL");
-        const bool pass = pass_e && pass_f1 && pass_f2 && pass_g && pass_h && drawn > 0;
-        std::fprintf(f, "%s\n", pass ? "PASS" : "FAIL");
-        std::fclose(f);
-        g_renderer.shutdown();
-        g_physics.shutdown();
-        return pass ? 0 : 1;
-    }
-
-    if (seabed_mode) {
-        // --seabed-tunnel: ADR-006 stage 1. The sea was wherever the
-        // GENERATED column is below sea level, so a character in a sealed
-        // tunnel under the seabed swam in dry air. Finds the coast nearest
-        // spawn, digs a sealed tunnel from under the beach out under the
-        // shallows, and a pit in the seabed open to the sea beside it, then
-        // stands the character in each place in turn:
-        //   A. three points in the tunnel, under sea columns: must stay DRY,
-        //      on its feet, not floated up to the roof;
-        //   B. open water over the tunnel's far end: must be in the sea;
-        //   C. the bottom of the open pit: must be in the sea.
-        // BIOMES_SEA_COLUMN_ONLY=1 is the mutant (the old rule): A must FAIL.
-        const engine::WorldGpu& wg = g_renderer.world();
-        const float sea = wg.params().sea_level;
-        g_renderer.set_vsync(true);
-        g_walk = true;
-        std::remove("build/seabed_tunnel.txt");
-        FILE* f = std::fopen("build/seabed_tunnel.txt", "w");
-        if (!f) return 1;
-        const bool mutant = std::getenv("BIOMES_SEA_COLUMN_ONLY") != nullptr;
-
-        // The coast: the nearest point to spawn along any of 72 spokes where
-        // land gives way to sea that stays sea for 30 m and is at least
-        // 1.5 m deep 25 m out.
-        float best_rc = 1e9f, dx = 0.0f, dz = 1.0f;
-        for (int sp = 0; sp < 72; ++sp) {
-            const float a = 6.2831853f * float(sp) / 72.0f;
-            const float ux = std::sin(a), uz = std::cos(a);
-            auto at = [&](float r) { return wg.height(g_spawn.x + ux * r, g_spawn.z + uz * r); };
-            float rc = -1.0f;
-            for (float r = 10.0f; r < 4000.0f && r < best_rc; r += 2.0f)
-                if (at(r) < sea) { rc = r; break; }
-            if (rc < 0.0f || at(rc - 10.0f) < sea) continue;
-            bool ok = true;
-            for (float s = 3.0f; s <= 30.0f && ok; s += 1.0f) ok = at(rc + s) < sea - 0.3f;
-            if (!ok || at(rc + 25.0f) > sea - 1.5f) continue;
-            best_rc = rc; dx = ux; dz = uz;
-        }
-        if (best_rc >= 1e9f) {
-            std::fprintf(f, "VOID RUN: no coast within 4 km of spawn with 30 m of sea 1.5 m deep\n");
-            std::fclose(f);
-            g_renderer.shutdown();
-            g_physics.shutdown();
-            return 1;
-        }
-        auto pt = [&](float s, float side, float out[2]) {
-            out[0] = g_spawn.x + dx * (best_rc + s) - dz * side;
-            out[1] = g_spawn.z + dz * (best_rc + s) + dx * side;
-        };
-
-        // The tunnel: 4 m across, from 10 m inland to 30 m out, its roof at
-        // least 2.5 m under the lowest seabed it passes beneath.
-        const float kR = 2.0f, kRoof = 2.5f;
-        float hmin = 1e9f;
-        for (float s = -10.0f; s <= 30.0f; s += 1.0f) {
-            float p[2];
-            pt(s, 0.0f, p);
-            hmin = (std::min)(hmin, wg.height(p[0], p[1]));
-        }
-        const float yc = hmin - kRoof - kR;
-        // The pit: 8 m to one side, half under the seabed, open to the sea.
-        float pit[2];
-        pt(15.0f, 8.0f, pit);
-        if (wg.height(pit[0], pit[1]) > sea - 0.5f) pt(15.0f, -8.0f, pit);
-        const float pit_r = 2.5f, pit_y = wg.height(pit[0], pit[1]);
-
-        float t = 0.0f;
-        const float kDt = 1.0f / 60.0f;
-        auto frame = [&]() -> bool {
-            MSG m = {};
-            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
-            sync_physics_terrain();
-            sync_sea(t);
-            g_physics.update(kDt, 0.0f, 0.0f, false);
-            g_physics.character_position(g_feet);
-            g_camera.x = g_feet[0]; g_camera.y = g_feet[1] + kEyeAboveFeet; g_camera.z = g_feet[2];
-            t += kDt;
-            RECT cr;
-            GetClientRect(hwnd, &cr);
-            const float w = float(cr.right - cr.left), h = float(cr.bottom - cr.top);
-            if (w < 1.0f || h < 1.0f) return false;
-            engine::ViewConstants v = {};
-            fill_view(g_camera, w, h, t, v);
-            g_renderer.render(v);
-            return true;
-        };
-
-        // Stream the place in from the beach above the tunnel's land end.
-        {
-            float p[2];
-            pt(-10.0f, 0.0f, p);
-            g_physics.place_character(p[0], Spawn::above(p[0], p[1]), p[1]);
-        }
-        int drawn = 0;
-        for (int i = 0; i < 120; ++i) drawn += frame() ? 1 : 0;
-
-        for (float s = -10.0f; s <= 30.0f; s += 1.0f) {
-            float p[2];
-            pt(s, 0.0f, p);
-            g_renderer.dig(p[0], yc, p[1], kR, -4.0f, 1);
-        }
-        g_renderer.dig(pit[0], pit_y, pit[1], pit_r, -4.0f, 1);
-
-        // Until every tunnel chunk physics holds is a MESH shape: before
-        // that a chunk is a heightfield, solid to its top surface, and a
-        // character placed in the tunnel would be pushed up onto the seabed.
-        const float kS[3] = {5.0f, 15.0f, 25.0f};
-        const float S0 = engine::lod_chunk_size(0);
-        auto key_at = [&](float x, float y, float z) {
-            engine::ChunkKey k;
-            k.x = int(std::floor(x / S0)); k.y = int(std::floor(y / S0));
-            k.z = int(std::floor(z / S0)); k.lod = 0;
-            return k;
-        };
-        int mesh_frames = -1;
-        for (int i = 1; i <= 900 && mesh_frames < 0; ++i) {
-            drawn += frame() ? 1 : 0;
-            bool all = true;
-            for (int k = 0; k < 3 && all; ++k) {
-                float p[2];
-                pt(kS[k], 0.0f, p);
-                all = g_physics.chunk_shape(key_at(p[0], yc, p[1])) == 2;
-            }
-            if (all && g_physics.chunk_shape(key_at(pit[0], pit_y - pit_r, pit[1])) == 2) mesh_frames = i;
-        }
-
-        std::fprintf(f, "seabed tunnel%s\n", mutant ? " -- MUTANT: BIOMES_SEA_COLUMN_ONLY, the old column rule" : "");
-        std::fprintf(f, "coast %.0f m from spawn (%.1f, %.1f) along (%.3f, %.3f); sea level %.2f\n",
-                     best_rc, g_spawn.x, g_spawn.z, dx, dz, sea);
-        std::fprintf(f, "tunnel: radius %.1f m, centre y %.2f, from 10 m inland to 30 m out; "
-                        "lowest seabed over it %.2f (roof >= %.1f m under it)\n", kR, yc, hmin, kRoof);
-        std::fprintf(f, "pit: radius %.1f m at the seabed (%.1f, %.2f, %.1f)\n", pit_r, pit[0], pit_y, pit[1]);
-        std::fprintf(f, "physics mesh shapes in place after %d frame(s)%s\n\n", mesh_frames,
-                     mesh_frames < 0 ? " -- NEVER: the cases below may stand on heightfields" : "");
-
-        // One case: place, run 1.5 s, count what physics called it.
-        struct Case { int dry = 0, wade = 0, swim = 0, frames = 0, eye_under = 0; float rise = 0.0f;
-                      bool grounded = false; unsigned long long calls = 0; double ms = 0.0; };
-        LARGE_INTEGER qf;
-        QueryPerformanceFrequency(&qf);
-        auto run = [&](float x, float y, float z) {
-            Case c;
-            g_physics.place_character(x, y, z);
-            const unsigned long long c0 = g_cover_calls, k0 = g_cover_ticks;
-            float settled = 1e9f;
-            for (int i = 0; i < 90; ++i) {
-                drawn += frame() ? 1 : 0;
-                if (i < 15) { settled = g_feet[1]; continue; }   // falls the last few cm
-                ++c.frames;
-                const engine::Medium md = g_physics.medium();
-                if (md == engine::Medium::Dry) ++c.dry;
-                else if (md == engine::Medium::Wading) ++c.wade;
-                else ++c.swim;
-                c.rise = (std::max)(c.rise, g_feet[1] - settled);
-                // The renderer's own verdict on the eye (ADR-006 stage 2).
-                if (g_renderer.camera_underwater()) ++c.eye_under;
-            }
-            c.grounded = g_physics.character_grounded();
-            c.calls = g_cover_calls - c0;
-            c.ms = double(g_cover_ticks - k0) * 1000.0 / double(qf.QuadPart);
-            return c;
-        };
-        auto line = [&](const char* name, const Case& c, float x, float z) {
-            std::fprintf(f, "%-24s generated column %+6.2f m (%s); dry %d, wading %d, swimming %d of %d; "
-                            "rose %.2f m; %s; drawn as underwater %d; cover test %llu calls, %.1f us each\n",
-                         name, wg.height(x, z) - sea, wg.height(x, z) < sea ? "sea by the old rule" : "land",
-                         c.dry, c.wade, c.swim, c.frames, c.rise, c.grounded ? "on its feet" : "NOT grounded",
-                         c.eye_under, c.calls, c.calls ? c.ms * 1000.0 / double(c.calls) : 0.0);
-        };
-
-        bool pass_a = mesh_frames > 0, pass_b = false, pass_c = false;
-        for (int k = 0; k < 3; ++k) {
-            float p[2];
-            pt(kS[k], 0.0f, p);
-            const Case c = run(p[0], yc - kR + 0.3f, p[1]);
-            char name[64];
-            std::snprintf(name, sizeof(name), "A. tunnel, %2.0f m out:", kS[k]);
-            line(name, c, p[0], p[1]);
-            if (c.dry != c.frames || !c.grounded || c.rise > 0.3f || c.eye_under > 0) pass_a = false;
-        }
-        {
-            float p[2];
-            pt(25.0f, 0.0f, p);
-            const float bed = wg.height(p[0], p[1]);
-            const Case c = run(p[0], (std::max)(bed + 0.3f, sea - engine::PhysicsWorld::kFloatDepth), p[1]);
-            line("B. open water over it:", c, p[0], p[1]);
-            pass_b = c.frames > 0 && c.dry == 0;
-        }
-        {
-            const Case c = run(pit[0], pit_y - pit_r + 0.3f, pit[1]);
-            line("C. open pit in the bed:", c, pit[0], pit[1]);
-            pass_c = c.frames > 0 && c.dry == 0;
-        }
-
-        // D. The eye itself under open water, over the tunnel's far end: the
-        // renderer must draw the view as underwater (stage 2), and the still
-        // looks back up the slope at the surface from below.
-        bool pass_d = false;
-        float d_depth = 0.0f;
-        {
-            float p[2];
-            pt(25.0f, 0.0f, p);
-            const float bed = wg.height(p[0], p[1]);
-            engine::Camera c = g_camera;
-            c.x = p[0]; c.z = p[1]; c.y = 0.5f * (sea + bed);
-            c.yaw = std::atan2(-dx, -dz);
-            c.pitch = 0.25f;
-            int under = 0;
-            for (int i = 0; i < 8; ++i) {
-                sync_sea(t);
-                engine::ViewConstants cv = {};
-                fill_view(c, g_res_w, g_res_h, t, cv);
-                g_renderer.render(cv);
-                t += kDt;
-                if (g_renderer.camera_underwater()) ++under;
-            }
-            d_depth = g_renderer.camera_water_depth();
-            pass_d = under == 8;
-            std::fprintf(f, "D. eye under open water:  camera (%.1f, %.2f, %.1f) over a %.2f m column; drawn as "
-                            "underwater %d of 8 frames, %.2f m under the surface\n",
-                         c.x, c.y, c.z, sea - bed, under, d_depth);
-            engine::ViewConstants cv = {};
-            fill_view(c, g_res_w, g_res_h, t, cv);
-            std::string e3;
-            g_renderer.capture(cv, "build/seabed_under.bmp", e3);
-            std::fprintf(f, "  still: build/seabed_under.bmp -- --cam %.2f %.2f %.2f %.4f %.2f\n",
-                         c.x, c.y, c.z, c.yaw, c.pitch);
-        }
-
-        // A still down the tunnel, seaward, from its 5 m point.
-        {
-            float p[2];
-            pt(5.0f, 0.0f, p);
-            engine::Camera c = g_camera;
-            c.x = p[0]; c.z = p[1]; c.y = yc + 0.3f;
-            c.yaw = std::atan2(dx, dz);
-            c.pitch = 0.0f;
-            engine::ViewConstants cv = {};
-            fill_view(c, g_res_w, g_res_h, t, cv);
-            std::string e3;
-            g_renderer.capture(cv, "build/seabed_tunnel.bmp", e3);
-            std::fprintf(f, "\nstill: build/seabed_tunnel.bmp -- --cam %.2f %.2f %.2f %.4f 0\n", c.x, c.y, c.z, c.yaw);
-        }
-
         const engine::FrameStats st = g_renderer.stats();
         if (drawn == 0 || st.chunks_classified == 0)
             std::fprintf(f, "\nVOID RUN: %d frames drawn, %llu chunks classified\n", drawn, st.chunks_classified);
-        std::fprintf(f, "\nA (tunnel dry, standing, not drawn as underwater): %s\nB (open water is sea): %s\n"
-                        "C (open pit is sea): %s\nD (an eye under open water is drawn as underwater): %s\n",
-                     pass_a ? "PASS" : "FAIL", pass_b ? "PASS" : "FAIL", pass_c ? "PASS" : "FAIL",
-                     pass_d ? "PASS" : "FAIL");
-        const bool pass = pass_a && pass_b && pass_c && pass_d && drawn > 0;
+        std::fprintf(f, "\ninland pit under sea level is water, still: %s\ninland pit over sea level is dry: %s\n"
+                        "coastal channel is water, still: %s\nan eye in the inland pit is under water: %s\n",
+                     pass_wet ? "PASS" : "FAIL", pass_dry ? "PASS" : "FAIL", pass_chan ? "PASS" : "FAIL",
+                     pass_eye ? "PASS" : "FAIL");
+        const bool pass = pass_wet && pass_dry && pass_chan && pass_eye && drawn > 0;
         std::fprintf(f, "%s\n", pass ? "PASS" : "FAIL");
         std::fclose(f);
         g_renderer.shutdown();

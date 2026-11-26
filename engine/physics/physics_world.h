@@ -130,34 +130,13 @@ public:
 
     // The sea. Set every frame, because time and sea state move.
     void set_sea(const SeaParams& s) { sea_ = s; }
-    // The BASE terrain's column height, which is the shader's rule for where
-    // sea exists at all: water.hlsl clips wherever real_terrain_height is
-    // above sea level. Using the same rule is what stops a pit dug on a beach
-    // filling with water nobody can see.
+    // The GENERATED terrain's column height. Water is a half-space -- every
+    // bit of air under sea level is water -- and this decides only what kind:
+    // the open sea's waves and swash over a generated sea column, still water
+    // in DUG ground (a point well under the generated ground: a pit, a
+    // tunnel, a cave), as water.hlsl draws them (water_wave.h ww_sea_at).
     void set_column_height(std::function<float(float, float)> fn) {
         column_height_ = fn;
-    }
-    // Whether anything solid lies in the column at (x, z) between two heights
-    // -- the EDITED field, generated rock and the player's digging both. The
-    // column rule alone put the sea in every tunnel and cave under the seabed:
-    // a character walking a sealed tunnel 8 m under the shallows swam in dry
-    // air, with rock overhead. With this set, the sea is only where nothing
-    // solid lies between the feet and sea level. Interim, ADR-006 stage 1:
-    // the column above the feet is all it asks, so a tunnel that BREAKS
-    // through into the sea is dry too until the connectivity flood (stage 3).
-    void set_sea_cover(std::function<bool(float x, float z, float y_lo, float y_hi)> fn) {
-        sea_cover_ = fn;
-    }
-    // The cover test starts this far over the feet: inside the capsule, so
-    // in air, clear of the ground the feet rest on.
-    static constexpr float kCoverFrom = 0.5f;
-    // ADR-006 stage 3: the connectivity flood's word at a point, asked first
-    // (Renderer::water_at): -1 not labelled there (the column rule and the
-    // cover test above decide, as before), 0 not water, 1 water -- with the
-    // surface over it (sea level, or an air pocket's floor) and the share of
-    // the open sea's waves that reaches it along the water's path.
-    void set_water_query(std::function<int(float x, float y, float z, float& surface, float& waves)> fn) {
-        water_query_ = fn;
     }
 
     // Diagnostics: what physics actually has. A ray straight up, once
@@ -175,7 +154,7 @@ public:
     int chunk_shape(const ChunkKey& k) const;
 
     Medium medium() const { return medium_; }
-    // World y of the displaced surface above the character, last step. Only
+    // World y of the water's surface over the character, last step. Only
     // meaningful when sea_present().
     float  water_surface() const { return water_y_; }
     bool   sea_present() const { return sea_here_; }
@@ -219,8 +198,6 @@ private:
 
     SeaParams sea_;
     std::function<float(float, float)> column_height_;
-    std::function<bool(float, float, float, float)> sea_cover_;
-    std::function<int(float, float, float, float&, float&)> water_query_;
     Medium medium_ = Medium::Dry;
     bool   sea_here_ = false;
     float  water_y_ = 0.0f;

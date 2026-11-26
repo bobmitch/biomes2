@@ -28,7 +28,6 @@
 #include "engine/render/canopy.h"
 #include "engine/render/height_gi.h"
 #include "engine/render/near_field.h"
-#include "engine/render/sea_access.h"
 #include "engine/render/far_shadow.h"
 #include "engine/render/scan_library.h"
 #include "engine/render/forest_map.h"
@@ -181,8 +180,8 @@ public:
     // physics sync) that needs this frame's sea before the frame is drawn.
     void  set_sea_state(float s) { weather_.set_storm(s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s)); }
     float sea_state() const { return weather_now_.storm; }
-    // Whether the last frame's eye was under the sea (ADR-006 stage 2), and
-    // how far under the surface over it.
+    // Whether the last frame's eye was under the water (below the surface over
+    // it: water is everything under sea level), and how far under it.
     bool  camera_underwater() const { return cam_under_; }
     float camera_water_depth() const { return cam_under_depth_; }
     Weather& weather() { return weather_; }
@@ -594,25 +593,6 @@ public:
     // lattice corner where one is stored, else the field at the 0.5 m voxel,
     // trilinear between. Away from any edit it is the field itself.
     float edited_density(float x, float y, float z) const;
-    // Whether the column at (x, z) holds anything solid between y_lo and
-    // y_hi, by the same field: a march up, careful near surfaces, with no
-    // bisection after the first rock. Physics' sea cover (a roof between
-    // the feet and sea level means no sea).
-    bool solid_between(float x, float z, float y_lo, float y_hi) const;
-    // ADR-006 stage 3: the sea as the connectivity flood labels it
-    // (sea_access.h), at a point. -1 not labelled here (the caller falls
-    // back to the column rule and stage 1's roof test); 0 not water; 1
-    // water, with the surface over it (sea level, or a pocket's floor) and
-    // how much of the open sea's waves reach it (1 the open sea, falling
-    // with the path through the water to it).
-    int water_at(float x, float y, float z, float& surface, float& waves) const;
-    // Where the player is, so the flood is asked about blocks round it as
-    // well as round the camera (a third-person camera can be metres off).
-    void set_flood_focus(float x, float y, float z) { flood_focus_[0] = x; flood_focus_[1] = y; flood_focus_[2] = z; flood_focus_set_ = true; }
-    // Until the flood's worker has answered everything asked (a test).
-    void flood_settle();
-    const SeaAccess& sea_access() const { return sea_access_; }
-    size_t flood_blocks() const { return flood_.size(); }
     // Where a ray first enters the terrain (edits included), within `reach`
     // metres. False if it starts inside rock or meets nothing.
     bool aim_terrain(const float from[3], const float dir[3], float reach,
@@ -816,40 +796,6 @@ private:
     ComPtr<ID3D12Resource> ssgi_;              // the screen-space bounce (L6): irradiance, distance
     HeightGi hfgi_;
     NearField near_;
-    // ADR-006 stage 3 (sea_access.h): the worker, and on the main thread its
-    // answers by block (kept while a newer one is asked for, so a dig does
-    // not blink the water off), what is asked and not yet answered, and the
-    // blocks' columns' placed caves (lowest cave air, cached).
-    SeaAccess sea_access_;
-    // arrive and t0: the fill (sea_access.h) -- a wet cell counts from
-    // t0 + arrive x kArriveStep on the game clock (flood_now_).
-    struct FloodBlock { uint64_t gen; double t0; uint8_t cell[SeaAccess::kCells]; uint8_t arrive[SeaAccess::kCells]; };
-    double flood_now_ = 0.0;
-    bool  flood_arrived(const FloodBlock& b, int idx) const;
-    // The edited density at the cell under sea level of columns round a
-    // FILLING hole (the mask's third plane), by world column; forgotten at
-    // every edit (BrickStore::generation).
-    std::unordered_map<int64_t, FloodBlock> flood_;
-    std::unordered_map<int64_t, uint64_t> flood_asked_;
-    std::unordered_map<int64_t, float> flood_cave_lo_;
-    float flood_focus_[3] = {0.0f, 0.0f, 0.0f};
-    bool  flood_focus_set_ = false;
-    int   flood_last_[6] = {1 << 30, 0, 0, 1 << 30, 0, 0};
-    uint64_t flood_last_gen_ = 0;
-    int   flood_frames_ = 0;
-    void  update_flood(const float cam[3]);
-    bool  flood_wanted(int bx, int by, int bz);
-    int   flood_label(int x, int y, int z, uint8_t& code) const;   // 0 unknown, 1 known
-    // The sea's surface mask round the camera (water.hlsl g_flood): a byte a
-    // 0.5 m column (128 m a side), 0 no word, else the waves' share x 255
-    // where the cell under sea level is flooded; one upload buffer a frame in
-    // flight.
-    static const int kFloodMask = 256;
-    ComPtr<ID3D12Resource> flood_mask_[kFrameCount];
-    void* flood_mask_cpu_[kFrameCount] = {};
-    int   flood_mask_origin_[2] = {0, 0};
-    bool  flood_mask_on_ = false;
-    void  fill_flood_mask(const float cam[3]);
     FarShadow far_;
     ScanLibrary scans_;
     ForestMap forest_;
