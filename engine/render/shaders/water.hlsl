@@ -39,7 +39,7 @@ cbuffer WaterConstants : register(b0) {
     float3 cam_right;  float tan_half_fov;
     float3 cam_up;     float pad1;
     float  sea_level;  float sea_state;  float grid_cells;  float extent;
-    float  debug_mode; float cam_water; float2 pad0;
+    float  debug_mode; float cam_water; float foam_mean; float pad0;   // foam_mean: the foam pattern's (foam_pattern.h)
     // The frame's light (ADR-004 L2), the same values the shadow constants
     // carry for everything else; lighting.hlsli reads them by these names.
     float4 l_sun_dir;
@@ -92,6 +92,9 @@ SamplerState g_wrap_u : register(s2);
 Texture2DArray<float4> g_detail : register(t5);
 SamplerState g_wrap : register(s3);
 Texture2D<float> g_cloud_shadow : register(t6);   // clouds.hlsl cs_shadow
+// Foam's bubbles (foam_pattern.h): R b (0 a hole's centre, 1 the film), GB
+// its gradient / 2.5 biased to 0.5, A b / 2; 16 cells a tile, mip-mapped.
+Texture2D<float4> g_foam : register(t7);
 #include "engine/render/shaders/lighting.hlsli"
 #include "engine/render/atmosphere.h"
 #include "engine/render/shaders/haze.hlsli"
@@ -160,8 +163,19 @@ VSOut vs_main(uint vid : SV_VertexID) {
     // 1.25 rather than 1.0: displacement pushes vertices sideways by up to the
     // Gerstner horizontal throw, and a grid that stopped exactly at the screen
     // edge would tear away from it.
+    // And the first kUnderRows rows reach far BELOW the screen, coarsely
+    // (to ndc -4): on a beach the sheet is lifted up to a metre and a half
+    // over sea level (the swash and its 12 cm over the sand), and a lifted
+    // vertex near a low camera moves UP the screen -- at 1.2 m over the swash
+    // the grid's own bottom row came into view, a straight edge across the
+    // water. Only for an eye over the water: under it, rays down meet nothing.
     const float over = 1.25f;
-    const float2 ndc = (float2(float(ix), float(iz)) / grid_cells * 2.0f - 1.0f) * over;
+    const uint kUnderRows = 12u;
+    float ndc_y = (float(iz) / grid_cells * 2.0f - 1.0f) * over;
+    if (cam_pos.y >= cam_water)
+        ndc_y = iz < kUnderRows ? lerp(-4.0f, -over, float(iz) / float(kUnderRows))
+                                : lerp(-over, over, float(iz - kUnderRows) / (grid_cells - float(kUnderRows)));
+    const float2 ndc = float2((float(ix) / grid_cells * 2.0f - 1.0f) * over, ndc_y);
 
     const float3 dir = screen_ray(ndc);
 
@@ -212,7 +226,7 @@ VSOut vs_main(uint vid : SV_VertexID) {
     // with no chop in it. The geometric mean is the cell's effective size and
     // keeps the short waves out to a sensible distance without letting them
     // alias along the stretched axis.
-    const float ang = (2.0f * over * tan_half_fov) / grid_cells;
+    const float ang = (2.0f * over * tan_half_fov) / (grid_cells - float(kUnderRows));
     const float lateral = d * ang;
     const float along = lateral / max(abs(denom), 0.02f);
     const float spacing = sqrt(max(lateral * along, 1e-8f));
@@ -428,7 +442,27 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // do not apply -- the water is calm at sea level -- so a pixel of sheet
     // they raised is shaded where its ray meets sea level instead, and the
     // ground behind decides whether any water shows (edge_fade).
-    const float dug = zb0 < 1.0f ? saturate((sea_level - i.gen - gp.y - 0.3f) / 0.3f) : 0.0f;
+    // Against the generated ground AT the ground point, not under the surface
+    // point: at a grazing view the ground behind a pixel lies metres along
+    // the ray, and a seabed falling away offshore read as dug -- the open
+    // sea's crests were flattened to sea level in a slab. Extrapolated from
+    // the surface point along the generated depth's own gradient over this
+    // triangle (the interpolants' screen derivatives), with a tolerance
+    // growing with the distance.
+    float2 ggen = float2(0.0f, 0.0f);
+    {
+        const float2 ex = ddx(i.world.xz), ey = ddy(i.world.xz);
+        const float gx = ddx(i.gen), gy = ddy(i.gen);
+        const float det = ex.x * ey.y - ex.y * ey.x;
+        if (abs(det) > 1e-12f) ggen = float2(gx * ey.y - ex.y * gy, ex.x * gy - ey.x * gx) / det;
+        const float gl = length(ggen);
+        if (gl > 2.0f) ggen *= 2.0f / gl;
+    }
+    float2 hv = gp.xz - i.world.xz;
+    const float hd = length(hv);
+    if (hd > 20.0f) hv *= 20.0f / hd;
+    const float gen_ground = sea_level - (i.gen + dot(ggen, hv));
+    const float dug = zb0 < 1.0f ? saturate((gen_ground - gp.y - 0.3f - 0.03f * hd) / 0.3f) : 0.0f;
     if (dug > 0.0f && P.y > sea_level + 1e-3f && v.y > 1e-3f) {
         P = lerp(P, cam_pos - v * ((cam_pos.y - sea_level) / v.y), dug);
         dist = length(P - cam_pos);
@@ -661,7 +695,6 @@ float4 ps_main(VSOut i) : SV_Target0 {
     const float contact = 0.7f * (1.0f - smoothstep(0.1f, 0.3f + 0.5f * rough_w, thick)) *
                           (1.0f - smoothstep(2.0f, 6.0f, under0));
     const float surf = lerp(0.15f, 1.0f, sea_w * saturate(0.35f + 2.0f * sea_state));
-    const float shore_foam = smoothstep(1.0f - contact, 1.25f - contact, lace) * contact * surf * i.fade;
     // Whitecaps where the surface FOLDS: the Jacobian of the trains' throw
     // (ww_surface_with) and the ripples' (ocean_fft.hlsl) together, 1 on
     // still water and 0 where a crest comes to a point and breaks. The wind
@@ -689,8 +722,78 @@ float4 ps_main(VSOut i) : SV_Target0 {
     // and never in dug water. The ripples' folding and the wind's streaks are
     // in the base layer everywhere, and unweighted they laid gale whitecaps on
     // a pit dug into a beach.
-    const float crest_foam = saturate(breaking * (0.55f + 0.9f * d0.w) + 0.25f * trail) * saturate(i.gen) * (1.0f - dug);
+    const float crest_raw = saturate(breaking * (0.55f + 0.9f * d0.w) + 0.25f * trail) * saturate(i.gen) * (1.0f - dug);
+
+    // --- foam's fine structure, by the pixel's footprint ----------------------
+    // Up close sea foam is a froth of holes of many sizes in a white film, and
+    // the lace above has nothing under half a metre, so near the camera it read
+    // as a smooth smear. Three octaves of BUBBLES (foam_pattern.h: a baked,
+    // tileable texture of holes of varied radius), 0.5 m, 12 cm and 3 cm cells,
+    // each turned its own way (no tile lines up with another) and drifting a
+    // little faster than the one above, so the froth shears as it moves. Each
+    // is whole while its cell spans 8 pixels of water (fp, stretched at a
+    // grazing view) and gone at 4, where it is replaced by the pattern's MEAN
+    // -- the mip chain filters towards the same mean -- so the foam's coverage,
+    // and the far look, do not move: from a distance the foam is exactly the
+    // lace, and walking up to it the holes open octave by octave with no switch
+    // to see. The threshold's softness follows the same footprint: the lace's
+    // 0.25 far off, down to what keeps the finest visible octave antialiased
+    // (its change across a pixel) up close, so edges sharpen as they resolve.
+    // A texture, not the pattern evaluated here: the procedural version
+    // searched nine points an octave and cost +0.4 ms of the sea pass at 1440p
+    // where foam filled the view.
+    float detail = 0.0f, near_w = 0.0f, aa = 0.0f;
+    float2 relief = float2(0.0f, 0.0f);
+    // Only where foam can come of it: crests, or a lace that the detail's most
+    // (0.4 over its mean) could lift over the shore's threshold. The gradients
+    // are taken outside the branch; the reads take them explicitly.
+    const float2 dpx = ddx(P.xz), dpy = ddy(P.xz);
+    if (crest_raw > 0.002f || (contact > 0.002f && lace + 0.4f > 1.0f - contact)) {
+        [unroll] for (int k = 0; k < 3; ++k) {
+            const float cs = k == 0 ? 0.5f : (k == 1 ? 0.12f : 0.03f);
+            const float amp = k == 0 ? 0.35f : (k == 1 ? 0.25f : 0.15f);
+            const float ang_k = k == 0 ? 0.5f : (k == 1 ? 2.1f : 4.0f);
+            const float ca = cos(ang_k), sa = sin(ang_k);
+            const float2x2 rot = float2x2(ca, -sa, sa, ca);
+            const float2 drift = float2(0.29f, 0.16f) * (time * (1.0f + 0.2f * float(k)));
+            const float sc = 1.0f / (cs * 16.0f);   // 16 cells a tile
+            const float2 uv = mul(rot, (P.xz - drift) * sc) + float2(0.13f, 0.71f) * float(k);
+            const float4 t = g_foam.SampleGrad(g_wrap, uv, mul(rot, dpx * sc), mul(rot, dpy * sc));
+            const float w = saturate(cs / max(fp, 1e-5f) * 0.25f - 1.0f);
+            if (k == 0) near_w = w;
+            detail += amp * w * (t.r - foam_mean);
+            // The relief: a hole is a dimple to its rim; the film between holes
+            // rises to the ridges where cells meet -- dense foam's honeycomb --
+            // for the finest octave only (the coarser ridges shaded as
+            // metre-wide facets). Turned back into the world's frame.
+            const float hole = smoothstep(0.55f, 0.45f, t.a);
+            relief += amp * w * lerp(k == 2 ? 0.35f : 0.0f, 1.0f, hole) * mul((t.gb * 2.0f - 1.0f) * 2.5f, rot);
+            aa += amp * w * fp / (0.7f * cs);
+        }
+    }
+    const float soft = lerp(0.25f, clamp(1.5f * aa, 0.03f, 0.25f), near_w);
+    // DENSITY: how far over its threshold the foam is. Up close thin foam is
+    // a translucent film -- the water shows through it, greyer -- and dense
+    // foam an opaque white: a flat white sheet with holes punched in it read
+    // as snow. Nothing where the detail has faded, so far foam is as before.
+    const float shore_f = lace + detail - (1.0f - contact);
+    const float shore_dens = saturate(shore_f / 0.3f);
+    const float shore_foam = smoothstep(0.0f, soft, shore_f) * lerp(1.0f, lerp(0.55f, 1.0f, shore_dens), near_w) *
+                             contact * surf * i.fade;
+    // The crests' foam is an amount, not a threshold of the lace: up close it
+    // is eroded by the same bubbles (the more foam, the smaller the holes),
+    // cross-faded in by the coarse octave's weight.
+    const float crest_f = 0.5f + detail - (1.0f - crest_raw);
+    const float crest_dens = saturate(crest_f / 0.3f);
+    const float crest_foam = lerp(crest_raw, smoothstep(0.0f, soft, crest_f) * lerp(0.55f, 1.0f, crest_dens), near_w);
     const float foam = saturate(max(shore_foam, crest_foam));
+    // How the foam is lit: its bubbles' relief tilts the water's normal (at a
+    // slope the same at every scale), and thin foam is darker, lit through
+    // itself.
+    const float3 nfoam = normalize(n - 0.6f * float3(relief.x, 0.0f, relief.y));
+    const float foam_shade = lerp(1.0f, lerp(0.78f, 1.0f, max(shore_dens, crest_dens)), near_w);
+    const float3 foam_light = (kSunLux * (max(kSunDir.y, 0.0f) * (0.25f + 0.75f * saturate(dot(nfoam, l))) * cls) +
+                               kPi * kSkyMean) / kPi * foam_shade;
 
     // 7: the folding measure, white at 1 (still), black at 0 (folding).
     // 9: red dug, green the natural sea's reach (sea_w), blue the land side.
@@ -758,7 +861,7 @@ float4 ps_main(VSOut i) : SV_Target0 {
     }
 
     float3 col = lerp(under, refl, fres) + spec;
-    col = lerp(col, srgb_to_linear(float3(0.86f, 0.90f, 0.93f)) * light_in, foam);
+    col = lerp(col, srgb_to_linear(float3(0.86f, 0.90f, 0.93f)) * foam_light, foam);
     col = min(col, kSceneMaxNits);
 
     // The air between the eye and the water, as the composite does for every

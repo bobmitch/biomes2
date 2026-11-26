@@ -72,7 +72,8 @@ struct WaterConstants {
     float extent;
     float debug_mode;
     float cam_water;   // world y of the sea surface directly at the camera
-    float pad0[2];
+    float foam_mean;   // the foam pattern's mean (FoamPattern::mean)
+    float pad0;
     float light[7][4]; // the frame's light (ADR-004 L2): Renderer::fill_light
     float wave_amp[WW_WAVES];   // the weather's sea (water_wave.h)
     float wave_steep;
@@ -104,7 +105,8 @@ static_assert(sizeof(WaterConstants) == 672, "WaterConstants must match water.hl
 // range every lit table has declared since DDGI.
 const UINT kWaterSceneSrv = 79, kWaterDepthSrv = 80, kPuddleSrv = Clouds::kHeapEnd,
            kFogOpenUav = NearField::kHeapEnd, kFogOpenAvgUav = kFogOpenUav + 1, kFogOpenAvgSrv = kFogOpenUav + 2,
-           kHeapSlots = kFogOpenUav + 3;
+           kFoamSrv = kFogOpenUav + 3,   // the foam's bubbles (FoamPattern), t7 in the sea's table
+           kHeapSlots = kFogOpenUav + 4;
 static_assert(NearField::kFirst == CharacterRenderer::kSrvB + 1, "the near field follows the character's textures");
 static_assert(CharacterRenderer::kSrvA == kPuddleSrv + 1, "the character's textures follow the puddle mask");
 
@@ -620,9 +622,10 @@ bool Renderer::create_water_pipeline(std::string& error) {
         // t1 depth's copy, t2 the sky-view table, t3 the aerial perspective,
         // t4 the mist -- one table from heap [3], the post chain's base.
         // The table is visible to every stage.
-        D3D12_DESCRIPTOR_RANGE wr[7] = {};
-        const UINT w_heap[7] = {kWaterSceneSrv, kWaterDepthSrv, 10, 11, 32, OceanDetail::kSrvSlot, Clouds::kShadowSrv};
-        for (UINT k = 0; k < 7; ++k) {
+        D3D12_DESCRIPTOR_RANGE wr[8] = {};
+        const UINT w_heap[8] = {kWaterSceneSrv, kWaterDepthSrv, 10, 11, 32, OceanDetail::kSrvSlot, Clouds::kShadowSrv,
+                                kFoamSrv};
+        for (UINT k = 0; k < 8; ++k) {
             wr[k].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
             wr[k].NumDescriptors = 1;
             wr[k].BaseShaderRegister = k;
@@ -630,7 +633,7 @@ bool Renderer::create_water_pipeline(std::string& error) {
         }
         params[12].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[12].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[12].DescriptorTable.NumDescriptorRanges = 7;
+        params[12].DescriptorTable.NumDescriptorRanges = 8;
         params[12].DescriptorTable.pDescriptorRanges = wr;
         D3D12_STATIC_SAMPLER_DESC ss[4] = {};
         ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -3006,6 +3009,13 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         if (!near_.init(device_.Get(), srv_heap_.Get(), Clouds::kShadowSrv, error)) return false;
         if (!near_.load_config("worldgen/data/archetypes.json", error)) return false;
         near_.set_world(&world_, &edits_);   // the sky-access flood reads its field and the edits (sky_access.h)
+        if (!foam_.init(device_.Get(), queue_.Get(), srv_heap_.Get(), kFoamSrv, error)) return false;
+        {
+            char line[160];
+            std::snprintf(line, sizeof line, "phase: foam pattern %dx%d, mean %.4f", FoamPattern::kSize,
+                          FoamPattern::kSize, foam_.mean());
+            startup_log().push_back(std::make_pair(std::string(line), foam_.bake_ms()));
+        }
         // The key light's shadow past the cascades.
         if (!far_.init(device_.Get(), srv_heap_.Get(), error)) return false;
         canopy_.set_models(trees_.models(), trees_.looks());
@@ -4386,6 +4396,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
             const float ground = world_.height(cx, cz);
             wc.cam_water = wc.sea_level + ww_sea_at(cx, cz, view.time, sea_, swash_, wc.sea_level - ground, ground - cy);
             cam_under_ = cy < wc.cam_water;
+            wc.foam_mean = foam_.mean();
             if (cam_under_) cam_under_depth_ = wc.cam_water - cy;
         }
         // What the post chain knows, for the haze and the sky (haze.hlsli).

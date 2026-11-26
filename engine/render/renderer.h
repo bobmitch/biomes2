@@ -31,6 +31,7 @@
 #include "engine/render/far_shadow.h"
 #include "engine/render/scan_library.h"
 #include "engine/render/forest_map.h"
+#include "engine/render/foam_pattern.h"
 #include "engine/rocks/rock_field.h"
 #include "engine/rocks/rock_renderer.h"
 #include "engine/props/glow_mushrooms.h"
@@ -798,6 +799,7 @@ private:
     FarShadow far_;
     ScanLibrary scans_;
     ForestMap forest_;
+    FoamPattern foam_;   // the sea's foam bubbles (foam_pattern.h), t7 in its table
     bool forest_on_ = true;
     bool far_on_ = true;
     void record_far(const float vp[16]);

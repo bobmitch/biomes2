@@ -222,6 +222,7 @@ if(BIOMES2_ENGINE)
     engine/render/far_shadow.cpp
     engine/render/scan_library.cpp
     engine/render/forest_map.cpp
+    engine/render/foam_pattern.cpp
     engine/rocks/rock_mesh.cpp
     engine/rocks/rock_field.cpp
     engine/rocks/rock_renderer.cpp
