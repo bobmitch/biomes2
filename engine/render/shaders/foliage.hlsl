@@ -88,6 +88,23 @@ static const uint kCaps[4] = {400000u, 400000u, 160000u, 40000u};
 // Index ranges in the shared index buffer, set by FoliageRenderer. A blade
 // instance's range holds kTuftMax blades; vs_blade collapses those past `tuft`.
 static const uint kTuftMax = 3u;
+// Per-blade variety, applied in vs_blade from the blade's own seed rather
+// than packed: `b.a` has all 32 of its bits spoken for and `pad` carries the
+// trample push, so there is nowhere to put either, and a hash is free.
+//
+// kTallMax: the most a blade overtops what its biome asked for, skewed by
+// the CUBE so most stand as they did and a handful tower -- a meadow reads
+// as grass by its stragglers, and a uniform lift would just be a taller lawn.
+// Applied after the height is unpacked, so the 255 cm the byte holds is not
+// a ceiling on it.
+// kWideMin/kWideMax: every blade in a biome used to be exactly as wide as
+// every other (only `narrow` and the distance widening moved it), so a sward
+// had one stem thickness in it.
+static const float kTallMax = 2.0f;
+static const float kWideMin = 1.5f, kWideMax = 2.0f;
+// What the clump cards stand in for, so the sward does not lose height at
+// the hand-over: the blades' mean boost, 1 + (kTallMax - 1) / 4.
+static const float kCardTall = 1.25f;
 static const uint kIdxFirst[4] = {0u, 81u, 108u, 120u};
 static const uint kIdxCount[4] = {81u, 27u, 12u, 144u};
 
@@ -300,7 +317,10 @@ void cs_emit(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
     const float d = length(centre - cam_pos);
     if (d > card_far + 2.0f) return;
     const float hhi = unpack8(c.look, 8) * 2.0f;
-    if (!sphere_visible(centre + float3(0, 0.5f * hhi, 0), 1.0f + hhi)) return;
+    // The bound has to hold the tallest blade the cell can grow, not the
+    // tallest the biome asked for, or a straggler pops at the screen's edge.
+    const float hbound = hhi * kTallMax;
+    if (!sphere_visible(centre + float3(0, 0.5f * hbound, 0), 1.0f + hbound)) return;
 
     const float grass = unpack8(c.dens, 0);
     const float flowers = unpack8(c.dens, 8) * 0.25f;
@@ -361,7 +381,8 @@ void cs_emit(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
         Blade b;
         const uint h = fhash(seed, 103u);
         b.pos = float3(float(cx) + 0.5f, c.y - 0.08f, float(cz) + 0.5f);
-        b.a = (h & 0xFFu) | (min(uint(hhi * 1.1f * 100.0f), 255u) << 8) | ((narrow > 0.5f ? 1u : 0u) << 25);
+        b.a = (h & 0xFFu) | (min(uint(hhi * 1.1f * kCardTall * 100.0f), 255u) << 8) |
+              ((narrow > 0.5f ? 1u : 0u) << 25);
         b.color = c.color | (c.look & 0x00FF0000u) << 8;
         b.dryc = c.dryc;
         b.seed = h;
@@ -479,7 +500,9 @@ FolOut vs_blade(uint vid_all : SV_VertexID, uint iid : SV_InstanceID) {
     const float side = (vid & 1u) ? 0.5f : -0.5f;
     const float tt = float(row) / float(S);
     const float ang = float(b.a & 0xFFu) / 255.0f * 6.2831853f;
-    const float hgt = float((b.a >> 8) & 0xFFu) * 0.01f * hmul;
+    const float tu = funit(fhash(b.seed, 43u));
+    const float hgt = float((b.a >> 8) & 0xFFu) * 0.01f * hmul *
+                      (1.0f + (kTallMax - 1.0f) * tu * tu * tu);
     const float widen = 1.0f + float((b.a >> 16) & 0xFu) / 5.0f;
     const bool narrow = ((b.a >> 25) & 1u) != 0u;
     const float scale = float((b.a >> 26) & 63u) / 63.0f;
@@ -497,7 +520,9 @@ FolOut vs_blade(uint vid_all : SV_VertexID, uint iid : SV_InstanceID) {
     // blade bends rather than stretches.
     const float3 D = (f * curl + lean_dir * lean_out + float3(w.x, 0.0f, w.y)) * hgt;
     const float lean2 = dot(D, D) / max(hgt * hgt, 1e-4f);
-    const float width = (narrow ? 0.009f : 0.016f) * blade_width * widen * (row == S ? 0.0f : pow(1.0f - tt, 0.6f));
+    const float wrnd = lerp(kWideMin, kWideMax, funit(fhash(b.seed, 41u)));
+    const float width = (narrow ? 0.009f : 0.016f) * blade_width * widen * wrnd *
+                        (row == S ? 0.0f : pow(1.0f - tt, 0.6f));
     const float h = hgt * max(scale, 0.05f);
     const float3 p = b.pos + float3(0.0f, h * tt * (1.0f - 0.35f * lean2 * tt), 0.0f) + D * (tt * tt) * max(scale, 0.05f)
                    + rt * (side * width);

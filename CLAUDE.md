@@ -1917,6 +1917,34 @@ tufts of 2 with the width +0.18. Tinting the terrain under grass toward
 the sward (a 256 m grass map from the cells, read by the terrain shader)
 was built and judged not to look right; left for a later quality pass.
 
+**Every blade takes its own height and width** (`kTallMax`, `kWideMin` /
+`kWideMax` in `foliage.hlsl`), from the blade's own seed in `vs_blade`
+rather than packed: `b.a`'s 32 bits are all spoken for and `pad` carries
+the trample push, so there is nowhere to put either, and a hash is free.
+
+- **Height: up to 2x what the biome asked for, skewed by the CUBE**, so
+  most blades stand as they did and a handful tower -- about a fifth clear
+  1.5x and a fifteenth 1.8x. A meadow reads as grass by its stragglers; a
+  uniform lift is just a taller lawn. It is applied AFTER the height is
+  unpacked, so the 255 cm that byte holds is not a ceiling on it (wetland's
+  1.15 m reeds would otherwise clamp).
+- **Width: 1.5x to 2x**, where every blade in a biome used to be exactly as
+  wide as every other -- only `narrow` and the distance widening moved it,
+  and neither varies blade to blade. The player's "Grass thickness" still
+  multiplies on top, so a slider already pushed up is now pushed up from a
+  base 1.75x wider.
+- **The cull bound had to grow with it.** `cs_emit` bounds a cell by the
+  biome's own `hhi`; a straggler is twice that, and without `hhi * kTallMax`
+  in the sphere it pops at the screen's edge. Clump cards take `kCardTall`
+  (the mean boost, 1.25) so the sward does not lose height at the hand-over
+  from blades at 48-60 m.
+- **Cost: +0.16 ms** walking at 2560 x 1440 (6.26 against 6.10), the
+  foliage pass 0.305 -> 0.421 ms in a still. The pipeline statistics say
+  why and agree with the arithmetic: the ground cover's pixel-shader
+  invocations went 0.545 to 1.134 per screen pixel, which is the 1.75x mean
+  width times the 1.25x mean height. Near blade instances rose 11270 ->
+  12146, all of it the wider cull bound letting edge cells in.
+
 **The draw distance is ONE number and the near distances are CLAMPED, not
 scaled** (`FoliageSettings::set_range`): card_far is the slider, blade_range
 is min(60, m - 10) and card_near min(48, blade_range - 12). Where blades
