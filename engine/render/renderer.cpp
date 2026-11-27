@@ -2632,7 +2632,7 @@ void Renderer::height_fog_constants(float out[3][4], bool on) const {
     for (int r = 0; r < 3; ++r) for (int k = 0; k < 4; ++k) out[r][k] = 0.0f;
     if (!on || !hfog_on_ || !fog_on_ || !fog_map_.built()) return;
     const FogSettings& fs = fog_map_.settings();
-    const float wet = fog_density_ * (1.0f + 1.5f * rain_intensity());
+    const float wet = fog_density_ * (1.0f + 1.5f * rain_intensity()) * height_fog_low_sun();
     const float valley = fog_map_.valley_factor(time_hours_, weather_now_.wind_speed);
     out[0][0] = fs.ground[0] * wet * hfog_scale_;
     out[0][1] = fs.ground[1];
@@ -2641,7 +2641,7 @@ void Renderer::height_fog_constants(float out[3][4], bool on) const {
     out[1][0] = fs.deep[0] * wet * hfog_scale_;
     out[1][1] = fs.deep[1];
     out[1][2] = world_.params().sea_level;
-    out[1][3] = 1.0f;
+    out[1][3] = fs.glow_from > 1.0f ? fs.glow_from : 1.0f;   // > 0.5: on
     const float cov = clouds_on_ && clouds_.ready() ? clouds_.coverage() : 0.0f;
     out[2][0] = cov * cov * 0.9f;
     out[2][1] = storm_dim();

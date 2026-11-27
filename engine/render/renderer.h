@@ -221,8 +221,8 @@ public:
     // cumulonimbus. Every sky term, the haze and the clouds' own ambient.
     float storm_dim() const;
     // The exploration fog (haze.hlsli): layered height fog that limits how
-    // far the low land can be seen. OFF by default; --height-fog <k> turns it on
-    // at that scale, --no-height-fog keeps it off.
+    // far the low land can be seen. On by default; --height-fog <k> scales it
+    // (and turns it on), --no-height-fog turns it off.
     void set_height_fog(bool on) { hfog_on_ = on; }
     void set_height_fog_scale(float k) { hfog_scale_ = k; }
     bool  height_fog() const { return hfog_on_; }
@@ -232,8 +232,11 @@ public:
         if (!hfog_on_ || !fog_on_ || !fog_map_.built()) return 0.0f;
         return fog_map_.height_sigma(y, world_.params().sea_level,
                                      fog_map_.valley_factor(time_hours_, weather_now_.wind_speed)) *
-               fog_density_ * (1.0f + 1.5f * rain_intensity()) * hfog_scale_;
+               fog_density_ * (1.0f + 1.5f * rain_intensity()) * hfog_scale_ * height_fog_low_sun();
     }
+    // Its density scale for the sun's elevation now: thinner at dawn and dusk
+    // (archetypes.json fog.layers.low_sun).
+    float height_fog_low_sun() const { return fog_map_.low_sun_factor(sky_frame().sun_elevation_deg); }
     float height_fog_valley() const { return fog_map_.valley_factor(time_hours_, weather_now_.wind_speed); }
     // Strikes seen since start (distinct), ground strikes among them, and
     // frames drawn with a flash lit -- the schedule's instrument.
@@ -777,7 +780,7 @@ private:
     Strike strike_;
     bool flash_suppress_ = false;   // a still's warm-up frames, before a forced strike
     bool lightning_on_ = true;      // --no-lightning
-    bool hfog_on_ = false;   // off by default: blown out at dawn and dusk (2026-11-26)
+    bool hfog_on_ = true;
     float hfog_scale_ = 1.0f;
     void height_fog_constants(float out[3][4], bool on) const;
     uint32_t last_strike_id_ = 0xFFFFFFFFu;
@@ -863,7 +866,7 @@ private:
     UINT64 post_query_freq_ = 0;
     bool   post_query_pending_[kFrameCount] = {};
     bool   fog_on_ = true, fog_hist_valid_ = false, fog_uploaded_ = false;
-    float  fog_density_ = 1.3f;  // the mist a little thicker with the height fog off
+    float  fog_density_ = 1.0f;
     GroundLook ground_look_;
     RockLook rock_look_;
     UINT   fog_cur_ = 0;
