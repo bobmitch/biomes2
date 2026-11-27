@@ -6,7 +6,7 @@ None of these blocks anything that works today. Ordered by area, not by
 priority.
 
 Last gathered: 2026-11-21, after the exploration fog; creatures added
-2026-11-27.
+2026-11-27, combat the same day.
 
 ## Gameplay: survival, the inventory, forage
 
@@ -374,9 +374,34 @@ Last gathered: 2026-11-21, after the exploration fog; creatures added
 
 ## Creatures (ADR-007)
 
-- **Every phase of ADR-007 is built**, and none of it has been PLAYED in
-  the window: each part is tested headless (`--mob-test`, `--nav-report`,
-  `--move-test`, `--mimic-test`). [Creatures and stealth]
+- **Every phase of ADR-007 is built**, and the chase has been played in the
+  window (four mimics at once); the blows have not. Each part is tested
+  headless (`--mob-test`, `--nav-report`, `--move-test`, `--mimic-test`,
+  `--combat-test`). [Creatures and stealth]
+- **Combat is one blow each way and nothing round it.** Built: a creature's
+  windup, reach and arc, its recovery, the player's axe, death both ways,
+  `on_hurt`, the HUD's red wash. Not built, in rough order of what a fight
+  wants next:
+  - **No stagger and no knockback**: a creature takes a hit without its
+    swing or its path being interrupted, so two creatures in reach are an
+    unbroken stream of blows. A hit that interrupts a windup is the one
+    change that would most change how a fight feels.
+  - **No blocking, dodging or parrying**, and no armour: the only defence
+    is to be out of reach or behind it when the blow lands.
+  - **One weapon** (the axe, 15 damage, 2.6 m), no durability, no other
+    damage types, no hit location. A tool's `tool` block is the hook.
+  - **Nothing drops**: a dead creature is simply removed -- no corpse, no
+    trophy, no meat. The player's death still keeps the inventory
+    (no tombstone, gaps above).
+  - **A hit is silent to perception**: the axe's swing is already 82 dB but
+    a landed blow adds nothing, so hitting a creature does not draw others.
+  - **The creature's swing is the library's `Sword_Attack`** on the action
+    layer, the player's own clip: no windup pose of its own, and nothing is
+    in its hands. The telegraph is therefore weaker than its 0.6 s.
+  - **No creature health is shown** -- no bar, no hit flash on the body:
+    the only feedback is the message line.
+  - **A windup is not saved**: a creature frozen mid-swing thaws and swings
+    afresh (health is saved). [Creatures and stealth]
 - **Sound passes through rock**: hearing is distance and level only, so a
   creature hears a jog through a hill. Sight is blocked by terrain,
   trunks and rocks (physics), not by crowns, bushes or grass.

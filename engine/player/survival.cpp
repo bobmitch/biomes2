@@ -93,6 +93,13 @@ bool Survival::spend(float cost) {
     return true;
 }
 
+void Survival::drain(float cost) {
+    // Taken, not spent: a blow takes what is there, and never refuses.
+    if (cost <= 0.0f) return;
+    stamina_ = std::max(0.0f, stamina_ - cost);
+    since_use_ = 0.0f;
+}
+
 void Survival::damage(float hp) {
     if (dead_ || hp <= 0.0f) return;
     health_ -= hp;

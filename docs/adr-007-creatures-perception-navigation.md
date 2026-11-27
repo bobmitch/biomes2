@@ -302,6 +302,13 @@ plan for persistent NPCs with schedules.
 
 ## Later
 
+**Combat's first slice is built** (CLAUDE.md, "Creatures and stealth"): a
+kind's `attack` block, a windup that lands only if the player is still in
+reach and in the arc, a recovery, the player's axe as one ray from the eye,
+death both ways and the `on_hurt` hook, with `--combat-test`. What a fight
+still wants -- stagger, blocking, weapons, drops -- is listed in
+`docs/gaps.md`.
+
 Night-vision creatures and light-averse ones (decision 3); ambient
 masking from weather; foliage and crowns blocking sight; jumping and
 climbing links; fliers and deep-water swimmers (3D navigation); combat;

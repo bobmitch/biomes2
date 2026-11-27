@@ -129,6 +129,30 @@ struct MindsApi {
         lua_pushnil(L);
         return 1;
     }
+    static int health(lua_State* L) { lua_pushnumber(L, mob(L).health); return 1; }
+    static int max_health(lua_State* L) {
+        const Mob& m = mob(L);
+        lua_pushnumber(L, self(L)->table_->kinds[size_t(m.kind)].health);
+        return 1;
+    }
+    static int attack(lua_State* L) {
+        const Mob& m = mob(L);
+        Minds* M = self(L);
+        lua_pushboolean(L, M->combat_ && M->combat_->begin(m));
+        return 1;
+    }
+    static int attacking(lua_State* L) {
+        const Mob& m = mob(L);
+        Minds* M = self(L);
+        lua_pushboolean(L, M->combat_ && M->combat_->winding_up(m.id));
+        return 1;
+    }
+    static int attack_reach(lua_State* L) {
+        const Mob& m = mob(L);
+        const CreatureKind::Attack& a = self(L)->table_->kinds[size_t(m.kind)].attack;
+        lua_pushnumber(L, a.damage > 0.0f ? a.reach_m : 0.0);
+        return 1;
+    }
     static int log(lua_State* L) {
         const Mob& m = mob(L);
         char head[64];
@@ -154,12 +178,15 @@ void Minds::log(const std::string& s) {
     }
 }
 
-bool Minds::init(const CreatureTable* t, Creatures* c, Locomotion* loco, nav::NavWorld* nav, std::string& error) {
+bool Minds::init(const CreatureTable* t, Creatures* c, Locomotion* loco, nav::NavWorld* nav, Combat* combat,
+                 std::string& error) {
     shutdown();
     table_ = t;
     creatures_ = c;
     loco_ = loco;
     nav_ = nav;
+    combat_ = combat;
+    if (combat_) combat_->set_table(t);
     std::remove(kLogPath);
     L_ = luaL_newstate();
     luaL_openlibs(L_);
@@ -175,6 +202,9 @@ bool Minds::init(const CreatureTable* t, Creatures* c, Locomotion* loco, nav::Na
         {"move_to", MindsApi::move_to}, {"stop", MindsApi::stop}, {"moving", MindsApi::moving},
         {"face", MindsApi::face}, {"player", MindsApi::player}, {"player_distance", MindsApi::player_distance},
         {"random", MindsApi::random}, {"random_point", MindsApi::random_point}, {"log", MindsApi::log},
+        {"health", MindsApi::health}, {"max_health", MindsApi::max_health},
+        {"attack", MindsApi::attack}, {"attacking", MindsApi::attacking},
+        {"attack_reach", MindsApi::attack_reach},
         {nullptr, nullptr}};
     luaL_newmetatable(L_, kMeta);
     lua_newtable(L_);
@@ -255,6 +285,21 @@ void Minds::call(int kind, const char* hook, Mob& m, int nev, const float* ev, c
         m.gait = 0;
     }
     lua_settop(L_, top);
+}
+
+void Minds::hurt(Mob& m, float damage, const float from[3]) {
+    static const char* const kHurt[] = {"damage", "health", "x", "y", "z", "dist"};
+    Mind& d = minds_[m.id];
+    if (!d.awake) {
+        d.awake = true;
+        call(m.kind, "on_wake", m, 0, nullptr, nullptr);
+    }
+    // It knows where that came from, whether or not it can see them.
+    for (int k = 0; k < 3; ++k) d.seen[k] = from[k];
+    const float dx = from[0] - m.pos[0], dy = from[1] - m.pos[1], dz = from[2] - m.pos[2];
+    const float ev[6] = {damage, m.health, from[0], from[1], from[2],
+                         std::sqrt(dx * dx + dy * dy + dz * dz)};
+    call(m.kind, "on_hurt", m, 6, ev, kHurt);
 }
 
 void Minds::update(float dt, const Player& p, const ClearFn& clear) {

@@ -2,7 +2,8 @@
 <!--
   The in-game HUD: the crosshair (where a dig lands and E picks), what E
   would do, the hotbar (slots 1-8), health with the foods eaten over it,
-  stamina, the day and the hour, the message line, and the dig radius.
+  stamina, the day and the hour, the message line, the dig radius, and the
+  red wash a creature's blow leaves.
   Markup only; game/scripts/hud.lua fills it and hides it all behind the
   pause menu. Nothing here takes the mouse (pointer-events: none), so a
   click still falls through to the game.
@@ -206,6 +207,16 @@
 			background-color: #00000070;
 			border-radius: 3dp;
 		}
+		/* a blow landing: the screen reddens for a moment (hud.lua) */
+		#hurt {
+			position: absolute;
+			left: 0;
+			right: 0;
+			top: 0;
+			bottom: 0;
+			background-color: #c01818;
+			opacity: 0;
+		}
 		#dead {
 			position: absolute;
 			left: 0;
@@ -218,6 +229,7 @@
 	</style>
 </head>
 <body>
+	<div id="hurt"></div>
 	<div id="cross"></div>
 	<div id="prompt"></div>
 	<div id="hotbar"></div>

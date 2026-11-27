@@ -146,6 +146,13 @@ bool ItemTable::load(const char* path, std::string& error) {
                 else if (use == "torch") d.use = ToolUse::Torch;
                 else throw std::runtime_error(d.id + ": a tool's use is axe or torch");
                 d.stack = 1;
+                if (e.has("tool")) {
+                    const jsonlite::Value& t = e.at("tool");
+                    if (t.has("damage")) d.tool.damage = float(t.number("damage"));
+                    if (t.has("reach_m")) d.tool.reach_m = float(t.number("reach_m"));
+                    if (d.tool.damage < 0.0f || d.tool.reach_m <= 0.0f)
+                        throw std::runtime_error(d.id + ": tool damage >= 0, reach_m > 0");
+                }
             }
             if (e.has("icon")) {
                 const jsonlite::Array& ic = e.array("icon");

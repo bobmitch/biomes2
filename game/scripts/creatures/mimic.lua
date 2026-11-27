@@ -8,8 +8,13 @@
 --   APPROACH  SEES the player (its 45 degree cone, 50 m x their visibility x
 --             the light): walks towards them
 --   CHASE     sees them within 40 m: runs
---   STARE     reaches them (2.2 m): stops and stares (no combat yet); they
---             step 3.5 m off and it comes on again
+--   ATTACK    reaches them (just inside its own reach): stops, faces them
+--             and swings -- a windup, a blow that lands only if they are
+--             still in reach and in front of it, then its recovery. They
+--             step clear and it comes on again. A kind with no attack
+--             stares instead (STARE), which is what this did before.
+--   HURT      being struck turns it on whoever did it, wherever it was
+--             looking (on_hurt)
 --   SEARCH    lost sight of them for LOSE_AFTER seconds (a chase keeps on
 --             to where it last saw them meanwhile: a pursuer weaving round
 --             trees has them out of its 45 degrees every few steps): walks
@@ -23,10 +28,12 @@
 -- with its zone resumes.
 
 local IDLE, ALERT, APPROACH, CHASE, STARE, SEARCH, LOOK, RETURN = 0, 1, 2, 3, 4, 5, 6, 7
+local ATTACK = 8
 
 local RUN_WITHIN = 40.0    -- seen this near: run
-local STARE_AT = 2.2       -- stop this near
-local STARE_UNTIL = 3.5    -- ... and come on again past this
+local STARE_AT = 2.2       -- stop this near, with no attack of its own
+local REACH_PAD = 0.3      -- ... or this far inside its reach, with one
+local HOLD_GIVE = 1.3      -- it holds them until they are this much further off
 local ALERT_HOLD = 4.0     -- seconds listening after the last sound
 local LOOK_FOR = 6.0       -- seconds looking about where it lost them
 local LOOK_EVERY = 1.5
@@ -41,7 +48,14 @@ local heard, wander_at, look_at, lost_at = {}, {}, {}, {}
 local M = {}
 
 local function chasing(s)
-	return s == APPROACH or s == CHASE or s == STARE
+	return s == APPROACH or s == CHASE or s == STARE or s == ATTACK
+end
+
+-- Where it stops: just inside its own reach, or STARE_AT if it has none.
+local function closes_to(c)
+	local reach = c:attack_reach()
+	if reach > 0 then return reach - REACH_PAD, reach end
+	return STARE_AT, 0
 end
 
 function M.on_wake(c)
@@ -51,14 +65,32 @@ end
 function M.on_see(c, ev)
 	lost_at[c:id()] = nil
 	c:set_mark(ev.x, ev.y, ev.z)
-	if c:state() == STARE and ev.dist < STARE_UNTIL then
+	local close, reach = closes_to(c)
+	local s = c:state()
+	if (s == STARE or s == ATTACK) and ev.dist < close + HOLD_GIVE then
+		-- It has them. Facing them is always right; what it does with its
+		-- feet is not.
 		c:face(ev.x, ev.z)
+		if s == STARE then return end
+		if c:attacking() then
+			-- Committed to this swing: it does not shuffle during a windup,
+			-- which is what makes stepping out of it work.
+			c:stop()
+		elseif ev.dist <= reach then
+			c:stop()
+			c:attack()
+		else
+			-- Drifted to the edge of its reach: step back in rather than
+			-- stand there while they stand just out of it.
+			c:move_to(ev.x, ev.y, ev.z, "walk")
+		end
 		return
 	end
-	if ev.dist <= STARE_AT then
+	if ev.dist <= close then
 		c:stop()
-		c:set_state(STARE)
+		c:set_state(reach > 0 and ATTACK or STARE)
 		c:face(ev.x, ev.z)
+		if reach > 0 then c:attack() end
 	elseif ev.dist <= RUN_WITHIN then
 		c:set_state(CHASE)
 		c:move_to(ev.x, ev.y, ev.z, "run")
@@ -73,7 +105,7 @@ function M.on_lose(c, ev)
 		-- Keep on to where they were; on_think calls it a search if they
 		-- stay unseen.
 		lost_at[c:id()] = c:state_time()
-		if c:state() == STARE then
+		if c:state() == STARE or c:state() == ATTACK then
 			c:set_state(SEARCH)
 			c:move_to(ev.x, ev.y, ev.z, "walk")
 		end
@@ -90,6 +122,25 @@ function M.on_hear(c, ev)
 	c:set_mark(ev.x, ev.y, ev.z)
 	c:face(ev.x, ev.z)
 	heard[c:id()] = c:state_time()
+end
+
+-- Struck. Wherever it was looking, it now knows where that came from: it
+-- turns on them and comes, unless it is already on them.
+function M.on_hurt(c, ev)
+	lost_at[c:id()] = nil
+	heard[c:id()] = nil
+	c:set_mark(ev.x, ev.y, ev.z)
+	c:face(ev.x, ev.z)
+	local s = c:state()
+	if s == ATTACK or s == STARE then return end
+	local close = closes_to(c)
+	if ev.dist <= close then
+		c:stop()
+		c:set_state(c:attack_reach() > 0 and ATTACK or STARE)
+	else
+		c:set_state(CHASE)
+		c:move_to(ev.x, ev.y, ev.z, "run")
+	end
 end
 
 function M.on_think(c, dt)
