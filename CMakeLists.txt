@@ -249,6 +249,7 @@ if(BIOMES2_ENGINE)
     engine/player/stealth.cpp
     engine/mobs/creature_table.cpp
     engine/mobs/creatures.cpp
+    engine/mobs/locomotion.cpp
     engine/nav/nav_tile.cpp
     engine/nav/nav_world.cpp
     engine/player/icons.cpp

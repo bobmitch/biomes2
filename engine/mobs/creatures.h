@@ -47,6 +47,10 @@ struct Mob {
     int   state = 0;              // the behaviour's (phase 5); 0 idle
     float state_t = 0.0f;         // seconds in that state
     double born = 0.0;            // game seconds
+    // Where it is going (ADR-007 phase 4): gait 0 standing, 1 walking, 2
+    // running, towards `goal`. Saved, so a frozen chase resumes.
+    int   gait = 0;
+    float goal[3] = {0, 0, 0};
 };
 
 struct ZoneKey {
@@ -86,6 +90,11 @@ public:
     ZoneKey zone_of(float x, float z) const;
     void zone_centre(const ZoneKey& k, float& x, float& z) const;
     bool active(const ZoneKey& k) const;
+
+    // A creature put down by hand (a test, a script): live at once, in
+    // whatever zone it stands. Its id.
+    uint32_t spawn_at(int kind, const float pos[3], float yaw, double now);
+    Mob* find_live(uint32_t id);
 
     const std::vector<Mob>& live() const { return live_; }
     std::vector<Mob>& live() { return live_; }

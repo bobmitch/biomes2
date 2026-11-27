@@ -72,6 +72,12 @@ public:
     bool path(const float a[3], const float b[3], unsigned short include, std::vector<float>& corners,
               float* length = nullptr, bool* complete = nullptr, float swim_cost = 3.0f) const;
 
+    // Move from `from` towards `to` along the mesh (Detour's
+    // moveAlongSurface: slides along edges, never leaves the mesh); `out` the
+    // point reached at the mesh's height, `area` its poly's. False off the mesh.
+    bool move_along(const float from[3], const float to[3], unsigned short include, float out[3],
+                    unsigned char* area = nullptr) const;
+
     const dtNavMesh* mesh() const { return mesh_; }
 
     struct Stats {

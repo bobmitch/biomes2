@@ -49,6 +49,7 @@
 #include "engine/player/icons.h"
 #include "engine/player/survival.h"
 #include "engine/mobs/creatures.h"
+#include "engine/mobs/locomotion.h"
 #include "engine/nav/nav_world.h"
 #include <array>
 #include <memory>
@@ -648,6 +649,8 @@ engine::mobs::CreatureTable g_creature_table;
 engine::mobs::Creatures     g_creatures;
 bool  g_creatures_ok = false;
 std::unordered_map<uint32_t, engine::CharacterAnimator> g_mob_anim;
+engine::mobs::Locomotion    g_loco;          // paths, bodies near the player, the mesh beyond
+bool  g_mob_wander = true;                   // the stand-in behaviour until scripts (phase 5)
 
 // --- The navmesh (engine/nav, ADR-007 decision 4) ------------------------------
 // Tiles within kNavRadius of the player, built from the field on workers.
@@ -855,6 +858,12 @@ void publish_creatures(float dt, const float from[3]) {
         engine::LocomotionInput in;
         in.dt = dt + first;
         in.grounded = true;
+        if (const engine::mobs::Locomotion::Body* lb = g_loco.body(m.id)) {
+            in.speed = lb->speed;
+            in.grounded = lb->grounded;
+            in.swimming = lb->swimming;
+            in.vertical = lb->vertical;
+        }
         it->second.update(in);
         it->second.skin(m.pos, m.yaw, one);
         bones.insert(bones.end(), one.begin(), one.end());
@@ -875,6 +884,8 @@ void creatures_frame(float dt, bool paused, float aspect) {
     if (!paused) {
         const double now = g_surv_ok ? g_surv.game_seconds() : double(g_renderer.time_of_day()) * 3600.0;
         g_creatures.update(now, player, creature_env(g_camera, aspect));
+        if (g_mob_wander) g_loco.wander(dt, g_creatures.live(), now);
+        g_loco.update(dt, g_creatures.live(), player);
     }
     publish_creatures(dt, player);
 }
@@ -2071,6 +2082,344 @@ int run_nav_report() {
     return fails;
 }
 
+// --move-test (ADR-007, phase 4): creatures walking, running and swimming
+// along the navmesh, with physics bodies near the player and on the mesh
+// beyond, the hand-over between, and a walk that freezes and resumes.
+// build/move_test.txt, stills build/move_walk.bmp and build/move_swim.bmp.
+int run_move_test() {
+    std::remove("build/move_test.txt");
+    FILE* f = std::fopen("build/move_test.txt", "w");
+    if (!f) return 1;
+    int fails = 0;
+    auto check = [&](bool ok, const std::string& what) {
+        std::fprintf(f, "%s  %s\n", ok ? "PASS" : "FAIL", what.c_str());
+        if (!ok) ++fails;
+    };
+    char buf[500];
+    check(g_nav_ok && g_creatures_ok, "the navmesh and the creature table");
+    if (!g_nav_ok || !g_creatures_ok) { std::fclose(f); return fails; }
+    const int mimic = g_creature_table.find("mimic");
+    const engine::mobs::CreatureKind& K = g_creature_table.kinds[size_t(mimic)];
+    const engine::WorldGpu& wg = g_renderer.world();
+    const float sea = wg.table().sea_level;
+    using engine::mobs::Mob;
+    const unsigned short walk = engine::nav::kFlagWalk;
+    g_mob_wander = false;
+    engine::mobs::Creatures& C = g_creatures;
+    C.clear();
+    double now = 10.0 * 3600.0;
+    float tsim = 0.0f;
+
+    // The world, physics and tiles round a point, the player standing there.
+    float player[3] = {g_spawn.x, g_spawn.ground, g_spawn.z};
+    auto settle_at = [&](float x, float z) {
+        g_walk = true;
+        g_physics.place_character(x, wg.height(x, z) + 1.0f, z);
+        g_have_prev_feet = false;
+        for (int i = 0; i < 20000; ++i) {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+            step_window_physics(1.0f / 60.0f, tsim, 0.0f, 0.0f, false, 0.0f);
+            tsim += 1.0f / 60.0f;
+            g_camera.x = g_feet[0]; g_camera.y = g_feet[1] + 1.6f; g_camera.z = g_feet[2];
+            engine::ViewConstants v = {};
+            fill_view(g_camera, g_res_w, g_res_h, tsim, v);
+            g_renderer.render(v);
+            g_nav.update(x, z, kNavRadius);
+            if (i >= 90 && g_nav.settled()) break;
+        }
+        player[0] = g_feet[0]; player[1] = g_feet[1]; player[2] = g_feet[2];
+    };
+    // Frames of play: physics and the creatures, the player standing.
+    struct Trace { float max_off_mesh = 0.0f, max_hjump = 0.0f, max_vjump = 0.0f; bool was_near = false, was_far = false; };
+    auto run = [&](float seconds, uint32_t watch, Trace* tr, bool until_stop) {
+        const float dt = 1.0f / 60.0f;
+        float t = 0.0f;
+        for (; t < seconds; t += dt) {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+            step_window_physics(dt, tsim, 0.0f, 0.0f, false, 0.0f);
+            tsim += dt;
+            now += dt * 48.0;
+            const Mob* w0 = watch ? C.find_live(watch) : nullptr;
+            const float before[3] = {w0 ? w0->pos[0] : 0.0f, w0 ? w0->pos[1] : 0.0f, w0 ? w0->pos[2] : 0.0f};
+            g_loco.update(dt, C.live(), player);
+            const Mob* w = watch ? C.find_live(watch) : nullptr;
+            if (w && tr) {
+                const engine::mobs::Locomotion::Body* b = g_loco.body(watch);
+                if (b) { tr->was_near = tr->was_near || b->close; tr->was_far = tr->was_far || !b->close; }
+                const float dx = w->pos[0] - before[0], dz = w->pos[2] - before[2];
+                tr->max_hjump = (std::max)(tr->max_hjump, std::sqrt(dx * dx + dz * dz));
+                tr->max_vjump = (std::max)(tr->max_vjump, std::fabs(w->pos[1] - before[1]));
+                float q[3];
+                const float ext[3] = {0.5f, 3.0f, 0.5f};
+                if (b && b->grounded && !b->swimming && g_nav.nearest(w->pos, ext, walk | engine::nav::kFlagWade, q) &&
+                    std::fabs(q[0] - w->pos[0]) < 0.3f && std::fabs(q[2] - w->pos[2]) < 0.3f)
+                    tr->max_off_mesh = (std::max)(tr->max_off_mesh, std::fabs(w->pos[1] - q[1]));
+            }
+            if (until_stop && w && w->gait == 0) break;
+        }
+        return t;
+    };
+    // A point on the walkable mesh near (x, z).
+    auto on_mesh = [&](float x, float z, float out[3]) {
+        const float p[3] = {x, wg.height(x, z), z}, ext[3] = {3.0f, 6.0f, 3.0f};
+        return g_nav.nearest(p, ext, walk, out);
+    };
+    auto hd = [](const float a[3], const float b[3]) {
+        return std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[2] - b[2]) * (a[2] - b[2]));
+    };
+
+    settle_at(g_spawn.x, g_spawn.z);
+    std::fprintf(f, "player at (%.1f, %.1f, %.1f); %s walks %.1f m/s, runs %.1f\n", player[0], player[1], player[2],
+                 K.name.c_str(), K.walk_speed, K.run_speed);
+
+    // A start and a goal: on the mesh, a complete path between them.
+    float a[3] = {0, 0, 0}, b[3] = {0, 0, 0};
+    bool found = false;
+    float plen = 0.0f;
+    for (int k = 0; k < 16 && !found; ++k) {
+        const float ang = float(k) * 0.3926991f;
+        if (!on_mesh(player[0] + std::sin(ang) * 12.0f, player[2] + std::cos(ang) * 12.0f, a)) continue;
+        if (!on_mesh(player[0] + std::sin(ang) * 32.0f, player[2] + std::cos(ang) * 32.0f, b)) continue;
+        std::vector<float> pts;
+        bool complete = false;
+        if (g_nav.path(a, b, walk, pts, &plen, &complete) && complete && plen < 30.0f) found = true;
+    }
+    check(found, "a start 12 m out and a goal 20 m beyond it, on the mesh");
+
+    // A. Walk, near: a physics body.
+    if (found) {
+        std::fprintf(f, "\nA. a walk near the player\n");
+        const uint32_t id = C.spawn_at(mimic, a, 0.0f, now);
+        Mob* m = C.find_live(id);
+        m->gait = 1;
+        std::memcpy(m->goal, b, sizeof b);
+        Trace tr;
+        const float t = run(40.0f, id, &tr, true);
+        m = C.find_live(id);
+        const float off = hd(m->pos, b), v = plen / t;
+        std::snprintf(buf, sizeof buf, "walked %.1f m of path in %.1f s (%.2f m/s, %.0f%% of %.1f), %.2f m from the goal; "
+                      "a physics body all the way: %s; feet within %.2f m of the mesh",
+                      plen, t, v, 100.0f * v / K.walk_speed, K.walk_speed, off, tr.was_near && !tr.was_far ? "yes" : "NO",
+                      tr.max_off_mesh);
+        check(m->gait == 0 && off < 1.0f && v > 0.75f * K.walk_speed && v < 1.15f * K.walk_speed && tr.was_near &&
+                  !tr.was_far && tr.max_off_mesh < 0.6f, buf);
+
+        // B. Run back.
+        std::fprintf(f, "\nB. a run back\n");
+        m->gait = 2;
+        std::memcpy(m->goal, a, sizeof a);
+        Trace tr2;
+        const float t2 = run(20.0f, id, &tr2, true);
+        m = C.find_live(id);
+        const float v2 = plen / t2;
+        std::snprintf(buf, sizeof buf, "ran it back in %.1f s (%.2f m/s, %.0f%% of %.1f), %.2f m from the goal",
+                      t2, v2, 100.0f * v2 / K.run_speed, K.run_speed, hd(m->pos, a));
+        check(m->gait == 0 && hd(m->pos, a) < 1.0f && v2 > 0.7f * K.run_speed && v2 < 1.15f * K.run_speed, buf);
+        C.clear();
+        run(0.1f, 0, nullptr, false);
+    }
+
+    // C. Walk, far: on the mesh, no physics.
+    std::fprintf(f, "\nC. a walk 70 m out\n");
+    {
+        float c0[3], c1[3];
+        bool ok = false;
+        float len = 0.0f;
+        for (int k = 0; k < 16 && !ok; ++k) {
+            const float ang = float(k) * 0.3926991f;
+            if (!on_mesh(player[0] + std::sin(ang) * 70.0f, player[2] + std::cos(ang) * 70.0f, c0)) continue;
+            if (!on_mesh(player[0] + std::sin(ang) * 95.0f, player[2] + std::cos(ang) * 95.0f, c1)) continue;
+            std::vector<float> pts;
+            bool complete = false;
+            ok = g_nav.path(c0, c1, walk, pts, &len, &complete) && complete && hd(c0, player) > 60.0f;
+        }
+        if (!ok) {
+            check(false, "no start 70 m out with a goal beyond");
+        } else {
+            const uint32_t id = C.spawn_at(mimic, c0, 0.0f, now);
+            Mob* m = C.find_live(id);
+            m->gait = 1;
+            std::memcpy(m->goal, c1, sizeof c1);
+            Trace tr;
+            const float t = run(60.0f, id, &tr, true);
+            m = C.find_live(id);
+            const float v = len / t;
+            std::snprintf(buf, sizeof buf, "walked %.1f m in %.1f s (%.2f m/s), %.2f m from the goal; no physics body: %s; "
+                          "feet within %.2f m of the mesh", len, t, v, hd(m->pos, c1), tr.was_near ? "NO" : "yes",
+                          tr.max_off_mesh);
+            check(m->gait == 0 && hd(m->pos, c1) < 1.0f && !tr.was_near && v > 0.75f * K.walk_speed &&
+                      v < 1.15f * K.walk_speed && tr.max_off_mesh < 0.3f, buf);
+        }
+        C.clear();
+        run(0.1f, 0, nullptr, false);
+    }
+
+    // D. The hand-over: running in from 50 m to 15 m.
+    std::fprintf(f, "\nD. running in from 50 m: mesh to physics\n");
+    {
+        float c0[3], c1[3];
+        bool ok = false;
+        for (int k = 0; k < 16 && !ok; ++k) {
+            const float ang = float(k) * 0.3926991f;
+            if (!on_mesh(player[0] + std::sin(ang) * 50.0f, player[2] + std::cos(ang) * 50.0f, c0)) continue;
+            if (!on_mesh(player[0] + std::sin(ang) * 15.0f, player[2] + std::cos(ang) * 15.0f, c1)) continue;
+            std::vector<float> pts;
+            bool complete = false;
+            float len = 0.0f;
+            ok = g_nav.path(c0, c1, walk, pts, &len, &complete) && complete && len < 45.0f;
+        }
+        if (!ok) {
+            check(false, "no straight run in from 50 m");
+        } else {
+            const uint32_t id = C.spawn_at(mimic, c0, 0.0f, now);
+            Mob* m = C.find_live(id);
+            m->gait = 2;
+            std::memcpy(m->goal, c1, sizeof c1);
+            Trace tr;
+            run(20.0f, id, &tr, true);
+            m = C.find_live(id);
+            const float step = K.run_speed / 60.0f;
+            std::snprintf(buf, sizeof buf, "on the mesh, then a body: %s; the biggest step in a frame %.3f m across "
+                          "(a run's is %.3f), %.3f m up or down; %.2f m from the goal",
+                          tr.was_far && tr.was_near ? "yes" : "NO", tr.max_hjump, step, tr.max_vjump, hd(m->pos, c1));
+            check(tr.was_far && tr.was_near && tr.max_hjump < 2.0f * step + 0.02f && tr.max_vjump < 0.3f &&
+                      hd(m->pos, c1) < 1.0f, buf);
+        }
+        C.clear();
+        run(0.1f, 0, nullptr, false);
+    }
+
+    // E. Freeze mid-walk, save, load, come back: it walks on to its goal.
+    std::fprintf(f, "\nE. a walk frozen half way, saved and resumed\n");
+    if (found) {
+        engine::mobs::SpawnEnv none;
+        none.ground = [](float, float, float&) { return false; };   // no spawning here
+        const uint32_t id = C.spawn_at(mimic, a, 0.0f, now);
+        C.update(now, player, none);
+        Mob* m = C.find_live(id);
+        m->gait = 1;
+        std::memcpy(m->goal, b, sizeof b);
+        run(4.0f, id, nullptr, false);
+        const Mob at = *C.find_live(id);
+        const float away[3] = {player[0] + 2000.0f, player[1], player[2]};
+        C.update(now, away, none);
+        run(0.1f, 0, nullptr, false);   // its body goes
+        std::string err;
+        const bool saved = C.save("build/move_test.bin", err);
+        C.clear();
+        const bool loaded = saved && C.load("build/move_test.bin", err);
+        C.update(now, player, none);    // thaws
+        Mob* back = C.find_live(id);
+        const bool same = back && back->gait == 1 && back->pos[0] == at.pos[0] && back->pos[2] == at.pos[2] &&
+                          back->goal[0] == b[0] && back->goal[2] == b[2];
+        float t = 0.0f;
+        if (back) t = run(40.0f, id, nullptr, true);
+        back = C.find_live(id);
+        std::snprintf(buf, sizeof buf, "frozen %.1f m along, walking: %s; saved and read back %s; thawed walking to the same "
+                      "goal %s; there %.1f s later, %.2f m off",
+                      hd(at.pos, a), at.gait == 1 ? "yes" : "no", loaded ? "yes" : ("NO " + err).c_str(), same ? "yes" : "NO",
+                      t, back ? hd(back->pos, b) : -1.0f);
+        check(at.gait == 1 && loaded && same && back && back->gait == 0 && hd(back->pos, b) < 1.0f, buf);
+        C.clear();
+        run(0.1f, 0, nullptr, false);
+    }
+
+    // F. The still of a walk: one walking past the camera.
+    if (found) {
+        const uint32_t id = C.spawn_at(mimic, a, 0.0f, now);
+        Mob* m = C.find_live(id);
+        m->gait = 1;
+        std::memcpy(m->goal, b, sizeof b);
+        run(3.0f, id, nullptr, false);
+        m = C.find_live(id);
+        // From its side, 5 m off.
+        const float yaw = m->yaw, sx = std::cos(yaw), sz = -std::sin(yaw);
+        g_camera.x = m->pos[0] + sx * 5.0f;
+        g_camera.z = m->pos[2] + sz * 5.0f;
+        g_camera.y = (std::max)(wg.height(g_camera.x, g_camera.z), m->pos[1]) + 1.4f;
+        g_camera.yaw = std::atan2(-sx, -sz);
+        g_camera.pitch = -0.08f;
+        const bool walk_was = g_walk;
+        g_walk = false;
+        for (int i = 0; i < 30; ++i) publish_creatures(1.0f / 60.0f, player);
+        engine::ViewConstants v = {};
+        fill_view(g_camera, g_res_w, g_res_h, tsim, v);
+        std::string err;
+        g_renderer.capture(v, "build/move_walk.bmp", err);
+        g_walk = walk_was;
+        std::fprintf(f, "\nbuild/move_walk.bmp: mid-walk from 5 m, speed %.2f m/s\n", g_loco.body(id) ? g_loco.body(id)->speed : -1.0f);
+        C.clear();
+        run(0.1f, 0, nullptr, false);
+    }
+
+    // G. A swim: from the beach nearest the spawn into deep water, near the player.
+    std::fprintf(f, "\nG. a swim\n");
+    {
+        float deep[3] = {0, 0, 0}, shore[3] = {0, 0, 0};
+        bool got = false;
+        for (float r = 8.0f; r < 400.0f && !got; r += 4.0f)
+            for (int k = 0; k < 32 && !got; ++k) {
+                const float ang = float(k) * 0.19634954f;
+                const float x = g_spawn.x + std::sin(ang) * r, z = g_spawn.z + std::cos(ang) * r;
+                if (wg.height(x, z) > sea - 3.0f) continue;
+                // Back towards the spawn to dry land.
+                for (float back = 2.0f; back < 60.0f; back += 1.0f) {
+                    const float bx = x - std::sin(ang) * back, bz = z - std::cos(ang) * back;
+                    if (wg.height(bx, bz) > sea + 0.5f) {
+                        shore[0] = bx; shore[2] = bz; shore[1] = wg.height(bx, bz);
+                        deep[0] = x + std::sin(ang) * 6.0f; deep[2] = z + std::cos(ang) * 6.0f; deep[1] = sea;
+                        got = wg.height(deep[0], deep[2]) < sea - 2.5f;
+                        break;
+                    }
+                }
+            }
+        if (!got) {
+            std::fprintf(f, "      no beach found within 400 m: not tested\n");
+        } else {
+            settle_at(shore[0], shore[2]);
+            float s0[3];
+            on_mesh(shore[0], shore[2], s0);
+            const uint32_t id = C.spawn_at(mimic, s0, 0.0f, now);
+            Mob* m = C.find_live(id);
+            m->gait = 1;
+            std::memcpy(m->goal, deep, sizeof deep);
+            Trace tr;
+            const float t = run(90.0f, id, &tr, true);
+            m = C.find_live(id);
+            const engine::mobs::Locomotion::Body* bd = g_loco.body(id);
+            std::snprintf(buf, sizeof buf, "from (%.0f, %.0f) to (%.0f, %.0f), %.1f m of water: %.1f s, %.2f m off; "
+                          "swimming at the end: %s; feet %.2f m under the surface (floats at 1.35)",
+                          s0[0], s0[2], deep[0], deep[2], sea - wg.height(deep[0], deep[2]), t, hd(m->pos, deep),
+                          bd && bd->swimming ? "yes" : "NO", sea - m->pos[1]);
+            check(bd && bd->close && bd->swimming && hd(m->pos, deep) < 2.0f && sea - m->pos[1] > 0.6f &&
+                      sea - m->pos[1] < 2.0f, buf);
+            // Its still, from the shore side.
+            const float dx = m->pos[0] - s0[0], dz = m->pos[2] - s0[2], dl = std::sqrt(dx * dx + dz * dz);
+            g_camera.x = m->pos[0] - dx / dl * 6.0f;
+            g_camera.z = m->pos[2] - dz / dl * 6.0f;
+            g_camera.y = sea + 2.0f;
+            g_camera.yaw = std::atan2(dx, dz);
+            g_camera.pitch = -0.2f;
+            g_walk = false;
+            for (int i = 0; i < 20; ++i) publish_creatures(1.0f / 60.0f, player);
+            engine::ViewConstants v = {};
+            fill_view(g_camera, g_res_w, g_res_h, tsim, v);
+            std::string err;
+            g_renderer.capture(v, "build/move_swim.bmp", err);
+            std::fprintf(f, "build/move_swim.bmp: the swimmer from 6 m\n");
+        }
+        C.clear();
+        run(0.1f, 0, nullptr, false);
+    }
+    std::fprintf(f, "\n%zu physics bodies left (0 expected)\n", g_physics.walkers());
+    check(g_physics.walkers() == 0, "every body given back");
+    std::fprintf(f, "\n%s: %d failed\n", fails ? "FAILURES" : "ALL PASSED", fails);
+    std::fclose(f);
+    return fails;
+}
+
 // --mob-test (ADR-007, phase 2): spawning, freezing, saving and thawing,
 // against the shipping creatures.json at the spawn. build/mob_test.txt, and
 // build/mob_test.bmp (the nearest creature from 5 m); the exit code is the
@@ -3138,8 +3487,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     const bool survival_mode = hl.find("--survival-test") != std::string::npos;
     const bool mob_mode = hl.find("--mob-test") != std::string::npos;
     const bool nav_mode = hl.find("--nav-report") != std::string::npos;
+    const bool move_mode = hl.find("--move-test") != std::string::npos;
     const bool headless = report_mode || fell_mode || dig_tree_mode || lights_mode || leak_mode ||
-                          pit_mode || survival_mode || mob_mode || nav_mode ||
+                          pit_mode || survival_mode || mob_mode || nav_mode || move_mode ||
                           !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
@@ -3240,6 +3590,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             }
             std::string nerr;
             g_nav_ok = g_nav.init(&wg.world(), &wg.params(), &wg.table(), g_creature_table.zones.size_m, 3, nerr);
+            g_loco.set(&g_creature_table, g_nav_ok ? &g_nav : nullptr, &g_physics, wg.table().sea_level);
             if (g_nav_ok) {
                 g_nav.set_gather(gather_nav);
                 g_nav.set_ready([] {
@@ -6019,6 +6370,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (move_mode) {
+        const int r = run_move_test();
+        g_loco.clear();
+        g_nav.shutdown();
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return r;
+    }
+
     if (nav_mode) {
         const int r = run_nav_report();
         g_nav.shutdown();
@@ -8088,7 +8448,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 const bool ok4 = g_surv_ok && g_surv.load("build/player.txt", err);
                 if (ok4) { g_surv.reset_fall(); g_jump_window = 0.0f; }
                 const bool ok5 = g_creatures_ok && g_creatures.load("build/mobs.bin", err);
-                if (ok5) g_mob_anim.clear();
+                if (ok5) { g_mob_anim.clear(); g_loco.clear(); }
                 if (g_nav_ok) g_nav.invalidate_all();
                 hud_say((ok || ok2 || ok3 || ok4 || ok5) ? "Loaded" : "Nothing to load");
             }

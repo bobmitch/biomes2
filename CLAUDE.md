@@ -22,7 +22,7 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `engine/props/` | Things to pick up: the caves' glowing mushrooms (`glow_mushrooms.h`), and layer 10's forage plants (`forage.h`): streaming in 64 m zones, picks and regrowth, drawing, picking with E. |
 | `engine/player/` | The player's survival: items (`items.h`), the 8 x 4 inventory, health / stamina / food / the game clock (`survival.h`), item icons painted from data (`icons.h`), the player as heard and seen (`stealth.h`). No GPU. |
 | `engine/nav/` | The navmesh (ADR-007): `nav_tile.h` builds one Recast/Detour tile from the field's solid spans, the water and the obstacles; `nav_world.h` streams tiles round the player on workers and answers queries. Recast/Detour is the `third_party/recastnavigation` submodule (v1.6.0, zlib). |
-| `engine/mobs/` | Creatures (ADR-007, being built): `perception.h`, the arithmetic of hearing (dB) and sight (cone, range, light); `creature_table.h` (`game/data/creatures.json`); `creatures.h`, the zones that spawn, freeze, save and thaw them. No GPU. |
+| `engine/mobs/` | Creatures (ADR-007, being built): `perception.h`, the arithmetic of hearing (dB) and sight (cone, range, light); `creature_table.h` (`game/data/creatures.json`); `creatures.h`, the zones that spawn, freeze, save and thaw them; `locomotion.h`, how they move. No GPU. |
 | `game/data/` | `items.json`: every item, the player's numbers, the clock, the start inventory. Gameplay data, outside the hash. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32), Windows only: seeds as maps plus their gameplay numbers. See "The world viewer". |
@@ -125,6 +125,7 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--band-report`, `--sea-report`, `--swim`, `--dig-water`, `--blend-report`, `--tab-test`,
 `--mob-test` (creatures: spawning, freezing, saving, thawing; see Creatures and stealth),
 `--nav-report` (the navmesh round the spawn: tiles, coverage, trunks, paths, a swim, a log, a dig, and a map),
+`--move-test` (creatures walking, running, swimming, handed from the mesh to physics, frozen mid-walk),
 `--clock-jump` (with `--shot`: the light under the ground after the clock
 jumps or runs, `build/time_jump.txt`; see The near field),
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
@@ -1374,8 +1375,9 @@ and sight, Recast/Detour navmeshes built from the field, simulation by
 distance, behaviour in Lua. Data in `game/data/creatures.json` (to come)
 and items.json's `stealth` block; never in the golden hash. **Phases 1
 (the player's side) and 2 (zones, spawning, freezing, saving, drawing) are
-built; creatures stand still until the navmesh (phase 3) and movement
-(phase 4). Phase 3, the navmesh, is built.**
+built, and phases 3 (the navmesh) and 4 (movement). What a creature
+DECIDES -- the mimic's hearing, seeing and chasing -- is phase 5; until
+then each wanders near home.**
 
 - **Crouch**: Left Ctrl toggles it on land (in the water Ctrl still dives
   while held; Right Ctrl does nothing); 1.4 m/s (`stealth.crouch_speed`),
@@ -1478,6 +1480,36 @@ built; creatures stand still until the navmesh (phase 3) and movement
   diagonally 0.1-0.2 m from the axis. A quarter cell of inflation left
   0.09 m past the bark; a whole cell, 0.46. Contours are simplified to
   0.35 m (Recast's demo allows 1.3 m, which cut corners through trunks).
+- **Movement** (`engine/mobs/locomotion.h`): a creature with a gait (1
+  walk, 2 run; saved on the Mob with its goal, so a frozen chase resumes)
+  follows a navmesh path to its goal -- re-planned when the goal moves 0.5
+  m or every 1.5 s (3 s far off), corners passed within 0.5 m, the goal
+  within 0.6 m, easing in over the last 1.5 m -- at its kind's speed,
+  filtered by how it moves (walkers walk and wade, the mimic swims too),
+  pushed apart from neighbours within 1.2 m. Asked to move and not moving
+  for 3 s, it gives the goal up.
+- **Near the player** (within 34 m, released past 38) a creature has a
+  PHYSICS BODY: `PhysicsWorld::add_walker`, the player's capsule and its
+  rules, through the same `step_body` -- ground, slopes, steps, buoyancy,
+  swimming, wading's drag. Jolt's `CharacterVsCharacterCollisionSimple`
+  makes the player and every creature collide. Further out it slides along
+  the mesh (`NavWorld::move_along`, Detour's moveAlongSurface), feet at the
+  mesh's height, or 1.35 m under the sea in a swim area at half speed, as a
+  body floats. The hand-over puts the body where the creature stands.
+- **Animated** from what it did -- measured speed, supported, swimming,
+  vertical speed -- through the player's animator, so walk, jog, sprint,
+  swim and the air come from the same clips.
+- **Until behaviours** (phase 5), `Locomotion::wander`: a creature that has
+  stood 5-15 s walks to a random point of the mesh within 15 m of home.
+- `--move-test` (`build/move_test.txt`): a walk near the player (1.40 m/s
+  measured against 1.4; feet within 0.10 m of the mesh; a body all the
+  way), a run back (5.19 against 5.0), a walk 70 m out (on the mesh, no
+  body), a run in from 50 m (mesh, then a body; the biggest step in a
+  frame 0.083 m, a run's own), a walk frozen half way, saved, read back and
+  finished, and a swim from the nearest beach to 3.7 m of water (feet 1.46
+  m under, swimming); stills `build/move_walk.bmp`, `move_swim.bmp`. Every
+  body is given back. The player's `--swim` and `--walk` are unchanged by
+  the refactor (eye never under; worst step 2 cm).
 - `--mob-test` (`build/mob_test.txt`, exit code = failures): 24 game hours
   at the spawn (spawns, distances, biome, unseen, both caps), the player
   2 km away (all freeze, the zone's clock stands for 10 game hours), a save

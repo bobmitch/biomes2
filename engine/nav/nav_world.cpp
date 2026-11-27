@@ -266,6 +266,33 @@ bool NavWorld::nearest(const float p[3], const float ext[3], unsigned short incl
     return true;
 }
 
+bool NavWorld::move_along(const float from[3], const float to[3], unsigned short include, float out[3],
+                          unsigned char* area) const {
+    if (!query_) return false;
+    dtQueryFilter f;
+    make_filter(f, include, 3.0f);
+    const float ext[3] = {1.0f, 3.0f, 1.0f};
+    dtPolyRef ref = 0;
+    float start[3];
+    if (dtStatusFailed(query_->findNearestPoly(from, ext, &f, &ref, start)) || !ref) return false;
+    dtPolyRef visited[16];
+    int nv = 0;
+    float res[3];
+    if (dtStatusFailed(query_->moveAlongSurface(ref, start, to, &f, res, visited, &nv, 16)) || nv <= 0) return false;
+    const dtPolyRef last = visited[nv - 1];
+    float h = res[1];
+    if (dtStatusSucceed(query_->getPolyHeight(last, res, &h))) res[1] = h;
+    out[0] = res[0];
+    out[1] = res[1];
+    out[2] = res[2];
+    if (area) {
+        const dtMeshTile* tile = nullptr;
+        const dtPoly* poly = nullptr;
+        if (dtStatusSucceed(mesh_->getTileAndPolyByRef(last, &tile, &poly))) *area = poly->getArea();
+    }
+    return true;
+}
+
 bool NavWorld::path(const float a[3], const float b[3], unsigned short include, std::vector<float>& corners,
                     float* length, bool* complete, float swim_cost) const {
     corners.clear();

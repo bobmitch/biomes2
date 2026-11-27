@@ -1,8 +1,8 @@
 # ADR-007: Creatures -- zones, spawning, perception and navigation
 
 Status: **accepted**, 2026-11-27. Phases 1 (the player's sound and sight)
-2 (zones, spawning, freezing, saving, drawing) and 3 (the navmesh) are
-built -- CLAUDE.md,
+2 (zones, spawning, freezing, saving, drawing), 3 (the navmesh) and 4
+(movement) are built -- CLAUDE.md,
 "Creatures and stealth", has what was measured; the rest is the plan. Gameplay follows Valheim by default,
 as the survival rules do; every number below is data, in
 `game/data/creatures.json` or `game/data/items.json`, never in the golden
@@ -219,10 +219,11 @@ built in the engine block like Jolt; worldgen and validate never see it.
 - **Near** (within 36 m of the player, inside the trunk and rock
   colliders' 40 m): a Jolt `CharacterVirtual` each, as the player's; the
   path's next corner is the wanted velocity; full animation.
-- **Mid** (the rest of the active area): no physics; the creature moves
-  along its corridor with Detour's crowd (local avoidance included), feet
-  on the polygon's detail height; AI at a lower rate; animated, skinned
-  less often far off.
+- **Mid** (the rest of the active area): no physics; the creature slides
+  along the mesh (Detour's moveAlongSurface), feet on the polygon's detail
+  height. Detour's crowd was the plan; at tens of creatures a path
+  follower with a separation push does the same, and a crowd can replace
+  it if crowds ever come. The near tier is 34 m in, 38 m out.
 - **Frozen**: outside the active area (decision 1).
 
 ### 6. Behaviour is Lua; the engine routes

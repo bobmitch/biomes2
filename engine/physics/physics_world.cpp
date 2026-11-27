@@ -75,6 +75,11 @@ struct PhysicsWorld::Impl {
     ObjectVsBPFilter          obj_vs_bp;
     ObjectPairFilter          obj_pair;
     JPH::Ref<JPH::CharacterVirtual> character;
+    JPH::RefConst<JPH::Shape> character_shape;
+    JPH::Ref<JPH::CharacterVirtualSettings> character_settings;
+    std::unordered_map<int, JPH::Ref<JPH::CharacterVirtual> > walkers;
+    // The player and every creature collide with each other.
+    JPH::CharacterVsCharacterCollisionSimple cvc;
     std::vector<JPH::RefConst<JPH::Shape>> prop_shapes;   // add_prop_mesh
 };
 
@@ -124,6 +129,9 @@ bool PhysicsWorld::init(std::string& error) {
     impl_->character = new JPH::CharacterVirtual(cs, JPH::RVec3(0, 0, 0),
                                                  JPH::Quat::sIdentity(), 0,
                                                  &impl_->system);
+    impl_->character_settings = cs;
+    impl_->cvc.Add(impl_->character);
+    impl_->character->SetCharacterVsCharacterCollision(&impl_->cvc);
     return true;
 }
 
@@ -141,6 +149,10 @@ void PhysicsWorld::shutdown() {
         bi.DestroyBody(it->second);
     }
     props_.clear();
+    for (auto& w : impl_->walkers) impl_->cvc.Remove(w.second);
+    impl_->walkers.clear();
+    walker_state_.clear();
+    if (impl_->character) impl_->cvc.Remove(impl_->character);
     impl_->character = nullptr;
     impl_.reset();
     // Factory and the registered types are process-wide and deliberately left
@@ -432,20 +444,98 @@ void PhysicsWorld::place_character(float x, float y, float z) {
     impl_->character->SetLinearVelocity(JPH::Vec3::sZero());
     // A teleport is not motion: the next step must not read the jump in
     // water height between the old place and the new as the sea rising.
-    sea_here_ = false;
-    medium_ = Medium::Dry;
+    player_.sea_here = false;
+    player_.medium = Medium::Dry;
 }
 
 void PhysicsWorld::launch_character(float vy) {
-    pending_launch_ = vy;
+    player_.pending_launch = vy;
 }
 
 void PhysicsWorld::update(float dt, float vx, float vz, bool jump, float swim) {
     if (!impl_ || !impl_->character) return;
     if (dt > 0.05f) dt = 0.05f;
+    step_body(impl_->character.GetPtr(), player_, dt, vx, vz, jump, swim);
+    // The static bodies still need the broadphase kept current as chunks come
+    // and go. A falling log is the one dynamic body; two collision steps at
+    // the 50 ms clamp keep a toppling trunk from tunnelling a heightfield.
+    impl_->system.Update(dt, dt > 0.02f ? 2 : 1, &impl_->temp, impl_->jobs.get());
+}
 
-    JPH::CharacterVirtual* c = impl_->character;
+int PhysicsWorld::add_walker(float x, float y, float z) {
+    if (!impl_ || !impl_->character_settings) return 0;
+    const int id = next_walker_++;
+    JPH::Ref<JPH::CharacterVirtual> c = new JPH::CharacterVirtual(
+        impl_->character_settings, JPH::RVec3(x, y, z), JPH::Quat::sIdentity(), 0, &impl_->system);
+    impl_->cvc.Add(c);
+    c->SetCharacterVsCharacterCollision(&impl_->cvc);
+    impl_->walkers[id] = c;
+    walker_state_[id] = BodyState();
+    return id;
+}
+
+void PhysicsWorld::remove_walker(int id) {
+    if (!impl_) return;
+    auto it = impl_->walkers.find(id);
+    if (it == impl_->walkers.end()) return;
+    impl_->cvc.Remove(it->second);
+    impl_->walkers.erase(it);
+    walker_state_.erase(id);
+}
+
+void PhysicsWorld::place_walker(int id, float x, float y, float z) {
+    if (!impl_) return;
+    auto it = impl_->walkers.find(id);
+    if (it == impl_->walkers.end()) return;
+    it->second->SetPosition(JPH::RVec3(x, y, z));
+    it->second->SetLinearVelocity(JPH::Vec3::sZero());
+    walker_state_[id].sea_here = false;
+    walker_state_[id].medium = Medium::Dry;
+}
+
+void PhysicsWorld::step_walker(int id, float dt, float vx, float vz, bool jump, float swim) {
+    if (!impl_) return;
+    auto it = impl_->walkers.find(id);
+    if (it == impl_->walkers.end()) return;
+    if (dt > 0.05f) dt = 0.05f;
+    if (dt <= 0.0f) return;
+    step_body(it->second.GetPtr(), walker_state_[id], dt, vx, vz, jump, swim);
+}
+
+bool PhysicsWorld::walker_position(int id, float out[3]) const {
+    if (!impl_) return false;
+    auto it = impl_->walkers.find(id);
+    if (it == impl_->walkers.end()) return false;
+    const JPH::RVec3 p = it->second->GetPosition();
+    out[0] = float(p.GetX());
+    out[1] = float(p.GetY());
+    out[2] = float(p.GetZ());
+    return true;
+}
+
+bool PhysicsWorld::walker_supported(int id) const {
+    if (!impl_) return false;
+    auto it = impl_->walkers.find(id);
+    return it != impl_->walkers.end() && it->second->IsSupported();
+}
+
+Medium PhysicsWorld::walker_medium(int id) const {
+    auto it = walker_state_.find(id);
+    return it == walker_state_.end() ? Medium::Dry : it->second.medium;
+}
+
+// One character's step: the water over it, buoyancy or gravity, the asked-for
+// horizontal velocity, and Jolt's ExtendedUpdate. The player's and every
+// creature's, the same rules.
+void PhysicsWorld::step_body(void* character, BodyState& b, float dt, float vx, float vz, bool jump, float swim) {
+    JPH::CharacterVirtual* c = static_cast<JPH::CharacterVirtual*>(character);
     const JPH::Vec3 gravity = impl_->system.GetGravity();
+    float& pending_launch_ = b.pending_launch;
+    Medium& medium_ = b.medium;
+    bool& sea_here_ = b.sea_here;
+    float& water_y_ = b.water_y;
+    float& submerged_ = b.submerged;
+    float& water_rate_ = b.water_rate;
 
     // Where the water is, from the same function the shader draws. Asked at
     // the start of the step, so a swimmer is judged against the surface it is
@@ -569,11 +659,6 @@ void PhysicsWorld::update(float dt, float vx, float vz, bool jump, float swim) {
                       impl_->system.GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
                       impl_->system.GetDefaultLayerFilter(Layers::MOVING),
                       {}, {}, impl_->temp);
-
-    // The static bodies still need the broadphase kept current as chunks come
-    // and go. A falling log is the one dynamic body; two collision steps at
-    // the 50 ms clamp keep a toppling trunk from tunnelling a heightfield.
-    impl_->system.Update(dt, dt > 0.02f ? 2 : 1, &impl_->temp, impl_->jobs.get());
 }
 
 void PhysicsWorld::character_position(float out[3]) const {

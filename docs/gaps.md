@@ -374,9 +374,16 @@ Last gathered: 2026-11-21, after the exploration fog; creatures added
 
 ## Creatures (ADR-007)
 
-- **Phases 1-3 are built** (the player's sound and sight; zones, spawning,
-  freezing, saving, drawing; the navmesh). Creatures stand still: movement
-  and the mimic's behaviour are phases 4-5. [Creatures and stealth]
+- **Phases 1-4 are built** (the player's sound and sight; zones, spawning,
+  freezing, saving, drawing; the navmesh; movement). The mimic's behaviour
+  is phase 5; until then creatures wander near home. Nothing has been
+  played in the window. [Creatures and stealth]
+- **Movement**: no jumping, climbing or turning on the spot (the body
+  turns as it walks); far-off creatures ignore a rolling log until it
+  rests and is stamped, and do not avoid the player; a far-off swimmer
+  floats at a fixed depth, with no waves; creatures do not tire, drown or
+  take falls; a stuck creature only gives up its goal after 3 s.
+  [Creatures and stealth]
 - **Spawn ground falls back to the 2.5D generated height** where no nav
   tile is in yet (a fresh start, the edge of the area), and a creature dug
   under does not settle. [Creatures and stealth]

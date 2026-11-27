@@ -20,7 +20,7 @@ uint64_t mix64(uint64_t x) {
 float u01(uint64_t h) { return float(h >> 40) / float(1ull << 24); }
 
 const uint32_t kMagic = 0x31424F4Du;   // "MOB1"
-const uint32_t kVersion = 1;
+const uint32_t kVersion = 2;   // 2: gait and goal
 
 bool in_hours(float hour, float from, float to) {
     if (from <= 0.0f && to >= 24.0f) return true;
@@ -103,6 +103,27 @@ double Creatures::zone_wait(const ZoneKey& k, int rule) const {
     const auto it = zones_.find(k);
     if (it == zones_.end() || rule < 0 || size_t(rule) >= it->second.wait.size()) return -1.0;
     return it->second.wait[size_t(rule)];
+}
+
+uint32_t Creatures::spawn_at(int kind, const float pos[3], float yaw, double now) {
+    if (!table_ || kind < 0 || size_t(kind) >= table_->kinds.size()) return 0;
+    Mob m;
+    m.id = next_id_++;
+    m.kind = kind;
+    std::memcpy(m.pos, pos, sizeof m.pos);
+    std::memcpy(m.home, pos, sizeof m.home);
+    std::memcpy(m.goal, pos, sizeof m.goal);
+    m.yaw = yaw;
+    m.health = table_->kinds[size_t(kind)].health;
+    m.born = now;
+    live_.push_back(m);
+    return m.id;
+}
+
+Mob* Creatures::find_live(uint32_t id) {
+    for (Mob& m : live_)
+        if (m.id == id) return &m;
+    return nullptr;
 }
 
 void Creatures::freeze(const ZoneKey& k) {
@@ -259,16 +280,25 @@ void put_mob(FILE* f, const Mob& m, uint16_t kind) {
     put(f, int32_t(m.state));
     put(f, m.state_t);
     put(f, m.born);
+    put(f, int32_t(m.gait));
+    for (int k = 0; k < 3; ++k) put(f, m.goal[k]);
 }
 
-bool get_mob(FILE* f, Mob& m, uint16_t& kind) {
-    int32_t st = 0;
+bool get_mob(FILE* f, Mob& m, uint16_t& kind, uint32_t version) {
+    int32_t st = 0, gait = 0;
     bool ok = get(f, m.id) && get(f, kind);
     for (int k = 0; k < 3 && ok; ++k) ok = get(f, m.pos[k]);
     ok = ok && get(f, m.yaw) && get(f, m.health);
     for (int k = 0; k < 3 && ok; ++k) ok = get(f, m.home[k]);
     ok = ok && get(f, st) && get(f, m.state_t) && get(f, m.born);
     m.state = st;
+    if (version >= 2) {
+        ok = ok && get(f, gait);
+        for (int k = 0; k < 3 && ok; ++k) ok = get(f, m.goal[k]);
+        m.gait = gait;
+    } else {
+        std::memcpy(m.goal, m.pos, sizeof m.goal);
+    }
     return ok;
 }
 
@@ -327,7 +357,8 @@ bool Creatures::load(const char* path, std::string& error) {
     auto fail = [&](const std::string& why) { std::fclose(f); error = std::string(path) + ": " + why; return false; };
     uint32_t magic = 0, version = 0, next = 0, nk = 0, nz = 0;
     uint64_t world = 0;
-    if (!get(f, magic) || magic != kMagic || !get(f, version) || version != kVersion) return fail("not a creature save");
+    if (!get(f, magic) || magic != kMagic || !get(f, version) || version < 1 || version > kVersion)
+        return fail("not a creature save");
     if (!get(f, world) || world != world_) return fail("a save of another world");
     if (!get(f, next) || !get(f, nk) || nk > 4096) return fail("truncated");
     std::vector<int> kind_map(nk, -1);
@@ -356,7 +387,7 @@ bool Creatures::load(const char* path, std::string& error) {
         for (uint32_t m = 0; m < nm; ++m) {
             Mob mob;
             uint16_t kind = 0;
-            if (!get_mob(f, mob, kind)) return fail("truncated");
+            if (!get_mob(f, mob, kind, version)) return fail("truncated");
             if (kind >= nk || kind_map[kind] < 0) continue;
             mob.kind = kind_map[kind];
             rec.frozen.push_back(mob);
