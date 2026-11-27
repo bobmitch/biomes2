@@ -65,6 +65,9 @@ public:
 
     // Stamina for an action: spends it and says true, or spends nothing.
     bool spend(float cost);
+    // Stamina taken by something that does not ask (a blow): what is there,
+    // down to zero.
+    void drain(float cost);
     bool can_sprint() const { return stamina_ > 0.0f; }
 
     // Eats one of `item` (does not touch the inventory).

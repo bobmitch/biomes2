@@ -120,6 +120,16 @@ uint32_t Creatures::spawn_at(int kind, const float pos[3], float yaw, double now
     return m.id;
 }
 
+bool Creatures::kill(uint32_t id) {
+    for (size_t i = 0; i < live_.size(); ++i) {
+        if (live_[i].id != id) continue;
+        live_.erase(live_.begin() + std::ptrdiff_t(i));
+        ++stats_.killed;
+        return true;
+    }
+    return false;
+}
+
 Mob* Creatures::find_live(uint32_t id) {
     for (Mob& m : live_)
         if (m.id == id) return &m;

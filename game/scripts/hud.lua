@@ -125,6 +125,9 @@ local function update_vitals(p)
 	end
 	set("foods", table.concat(rows))
 
+	-- A blow just landed: the screen reddens and fades (engine side: g_hurt).
+	set_opacity("hurt", 0.35 * (p.hurt or 0))
+
 	set_width("health-fill", p.max_health > 0 and p.health / p.max_health or 0)
 	set("health-text", string.format("%d / %d", math.floor(p.health + 0.5), math.floor(p.max_health + 0.5)))
 

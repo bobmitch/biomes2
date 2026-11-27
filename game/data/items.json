@@ -1,5 +1,5 @@
 {
-  "_note": "Gameplay data (engine/player/items.h): the player's numbers, the clock, what a new game starts with and every item. Never in the golden hash. Foods follow Valheim: health and stamina raise the MAXIMUM of each while the food lasts (its value is (time left / duration)^food_decay_power of the full amounts), regen is health a tick (every regen_interval_s), duration_s is seconds of play, and a food can be eaten again once below food_refresh_at of its time. Icons are shapes in a unit square, y down, painted in order: e [cx, cy, rx, ry] an ellipse, r [x0, y0, x1, y1] a rectangle turned rot degrees, p [x, y, ...] a polygon; c #rrggbb[aa], sRGB.",
+  "_note": "Gameplay data (engine/player/items.h): the player's numbers, the clock, what a new game starts with and every item. Never in the golden hash. Foods follow Valheim: health and stamina raise the MAXIMUM of each while the food lasts (its value is (time left / duration)^food_decay_power of the full amounts), regen is health a tick (every regen_interval_s), duration_s is seconds of play, and a food can be eaten again once below food_refresh_at of its time. A tool's `tool` block is what it does to a creature: damage a hit, reach_m from the eye along the swing (engine/mobs/combat.h). Icons are shapes in a unit square, y down, painted in order: e [cx, cy, rx, ry] an ellipse, r [x0, y0, x1, y1] a rectangle turned rot degrees, p [x, y, ...] a polygon; c #rrggbb[aa], sRGB.",
   "player": {
     "base_health": 25, "base_stamina": 50,
     "regen_interval_s": 10, "regen_base": 0,
@@ -60,7 +60,8 @@
        {"e": [0.66, 0.42, 0.03, 0.022], "c": "#c8ecff"}
      ]},
     {"id": "axe", "name": "Axe", "kind": "tool", "use": "axe",
-     "description": "Equip it to fell trees (left click). Each swing costs stamina.",
+     "description": "Equip it to fell trees and fight (left click). Each swing costs stamina.",
+     "tool": {"damage": 15, "reach_m": 2.6},
      "icon": [
        {"p": [0.20, 0.86, 0.27, 0.92, 0.74, 0.26, 0.67, 0.20], "c": "#8a5a2b"},
        {"p": [0.22, 0.88, 0.25, 0.91, 0.72, 0.25, 0.69, 0.22], "c": "#a87440"},

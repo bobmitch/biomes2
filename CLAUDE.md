@@ -22,7 +22,7 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `engine/props/` | Things to pick up: the caves' glowing mushrooms (`glow_mushrooms.h`), and layer 10's forage plants (`forage.h`): streaming in 64 m zones, picks and regrowth, drawing, picking with E. |
 | `engine/player/` | The player's survival: items (`items.h`), the 8 x 4 inventory, health / stamina / food / the game clock (`survival.h`), item icons painted from data (`icons.h`), the player as heard and seen (`stealth.h`). No GPU. |
 | `engine/nav/` | The navmesh (ADR-007): `nav_tile.h` builds one Recast/Detour tile from the field's solid spans, the water and the obstacles; `nav_world.h` streams tiles round the player on workers and answers queries. Recast/Detour is the `third_party/recastnavigation` submodule (v1.6.0, zlib). |
-| `engine/mobs/` | Creatures (ADR-007, being built): `perception.h`, the arithmetic of hearing (dB) and sight (cone, range, light); `creature_table.h` (`game/data/creatures.json`); `creatures.h`, the zones that spawn, freeze, save and thaw them; `locomotion.h`, how they move; `minds.h`, what they notice (perception on a think tick) and the Lua host for their behaviours (`game/scripts/creatures/*.lua`). No GPU. |
+| `engine/mobs/` | Creatures (ADR-007, being built): `perception.h`, the arithmetic of hearing (dB) and sight (cone, range, light); `creature_table.h` (`game/data/creatures.json`); `creatures.h`, the zones that spawn, freeze, save and thaw them; `locomotion.h`, how they move; `minds.h`, what they notice (perception on a think tick) and the Lua host for their behaviours (`game/scripts/creatures/*.lua`); `combat.h`, blows both ways. No GPU. |
 | `game/data/` | `items.json`: every item, the player's numbers, the clock, the start inventory. Gameplay data, outside the hash. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32), Windows only: seeds as maps plus their gameplay numbers. See "The world viewer". |
@@ -127,6 +127,7 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--nav-report` (the navmesh round the spawn: tiles, coverage, trunks, paths, a swim, a log, a dig, and a map),
 `--move-test` (creatures walking, running, swimming, handed from the mesh to physics, frozen mid-walk),
 `--mimic-test` (the mimic's script: heard, unheard, seen, chased, stared, lost, by moonlight and torchlight),
+`--combat-test` (blows both ways: a windup that lands or is stepped out of, the player's axe, a death),
 `--clock-jump` (with `--shot`: the light under the ground after the clock
 jumps or runs, `build/time_jump.txt`; see The near field),
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
@@ -1318,7 +1319,8 @@ Valheim's rules, deliberately (`engine/player/`, data in
 - **The inventory** is 8 x 4; the top row is the hotbar. A pick-up stacks
   onto the same item, then fills the first empty slot from the top left, so
   new kinds land in the hotbar. **1-8** use a slot: eat a food, equip or put
-  away a tool. **Tools**: the axe (left click chops only with it in hand)
+  away a tool. **Tools**: the axe (left click chops, and fights, only with
+  it in hand: a creature in the swing's way takes it instead of the tree)
   and the torch (in hand = the carried light; `F` still toggles the light
   directly, for debugging). A new game starts with both (`start` in
   items.json). **Left Ctrl** crouches (see Creatures and stealth).
@@ -1536,8 +1538,12 @@ behaviour scripts): every phase of the ADR.**
 - **The mimic** (`game/scripts/creatures/mimic.lua`): IDLE wanders near
   home; HEARD, it stops, turns to the sound and listens (ALERT, 4 s after
   the last sound) -- turned, it often then sees; SEEN within its sight it
-  walks over (APPROACH), within 40 m runs (CHASE), at 2.2 m stops and
-  stares (STARE) until they step 3.5 m off. Out of view it keeps on to
+  walks over (APPROACH), within 40 m runs (CHASE), and closes to just
+  inside its own reach (2.1 m), where it stops, faces them and swings
+  (ATTACK) until they are 1.3 m further off than that -- a kind with no
+  attack of its own stares instead (STARE), which is what this did before
+  blows existed. Struck, it turns on whoever did it (`on_hurt`), wherever
+  it was looking. Out of view it keeps on to
   where it saw them for 3 s (a pursuer weaving round trees has them out of
   its 45 degrees every few steps; without the grace it flipped to
   searching and back), then SEARCHes there, LOOKs about for 6 s and
@@ -1546,6 +1552,42 @@ behaviour scripts): every phase of the ADR.**
   turns to its travel. A body settling on a slope slid fast enough to swing
   an idle mimic 8 degrees, and a player 15 degrees off its facing fell out
   of the cone.
+- **Blows, both ways** (`engine/mobs/combat.h`). A kind's `attack` block in
+  creatures.json is the arithmetic -- `damage` and `stamina` off the player,
+  `reach_m` chest to chest, `windup_s`, `recover_s`, `arc_deg` -- and the
+  script decides WHEN (`c:attack()`, with `c:attacking()` and
+  `c:attack_reach()`; a kind with no block cannot strike and only stares, as
+  every kind did before). **A blow is in two parts because a blow that lands
+  the instant it is decided cannot be avoided**: `begin` starts the windup,
+  and when it runs out the blow lands only if the player is STILL within
+  reach and within the arc of its facing -- so a step back or round during
+  the telegraph is a miss, and `--combat-test` A asserts both. Then
+  `recover_s` before the next. The windup is session state, not saved: a
+  creature frozen mid-swing thaws and swings again. Health IS on the Mob, so
+  one frozen half dead thaws half dead.
+- **The player's swing is one ray from the eye**, as a chop is: a creature
+  whose body capsule (the navmesh's agent sizes) it enters within the tool's
+  `reach_m` takes the tool's `damage` (items.json's `tool` block: the axe 15
+  against the mimic's 40, so three swings), and the tree behind it does not
+  -- one swing, one target. A creature at zero health leaves the live list
+  (`Creatures::kill`); nothing drops. The blow calls `on_hurt(c, ev)` at
+  once, not on its tick, so a creature cannot be killed from behind without
+  ever turning round: the mimic turns on whoever struck it and chases.
+- **Being hit**: health and stamina go (`Survival::drain` takes what is
+  there and never refuses, where `spend` would), the HUD's `#hurt` reddens
+  and fades over 0.8 s (`engine.player().hurt`), and death is the survival
+  layer's own -- the player wakes at the spawn, foods gone. The mimic's
+  ATTACK state is state 8; `--mimic-test` knows it as "reached them"
+  alongside STARE.
+- `--combat-test` (`build/combat_test.txt`, exit code = failures): section A
+  is the arithmetic on a table of its own, so retuning creatures.json moves
+  nothing there -- the windup, a step out of reach, a step round behind, the
+  recovery, and the ray against a body, in front and behind. Section B is
+  the shipping world at the spawn: a mimic 10 m off sees the player, walks
+  up and lands a blow in 2.3 s (health 25 -> 17, stamina 50 -> 44), does not
+  swing again inside its recovery and does once it is over; three swings of
+  the axe kill it; a wounded one comes back wounded through a save.
+  `build/combat_hit.bmp` is the pair, from off the player's shoulder.
 - `--mimic-test` (`build/mimic_test.txt`): a player whose speed, crouch and
   light the test sets, at places along a line of clear sight: a jog 15 m
   behind (ALERT 0.7 s, standing, CHASE at 1.2 s as it turns and sees); a

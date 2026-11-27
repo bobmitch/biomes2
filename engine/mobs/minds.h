@@ -16,18 +16,25 @@
 //   on_lose(c, ev)        the tick it stops seeing them: ev.x/y/z last seen
 //   on_hear(c, ev)        every tick it hears them and does not see them:
 //                         ev.x/y/z, ev.dist, ev.db (the level reaching it)
+//   on_hurt(c, ev)        the moment it is struck, whatever its tick:
+//                         ev.damage, ev.health (what is left), ev.x/y/z
+//                         (the blow came from there), ev.dist
 //   on_think(c, dt)       every tick, after the events
 // -- and c's methods: id, kind, pos, home, yaw, state, set_state (an
 // integer, saved; the timer restarts on a change), state_time, mark and
 // set_mark (a saved place), move_to(x, y, z, "walk"|"run"), stop, moving,
 // face(x, z), player (feet; nil when there is no body), player_distance,
-// random_point(radius) (on its mesh near home), random, log. One Lua state
+// random_point(radius) (on its mesh near home), random, log, and for
+// fighting: health, max_health, attack (begin a swing: false if it cannot,
+// or is still winding up or recovering), attacking (its windup is running),
+// attack_reach (its kind's, so a script need not repeat the number). One Lua state
 // for every creature; its errors go to build/creature_log.txt and leave
 // the creature standing.
 // ---------------------------------------------------------------------------
 #ifndef ENGINE_MOBS_MINDS_H
 #define ENGINE_MOBS_MINDS_H
 
+#include "engine/mobs/combat.h"
 #include "engine/mobs/creatures.h"
 #include "engine/mobs/perception.h"
 
@@ -61,13 +68,18 @@ public:
     ~Minds();
     // Loads every kind's script. False (and `error`) on the first that does
     // not load; the rest still do.
-    bool init(const CreatureTable* t, Creatures* c, Locomotion* loco, nav::NavWorld* nav, std::string& error);
+    bool init(const CreatureTable* t, Creatures* c, Locomotion* loco, nav::NavWorld* nav, Combat* combat,
+              std::string& error);
     void shutdown();
     bool scripted(int kind) const { return kind >= 0 && size_t(kind) < scripted_.size() && scripted_[size_t(kind)]; }
     perception::LightCurve& light() { return light_; }
 
     // A frame: perception and the hooks for every creature whose tick came.
     void update(float dt, const Player& p, const ClearFn& clear);
+    // It has just been struck from `from`: on_hurt at once, not on its tick
+    // (a creature that learns it is being hit a second later is a creature
+    // you can kill from behind without it ever turning round).
+    void hurt(Mob& m, float damage, const float from[3]);
     // Forget every creature's runtime (a load: each wakes again).
     void clear() { minds_.clear(); }
 
@@ -92,6 +104,7 @@ private:
     Creatures* creatures_ = nullptr;
     Locomotion* loco_ = nullptr;
     nav::NavWorld* nav_ = nullptr;
+    Combat* combat_ = nullptr;
     lua_State* L_ = nullptr;
     std::vector<bool> scripted_;
     std::unordered_map<uint32_t, Mind> minds_;

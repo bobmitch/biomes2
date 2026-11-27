@@ -22,7 +22,7 @@
 //   engine.time() -> seconds since start (wall clock, runs while paused)
 //
 // The player (engine/player/survival.h). Slots are 1..32, the hotbar 1..8:
-//   engine.player() -> {health, max_health, stamina, max_stamina, since_stamina,
+//   engine.player() -> {health, max_health, stamina, max_stamina, since_stamina, hurt,
 //                       dead, walking, day, hour, equipped (slot or 0),
 //                       foods = { {id, name, value, share, time_left, can_eat}, ... }}
 //   engine.inventory() -> { {id, name, count}, ... } 32 of them, id "" empty
@@ -88,6 +88,9 @@ struct PlayerView {
     float visibility = 0.0f;    // posture and speed, 0..1
     float light = 0.0f;         // the light share an ordinary eye gets, 0..1
     float lux = 0.0f;
+    // 1 the moment a creature's blow lands, fading over kHurtFade: the
+    // HUD's red edge.
+    float hurt = 0.0f;
 };
 
 struct SlotView {

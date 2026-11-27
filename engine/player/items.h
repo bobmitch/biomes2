@@ -40,6 +40,13 @@ struct IconShape {
     float col[4] = {1, 1, 1, 1};   // sRGB, alpha
 };
 
+// What a tool does to a creature (engine/mobs/combat.h). damage 0: it hurts
+// nothing, whatever it is for.
+struct ToolStats {
+    float damage = 0.0f;
+    float reach_m = 2.6f;      // from the eye along the swing
+};
+
 struct ItemDef {
     std::string id;            // stable: saves and the forage table name items by it
     std::string name;
@@ -48,6 +55,7 @@ struct ItemDef {
     ItemKind kind = ItemKind::Resource;
     ToolUse use = ToolUse::None;
     FoodStats food;
+    ToolStats tool;
     std::vector<IconShape> icon;
 };
 

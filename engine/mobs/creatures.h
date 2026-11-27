@@ -98,6 +98,9 @@ public:
     // whatever zone it stands. Its id.
     uint32_t spawn_at(int kind, const float pos[3], float yaw, double now);
     Mob* find_live(uint32_t id);
+    // Take a creature out of the world for good (killed): it leaves the live
+    // list and no zone keeps it. False if it was not live.
+    bool kill(uint32_t id);
 
     const std::vector<Mob>& live() const { return live_; }
     std::vector<Mob>& live() { return live_; }
@@ -114,7 +117,7 @@ public:
     struct Stats {
         uint64_t attempts = 0, rolls_won = 0, spawned = 0;
         uint64_t no_point = 0, capped = 0, out_of_hours = 0;
-        uint64_t frozen = 0, thawed = 0;
+        uint64_t frozen = 0, thawed = 0, killed = 0;
     };
     const Stats& stats() const { return stats_; }
 

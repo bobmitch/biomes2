@@ -193,6 +193,7 @@ int l_player(lua_State* L) {
     set_num(L, "visibility", p.visibility);
     set_num(L, "light", p.light);
     set_num(L, "lux", p.lux);
+    set_num(L, "hurt", p.hurt);
     lua_newtable(L);
     for (size_t i = 0; i < p.foods.size(); ++i) {
         const FoodView& f = p.foods[i];

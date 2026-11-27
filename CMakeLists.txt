@@ -247,6 +247,7 @@ if(BIOMES2_ENGINE)
     engine/player/inventory.cpp
     engine/player/survival.cpp
     engine/player/stealth.cpp
+    engine/mobs/combat.cpp
     engine/mobs/creature_table.cpp
     engine/mobs/creatures.cpp
     engine/mobs/locomotion.cpp

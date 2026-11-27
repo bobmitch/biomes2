@@ -37,6 +37,18 @@ struct CreatureKind {
     // How far above or below level it sees, degrees; 90 or more: no limit
     // (the cone is horizontal).
     float view_vertical_deg = 60.0f;
+    // What a blow of its own does (engine/mobs/combat.h). A kind with no
+    // `attack` block, or damage 0, cannot strike: it can only follow and
+    // stare. The script decides WHEN (c:attack()); these are the arithmetic.
+    struct Attack {
+        float damage = 0.0f;       // health off the player
+        float reach_m = 2.0f;      // its chest to theirs, when the blow LANDS
+        float windup_s = 0.5f;     // the telegraph: step out of reach and it misses
+        float recover_s = 1.5f;    // after a swing, before the next
+        float arc_deg = 100.0f;    // the total width it must still be facing them in
+        float stamina = 0.0f;      // ... taken as well, if they have it
+    };
+    Attack attack;
     std::string script;                  // game/scripts/<script>
 };
 

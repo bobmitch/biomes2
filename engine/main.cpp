@@ -48,6 +48,7 @@
 #include "engine/ui/ui.h"
 #include "engine/player/icons.h"
 #include "engine/player/survival.h"
+#include "engine/mobs/combat.h"
 #include "engine/mobs/creatures.h"
 #include "engine/mobs/locomotion.h"
 #include "engine/mobs/minds.h"
@@ -654,6 +655,10 @@ engine::mobs::Locomotion    g_loco;          // paths, bodies near the player, t
 bool  g_mob_wander = true;                   // the stand-in behaviour for kinds with no script
 engine::mobs::Minds g_minds;                 // perception and the Lua behaviours
 bool  g_minds_ok = false;
+engine::mobs::Combat g_combat;               // blows: windups, what lands, what the axe hits
+float g_hurt = 0.0f;                         // the screen's red, 1 at a blow, fading over kHurtFade
+const float kHurtFade = 0.8f;                // seconds
+uint32_t g_killed = 0;                       // creatures killed this session (the reports)
 
 // --- The navmesh (engine/nav, ADR-007 decision 4) ------------------------------
 // Tiles within kNavRadius of the player, built from the field on workers.
@@ -873,6 +878,10 @@ void publish_creatures(float dt, const float from[3]) {
         const float* t = g_creature_table.kinds[size_t(m.kind)].tint;
         tints.insert(tints.end(), t, t + 3);
     }
+    for (const uint32_t id : g_combat.take_started()) {
+        const auto a = g_mob_anim.find(id);
+        if (a != g_mob_anim.end()) a->second.trigger_action();
+    }
     for (auto it = g_mob_anim.begin(); it != g_mob_anim.end();)
         it = seen.count(it->first) ? std::next(it) : g_mob_anim.erase(it);
     cr.set_creatures(bones, tints, n);
@@ -899,6 +908,64 @@ bool minds_clear(const float a[3], const float b[3]) {
     return g_physics.probe_ray(a, dir, len - 0.3f, prop) < 0.0f;
 }
 
+// The tool in hand, for what a swing does to a creature. Empty hands, or a
+// tool with no `tool` block, do nothing: damage 0.
+engine::player::ToolStats hand_tool() {
+    engine::player::ToolStats t;
+    t.damage = 0.0f;
+    if (!g_surv_run) return t;
+    const int slot = g_surv.equipped();
+    if (!engine::player::Inventory::valid(slot)) return t;
+    const engine::player::Slot& sl = g_surv.inventory().at(slot);
+    if (sl.empty() || !g_items.valid(sl.item)) return t;
+    return g_items[sl.item].tool;
+}
+
+// The player's swing at a creature: the nearest its ray reaches. True if
+// one was hit (a tree is not chopped in the same swing).
+bool swing_at_creature(const float eye[3], const float dir[3]) {
+    if (!g_creatures_ok) return false;
+    const engine::player::ToolStats tool = hand_tool();
+    if (tool.damage <= 0.0f) return false;
+    bool died = false;
+    float point[3] = {0, 0, 0};
+    const uint32_t id = g_combat.strike(g_creatures.live(), eye, dir, tool.reach_m, tool.damage, died, point);
+    if (!id) return false;
+    engine::mobs::Mob* m = g_creatures.find_live(id);
+    if (!m) return false;
+    const std::string name = g_creature_table.kinds[size_t(m->kind)].name;
+    const float from[3] = {g_feet[0], g_feet[1], g_feet[2]};
+    if (died) {
+        // The hook first, while it is still live and can be found by id.
+        if (g_minds_ok) g_minds.hurt(*m, tool.damage, from);
+        g_creatures.kill(id);
+        ++g_killed;
+        hud_say(name + " dies");
+    } else {
+        if (g_minds_ok) g_minds.hurt(*m, tool.damage, from);
+        std::snprintf(g_tree_msg, sizeof g_tree_msg, "hit the %s", name.c_str());
+    }
+    return true;
+}
+
+// The creatures' blows: windups run on, and one that comes due takes health
+// (and stamina) off the player and paints the screen red for a moment. A
+// blow is only felt while the player is on foot and alive.
+void combat_frame(float dt) {
+    engine::mobs::Combat::Target t;
+    t.present = g_walk && g_surv_run && !g_surv.dead();
+    for (int k = 0; k < 3; ++k) t.feet[k] = g_feet[k];
+    g_combat.update(dt, g_creatures.live(), t, [](const engine::mobs::Combat::Blow& b) {
+        if (!g_surv_run) return;
+        g_surv.damage(b.damage);
+        g_surv.drain(b.stamina);
+        g_hurt = 1.0f;
+        const engine::mobs::CreatureKind& K = g_creature_table.kinds[size_t(b.kind)];
+        hud_say(K.name + " hits you");
+    });
+    if (g_hurt > 0.0f) g_hurt = (std::max)(0.0f, g_hurt - dt / kHurtFade);
+}
+
 // A frame of the creatures: zones round the player wake and freeze, spawns
 // come due on the game clock, the nearest are drawn.
 void creatures_frame(float dt, bool paused, float aspect) {
@@ -909,6 +976,7 @@ void creatures_frame(float dt, bool paused, float aspect) {
         const double now = g_surv_ok ? g_surv.game_seconds() : double(g_renderer.time_of_day()) * 3600.0;
         g_creatures.update(now, player, creature_env(g_camera, aspect));
         g_minds.update(dt, minds_player(), minds_clear);
+        combat_frame(dt);
         if (g_mob_wander) g_loco.wander(dt, g_creatures.live(), now);
         g_loco.update(dt, g_creatures.live(), player);
     }
@@ -1617,6 +1685,7 @@ void setup_ui(HWND hwnd) {
             p.visibility = g_stealth.visibility();
             p.light = g_stealth.light();
             p.lux = g_stealth.lux();
+            p.hurt = g_hurt;
             for (const engine::player::ActiveFood& f : g_surv.foods()) {
                 engine::ui::FoodView v;
                 v.id = g_items[f.item].id;
@@ -2128,9 +2197,13 @@ int run_mimic_test() {
     const int mimic = g_creature_table.find("mimic");
     const engine::WorldGpu& wg = g_renderer.world();
     using engine::mobs::Mob;
-    static const char* kState[] = {"IDLE", "ALERT", "APPROACH", "CHASE", "STARE", "SEARCH", "LOOK", "RETURN"};
-    auto sname = [](int st) { return st >= 0 && st < 8 ? kState[st] : "?"; };
-    enum { IDLE, ALERT, APPROACH, CHASE, STARE, SEARCH, LOOK, RETURN };
+    static const char* kState[] = {"IDLE", "ALERT", "APPROACH", "CHASE", "STARE", "SEARCH", "LOOK",
+                                   "RETURN", "ATTACK"};
+    auto sname = [](int st) { return st >= 0 && st < 9 ? kState[st] : "?"; };
+    enum { IDLE, ALERT, APPROACH, CHASE, STARE, SEARCH, LOOK, RETURN, ATTACK };
+    // Reaching the player is STARE for a kind with no attack and ATTACK for
+    // one with it (game/scripts/creatures/mimic.lua); the mimic has one.
+    auto reached = [&](int st) { return st == STARE || st == ATTACK; };
     engine::mobs::Creatures& C = g_creatures;
     C.clear();
     float tsim = 0.0f;
@@ -2318,7 +2391,8 @@ int run_mimic_test() {
         check(has(s3, ALERT), "a crouch-walk 0.8 m behind: " + trace(s3));
     }
     // 3. Seen ahead: not standing still at 45 m (0.7 x 50 = 35 m), but
-    // sprinting (50 m); walks, runs inside 40 m, stares at 2.2 m.
+    // sprinting (50 m); walks, runs inside 40 m, and closes to just inside
+    // its own reach, where it attacks (--combat-test has the blows).
     std::fprintf(f, "\n3. ahead, 45 m\n");
     float stare_yaw_err = 99.0f;
     {
@@ -2341,7 +2415,7 @@ int run_mimic_test() {
                 gait_chase = gait();
                 chase_dist = std::sqrt((w->pos[0] - player[0]) * (w->pos[0] - player[0]) + (w->pos[2] - player[2]) * (w->pos[2] - player[2]));
             }
-            return state() == STARE;
+            return reached(state());
         });
         run(1.0f, nullptr, nullptr);   // it turns to face
         const Mob* w = C.find_live(mid);
@@ -2350,11 +2424,11 @@ int run_mimic_test() {
         e -= 6.2831853f * std::floor((e + 3.14159265f) / 6.2831853f);
         stare_yaw_err = std::fabs(e) * 57.29578f;
         const float d = std::sqrt((w->pos[0] - player[0]) * (w->pos[0] - player[0]) + (w->pos[2] - player[2]) * (w->pos[2] - player[2]));
-        std::snprintf(buf, sizeof buf, "sprinting: %s; walking when approaching %s, running from %.1f m %s; stares %.1f m off, "
-                      "%.0f degrees off facing the player",
+        std::snprintf(buf, sizeof buf, "sprinting: %s; walking when approaching %s, running from %.1f m %s; reaches them "
+                      "%.1f m off, %.0f degrees off facing the player",
                       trace(s).c_str(), gait_approach == 1 ? "yes" : "NO", chase_dist, gait_chase == 2 ? "yes" : "NO", d,
                       stare_yaw_err);
-        check(has(s, APPROACH) && gait_approach == 1 && gait_chase == 2 && chase_dist <= 40.5f && state() == STARE &&
+        check(has(s, APPROACH) && gait_approach == 1 && gait_chase == 2 && chase_dist <= 40.5f && reached(state()) &&
                   gait() == 0 && d < 3.0f && stare_yaw_err < 25.0f, buf);
         // The still: from the side of the pair, wherever a camera sees both
         // (a trunk stood behind the player's shoulder).
@@ -2506,8 +2580,8 @@ int run_mimic_test() {
                     act = Act();
                     act.speed = 1.4f;
                     Seen sv;
-                    run(1.5f, &sv, [&] { return state() == APPROACH || state() == CHASE || state() == STARE; });
-                    const bool seen = has(sv, APPROACH) || has(sv, CHASE) || has(sv, STARE);
+                    run(1.5f, &sv, [&] { return state() == APPROACH || state() == CHASE || reached(state()); });
+                    const bool seen = has(sv, APPROACH) || has(sv, CHASE) || has(sv, STARE) || has(sv, ATTACK);
                     if (seen) { ++seen_n; continue; }
                     if (dist > 50.0f * 0.85f) ++hid_range;
                     else if (v > 60.0f) ++hid_vertical;
@@ -2569,6 +2643,363 @@ int run_mimic_test() {
     }
     C.clear();
     run(0.05f, nullptr, nullptr);
+    std::snprintf(buf, sizeof buf, "no script errors (%zu; build/creature_log.txt)", g_minds.errors());
+    check(g_minds.errors() == 0, buf);
+    std::fprintf(f, "\n%s: %d failed\n", fails ? "FAILURES" : "ALL PASSED", fails);
+    std::fclose(f);
+    return fails;
+}
+
+// --combat-test (ADR-007's "Later": combat): blows both ways. Section A is
+// the arithmetic on a table of its own, so retuning creatures.json moves
+// nothing here: the windup, a step out of reach, a step round behind, the
+// recovery, and the player's ray against a body. Section B is the shipping
+// world at the spawn: a mimic that sees the player walks up, swings, and
+// takes health off them; the player swings back until it dies; and a mimic
+// left half dead is still half dead after a freeze and a thaw.
+// build/combat_test.txt, still build/combat_hit.bmp. Exit code = failures.
+int run_combat_test() {
+    std::remove("build/combat_test.txt");
+    FILE* f = std::fopen("build/combat_test.txt", "w");
+    if (!f) return 1;
+    int fails = 0;
+    auto check = [&](bool ok, const std::string& what) {
+        std::fprintf(f, "%s  %s\n", ok ? "PASS" : "FAIL", what.c_str());
+        if (!ok) ++fails;
+    };
+    char buf[500];
+    using engine::mobs::Combat;
+    using engine::mobs::Mob;
+
+    // ---- A. the arithmetic, on a table of its own -------------------------
+    std::fprintf(f, "A. blows, on a test table (damage 10, reach 2.0 m, windup 0.5 s, recover 1.5 s, arc 90)\n");
+    {
+        engine::mobs::CreatureTable T;
+        engine::mobs::CreatureKind k;
+        k.id = k.name = "dummy";
+        k.health = 30.0f;
+        k.attack.damage = 10.0f;
+        k.attack.reach_m = 2.0f;
+        k.attack.windup_s = 0.5f;
+        k.attack.recover_s = 1.5f;
+        k.attack.arc_deg = 90.0f;
+        k.attack.stamina = 5.0f;
+        T.kinds.push_back(k);
+        engine::mobs::CreatureKind quiet;     // no attack at all
+        quiet.id = quiet.name = "quiet";
+        T.kinds.push_back(quiet);
+
+        Combat cb;
+        cb.set_table(&T);
+        std::vector<Mob> live;
+        Mob m;
+        m.id = 1;
+        m.kind = 0;
+        m.health = k.health;
+        m.yaw = 0.0f;                          // facing +z
+        live.push_back(m);
+        Mob q;
+        q.id = 2;
+        q.kind = 1;
+        q.health = 30.0f;
+        live.push_back(q);
+
+        Combat::Target p;
+        p.present = true;
+        float hits = 0.0f, taken = 0.0f;
+        auto hit = [&](const Combat::Blow& b) { ++hits; taken += b.damage; };
+        auto place = [&](float x, float z) { p.feet[0] = x; p.feet[1] = 0.0f; p.feet[2] = z; };
+        auto step = [&](float seconds) {
+            for (float t = 0.0f; t < seconds; t += 1.0f / 60.0f) cb.update(1.0f / 60.0f, live, p, hit);
+        };
+
+        check(!cb.begin(live[1]), "a kind with no attack cannot swing");
+        place(0.0f, 1.5f);                      // in front, in reach
+        check(cb.begin(live[0]), "it swings");
+        check(!cb.begin(live[0]), "... and not again while that one is in flight");
+        check(cb.winding_up(1), "the windup is running");
+        step(0.3f);
+        std::snprintf(buf, sizeof buf, "nothing has landed 0.3 s in (hits %.0f)", hits);
+        check(hits == 0.0f, buf);
+        step(0.3f);
+        std::snprintf(buf, sizeof buf, "the blow lands at 0.5 s: %.0f hit, %.0f damage", hits, taken);
+        check(hits == 1.0f && taken == 10.0f, buf);
+        check(cb.busy(1) && !cb.winding_up(1), "it is recovering, not winding up");
+        check(!cb.begin(live[0]), "... and cannot swing again yet");
+        step(1.6f);
+        check(!cb.busy(1), "after recover_s it can swing again");
+
+        // A step back during the windup is a miss.
+        place(0.0f, 1.5f);
+        check(cb.begin(live[0]), "it swings again");
+        step(0.3f);
+        place(0.0f, 3.0f);                      // out of reach before it lands
+        step(0.3f);
+        std::snprintf(buf, sizeof buf, "a step out of reach during the windup misses (hits %.0f, missed %llu)",
+                      hits, (unsigned long long)cb.blows_missed());
+        check(hits == 1.0f && cb.blows_missed() == 1, buf);
+
+        // A step round behind it is a miss too: the arc is its facing.
+        step(1.6f);
+        place(0.0f, 1.5f);
+        check(cb.begin(live[0]), "it swings a third time");
+        step(0.3f);
+        place(0.0f, -1.5f);                     // behind it, still within reach
+        step(0.3f);
+        std::snprintf(buf, sizeof buf, "a step round behind it misses (hits %.0f, missed %llu)",
+                      hits, (unsigned long long)cb.blows_missed());
+        check(hits == 1.0f && cb.blows_missed() == 2, buf);
+
+        // The player's ray: the nearest body it enters, and death at zero.
+        const float eye[3] = {0.0f, 1.6f, -2.0f}, fwd[3] = {0.0f, 0.0f, 1.0f};
+        live[0].pos[0] = 0.0f; live[0].pos[1] = 0.0f; live[0].pos[2] = 0.0f;
+        live[1].pos[0] = 0.0f; live[1].pos[1] = 0.0f; live[1].pos[2] = 6.0f;   // behind it
+        bool died = false;
+        float where[3] = {0, 0, 0};
+        uint32_t id = cb.strike(live, eye, fwd, 2.6f, 12.0f, died, where);
+        std::snprintf(buf, sizeof buf, "a swing reaches the near body (#%u), not the one behind it, for 12: health %.0f",
+                      id, live[0].health);
+        check(id == 1 && !died && live[0].health == 18.0f, buf);
+        const float away[3] = {1.0f, 0.0f, 0.0f};
+        check(cb.strike(live, eye, away, 2.6f, 12.0f, died, where) == 0, "a swing past it hits nothing");
+        const float back[3] = {0.0f, 1.6f, -4.0f};
+        check(cb.strike(live, back, fwd, 2.6f, 12.0f, died, where) == 0,
+              "... and so does one swung from out of reach");
+        cb.strike(live, eye, fwd, 2.6f, 12.0f, died, where);
+        std::snprintf(buf, sizeof buf, "a second takes it to %.0f, still alive", live[0].health);
+        check(!died && live[0].health == 6.0f, buf);
+        cb.strike(live, eye, fwd, 2.6f, 12.0f, died, where);
+        std::snprintf(buf, sizeof buf, "a third kills it (health %.0f)", live[0].health);
+        check(died && live[0].health == 0.0f, buf);
+    }
+
+    // ---- B. the shipping world, at the spawn ------------------------------
+    std::fprintf(f, "\nB. a mimic at the spawn (game/data/creatures.json, game/data/items.json)\n");
+    check(g_nav_ok && g_creatures_ok && g_minds_ok && g_surv_ok,
+          "the navmesh, the creature table, the scripts and the item table");
+    if (!g_nav_ok || !g_creatures_ok || !g_minds_ok || !g_surv_ok) {
+        std::fprintf(f, "\n%s: %d failed\n", fails ? "FAILURES" : "ALL PASSED", fails);
+        std::fclose(f);
+        return fails;
+    }
+    const int mimic = g_creature_table.find("mimic");
+    const engine::mobs::CreatureKind& MK = g_creature_table.kinds[size_t(mimic)];
+    const engine::WorldGpu& wg = g_renderer.world();
+    engine::mobs::Creatures& C = g_creatures;
+    C.clear();
+    g_combat.clear();
+    float tsim = 0.0f;
+    g_walk = true;
+    g_surv_run = true;
+    g_surv.new_game(12.0f);
+    g_physics.place_character(g_spawn.x, g_spawn.ground + 1.0f, g_spawn.z);
+    for (int i = 0; i < 20000; ++i) {
+        MSG msg = {};
+        while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageA(&msg); }
+        step_window_physics(1.0f / 60.0f, tsim, 0.0f, 0.0f, false, 0.0f);
+        tsim += 1.0f / 60.0f;
+        g_camera.x = g_feet[0]; g_camera.y = g_feet[1] + 1.6f; g_camera.z = g_feet[2];
+        engine::ViewConstants v = {};
+        fill_view(g_camera, g_res_w, g_res_h, tsim, v);
+        g_renderer.render(v);
+        g_nav.update(g_spawn.x, g_spawn.z, kNavRadius);
+        if (i >= 90 && g_nav.settled()) break;
+    }
+    float player[3] = {g_feet[0], g_feet[1], g_feet[2]};
+    // A mimic 10 m away on the mesh, facing the player, in broad daylight.
+    const unsigned short walkflag = engine::nav::kFlagWalk;
+    float M[3] = {0, 0, 0};
+    bool placed = false;
+    for (int k = 0; k < 16 && !placed; ++k) {
+        const float a = float(k) * 0.3926991f;
+        const float x = player[0] + std::sin(a) * 10.0f, z = player[2] + std::cos(a) * 10.0f;
+        const float q[3] = {x, wg.height(x, z), z}, ext[3] = {1.0f, 4.0f, 1.0f};
+        float out[3];
+        if (!g_nav.nearest(q, ext, walkflag, out)) continue;
+        const float eye[3] = {out[0], out[1] + 1.6f, out[2]}, chest[3] = {player[0], player[1] + 1.2f, player[2]};
+        if (!minds_clear(eye, chest)) continue;
+        std::memcpy(M, out, sizeof M);
+        placed = true;
+    }
+    std::snprintf(buf, sizeof buf, "a mimic 10 m from the spawn with clear sight: (%.1f, %.1f, %.1f)", M[0], M[1], M[2]);
+    check(placed, buf);
+    if (!placed) {
+        std::fprintf(f, "\n%s: %d failed\n", fails ? "FAILURES" : "ALL PASSED", fails);
+        std::fclose(f);
+        return fails;
+    }
+    const float face = std::atan2(player[0] - M[0], player[2] - M[2]);
+    const uint32_t mid = C.spawn_at(mimic, M, face, 12.0 * 3600.0);
+
+    // The window's own creature loop, with the player standing where they
+    // were put, loud and lit so it sees them at once.
+    auto run = [&](float seconds, const std::function<bool()>& until) {
+        const float dt = 1.0f / 60.0f;
+        float t = 0.0f;
+        for (; t < seconds; t += dt) {
+            MSG msg = {};
+            while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageA(&msg); }
+            g_physics.place_character(player[0], player[1] + 0.05f, player[2]);
+            step_window_physics(dt, tsim, 0.0f, 0.0f, false, 0.0f);
+            g_physics.character_position(g_feet);
+            tsim += dt;
+            g_felling.update(g_feet[0], g_feet[2]);
+            engine::player::StealthInput si;
+            si.body = true;
+            si.grounded = true;
+            si.speed = 5.0f;         // a jog: heard and seen
+            si.lux = 50000.0f;
+            g_stealth.update(dt, si);
+            engine::player::Motion mo;
+            mo.body = true;
+            mo.grounded = true;
+            mo.feet_y = g_feet[1];
+            g_surv.update(dt, mo);
+            g_minds.update(dt, minds_player(), minds_clear);
+            combat_frame(dt);
+            g_loco.update(dt, C.live(), g_feet);
+            if (until && until()) break;
+        }
+        return t;
+    };
+    auto mob = [&]() { return C.find_live(mid); };
+    auto aim = [&](const Mob& w, float eye[3], float dir[3]) {
+        eye[0] = player[0];
+        eye[1] = player[1] + 1.6f;
+        eye[2] = player[2];
+        const float to[3] = {w.pos[0] - eye[0], (w.pos[1] + 0.9f) - eye[1], w.pos[2] - eye[2]};
+        const float len = std::sqrt(to[0] * to[0] + to[1] * to[1] + to[2] * to[2]);
+        for (int c = 0; c < 3; ++c) dir[c] = to[c] / len;
+    };
+
+    // 1. It comes, and it hits: the player loses health and stamina.
+    std::fprintf(f, "\n1. it attacks\n");
+    {
+        const float h0 = g_surv.health(), s0 = g_surv.stamina();
+        const float waited = run(25.0f, [&] { return g_combat.blows_landed() > 0; });
+        const Mob* w = mob();
+        const float gap = w ? std::sqrt((w->pos[0] - player[0]) * (w->pos[0] - player[0]) +
+                                        (w->pos[2] - player[2]) * (w->pos[2] - player[2])) : -1.0f;
+        std::snprintf(buf, sizeof buf, "it reached the player and its blow landed after %.1f s (state %d, %.1f m off)",
+                      waited, w ? w->state : -1, gap);
+        check(g_combat.blows_landed() > 0, buf);
+        std::snprintf(buf, sizeof buf, "health %.1f -> %.1f (its damage %.0f), stamina %.1f -> %.1f",
+                      h0, g_surv.health(), MK.attack.damage, s0, g_surv.stamina());
+        check(g_surv.health() <= h0 - MK.attack.damage + 0.01f, buf);
+        std::snprintf(buf, sizeof buf, "the red wash is up (hurt %.2f)", g_hurt);
+        check(g_hurt > 0.5f, buf);
+        // It keeps swinging, but not faster than its recovery allows.
+        const unsigned long long one = g_combat.blows_landed();
+        run(MK.attack.recover_s * 0.5f, nullptr);
+        std::snprintf(buf, sizeof buf, "it does not swing again inside its recovery (%llu blows)",
+                      (unsigned long long)g_combat.blows_landed());
+        check(g_combat.blows_landed() == one, buf);
+        run(MK.attack.recover_s + MK.attack.windup_s + 0.5f, nullptr);
+        std::snprintf(buf, sizeof buf, "... and does once it is over (%llu blows)",
+                      (unsigned long long)g_combat.blows_landed());
+        check(g_combat.blows_landed() > one, buf);
+    }
+
+    // 2. The player swings back: the axe takes it down.
+    std::fprintf(f, "\n2. the player swings back\n");
+    {
+        const int axe = g_items.find("axe");
+        check(axe >= 0 && g_items.valid(axe) && g_items[axe].tool.damage > 0.0f,
+              "the axe does damage (game/data/items.json)");
+        g_surv.use_slot(0);    // the axe in hand (slot 1 of a new game)
+        check(g_surv.hand() == engine::player::ToolUse::Axe, "the axe is in hand");
+        check(mob() != nullptr, "the mimic is still alive");
+        if (mob() && axe >= 0) {
+            const float full = MK.health;
+            int swings = 0;
+            bool killed = false;
+            for (; swings < 20 && !killed; ++swings) {
+                const Mob* cur = mob();
+                if (!cur) { killed = true; break; }
+                float eye[3], dir[3];
+                aim(*cur, eye, dir);
+                const float before = cur->health;
+                const bool hit = swing_at_creature(eye, dir);
+                const Mob* after = mob();
+                if (swings == 0) {
+                    std::snprintf(buf, sizeof buf, "the first swing hits: health %.0f -> %.0f of %.0f",
+                                  before, after ? after->health : 0.0f, full);
+                    check(hit && after && after->health < before, buf);
+                }
+                if (!after) killed = true;
+                run(0.4f, nullptr);
+            }
+            std::snprintf(buf, sizeof buf, "%d swings of the axe (%.0f damage against %.0f health) killed it",
+                          swings, g_items[axe].tool.damage, full);
+            check(killed && !mob(), buf);
+            std::snprintf(buf, sizeof buf, "it is out of the live list and counted (%u killed, %zu live)",
+                          g_killed, C.live().size());
+            check(g_killed >= 1 && C.live().empty(), buf);
+        }
+    }
+
+    // 3. A wounded mimic stays wounded through a save, and the still.
+    std::fprintf(f, "\n3. a wound is saved, and the still\n");
+    {
+        C.clear();
+        g_combat.clear();
+        const uint32_t id2 = C.spawn_at(mimic, M, face, 12.0 * 3600.0);
+        // It has to walk over before a swing can reach it.
+        run(25.0f, [&] {
+            const Mob* w = C.find_live(id2);
+            if (!w) return false;
+            const float dx = w->pos[0] - player[0], dz = w->pos[2] - player[2];
+            return dx * dx + dz * dz < 2.0f * 2.0f;
+        });
+        if (const Mob* cur = C.find_live(id2)) {
+            float eye[3], dir[3];
+            aim(*cur, eye, dir);
+            swing_at_creature(eye, dir);
+        }
+        const Mob* hurt_mob = C.find_live(id2);
+        const float left = hurt_mob ? hurt_mob->health : -1.0f;
+        std::string err;
+        C.save("build/combat_test.bin", err);
+        engine::mobs::Creatures D;
+        D.set_table(&g_creature_table);
+        D.set_world(wg.field_id());
+        const bool loaded = D.load("build/combat_test.bin", err);
+        D.update(12.0 * 3600.0, player, engine::mobs::SpawnEnv());
+        const Mob* back = D.find_live(id2);
+        std::snprintf(buf, sizeof buf, "a wounded mimic (%.0f of %.0f) comes back wounded: %.0f",
+                      left, MK.health, back ? back->health : -1.0f);
+        check(loaded && back && std::fabs(back->health - left) < 0.01f && left < MK.health, buf);
+
+        // The still: over the player's shoulder, the mimic in front of them.
+        if (const Mob* w = C.find_live(id2)) {
+            const float bx = w->pos[0] - player[0], bz = w->pos[2] - player[2];
+            const float d = std::sqrt(bx * bx + bz * bz);
+            const float fx = bx / d, fz = bz / d;        // player -> mimic
+            const float rx = -fz, rz = fx;               // and across it
+            // Behind the player and off to one side, or the player's own
+            // back fills the frame and hides what they are fighting.
+            g_camera.x = player[0] - fx * 4.0f + rx * 2.6f;
+            g_camera.z = player[2] - fz * 4.0f + rz * 2.6f;
+            g_camera.y = player[1] + 2.0f;
+            const float mid[3] = {(player[0] + w->pos[0]) * 0.5f, 0.0f, (player[2] + w->pos[2]) * 0.5f};
+            g_camera.yaw = std::atan2(mid[0] - g_camera.x, mid[2] - g_camera.z);
+            g_camera.pitch = -0.16f;
+            g_feet[0] = player[0]; g_feet[1] = player[1]; g_feet[2] = player[2];
+            g_char_yaw = g_camera.yaw;
+            g_cam_dist = 4.5f;
+            g_have_prev_feet = false;
+            for (int i = 0; i < 20; ++i) update_character(1.0f / 60.0f, tsim, 0.0f, 0.0f);
+            publish_character();
+            for (int i = 0; i < 20; ++i) publish_creatures(1.0f / 60.0f, player);
+            engine::ViewConstants v = {};
+            fill_view(g_camera, g_res_w, g_res_h, tsim, v);
+            g_renderer.capture(v, "build/combat_hit.bmp", err);
+            std::fprintf(f, "      build/combat_hit.bmp: the player facing a wounded mimic\n");
+        }
+    }
+
+    C.clear();
+    run(0.05f, nullptr);
     std::snprintf(buf, sizeof buf, "no script errors (%zu; build/creature_log.txt)", g_minds.errors());
     check(g_minds.errors() == 0, buf);
     std::fprintf(f, "\n%s: %d failed\n", fails ? "FAILURES" : "ALL PASSED", fails);
@@ -4166,8 +4597,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     const bool nav_mode = hl.find("--nav-report") != std::string::npos;
     const bool move_mode = hl.find("--move-test") != std::string::npos;
     const bool mimic_mode = hl.find("--mimic-test") != std::string::npos;
+    const bool combat_mode = hl.find("--combat-test") != std::string::npos;
     const bool headless = report_mode || fell_mode || dig_tree_mode || lights_mode || leak_mode ||
                           pit_mode || survival_mode || mob_mode || nav_mode || move_mode || mimic_mode ||
+                          combat_mode ||
                           !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
@@ -4271,7 +4704,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_loco.set(&g_creature_table, g_nav_ok ? &g_nav : nullptr, &g_physics, wg.table().sea_level);
             if (g_creatures_ok) {
                 std::string merr;
-                g_minds_ok = g_minds.init(&g_creature_table, &g_creatures, &g_loco, g_nav_ok ? &g_nav : nullptr, merr);
+                g_minds_ok = g_minds.init(&g_creature_table, &g_creatures, &g_loco, g_nav_ok ? &g_nav : nullptr,
+                                          &g_combat, merr);
                 if (g_surv_ok) g_minds.light() = g_items.stealth.light;
                 g_loco.skip_wander.assign(g_creature_table.kinds.size(), false);
                 for (size_t k = 0; k < g_creature_table.kinds.size(); ++k) g_loco.skip_wander[k] = g_minds.scripted(int(k));
@@ -7059,6 +7493,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (combat_mode) {
+        const int r = run_combat_test();
+        g_minds.shutdown();
+        g_loco.clear();
+        g_nav.shutdown();
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return r;
+    }
+
     if (mimic_mode) {
         const int r = run_mimic_test();
         g_minds.shutdown();
@@ -9066,12 +9510,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 g_anim.trigger_action();
                 g_ev_swung = true;
             }
-            uint32_t id = 0;
-            int hits = 0, need = 0;
-            const int r = g_felling.chop(eye, fwd, t, &id, &hits, &need);
-            if (r == 0) std::snprintf(g_tree_msg, sizeof g_tree_msg, "nothing in reach");
-            else if (r == 1) std::snprintf(g_tree_msg, sizeof g_tree_msg, "chop %d/%d", hits, need);
-            else hud_say("Timber!");
+            // A creature in the swing's way takes it; the tree behind it
+            // does not (one swing, one target).
+            if (!swing_at_creature(eye, fwd)) {
+                uint32_t id = 0;
+                int hits = 0, need = 0;
+                const int r = g_felling.chop(eye, fwd, t, &id, &hits, &need);
+                if (r == 0) std::snprintf(g_tree_msg, sizeof g_tree_msg, "nothing in reach");
+                else if (r == 1) std::snprintf(g_tree_msg, sizeof g_tree_msg, "chop %d/%d", hits, need);
+                else hud_say("Timber!");
+            }
         }
         if (g_want_pick) {
             g_want_pick = false;
@@ -9147,7 +9595,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 const bool ok4 = g_surv_ok && g_surv.load("build/player.txt", err);
                 if (ok4) { g_surv.reset_fall(); g_jump_window = 0.0f; }
                 const bool ok5 = g_creatures_ok && g_creatures.load("build/mobs.bin", err);
-                if (ok5) { g_mob_anim.clear(); g_loco.clear(); g_minds.clear(); }
+                if (ok5) { g_mob_anim.clear(); g_loco.clear(); g_minds.clear(); g_combat.clear(); }
                 if (g_nav_ok) g_nav.invalidate_all();
                 hud_say((ok || ok2 || ok3 || ok4 || ok5) ? "Loaded" : "Nothing to load");
             }
