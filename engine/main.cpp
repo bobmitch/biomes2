@@ -131,6 +131,7 @@ float g_cam_dist = 4.5f;        // wanted, metres; 0 is first person
 float g_cam_dist_now = 4.5f;    // after collision, eased back out
 float g_char_yaw = 0.0f;        // the character's facing, Camera's convention
 float g_char_speed = 0.0f;      // horizontal, m/s, from what physics did
+bool  g_crouch = false;         // crouched (Left Ctrl toggles, on land; ADR-007)
 float g_prev_feet[3] = {0.0f, 0.0f, 0.0f};
 bool  g_have_prev_feet = false;
 std::vector<float> g_bones;
@@ -188,6 +189,7 @@ void update_character(float dt, float t, float vx, float vz) {
     in.vertical = vy;
     in.time = t;
     in.torch = g_renderer.carried_torch();
+    in.crouch = g_crouch;
     g_anim.update(in);
 }
 
@@ -507,6 +509,13 @@ std::string g_prompt;           // what E would do now
 bool  g_jump_was_down = false;
 float g_jump_window = 0.0f;     // seconds a paid-for jump stays asked for
 bool  g_torch_in_hand = false;  // the equipped torch, as last handed to the renderer
+// The player as creatures hear and see them (engine/player/stealth.h,
+// docs/adr-007-*): crouch (Left Ctrl toggles, on land), and this frame's
+// noisy events, gathered where they happen and handed over once a frame.
+engine::player::Stealth g_stealth;
+bool  g_ev_jumped = false, g_ev_swung = false, g_ev_dug = false;
+bool  g_stealth_air = false;    // airborne last frame (a landing ends it)
+float g_stealth_peak = 0.0f;    // the feet's highest point since leaving the ground
 
 std::string lower_case(std::string t) {
     for (char& c : t) c = char(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
@@ -543,6 +552,8 @@ void toggle_walk() {
         g_have_prev_feet = false;
     }
     g_surv.reset_fall();
+    g_crouch = false;
+    g_stealth_air = false;
 }
 
 // E: the ripe forage plant under the crosshair, else a glowing mushroom.
@@ -593,6 +604,36 @@ void update_prompt() {
         const int item = g_items.find(sp.item);
         g_prompt = "[E] Pick " + lower_case(item >= 0 ? g_items[item].name : sp.name);
     }
+}
+
+// A frame of the player as creatures perceive them: what the body did, this
+// frame's noisy events, and the light on them (ADR-007).
+void stealth_frame(float dt) {
+    engine::player::StealthInput in;
+    in.body = g_walk;
+    if (g_walk) {
+        const engine::Medium md = g_physics.medium();
+        in.speed = g_char_speed;
+        in.crouching = g_crouch;
+        in.swimming = md == engine::Medium::Swimming;
+        in.wading = md == engine::Medium::Wading;
+        in.grounded = g_physics.character_supported();
+        in.jumped = g_ev_jumped;
+        in.swung = g_ev_swung;
+        in.dug = g_ev_dug;
+        // A landing: the drop from the highest point since the feet left.
+        const bool air = !in.grounded && !in.swimming && !in.wading;
+        if (air) {
+            if (!g_stealth_air || g_feet[1] > g_stealth_peak) g_stealth_peak = g_feet[1];
+        } else if (g_stealth_air) {
+            in.landed_m = (std::max)(0.0f, g_stealth_peak - g_feet[1]);
+        }
+        g_stealth_air = air;
+        const float chest[3] = {g_feet[0], g_feet[1] + 1.2f, g_feet[2]};
+        in.lux = g_renderer.illuminance_at(chest);
+    }
+    g_ev_jumped = g_ev_swung = g_ev_dug = false;
+    g_stealth.update(dt, in);
 }
 
 // A frame of the player's survival in the window: the clock, the drains,
@@ -729,6 +770,12 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 const engine::Mode m = g_renderer.mode();
                 g_renderer.set_mode(m == engine::Mode::Mesh ? engine::Mode::Wireframe
                                                             : engine::Mode::Mesh);
+                return 0;
+            }
+            // Left Ctrl crouches (a toggle, as Valheim's), on land: in the
+            // water Ctrl dives while held. Right Ctrl (extended) does nothing.
+            if (wp == VK_CONTROL && !(lp & (1 << 24)) && !(lp & (1 << 30))) {
+                if (g_walk && g_physics.medium() != engine::Medium::Swimming) g_crouch = !g_crouch;
                 return 0;
             }
             // F10 flies / walks (Tab is the inventory's now, the script's).
@@ -1286,6 +1333,11 @@ void setup_ui(HWND hwnd) {
             p.day = g_surv.day();
             p.hour = g_surv.hour();
             p.equipped = g_surv.equipped() + 1;
+            p.crouching = g_walk && g_crouch;
+            p.noise_db = g_stealth.level_db();
+            p.visibility = g_stealth.visibility();
+            p.light = g_stealth.light();
+            p.lux = g_stealth.lux();
             for (const engine::player::ActiveFood& f : g_surv.foods()) {
                 engine::ui::FoodView v;
                 v.id = g_items[f.item].id;
@@ -1560,6 +1612,94 @@ int run_survival_test(HWND hwnd) {
         }
     }
 
+    // --- A2. stealth and perception (ADR-007) ---------------------------------
+    // The default tuning (stealth.h), not items.json's, so retuning the data
+    // moves nothing here; and the mimic's numbers from the ADR.
+    std::fprintf(f, "\nA2. the player as heard and seen, against the mimic (range 20 m, 34 dB; 50 m, 45 deg)\n");
+    {
+        namespace pc = engine::perception;
+        using engine::player::Stealth;
+        using engine::player::StealthInput;
+        Stealth st;
+        const float kHear = 20.0f, kThr = 34.0f, kView = 50.0f, kCone = 45.0f;
+        check(st.gait_level(0.0f, false, false, false) <= pc::kSilent, "standing still is silent");
+        check(close_to(st.gait_level(1.4f, true, false, false), 35, 1e-3) &&
+                  close_to(st.gait_level(1.4f, false, false, false), 50, 1e-3) &&
+                  close_to(st.gait_level(5.0f, false, false, false), 60, 1e-3) &&
+                  close_to(st.gait_level(8.0f, false, false, false), 70, 1e-3),
+              "gaits: crouch walk 35, walk 50, jog 60, sprint 70 dB");
+        check(close_to(st.gait_level(1.4f, false, false, true), 54, 1e-3) &&
+                  close_to(st.gait_level(2.0f, false, true, false), 55, 1e-3) &&
+                  close_to(st.gait_level(0.0f, false, true, false), 40, 1e-3),
+              "wading walk 54, swimming 55, treading water 40 dB");
+        // Hearing: inverse square against the threshold, inside the range.
+        check(pc::hears(60, 19.9f, kHear, kThr) && !pc::hears(60, 20.5f, kHear, kThr),
+              num("a jog is heard to the range's edge: %.1f m", pc::hear_distance(60, kHear, kThr)));
+        check(pc::hears(50, 6.0f, kHear, kThr) && !pc::hears(50, 6.6f, kHear, kThr),
+              num("a walk is heard to %.2f m (6.31)", pc::hear_distance(50, kHear, kThr)));
+        check(pc::hears(35, 1.0f, kHear, kThr) && !pc::hears(35, 1.3f, kHear, kThr),
+              num("a crouch walk is heard to %.2f m (1.12)", pc::hear_distance(35, kHear, kThr)));
+        check(pc::hears(82, 20.0f, kHear, kThr) && !pc::hears(82, 21.0f, kHear, kThr) && !pc::hears(82, 5.0f, 0.0f, kThr),
+              "the axe is heard to the range and no further; a deaf creature hears nothing");
+        // Spikes and their decay; no footsteps in the air.
+        {
+            StealthInput in;
+            in.body = true;
+            in.grounded = true;
+            in.jumped = true;
+            st.update(1.0f / 60.0f, in);
+            const float j = st.level_db();
+            in.jumped = false;
+            for (int i = 0; i < 60; ++i) st.update(1.0f / 60.0f, in);
+            const float later = st.level_db();
+            check(close_to(j, 62, 1e-3) && close_to(later, 32, 0.6),
+                  num("a jump 62 dB, a second later %.1f (decays 30 dB/s)", later));
+            in.landed_m = 5.0f;
+            st.update(1.0f / 60.0f, in);
+            check(close_to(st.level_db(), 74, 1e-3), num("landing after 5 m: %.1f dB (64 + 2/m)", st.level_db()));
+            for (int i = 0; i < 240; ++i) st.update(1.0f / 60.0f, StealthInput());
+            in = StealthInput();
+            in.body = true;
+            in.grounded = false;
+            in.speed = 5.0f;
+            st.update(1.0f / 60.0f, in);
+            check(st.level_db() <= pc::kSilent, "a jog's footsteps stop in the air");
+            in.grounded = true;
+            in.swung = true;
+            st.update(1.0f / 60.0f, in);
+            check(close_to(st.level_db(), 82, 1e-3), "a swing of the axe: 82 dB over a jog's 60");
+        }
+        // Sight.
+        check(close_to(st.gait_visibility(0, true, false), 0.35, 1e-4) &&
+                  close_to(st.gait_visibility(1.4f, true, false), 0.50, 1e-4) &&
+                  close_to(st.gait_visibility(1.4f, false, false), 0.85, 1e-4) &&
+                  close_to(st.gait_visibility(8.0f, false, false), 1.0, 1e-4),
+              "visibility: crouched 0.35 / 0.5, walking 0.85, sprinting 1");
+        const pc::LightCurve lc;
+        const float l10 = pc::light_factor(10.0f, 1.0f, lc), l60 = pc::light_factor(60.0f, 1.0f, lc);
+        const float lmoon = pc::light_factor(0.19f, 1.0f, lc), lnv = pc::light_factor(0.19f, 100.0f, lc);
+        check(pc::light_factor(1e5f, 1.0f, lc) == 1.0f && pc::light_factor(400.0f, 1.0f, lc) == 1.0f &&
+                  close_to(l10, 0.59, 0.01) && close_to(l60, 0.79, 0.01) && close_to(lmoon, 0.15, 0.01) &&
+                  pc::light_factor(0.001f, 1.0f, lc) == lc.floor,
+              num("light: day 1, 10 lx %.2f, torch 60 lx %.2f, moon %.2f, cave the floor", l10, l60, lmoon));
+        check(lnv > 0.6f, num("night vision (gain 100) by moonlight: %.2f", lnv));
+        const float eye[3] = {0, 1.6f, 0}, fwd[3] = {0, 0, 1};
+        auto at = [&](float deg, float d, float out[3]) {
+            const float r = deg * 0.017453293f;
+            out[0] = std::sin(r) * d; out[1] = 1.2f; out[2] = std::cos(r) * d;
+        };
+        float p20[3], p25[3], pb[3], p42[3], p43[3];
+        at(20, 30, p20); at(25, 30, p25); at(180, 5, pb); at(0, 42, p42); at(0, 43, p43);
+        check(pc::sees(eye, fwd, p20, kView, kCone, 1, 1, true) && !pc::sees(eye, fwd, p25, kView, kCone, 1, 1, true) &&
+                  !pc::sees(eye, fwd, pb, kView, kCone, 1, 1, true),
+              "the 45 degree cone: 20 off seen, 25 off and behind not");
+        check(pc::sees(eye, fwd, p42, kView, kCone, 0.85f, 1, true) && !pc::sees(eye, fwd, p43, kView, kCone, 0.85f, 1, true) &&
+                  !pc::sees(eye, fwd, p20, kView, kCone, 1, 1, false),
+              "a walker by day is seen to 42.5 m; a blocked ray sees nothing");
+        check(close_to(pc::sight_range(kView, 0.5f, 1), 25, 1e-3) && close_to(pc::sight_range(kView, 1, lmoon), 7.5, 0.5),
+              num("a crouched walker by day: 25 m; a sprinter by moonlight: %.1f m", pc::sight_range(kView, 1, lmoon)));
+    }
+
     // --- B. the world's forage ---------------------------------------------
     std::fprintf(f, "\nB. forage round the spawn (seed %llu)\n", static_cast<unsigned long long>(engine::WorldGpu::world_seed));
     engine::Forage& fo = g_renderer.forage();
@@ -1651,6 +1791,20 @@ int run_survival_test(HWND hwnd) {
         hud_say("Ate strawberries");
         g_prompt = "[E] Pick strawberries";
         g_walk = true;
+        // Crouch-walking, in the light where the camera is: the stealth meter.
+        g_crouch = true;
+        {
+            engine::player::StealthInput si;
+            si.body = true;
+            si.crouching = true;
+            si.speed = 1.4f;
+            si.grounded = true;
+            const float at[3] = {g_camera.x, g_camera.y, g_camera.z};
+            si.lux = g_renderer.illuminance_at(at);
+            g_stealth.update(1.0f / 60.0f, si);
+            std::fprintf(f, "      stealth in the HUD still: %.0f dB, visibility %.2f, %.0f lux, light %.2f\n",
+                         g_stealth.level_db(), g_stealth.visibility(), g_stealth.lux(), g_stealth.light());
+        }
         g_display.forced = true;
         setup_ui(hwnd);
         std::string err;
@@ -2314,6 +2468,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         if (g_surv_ok) {
             g_surv.init(&g_items);
             g_surv.new_game(14.0f);
+            g_stealth.set_tuning(g_items.stealth);
         }
         if (FILE* sf = std::fopen("build/startup.txt", "a")) {
             if (g_surv_ok)
@@ -6289,7 +6444,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // speed: m/s; air / swim: the medium; action: seconds into the axe's
         // swing, -1 none.
         struct Pose { const char* name; float speed; bool air, swim, torch; float action; float phase;
-                      float cam_yaw; float cam_pitch; float dist; float pivot; };
+                      float cam_yaw; float cam_pitch; float dist; float pivot; bool crouch; };
         // Camera yaw: the character faces +z (yaw 0); -pi/2 looks along -x,
         // which is from the character's left side; pi looks back at its front.
         const float side = -1.5707963f, front = 3.1415927f, behind = 0.35f;
@@ -6310,6 +6465,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             {"torch_jog", 5.0f, false, false, true, -1.0f, 0.3f, side, -0.05f, 3.4f, 1.0f},
             {"chop", 0.0f, false, false, false, 0.55f, 0.0f, front, -0.05f, 3.2f, 1.0f},
             {"third_person", 5.0f, false, false, false, -1.0f, 0.6f, behind, -0.2f, 4.5f, kCamPivot},
+            {"crouch_idle", 0.0f, false, false, false, -1.0f, 0.0f, side, -0.05f, 3.2f, 0.8f, true},
+            {"crouch_walk", 1.4f, false, false, false, -1.0f, 0.0f, side, -0.05f, 3.2f, 0.8f, true},
+            {"crouch_front", 1.4f, false, false, false, -1.0f, 0.0f, front, -0.05f, 3.2f, 0.8f, true},
         };
         FILE* rf = std::fopen("build/pose_sheet.txt", "w");
         if (rf) std::fprintf(rf, "%s\n%s\nfeet at (%.2f, %.2f, %.2f)\n", g_renderer.character().note().c_str(),
@@ -6322,6 +6480,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             in.grounded = !p.air && !p.swim;
             in.swimming = p.swim;
             in.torch = p.torch;
+            in.crouch = p.crouch;
             for (int i = 0; i < 60; ++i) {
                 in.time = float(i) * in.dt;
                 g_anim.set_phase(p.phase);
@@ -6897,6 +7056,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             const bool swimming = g_physics.medium() == engine::Medium::Swimming;
             const bool sprinting = (GetAsyncKeyState(VK_SHIFT) & 0x8000) && moving && !swimming &&
                                    (!g_surv_run || g_surv.can_sprint());
+            // Swimming and sprinting stand the player up; crouched is slow.
+            if (swimming || sprinting) g_crouch = false;
+            if (g_crouch) sp = g_stealth.tuning().crouch_speed;
             if (sprinting) sp = kSprintSpeed;
             walk_moving = moving;
             walk_sprinting = sprinting;
@@ -6908,6 +7070,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             // A jump from the ground costs stamina, paid on the press; in the
             // water Space swims up and the swim's drain pays for it.
             bool jump = space;
+            if (space && !g_jump_was_down && !swimming && g_physics.character_supported() &&
+                (!g_surv_run || g_surv.stamina() * 2.0f >= g_surv.tuning().jump_cost)) {
+                g_ev_jumped = true;    // a jump is heard (stealth), and stands the player up
+                g_crouch = false;
+            }
             if (g_surv_run && !swimming) {
                 if (space && !g_jump_was_down && g_physics.character_supported()) {
                     if (g_surv.spend(g_surv.tuning().jump_cost)) g_jump_window = 0.25f;
@@ -6975,6 +7142,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (g_walk) {
                 g_char_yaw = g_camera.yaw;
                 g_anim.trigger_action();
+                g_ev_swung = true;
             }
             uint32_t id = 0;
             int hits = 0, need = 0;
@@ -7016,10 +7184,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
             const engine::Renderer::AimedDig d =
                 g_renderer.dig_aimed(eye, fwd, kDigReach, kDigRadii[g_dig_size]);
+            if (d.hit && g_walk) g_ev_dug = true;
             if (!d.hit) std::snprintf(g_tree_msg, sizeof g_tree_msg, "dig: no ground within %.0f m", kDigReach);
             else std::snprintf(g_tree_msg, sizeof g_tree_msg, "dug r %.2f m at %.1f m, %zu voxels, %.1f ms",
                                kDigRadii[g_dig_size], d.dist, d.voxels, d.ms);
         }
+        stealth_frame(float(dt));
         if (g_snap_walk_frames >= 0 && --g_snap_walk_frames < 0) {
             g_walk = true;
             g_physics.place_character(g_snap_feet[0], g_snap_feet[1] + 0.2f, g_snap_feet[2]);

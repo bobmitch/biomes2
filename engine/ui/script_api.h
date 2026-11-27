@@ -82,6 +82,12 @@ struct PlayerView {
     float hour = 0.0f;
     int equipped = 0;   // 1-based slot, 0 for empty hands
     std::vector<FoodView> foods;
+    // The player as creatures hear and see them (engine/player/stealth.h).
+    bool crouching = false;
+    float noise_db = -100.0f;   // source level, dB at 1 m; -100 silent
+    float visibility = 0.0f;    // posture and speed, 0..1
+    float light = 0.0f;         // the light share an ordinary eye gets, 0..1
+    float lux = 0.0f;
 };
 
 struct SlotView {

@@ -450,6 +450,8 @@ void CharacterAnimator::bind(const CharacterModel* m, const AnimLibrary* lib) {
         c_swim_fwd_ = lib_->find("Swim_Fwd_Loop");
         c_torch_ = lib_->find("Idle_Torch_Loop");
         c_action_ = lib_->find("Sword_Attack");
+        c_crouch_idle_ = lib_->find("Crouch_Idle_Loop");
+        c_crouch_fwd_ = lib_->find("Crouch_Fwd_Loop");
         // Masks: the upper body (spine_01 and everything it carries) and the
         // right arm (clavicle_r down), by walking each joint's parents.
         const int spine = m->find("spine_01"), clav_r = m->find("clavicle_r");
@@ -493,6 +495,7 @@ void CharacterAnimator::update(const LocomotionInput& in) {
     run_ = approach(run_, smooth(2.2f, 5.0f, in.speed), 5.0f, dt);
     air_ = approach(air_, (!in.grounded && !in.swimming) ? 1.0f : 0.0f, in.grounded ? 12.0f : 6.0f, dt);
     swim_ = approach(swim_, in.swimming ? 1.0f : 0.0f, 4.0f, dt);
+    crouch_ = approach(crouch_, (in.crouch && !in.swimming) ? 1.0f : 0.0f, 8.0f, dt);
     for (size_t j = 0; j < M.joints.size(); ++j) std::memcpy(&local_q_[j * 4], M.joints[j].q, 16);
     pelvis_offset_[0] = pelvis_offset_[1] = pelvis_offset_[2] = 0.0f;
     pelvis_t_on_ = false;
@@ -625,6 +628,19 @@ void CharacterAnimator::pose_clips(const LocomotionInput& in) {
         sample_phase(ca, phase_, A);
         if (cb != ca && t > 0.0f) { sample_phase(cb, phase_, B); pose_blend(A, B, t, nullptr, true); }
         pose_blend(P, A, move_, nullptr, true);
+    }
+    // Crouched: down to the crouch's idle, and its walk by speed on its own
+    // phase (a crouch's stride is not the walk's), advanced by distance.
+    if (crouch_ > 0.001f && (c_crouch_idle_ >= 0 || c_crouch_fwd_ >= 0)) {
+        const int a = c_crouch_idle_ >= 0 ? c_crouch_idle_ : c_crouch_fwd_;
+        sample(a, idle_t_, A);
+        if (c_crouch_fwd_ >= 0) {
+            if (in.grounded && !in.swimming) crouch_phase_ += v * dt / stride(c_crouch_fwd_, 1.5f);
+            crouch_phase_ -= std::floor(crouch_phase_);
+            sample_phase(c_crouch_fwd_, crouch_phase_, B);
+            pose_blend(A, B, smooth(0.1f, 0.6f, v), nullptr, true);
+        }
+        pose_blend(P, A, crouch_, nullptr, true);
     }
     // The air: the jump's loop from the moment the feet leave.
     if (airborne && !was_air_) air_t_ = 0.0f;

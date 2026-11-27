@@ -142,6 +142,19 @@ local function update_vitals(p)
 	set("clock", string.format("Day %d &nbsp; %02d:%02d", p.day, h, m))
 end
 
+-- Stealth (docs/adr-007-*): how loud the player is (the source level, 30 to
+-- 85 dB across the bar) and how visible (posture and speed x the light on
+-- them). Shown while walking, brighter crouched.
+local function update_stealth(p)
+	set_opacity("stealth", p.walking and (p.crouching and 1 or 0.55) or 0)
+	set_class("stealth", "crouched", p.crouching)
+	local loud = p.noise_db > -50 and string.format("%d dB", math.floor(p.noise_db + 0.5)) or "silent"
+	set("stealth-state", string.format("%s &nbsp; %s &nbsp; seen %d%%", p.crouching and "crouched" or "standing",
+		loud, math.floor(100 * p.visibility * p.light + 0.5)))
+	set_width("noise-fill", (p.noise_db - 30) / 55)
+	set_width("seen-fill", p.visibility * p.light)
+end
+
 -- The inventory shows its own top row; the HUD's hotbar goes while it is open.
 function hud.set_hotbar_hidden(h)
 	hotbar_hidden = h
@@ -165,4 +178,5 @@ function hud.update(paused)
 	if not p then return end
 	if hotbar_hidden then set("hotbar", "") else update_hotbar(p) end
 	update_vitals(p)
+	update_stealth(p)
 end

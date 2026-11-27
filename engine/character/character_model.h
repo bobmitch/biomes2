@@ -113,6 +113,7 @@ struct LocomotionInput {
     float vertical = 0.0f;    // m/s, + up
     float time = 0.0f;
     bool  torch = false;      // carrying one: the right arm holds it up
+    bool  crouch = false;     // crouched: Crouch_Idle_Loop to Crouch_Fwd_Loop by speed
 };
 
 class CharacterAnimator {
@@ -139,6 +140,7 @@ public:
     void  set_phase(float p) { phase_ = p - std::floor(p); }
     float run_blend() const { return run_; }
     float air_blend() const { return air_; }
+    float crouch_blend() const { return crouch_; }
     float foot_drop() const { return drop_; }
 
 private:
@@ -154,10 +156,12 @@ private:
     // Clips by role, -1 if the library lacks one.
     int c_idle_ = -1, c_walk_ = -1, c_jog_ = -1, c_sprint_ = -1, c_air_ = -1, c_land_ = -1;
     int c_swim_idle_ = -1, c_swim_fwd_ = -1, c_torch_ = -1, c_action_ = -1;
+    int c_crouch_idle_ = -1, c_crouch_fwd_ = -1;
     std::vector<uint8_t> upper_mask_, right_arm_mask_;
     AnimPose pose_a_, pose_b_, pose_c_;
     float idle_t_ = 0.0f, air_t_ = 0.0f, land_t_ = -1.0f, swim_t_ = 0.0f, swim_phase_ = 0.0f;
     float action_t_ = -1.0f, torch_ = 0.0f;
+    float crouch_ = 0.0f, crouch_phase_ = 0.0f;
     bool  was_air_ = false;
     bool  pelvis_t_on_ = false;
     float pelvis_t_[3] = {0, 0, 0};

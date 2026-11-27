@@ -81,6 +81,38 @@ bool ItemTable::load(const char* path, std::string& error) {
                 throw std::runtime_error("player: base_health and base_stamina > 0, 1..6 food_slots, "
                                          "regen_interval_s > 0, fall_lethal_m > fall_safe_m");
         }
+        if (root.has("stealth")) {
+            const jsonlite::Value& p = root.at("stealth");
+            auto num = [&](const char* k, float& v) { if (p.has(k)) v = float(p.number(k)); };
+            StealthTuning& s = stealth;
+            num("crouch_speed", s.crouch_speed);
+            num("crouch_db", s.crouch_db);
+            num("walk_db", s.walk_db);
+            num("jog_db", s.jog_db);
+            num("sprint_db", s.sprint_db);
+            num("swim_db", s.swim_db);
+            num("swim_idle_db", s.swim_idle_db);
+            num("wade_add_db", s.wade_add_db);
+            num("jump_db", s.jump_db);
+            num("land_db", s.land_db);
+            num("land_db_per_m", s.land_db_per_m);
+            num("axe_db", s.axe_db);
+            num("dig_db", s.dig_db);
+            num("spike_decay_db_s", s.spike_decay_db_s);
+            num("vis_still", s.vis_still);
+            num("vis_walk", s.vis_walk);
+            num("vis_jog", s.vis_jog);
+            num("vis_sprint", s.vis_sprint);
+            num("vis_crouch_still", s.vis_crouch_still);
+            num("vis_crouch_move", s.vis_crouch_move);
+            num("vis_swim", s.vis_swim);
+            num("dark_lux", s.light.dark_lux);
+            num("full_lux", s.light.full_lux);
+            num("light_floor", s.light.floor);
+            if (s.crouch_speed <= 0.0f || s.spike_decay_db_s <= 0.0f || s.light.dark_lux <= 0.0f ||
+                s.light.full_lux <= s.light.dark_lux)
+                throw std::runtime_error("stealth: crouch_speed and spike_decay_db_s > 0, 0 < dark_lux < full_lux");
+        }
         if (root.has("clock")) {
             const jsonlite::Value& c = root.at("clock");
             if (c.has("day_length_min")) day_length_s = float(c.number("day_length_min")) * 60.0f;

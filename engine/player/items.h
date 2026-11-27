@@ -12,6 +12,8 @@
 #ifndef ENGINE_PLAYER_ITEMS_H
 #define ENGINE_PLAYER_ITEMS_H
 
+#include "engine/player/stealth.h"
+
 #include <string>
 #include <vector>
 
@@ -86,6 +88,7 @@ public:
     bool valid(int i) const { return i >= 0 && i < size(); }
 
     PlayerTuning tuning;
+    StealthTuning stealth;          // the `stealth` block: the player as heard and seen
     float day_length_s = 1800.0f;   // real seconds of play for 24 game hours
     std::vector<StartItem> start;
 

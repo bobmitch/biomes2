@@ -231,6 +231,7 @@ if(BIOMES2_ENGINE)
     engine/player/items.cpp
     engine/player/inventory.cpp
     engine/player/survival.cpp
+    engine/player/stealth.cpp
     engine/player/icons.cpp
     engine/character/character_model.cpp
     engine/character/character_renderer.cpp

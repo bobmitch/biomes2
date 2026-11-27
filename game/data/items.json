@@ -10,6 +10,17 @@
     "fall_safe_m": 4, "fall_lethal_m": 20, "fall_max_damage": 100,
     "food_slots": 3, "food_decay_power": 0.3, "food_refresh_at": 0.5
   },
+  "_note_stealth": "The player as creatures hear and see them (docs/adr-007-creatures-perception-navigation.md). Sound: dB at 1 m, heard at d metres as dB - 20 log10(d) against a creature's threshold within its range. Gaits by speed (walk 1.4 m/s, jog 5, sprint 8), silent standing; events are spikes decaying at spike_decay_db_s. Visibility 0..1 by posture and speed scales a creature's view range, and so does the light on the player, on a log scale from dark_lux (light_floor) to full_lux (1).",
+  "stealth": {
+    "crouch_speed": 1.4,
+    "crouch_db": 35, "walk_db": 50, "jog_db": 60, "sprint_db": 70,
+    "swim_db": 55, "swim_idle_db": 40, "wade_add_db": 4,
+    "jump_db": 62, "land_db": 64, "land_db_per_m": 2,
+    "axe_db": 82, "dig_db": 78, "spike_decay_db_s": 30,
+    "vis_still": 0.70, "vis_walk": 0.85, "vis_jog": 0.95, "vis_sprint": 1.0,
+    "vis_crouch_still": 0.35, "vis_crouch_move": 0.50, "vis_swim": 0.50,
+    "dark_lux": 0.05, "full_lux": 400, "light_floor": 0.1
+  },
   "_note_clock": "day_length_min: real minutes of play for 24 game hours. Forage regrows in game days (worldgen/data/archetypes.json forage regrow_days).",
   "clock": {"day_length_min": 30},
   "start": [

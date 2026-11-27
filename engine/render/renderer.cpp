@@ -2649,6 +2649,54 @@ void Renderer::height_fog_constants(float out[3][4], bool on) const {
     out[2][3] = hfgi_on_ ? hfgi_.camera_sky() : 1.0f;
 }
 
+float Renderer::illuminance_at(const float p[3]) const {
+    auto lum = [](const float c[3]) { return 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2]; };
+    const SkyFrame& f = sky_frame_;
+    float lux = 0.0f;
+    // The key light's beam, on a body (normal to the beam).
+    const float key = lum(f.key_lux);
+    if (key > 0.0f && f.key_dir[1] > 0.0f) {
+        const bool clear = !ray_query_ || ray_query_(p, f.key_dir, 400.0f) < 0.0f;
+        if (clear) {
+            // The cloud shadow map's sunlit share by coverage, as the shot
+            // report measures it: 0.17 85%, 0.35 70%, 0.56 45%, 0.68 20%,
+            // 0.80 2%. A mean, not the shadow at p.
+            const float cov = clouds_on_ && clouds_.ready() ? clouds_.coverage() : 0.0f;
+            float sun = 1.0f - (cov - 0.05f) / 0.78f;
+            sun = sun < 0.0f ? 0.0f : (sun > 1.0f ? 1.0f : sun);
+            lux += key * sun;
+        }
+    }
+    // The sky: pi x its mean radiance on a level surface, by the open sky.
+    const float open = hfgi_on_ ? hfgi_.camera_open() : 1.0f;
+    lux += 3.14159265f * lum(f.sky_mean) * open * storm_dim();
+    // Local lights: lumens over 4 pi d^2 inside each light's range.
+    auto add = [&](const LocalLight& l, bool always) {
+        const float dx = l.pos[0] - p[0], dy = l.pos[1] - p[1], dz = l.pos[2] - p[2];
+        const float d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 >= l.range * l.range) return;
+        const float w = 1.0f - d2 / (l.range * l.range);
+        const float e = l.lumens / (12.566371f * (std::max)(d2, 0.25f)) * w * w;
+        if (e < 1e-3f) return;
+        if (!always && ray_query_) {
+            const float d = std::sqrt(d2);
+            if (d > 0.6f) {
+                const float dir[3] = {dx / d, dy / d, dz / d};
+                if (ray_query_(p, dir, d - 0.5f) >= 0.0f) return;
+            }
+        }
+        lux += e;
+    };
+    if (torch_on_) {
+        LocalLight t = make_torch();
+        for (int k = 0; k < 3; ++k) t.pos[k] = torch_anchored_ ? torch_anchor_[k] : p[k];
+        if (!torch_anchored_) t.pos[1] += 0.4f;
+        add(t, true);
+    }
+    for (size_t i = 0; i < lights_.size(); ++i) add(lights_[i], false);
+    return lux;
+}
+
 float Renderer::storm_dim() const {
     if (!clouds_on_ || !clouds_.ready() || mode_ == Mode::Wireframe) return 1.0f;
     auto smooth = [](float a, float b, float x) {

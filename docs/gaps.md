@@ -5,7 +5,8 @@ the section of CLAUDE.md named in brackets has the measurement and the why.
 None of these blocks anything that works today. Ordered by area, not by
 priority.
 
-Last gathered: 2026-11-21, after the exploration fog.
+Last gathered: 2026-11-21, after the exploration fog; creatures added
+2026-11-27.
 
 ## Gameplay: survival, the inventory, forage
 
@@ -371,7 +372,33 @@ Last gathered: 2026-11-21, after the exploration fog.
 - Keys are fixed: the controls screen is a table in `menu.lua`, not a
   binding table. The engine's own hotkeys stay in `wnd_proc`. [UI and scripting]
 
+## Creatures (ADR-007)
+
+- **Only phase 1 is built** (crouch, the player's sound and sight). Zones,
+  spawning, freezing and saving, the navmesh, movement and the mimic are
+  the ADR's phases 2-5. [Creatures and stealth]
+- **Crouching keeps the capsule's height**: no crawling under a low roof.
+  [Creatures and stealth]
+- **The light on the player is approximate**: the cloud cover's mean
+  (not the shadow map where they stand), the CAMERA's open sky, and crowns
+  do not shade it -- standing in a wood at noon counts as full sun.
+  [Creatures and stealth]
+- **No ambient masking yet**: wind and rain do not cover footsteps (the
+  perception call takes `ambient_db`, passed 0). No audio at all: sound is
+  a gameplay number. [Creatures and stealth]
+- **Creatures that cannot bear light** (blinded by a torch, hiding by day)
+  need a gain CURVE, not `dark_gain`; foliage and crowns do not block a
+  creature's sight. [ADR-007]
+- **`--pose-sheet` stands the character under the sea** on v18's world
+  (its spot predates the archipelago); the poses still read, through
+  water. [The player character]
+
 ## Future design: NPC simulation by distance (nothing built)
+
+*ADR-007 settles this for CREATURES: a zone that leaves the active area
+freezes its creatures as they are and saves them, with no catch-up (a
+player cannot shake a chase by leaving). The catch-up below is for
+persistent NPCs with schedules, still to come.*
 
 A note from 2026-11-23, before any NPC code exists, so the first NPC work
 does not simulate every NPC in the world. NPCs and player constructions

@@ -20,7 +20,8 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `tools/models/` | `pack_character.py`: the rigged glTF characters and the animation library in `assets/models/` (not in git) to `assets/models/packed/` (`*.chr`, `ual.anim`). |
 | `engine/rocks/` | Layer 9's rocks: procedural meshes, the CPU tile streamer, instanced drawing on the terrain's root signature, static colliders. |
 | `engine/props/` | Things to pick up: the caves' glowing mushrooms (`glow_mushrooms.h`), and layer 10's forage plants (`forage.h`): streaming in 64 m zones, picks and regrowth, drawing, picking with E. |
-| `engine/player/` | The player's survival: items (`items.h`), the 8 x 4 inventory, health / stamina / food / the game clock (`survival.h`), item icons painted from data (`icons.h`). No GPU. |
+| `engine/player/` | The player's survival: items (`items.h`), the 8 x 4 inventory, health / stamina / food / the game clock (`survival.h`), item icons painted from data (`icons.h`), the player as heard and seen (`stealth.h`). No GPU. |
+| `engine/mobs/` | Creatures (ADR-007, being built): `perception.h`, the arithmetic of hearing (dB) and sight (cone, range, light). |
 | `game/data/` | `items.json`: every item, the player's numbers, the clock, the start inventory. Gameplay data, outside the hash. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32), Windows only: seeds as maps plus their gameplay numbers. See "The world viewer". |
@@ -124,8 +125,8 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--clock-jump` (with `--shot`: the light under the ground after the clock
 jumps or runs, `build/time_jump.txt`; see The near field),
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
-references), `--pose-sheet` (the character in sixteen fixed poses from fixed
-cameras -- idle, walk, jog, sprint, jump, swim, torch, the axe -- `build/pose_*.bmp` and `pose_sheet.txt`), `--shot ... --gpu-profile [frames]` (per-pass GPU times,
+references), `--pose-sheet` (the character in nineteen fixed poses from fixed
+cameras -- idle, walk, jog, sprint, jump, swim, torch, the axe, crouch -- `build/pose_*.bmp` and `pose_sheet.txt`), `--shot ... --gpu-profile [frames]` (per-pass GPU times,
 pipeline statistics and the trees' overdraw, `<shot>.gpu.txt`; see Trees),
 `--leak-test`
 (ADR-004 L6: a sealed chamber, unlit and torch-lit, the heightfield GI against
@@ -1315,7 +1316,8 @@ Valheim's rules, deliberately (`engine/player/`, data in
   away a tool. **Tools**: the axe (left click chops only with it in hand)
   and the torch (in hand = the carried light; `F` still toggles the light
   directly, for debugging). A new game starts with both (`start` in
-  items.json). **Tab** opens the inventory (the old fly/walk toggle is
+  items.json). **Left Ctrl** crouches (see Creatures and stealth).
+  **Tab** opens the inventory (the old fly/walk toggle is
   **F10**, a system key: `WM_SYSKEYDOWN`): click takes a stack, click again
   places it (merge or swap), Shift + click splits into an empty slot, right
   click uses. The game runs on behind it.
@@ -1359,6 +1361,51 @@ Valheim's rules, deliberately (`engine/player/`, data in
 - **Not done**: see gaps.md -- the window loop itself (keys, the clock
   running, sprint drain, a jump's cost, fall damage, the respawn) has only
   been run through its parts headlessly, not played.
+
+### Creatures and stealth (ADR-007)
+
+`docs/adr-007-creatures-perception-navigation.md` is the plan: 64 m zones
+that spawn, simulate and FREEZE their creatures (saved, so leaving does not
+shake a chase), per-zone spawn rules with an area cap, perception by sound
+and sight, Recast/Detour navmeshes built from the field, simulation by
+distance, behaviour in Lua. Data in `game/data/creatures.json` (to come)
+and items.json's `stealth` block; never in the golden hash. **Phase 1 is
+built: the player's side.**
+
+- **Crouch**: Left Ctrl toggles it on land (in the water Ctrl still dives
+  while held; Right Ctrl does nothing); 1.4 m/s (`stealth.crouch_speed`),
+  no sprint -- Shift, a jump or swimming stands the player up. The
+  animator blends `Crouch_Idle_Loop` to `Crouch_Fwd_Loop` by speed on the
+  crouch's own phase (`LocomotionInput::crouch`). The capsule keeps its
+  height.
+- **Sound** (`engine/player/stealth.h`): a source level in dB at 1 m --
+  silent standing, crouch walk 35, walk 50, jog 60, sprint 70 (by speed,
+  walk 1.4 m/s, jog 5, sprint 8), swimming 55, treading water 40, +4
+  wading, nothing in the air -- and decaying spikes (30 dB/s): jump 62,
+  landing 64 + 2 a metre fallen, the axe 82, a dig 78. A creature hears
+  it within its `hear_range` where L - 20 log10(d) reaches its threshold
+  (`engine/mobs/perception.h`): the mimic's 20 m and 34 dB hear a jog to
+  20 m, a walk to 6.3, a crouch walk to 1.1.
+- **Sight**: visibility by posture and speed (crouched still 0.35, moving
+  0.5; standing 0.7, walk 0.85, jog 0.95, sprint 1; swimming 0.5) x the
+  LIGHT on the player through a log curve (0.05 lx the floor 0.1, 400 lx
+  full; moonlight 0.15, dusk 0.59, a carried torch at night 0.79), scaled
+  by a creature's `dark_gain` for night vision, x its view range, inside
+  its cone (the TOTAL width), with a clear ray.
+- **The light on the player** is `Renderer::illuminance_at` (chest height,
+  every frame): the key light's beam if a physics ray to it is clear,
+  times the cloud cover's MEAN sunlit share (not the shadow map at the
+  player); pi x the sky's mean radiance x the camera's open sky x
+  `storm_dim`; every placed light in clear view and the carried torch.
+  Crowns do not shade it (they are not colliders).
+- **The HUD** shows it bottom right while walking (brighter crouched): the
+  level in dB and the share seen in full light, as two bars
+  (`engine.player()` has `crouching`, `noise_db`, `visibility`, `light`,
+  `lux`).
+- `--survival-test` section A2 checks the gaits, spikes and decay, the
+  hearing distances, the visibility table, the light curve, the cone and
+  the sight ranges against the mimic's numbers, on the default tuning (so
+  retuning items.json moves nothing there).
 
 ### Forage (layer 10): things to pick, and the zones they live in
 

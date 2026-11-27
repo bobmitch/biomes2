@@ -188,6 +188,11 @@ int l_player(lua_State* L) {
     set_num(L, "day", p.day);
     set_num(L, "hour", p.hour);
     set_num(L, "equipped", p.equipped);
+    set_bool(L, "crouching", p.crouching);
+    set_num(L, "noise_db", p.noise_db);
+    set_num(L, "visibility", p.visibility);
+    set_num(L, "light", p.light);
+    set_num(L, "lux", p.lux);
     lua_newtable(L);
     for (size_t i = 0; i < p.foods.size(); ++i) {
         const FoodView& f = p.foods[i];
