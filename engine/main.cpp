@@ -46,6 +46,8 @@
 #include "engine/physics/physics_world.h"
 #include "engine/trees/felling.h"
 #include "engine/ui/ui.h"
+#include "engine/player/icons.h"
+#include "engine/player/survival.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -491,6 +493,146 @@ void jump_to_cave(int step) {
                   c.length, c.y - c.floor_y, std::sqrt(dx * dx + dz * dz));
 }
 
+// --- The player's survival (engine/player): health, stamina, food, the
+// inventory, what is in hand and the game's clock. Loaded in every mode (a
+// --shot --ui shows a fresh game's HUD); RUN only by the window loop, where
+// the clock moves and the body spends stamina. Headless modes keep the clock
+// where --time put it.
+engine::player::ItemTable g_items;
+engine::player::Survival  g_surv;
+bool  g_surv_ok = false;        // game/data/items.json loaded
+bool  g_surv_run = false;       // the window loop is running it
+std::vector<std::string> g_hud_msgs;   // the HUD's message line, drained by the script
+std::string g_prompt;           // what E would do now
+bool  g_jump_was_down = false;
+float g_jump_window = 0.0f;     // seconds a paid-for jump stays asked for
+bool  g_torch_in_hand = false;  // the equipped torch, as last handed to the renderer
+
+std::string lower_case(std::string t) {
+    for (char& c : t) c = char(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+    return t;
+}
+
+// A message for the player: the HUD's line, and the window title's.
+void hud_say(const std::string& m) {
+    g_hud_msgs.push_back(m);
+    if (g_hud_msgs.size() > 32) g_hud_msgs.erase(g_hud_msgs.begin());
+    std::snprintf(g_tree_msg, sizeof g_tree_msg, "%s", m.c_str());
+}
+
+void drain_survival_messages() {
+    for (const std::string& m : g_surv.take_messages()) hud_say(m);
+}
+
+// 1-8, or a right click in the inventory: eat, equip, put away.
+void use_hotbar_slot(int slot) {
+    if (!g_surv_ok) return;
+    const std::string m = g_surv.use_slot(slot);
+    if (!m.empty()) hud_say(m);
+    drain_survival_messages();
+}
+
+// F10: walk (third person) or fly.
+void toggle_walk() {
+    g_walk = !g_walk;
+    if (g_walk) {
+        // Drop in where the camera is, so the first frames are a
+        // short fall rather than a long one.
+        g_physics.place_character(g_camera.x, g_camera.y, g_camera.z);
+        g_char_yaw = g_camera.yaw;
+        g_have_prev_feet = false;
+    }
+    g_surv.reset_fall();
+}
+
+// E: the ripe forage plant under the crosshair, else a glowing mushroom.
+void pick_up() {
+    float fwd[3], right[3], up[3];
+    g_camera.basis(fwd, right, up);
+    const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
+    float hand[3];
+    chop_origin(hand);
+    engine::Forage::Hit fh;
+    if (g_renderer.aim_forage(eye, fwd, hand, kPickReach, fh)) {
+        const engine::Forage::Species& sp = g_renderer.forage().species(fh.species);
+        const int item = g_items.find(sp.item);
+        if (item < 0) { hud_say(sp.name + " gives " + sp.item + ", which items.json does not list"); return; }
+        if (g_surv.inventory().room_for(item) <= 0) { hud_say("Your inventory is full"); return; }
+        const int n = g_renderer.forage().pick(fh.id, g_renderer.game_time());
+        const int left = g_surv.give(item, n);
+        hud_say("+" + std::to_string(n - left) + " " + g_items[item].name + (left > 0 ? " (inventory full)" : ""));
+        return;
+    }
+    const int item = g_items.find(g_renderer.mushrooms().config().item);
+    if (item >= 0 && g_surv.inventory().room_for(item) <= 0) { hud_say("Your inventory is full"); return; }
+    if (g_renderer.pick_mushroom(eye, fwd, hand, kPickReach)) {
+        if (item >= 0) {
+            g_surv.give(item, 1);
+            hud_say("+1 " + g_items[item].name);
+        } else {
+            hud_say("picked a glowing mushroom");
+        }
+    } else {
+        hud_say("Nothing to pick up in reach");
+    }
+}
+
+// What E would pick, for the HUD's prompt. Cheap when nothing is near:
+// Forage::aim looks at the plants within reach before any ray is marched.
+void update_prompt() {
+    g_prompt.clear();
+    if (!g_captured || g_paused) return;
+    float fwd[3], right[3], up[3];
+    g_camera.basis(fwd, right, up);
+    const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
+    float hand[3];
+    chop_origin(hand);
+    engine::Forage::Hit fh;
+    if (g_renderer.aim_forage(eye, fwd, hand, kPickReach, fh)) {
+        const engine::Forage::Species& sp = g_renderer.forage().species(fh.species);
+        const int item = g_items.find(sp.item);
+        g_prompt = "[E] Pick " + lower_case(item >= 0 ? g_items[item].name : sp.name);
+    }
+}
+
+// A frame of the player's survival in the window: the clock, the drains,
+// falls and drowning, death and the respawn, and the torch in hand.
+void survival_frame(float dt, bool moving, bool sprinting) {
+    if (!g_surv_run) return;
+    engine::player::Motion m;
+    m.body = g_walk;
+    if (g_walk) {
+        m.moving = moving;
+        m.sprinting = sprinting;
+        m.swimming = g_physics.medium() == engine::Medium::Swimming;
+        m.in_water = g_physics.medium() != engine::Medium::Dry;
+        m.grounded = g_physics.character_supported();
+        m.feet_y = g_feet[1];
+    }
+    g_surv.update(dt, m);
+    if (g_time_lapse && dt > 0.0f) g_surv.advance_clock(double(dt) * 360.0);   // H: an hour every ten seconds
+    if (g_surv.dead()) {
+        g_physics.place_character(g_spawn.x, g_spawn.ground + 1.0f, g_spawn.z);
+        g_have_prev_feet = false;
+        g_surv.respawn();
+        g_surv.reset_fall();
+        drain_survival_messages();
+        hud_say("You wake where you began");
+    }
+    drain_survival_messages();
+    const bool torch = g_surv.hand() == engine::player::ToolUse::Torch;
+    if (torch != g_torch_in_hand) {
+        g_torch_in_hand = torch;
+        g_renderer.set_carried_torch(torch);
+    }
+    // The sky's light is integrated over the hemisphere (~0.3 ms) whenever
+    // the hour moves; at 48x that would be every frame. In steps of 6 game
+    // seconds (0.025 degrees of sun, an eighth of a real second) it is one
+    // frame in eight.
+    g_renderer.set_time_of_day(float(std::floor(double(g_surv.hour()) * 600.0) / 600.0));
+    g_renderer.set_game_time(g_surv.game_seconds());
+}
+
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (g_ui.ready() && g_ui.on_message(hwnd, msg, wp, lp, g_captured)) return 0;
     switch (msg) {
@@ -519,6 +661,10 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_RBUTTONUP:
             g_dig_held = false;
             return 0;
+        case WM_SYSKEYDOWN:
+            // F10 is a system key: it arrives here, never as WM_KEYDOWN.
+            if (wp == VK_F10) { toggle_walk(); return 0; }
+            break;
         case WM_KEYDOWN:
             if (wp == VK_ESCAPE) {
                 if (g_captured) set_capture(hwnd, false);
@@ -585,17 +731,11 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                                             : engine::Mode::Mesh);
                 return 0;
             }
-            if (wp == VK_TAB) {
-                g_walk = !g_walk;
-                if (g_walk) {
-                    // Drop in where the camera is, so the first frames are a
-                    // short fall rather than a long one.
-                    g_physics.place_character(g_camera.x, g_camera.y, g_camera.z);
-                    g_char_yaw = g_camera.yaw;
-                    g_have_prev_feet = false;
-                }
-                return 0;
-            }
+            // F10 flies / walks (Tab is the inventory's now, the script's).
+            if (wp == VK_F10) { toggle_walk(); return 0; }
+            // 1-8 use the hotbar. The UI's script does it when the UI is up
+            // (it sees the key first); this is the fallback without one.
+            if (wp >= '1' && wp <= '8') { use_hotbar_slot(int(wp - '1')); return 0; }
             if (wp == VK_F2) { g_want_shot = true; return 0; }
             if (wp == VK_INSERT) { jump_to_cave((GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1); return 0; }
             if (wp == VK_OEM_MINUS || wp == VK_OEM_PLUS) {
@@ -619,7 +759,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // Shift for five minutes at a time.
             if (wp == VK_PRIOR || wp == VK_NEXT) {
                 const float step = (GetKeyState(VK_SHIFT) & 0x8000) ? 5.0f / 60.0f : 0.5f;
-                g_renderer.set_time_of_day(g_renderer.time_of_day() + (wp == VK_PRIOR ? step : -step));
+                if (g_surv_run) g_surv.advance_clock(double(wp == VK_PRIOR ? step : -step) * 3600.0);
+                else g_renderer.set_time_of_day(g_renderer.time_of_day() + (wp == VK_PRIOR ? step : -step));
                 return 0;
             }
             // Local lights (ADR-004 L3): F carries a torch; V drops a campfire
@@ -1132,6 +1273,78 @@ void setup_ui(HWND hwnd) {
     g_host.display = [hwnd] { return current_display(hwnd); };
     g_host.display_modes = [hwnd] { return display_modes(hwnd); };
     g_host.apply_display = [hwnd](const engine::ui::DisplayState& d) { apply_display(hwnd, d); };
+    if (g_surv_ok) {
+        g_host.player = [] {
+            engine::ui::PlayerView p;
+            p.health = g_surv.health();
+            p.max_health = g_surv.max_health();
+            p.stamina = g_surv.stamina();
+            p.max_stamina = g_surv.max_stamina();
+            p.since_stamina = g_surv.since_stamina_use();
+            p.dead = g_surv.dead();
+            p.walking = g_walk;
+            p.day = g_surv.day();
+            p.hour = g_surv.hour();
+            p.equipped = g_surv.equipped() + 1;
+            for (const engine::player::ActiveFood& f : g_surv.foods()) {
+                engine::ui::FoodView v;
+                v.id = g_items[f.item].id;
+                v.name = g_items[f.item].name;
+                v.value = g_surv.food_value(f);
+                v.share = g_surv.food_share(f);
+                v.time_left = f.time_left;
+                v.can_eat = g_surv.can_eat_again(f);
+                p.foods.push_back(v);
+            }
+            return p;
+        };
+        g_host.inventory = [] {
+            std::vector<engine::ui::SlotView> v(engine::player::Inventory::kSlots);
+            for (int i = 0; i < engine::player::Inventory::kSlots; ++i) {
+                const engine::player::Slot& sl = g_surv.inventory().at(i);
+                if (sl.empty()) continue;
+                v[size_t(i)].id = g_items[sl.item].id;
+                v[size_t(i)].name = g_items[sl.item].name;
+                v[size_t(i)].count = sl.count;
+            }
+            return v;
+        };
+        g_host.item = [](const std::string& id) {
+            engine::ui::ItemView v;
+            const int i = g_items.find(id);
+            if (i < 0) return v;
+            const engine::player::ItemDef& d = g_items[i];
+            v.found = true;
+            v.id = d.id;
+            v.name = d.name;
+            v.description = d.description;
+            v.kind = d.kind == engine::player::ItemKind::Food ? "food"
+                   : d.kind == engine::player::ItemKind::Tool ? "tool" : "resource";
+            v.stack = d.stack;
+            v.health = d.food.health;
+            v.stamina = d.food.stamina;
+            v.regen = d.food.regen;
+            v.duration = d.food.duration_s;
+            return v;
+        };
+        g_host.use_slot = [](int i) { use_hotbar_slot(i); };
+        g_host.move_slot = [](int a, int b) { return g_surv.move_slot(a, b); };
+        g_host.split_slot = [](int a, int b) { return g_surv.split_slot(a, b); };
+        g_host.prompt = [] { return g_prompt; };
+        g_host.messages = [] {
+            std::vector<std::string> m;
+            m.swap(g_hud_msgs);
+            return m;
+        };
+        g_host.captured = [] { return g_captured; };
+        g_host.image = [](const std::string& name, std::vector<unsigned char>& rgba, int& w, int& h) {
+            const int i = g_items.find(name);
+            if (i < 0) return false;
+            engine::player::paint_icon(g_items[i], 64, rgba);
+            w = h = 64;
+            return true;
+        };
+    }
     std::string err;
     if (!g_ui.init(hwnd, g_renderer.device(), g_renderer.width(), g_renderer.height(), &g_host, err)) {
         if (FILE* ef = std::fopen("build/engine_error.txt", "w")) {
@@ -1143,6 +1356,325 @@ void setup_ui(HWND hwnd) {
     g_renderer.set_overlay([](ID3D12GraphicsCommandList* cmd, D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT w, UINT h) {
         g_ui.draw(cmd, rtv, w, h);
     });
+}
+
+// --survival-test: the player's rules and the forage layer, headless.
+// build/survival_test.txt says PASS or FAIL per check; the run's exit code
+// is the number of failures. Three parts:
+//   A. the rules (engine/player/survival.h) on a TEST item table it writes
+//      itself (build/survival_test_items.json: four foods and an axe), so a
+//      retuned items.json moves nothing here;
+//   B. the shipping seed's forage round the spawn: streamed, the nearest
+//      plant picked, ripe again exactly regrow_days later, picks saved and
+//      loaded;
+//   C. stills: that plant before and after the pick (build/forage_ripe.bmp,
+//      build/forage_picked.bmp), and the HUD and the inventory over the
+//      world with a few foods eaten (build/survival_hud.bmp,
+//      build/survival_inventory.bmp).
+int run_survival_test(HWND hwnd) {
+    using namespace engine::player;
+    std::remove("build/survival_test.txt");
+    FILE* f = std::fopen("build/survival_test.txt", "w");
+    if (!f) return 1;
+    int fails = 0;
+    auto check = [&](bool ok, const std::string& what) {
+        std::fprintf(f, "%s  %s\n", ok ? "PASS" : "FAIL", what.c_str());
+        if (!ok) ++fails;
+    };
+    auto num = [](const char* fmt, double a, double b = 0.0, double c = 0.0) {
+        char buf[200];
+        std::snprintf(buf, sizeof buf, fmt, a, b, c);
+        return std::string(buf);
+    };
+    auto close_to = [](double a, double b, double tol) { return std::fabs(a - b) <= tol; };
+
+    // --- A. the rules -----------------------------------------------------
+    std::fprintf(f, "A. the rules, on build/survival_test_items.json\n");
+    {
+        FILE* jf = std::fopen("build/survival_test_items.json", "w");
+        std::fprintf(jf, "{\"player\": {\"base_health\": 25, \"base_stamina\": 50, \"regen_interval_s\": 10, "
+                         "\"stamina_regen\": 6, \"stamina_regen_delay_s\": 1, \"sprint_drain\": 10, \"swim_drain\": 6, "
+                         "\"jump_cost\": 10, \"drown_damage\": 5, \"fall_safe_m\": 4, \"fall_lethal_m\": 20, "
+                         "\"fall_max_damage\": 100, \"food_slots\": 3, \"food_decay_power\": 0.3, \"food_refresh_at\": 0.5},\n"
+                         " \"clock\": {\"day_length_min\": 30},\n"
+                         " \"start\": [{\"item\": \"axe\", \"slot\": 0}],\n"
+                         " \"items\": [\n"
+                         "  {\"id\": \"a\", \"name\": \"A\", \"kind\": \"food\", \"stack\": 50, \"food\": {\"health\": 10, \"stamina\": 20, \"regen\": 2, \"duration_s\": 100}},\n"
+                         "  {\"id\": \"b\", \"name\": \"B\", \"kind\": \"food\", \"stack\": 50, \"food\": {\"health\": 20, \"stamina\": 10, \"regen\": 1, \"duration_s\": 200}},\n"
+                         "  {\"id\": \"c\", \"name\": \"C\", \"kind\": \"food\", \"stack\": 50, \"food\": {\"health\": 5, \"stamina\": 5, \"regen\": 1, \"duration_s\": 50}},\n"
+                         "  {\"id\": \"d\", \"name\": \"D\", \"kind\": \"food\", \"stack\": 50, \"food\": {\"health\": 8, \"stamina\": 8, \"regen\": 1, \"duration_s\": 100}},\n"
+                         "  {\"id\": \"axe\", \"name\": \"Axe\", \"kind\": \"tool\", \"use\": \"axe\"}\n"
+                         " ]}\n");
+        std::fclose(jf);
+        ItemTable T;
+        std::string err;
+        const bool loaded = T.load("build/survival_test_items.json", err);
+        check(loaded, "test table loads " + err);
+        if (!loaded) { std::fclose(f); return 1; }
+        const int A = T.find("a"), B = T.find("b"), C = T.find("c"), D = T.find("d"), AXE = T.find("axe");
+        Survival s;
+        s.init(&T);
+        s.new_game(8.0f);
+        Motion idle;
+        auto run = [&](float secs, const Motion& m) {
+            for (float t = 0.0f; t < secs - 1e-4f; t += 0.1f) s.update((std::min)(0.1f, secs - t), m);
+        };
+        check(s.health() == 25.0f && s.max_health() == 25.0f && s.stamina() == 50.0f, "a new game: 25 health, 50 stamina");
+        check(s.inventory().at(0).item == AXE, "the axe starts in slot 1");
+        check(s.day() == 1 && close_to(s.hour(), 8.0, 1e-3), "day 1, 08:00");
+        s.give(A, 3);
+        check(s.inventory().at(1).item == A && s.inventory().at(1).count == 3, "three A land in slot 2 (the first free)");
+        s.use_slot(1);
+        check(s.foods().size() == 1 && close_to(s.max_health(), 35, 1e-3) && close_to(s.health(), 35, 1e-3) &&
+              close_to(s.stamina(), 70, 1e-3) && s.inventory().at(1).count == 2,
+              num("eating A: max health %.1f (35), stamina %.1f (70), two left", s.max_health(), s.stamina()));
+        s.use_slot(1);
+        check(s.foods().size() == 1 && s.inventory().at(1).count == 2, "A again at full time: refused, none eaten");
+        run(51.0f, idle);
+        {
+            const float v = s.food_value(s.foods()[0]);
+            check(close_to(v, std::pow(0.49, 0.3), 2e-3) && close_to(s.max_health(), 25 + 10 * v, 1e-3),
+                  num("51 s of 100: value %.3f ((0.49)^0.3 = %.3f), max health %.2f", v, std::pow(0.49, 0.3), s.max_health()));
+            check(close_to(s.day(), 1, 0) && close_to(s.hour(), 8.0 + 51.0 * 48.0 / 3600.0, 1e-3),
+                  num("the clock ran 48x: %.4f h (%.4f)", s.hour(), 8.0 + 51.0 * 48.0 / 3600.0));
+        }
+        s.use_slot(1);
+        check(s.foods().size() == 1 && close_to(s.food_share(s.foods()[0]), 1.0, 1e-4) && s.inventory().at(1).count == 1,
+              "A again under half its time: refreshed");
+        s.give(B, 2);
+        s.give(C, 2);
+        s.give(D, 2);
+        s.eat(B);
+        s.use_slot(s.inventory().at(3).item == C ? 3 : 4);
+        check(s.foods().size() == 3, num("A, B, C eaten: %.0f foods", double(s.foods().size())));
+        check(s.eat(D) == EatResult::TooFull, "D with three foods all over half: too full");
+        run(30.0f, idle);
+        {
+            const EatResult r = s.eat(D);
+            bool has_c = false, has_d = false;
+            for (const ActiveFood& a : s.foods()) { has_c |= a.item == C; has_d |= a.item == D; }
+            check(r == EatResult::Replaced && !has_c && has_d && s.foods().size() == 3,
+                  "30 s on, C is under half: D replaces it");
+        }
+        run(101.0f, idle);
+        check(s.foods().size() == 1 && s.foods()[0].item == B, num("101 s later A and D have worn off, B is left (%.0f foods)", double(s.foods().size())));
+        bool wore = false;
+        for (const std::string& m : s.take_messages()) wore |= m.find("wore off") != std::string::npos;
+        check(wore, "a food wearing off says so");
+        {
+            s.damage(15.0f);
+            const float h0 = s.health();
+            run(10.0f, idle);
+            check(close_to(s.health() - h0, 1.0, 1e-3), num("10 s with B: +%.2f health (B's regen 1)", s.health() - h0));
+        }
+        {
+            run(5.0f, idle);
+            const float st0 = s.max_stamina();
+            check(close_to(s.stamina(), st0, 1e-3), "stamina fills to its max at rest");
+            s.spend(10.0f);
+            const float a = s.stamina();
+            run(0.5f, idle);
+            const float b = s.stamina();
+            run(1.0f, idle);
+            check(close_to(b, a, 1e-4) && s.stamina() > b + 2.0f,
+                  num("after a spend: %.2f held for the delay, then %.2f", b, s.stamina()));
+            Motion sprint;
+            sprint.body = true; sprint.moving = true; sprint.sprinting = true; sprint.grounded = true;
+            const float c = s.stamina();
+            run(1.0f, sprint);
+            check(close_to(c - s.stamina(), 10.0, 0.05), num("a second of sprint: -%.2f (10)", c - s.stamina()));
+            run(20.0f, sprint);
+            check(s.stamina() == 0.0f && !s.can_sprint() && !s.spend(10.0f), "sprinted out: 0, no sprint, no jump");
+            Motion swim;
+            swim.body = true; swim.moving = true; swim.swimming = true; swim.in_water = true;
+            const float h0 = s.health();
+            run(2.0f, swim);
+            // One regeneration tick (B's +1) can fall inside the two seconds.
+            const float lost = h0 - s.health();
+            check((close_to(lost, 10.0, 0.05) || close_to(lost, 9.0, 0.05)) && s.stamina() == 0.0f,
+                  num("2 s swimming with none: -%.2f health (drowning, 5 a second, less a regen tick)", lost));
+        }
+        {
+            run(30.0f, idle);
+            auto fall = [&](float from, bool water) {
+                Motion g;
+                g.body = true; g.grounded = true; g.feet_y = 0.0f;
+                s.update(0.016f, g);
+                Motion a = g;
+                a.grounded = false;
+                for (int k = 0; k <= 10; ++k) { a.feet_y = from * float(k) / 10.0f; s.update(0.016f, a); }
+                for (int k = 10; k >= 1; --k) { a.feet_y = from * float(k) / 10.0f; s.update(0.016f, a); }
+                g.in_water = water;
+                g.grounded = !water;
+                s.update(0.016f, g);
+            };
+            const float h0 = s.health();
+            fall(7.0f, false);
+            check(close_to(s.last_fall(), 7.0, 0.2) && close_to(s.last_fall_damage(), 18.75, 1.5) &&
+                      close_to(h0 - s.health(), s.last_fall_damage(), 0.2) && !s.dead(),
+                  num("a 7 m fall: %.1f m, %.1f damage (18.75), health %.1f", s.last_fall(), s.last_fall_damage(), s.health()));
+            const float h1 = s.health();
+            fall(15.0f, true);
+            check(close_to(s.health(), h1, 0.2), "15 m into water: no damage");
+            fall(30.0f, false);
+            check(s.dead(), "30 m onto ground: dead");
+            s.respawn();
+            check(!s.dead() && s.health() == 25.0f && s.foods().empty(), "respawned: 25 health, no food");
+        }
+        {
+            s.use_slot(0);
+            check(s.hand() == ToolUse::Axe && s.equipped() == 0, "slot 1: the axe in hand");
+            s.move_slot(0, 12);
+            check(s.equipped() == 12 && s.hand() == ToolUse::Axe, "moving it keeps it in hand");
+            s.use_slot(12);
+            check(s.hand() == ToolUse::None, "using it again puts it away");
+            Inventory& inv = s.inventory();
+            const int had = inv.count_of(A);
+            const int left = s.give(A, 120);
+            check(left == 0 && inv.count_of(A) == had + 120, num("120 more A fit in stacks of 50 (%.0f left over, %.0f had)", left, had));
+            int stacks = 0;
+            for (int i = 0; i < Inventory::kSlots; ++i) stacks += inv.at(i).item == A ? 1 : 0;
+            check(stacks == 3, num("as three stacks (%.0f)", stacks));
+            int full = -1, empty = -1;
+            for (int i = 0; i < Inventory::kSlots; ++i) {
+                if (full < 0 && inv.at(i).item == A && inv.at(i).count == 50) full = i;
+                if (empty < 0 && inv.at(i).empty()) empty = i;
+            }
+            s.split_slot(full, empty);
+            check(inv.at(full).count == 25 && inv.at(empty).count == 25, "splitting 50: 25 and 25");
+        }
+        {
+            s.eat(B);
+            s.give(D, 3);
+            std::string e2;
+            const bool saved = s.save("build/survival_test_player.txt", e2);
+            Survival r;
+            r.init(&T);
+            r.new_game(0.0f);
+            const bool loaded2 = r.load("build/survival_test_player.txt", e2);
+            bool same = saved && loaded2 && close_to(r.health(), s.health(), 1e-3) && close_to(r.stamina(), s.stamina(), 1e-3) &&
+                        r.foods().size() == s.foods().size() && close_to(r.game_seconds(), s.game_seconds(), 1e-2);
+            for (int i = 0; i < Inventory::kSlots && same; ++i)
+                same = r.inventory().at(i).item == s.inventory().at(i).item && r.inventory().at(i).count == s.inventory().at(i).count;
+            check(same, "a player save loads back as it was " + e2);
+        }
+    }
+
+    // --- B. the world's forage ---------------------------------------------
+    std::fprintf(f, "\nB. forage round the spawn (seed %llu)\n", static_cast<unsigned long long>(engine::WorldGpu::world_seed));
+    engine::Forage& fo = g_renderer.forage();
+    bool have_plant = false;
+    worldgen::ForageInstance plant = {};
+    double t0 = 14.0 * 3600.0;
+    {
+        check(g_surv_ok, "game/data/items.json loads");
+        check(fo.ready() && fo.species_count() > 0, num("forage species: %.0f", fo.species_count()));
+        fo.update(g_spawn.x, g_spawn.z, true);
+        const std::vector<worldgen::ForageInstance>& ps = fo.plants();
+        std::vector<uint32_t> patches;
+        int within = 0;
+        for (const worldgen::ForageInstance& p : ps) {
+            const float dx = p.x - g_spawn.x, dz = p.z - g_spawn.z;
+            if (dx * dx + dz * dz > 150.0f * 150.0f) continue;
+            ++within;
+            const uint32_t cell = p.id & ~(3u << 26);
+            if (std::find(patches.begin(), patches.end(), cell) == patches.end()) patches.push_back(cell);
+        }
+        std::fprintf(f, "      %zu tiles, %zu plants resident; within 150 m of spawn %d plants in %zu patches\n",
+                     fo.tiles(), ps.size(), within, patches.size());
+        check(within > 0, "some plants within 150 m of the spawn");
+        const float sp[3] = {g_spawn.x, g_spawn.ground, g_spawn.z};
+        have_plant = fo.nearest(sp, true, t0, plant);
+        if (have_plant) {
+            const float dx = plant.x - g_spawn.x, dz = plant.z - g_spawn.z;
+            std::fprintf(f, "      nearest: %08x (%s, plant %u of its patch) at (%.2f, %.2f, %.2f), %.0f m from spawn\n",
+                         plant.id, fo.species(plant.species).name.c_str(), unsigned(plant.plant), plant.x, plant.y, plant.z,
+                         std::sqrt(dx * dx + dz * dz));
+            const float ge = g_renderer.edited_density(plant.x, plant.y + 0.05f, plant.z);
+            const float gr = g_renderer.edited_density(plant.x, plant.y - 0.05f, plant.z);
+            check(ge <= 0.0f && gr > 0.0f, num("it stands on the ground (density %.3f over, %.3f under)", ge, gr));
+        }
+        check(have_plant, "a ripe plant to test with");
+    }
+    if (have_plant) {
+        const engine::Forage::Species& sp = fo.species(plant.species);
+        const double regrow = double(sp.regrow_days) * 86400.0;
+        const int n = fo.pick(plant.id, t0);
+        check(n >= sp.yield_min && n <= sp.yield_max, num("picked: %.0f (%.0f to %.0f)", n, sp.yield_min, sp.yield_max));
+        check(fo.pick(plant.id, t0) == 0 && !fo.ripe(plant.id, t0), "picked again at once: nothing");
+        check(!fo.ripe(plant.id, t0 + regrow - 60.0) && fo.ripe(plant.id, t0 + regrow),
+              num("bears again after %.1f game days (%.0f real minutes), not a minute before", sp.regrow_days,
+                  regrow / 48.0 / 60.0));
+        std::string err;
+        const uint64_t fid = g_renderer.world().field_id();
+        const bool saved = fo.save("build/survival_test_forage.bin", fid, err);
+        fo.forget_picks();
+        const bool back = fo.ripe(plant.id, t0);
+        const bool loaded = fo.load("build/survival_test_forage.bin", fid, err);
+        check(saved && back && loaded && !fo.ripe(plant.id, t0), "picks save and load " + err);
+        check(!fo.load("build/survival_test_forage.bin", fid ^ 1ull, err), "another world's picks are refused");
+        fo.forget_picks();
+    }
+
+    // --- C. stills ------------------------------------------------------------
+    std::fprintf(f, "\nC. stills\n");
+    if (have_plant) {
+        // 2.2 m from the plant, its eye 1.3 m over the plant's foot, looking at it.
+        const float dir[2] = {0.6f, 0.8f};
+        g_camera.x = plant.x - dir[0] * 2.2f;
+        g_camera.z = plant.z - dir[1] * 2.2f;
+        g_camera.y = plant.y + 1.3f;
+        g_camera.yaw = std::atan2(dir[0], dir[1]);
+        g_camera.pitch = -std::atan2(1.15f, 2.2f);
+        g_renderer.set_game_time(t0);
+        engine::ViewConstants v = {};
+        fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
+        std::string err;
+        bool ok = g_renderer.capture(v, "build/forage_ripe.bmp", err);
+        std::fprintf(f, "      --cam %.2f %.2f %.2f %.4f %.4f   %zu plants drawn\n", g_camera.x, g_camera.y, g_camera.z,
+                     g_camera.yaw, g_camera.pitch, fo.drawn());
+        fo.pick(plant.id, t0);
+        if (ok) ok = g_renderer.capture(v, "build/forage_picked.bmp", err);
+        check(ok, "build/forage_ripe.bmp and build/forage_picked.bmp " + err);
+        fo.forget_picks();
+    }
+    if (g_surv_ok) {
+        // The HUD over the world: two foods eaten, a few things carried.
+        g_surv.new_game(16.5f);
+        const int straw = g_items.find("strawberry"), mush = g_items.find("glow_mushroom");
+        if (straw >= 0) { g_surv.give(straw, 7); g_surv.eat(straw); }
+        if (mush >= 0) { g_surv.give(mush, 3); g_surv.eat(mush); }
+        g_surv.use_slot(0);
+        g_surv.spend(25.0f);
+        g_surv.take_messages();
+        hud_say("+3 Strawberries");
+        hud_say("Ate strawberries");
+        g_prompt = "[E] Pick strawberries";
+        g_walk = true;
+        g_display.forced = true;
+        setup_ui(hwnd);
+        std::string err;
+        if (g_ui.ready()) {
+            g_ui.run("");
+            for (int k = 0; k < 4; ++k) g_ui.update(0.25f);
+            g_renderer.set_capture_overlay(true);
+            engine::ViewConstants v = {};
+            fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
+            bool ok = g_renderer.capture(v, "build/survival_hud.bmp", err);
+            g_ui.run("inventory.open()");
+            for (int k = 0; k < 4; ++k) g_ui.update(0.25f);
+            if (ok) ok = g_renderer.capture(v, "build/survival_inventory.bmp", err);
+            check(ok, "build/survival_hud.bmp and build/survival_inventory.bmp " + err);
+            g_renderer.flush();
+            g_renderer.set_overlay(nullptr);
+            g_ui.shutdown();
+        } else {
+            check(false, "the UI came up for the HUD stills (build/ui_log.txt)");
+        }
+    }
+    std::fprintf(f, "\n%s: %d failed\n", fails ? "FAILED" : "ALL PASSED", fails);
+    std::fclose(f);
+    return fails;
 }
 
 }  // namespace
@@ -1632,8 +2164,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     const bool lights_mode = hl.find("--lights-report") != std::string::npos;
     const bool leak_mode = hl.find("--leak-test") != std::string::npos;
     const bool pit_mode = hl.find("--dig-water") != std::string::npos;
+    const bool survival_mode = hl.find("--survival-test") != std::string::npos;
     const bool headless = report_mode || fell_mode || dig_tree_mode || lights_mode || leak_mode ||
-                          pit_mode ||
+                          pit_mode || survival_mode ||
                           !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
@@ -1770,6 +2303,24 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                              wg.table()[size_t(c.biome)].name.c_str(), std::sqrt(cnear[k].first),
                              c.x - c.hx * 25.0f, c.y + 12.0f, c.z - c.hz * 25.0f, std::atan2(c.hx, c.hz));
             }
+            std::fclose(sf);
+        }
+    }
+    // The player's survival: the item table, and a fresh game (the window
+    // loop sets its clock from --time before it starts it).
+    {
+        std::string err;
+        g_surv_ok = g_items.load("game/data/items.json", err);
+        if (g_surv_ok) {
+            g_surv.init(&g_items);
+            g_surv.new_game(14.0f);
+        }
+        if (FILE* sf = std::fopen("build/startup.txt", "a")) {
+            if (g_surv_ok)
+                std::fprintf(sf, "           items: %d in game/data/items.json, %d to start with, a day is %.0f min\n",
+                             g_items.size(), int(g_items.start.size()), g_items.day_length_s / 60.0f);
+            else
+                std::fprintf(sf, "           items NOT loaded (no HUD stats, no inventory): %s\n", err.c_str());
             std::fclose(sf);
         }
     }
@@ -1927,6 +2478,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         }
         if (c2.find("--no-rocks") != std::string::npos) g_renderer.set_rocks(false);
         if (c2.find("--no-mushrooms") != std::string::npos) g_renderer.set_mushrooms(false);
+        if (c2.find("--no-forage") != std::string::npos) g_renderer.set_forage(false);
         // Bare ground (GroundLook): --no-ground-look is the scans as they
         // were; the others set one part. Not "--ground-...": --ground is
         // taken (the camera at eye height), and a find() for it matches.
@@ -4464,6 +5016,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (survival_mode) {
+        const int r = run_survival_test(hwnd);
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return r;
+    }
+
     if (dig_tree_mode) {
         // --dig-settle: a tree, then a boulder, dug out from under. Picks a fellable tree near
         // spawn, carves a 3 m sphere a metre under its base, then with the
@@ -6264,6 +6823,21 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     int    fps_frames = 0;
     float  t = 0.0f;
 
+    // The game: its clock from --time (or the default), and a window that
+    // opens over the start walks there once the ground has streamed in
+    // (unless a --cam or a snapshot put the camera somewhere on purpose).
+    if (g_surv_ok) {
+        g_surv_run = true;
+        g_surv.set_game_seconds(double(g_renderer.time_of_day()) * 3600.0);
+        g_renderer.set_game_time(g_surv.game_seconds());
+        if (!have_cam && g_snapshot_dir.empty() && g_snap_walk_frames < 0) {
+            g_snap_feet[0] = g_spawn.x;
+            g_snap_feet[1] = g_spawn.ground + 0.5f;
+            g_snap_feet[2] = g_spawn.z;
+            g_snap_cam_dist = -1.0f;
+            g_snap_walk_frames = 90;
+        }
+    }
     setup_ui(hwnd);
 
     MSG msg = {};
@@ -6292,6 +6866,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const float h = static_cast<float>(cr.bottom - cr.top);
         if (w < 1.0f || h < 1.0f) continue;
 
+        bool walk_moving = false, walk_sprinting = false;
         if (g_paused) {
             // Still hand physics what streamed in: the events are this
             // frame's only (see step_window_physics).
@@ -6316,12 +6891,31 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             // no faster than straight ahead.
             float sp = kJogSpeed;
             if (GetKeyState(VK_CAPITAL) & 1) sp = kWalkSpeed;
-            if (GetAsyncKeyState(VK_SHIFT) & 0x8000) sp = kSprintSpeed;
+            // A sprint needs stamina (engine/player/survival.h); with none
+            // left it is a jog until some has come back.
+            const bool moving = mx != 0.0f || mz != 0.0f;
+            const bool swimming = g_physics.medium() == engine::Medium::Swimming;
+            const bool sprinting = (GetAsyncKeyState(VK_SHIFT) & 0x8000) && moving && !swimming &&
+                                   (!g_surv_run || g_surv.can_sprint());
+            if (sprinting) sp = kSprintSpeed;
+            walk_moving = moving;
+            walk_sprinting = sprinting;
             const float ml = std::sqrt(mx * mx + mz * mz);
             if (ml > 1.0f) { mx /= ml; mz /= ml; }
             const float vx = (sy * mz - cy * mx) * sp;
             const float vz = (cy * mz + sy * mx) * sp;
-            const bool jump = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+            const bool space = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0 && g_captured;
+            // A jump from the ground costs stamina, paid on the press; in the
+            // water Space swims up and the swim's drain pays for it.
+            bool jump = space;
+            if (g_surv_run && !swimming) {
+                if (space && !g_jump_was_down && g_physics.character_supported()) {
+                    if (g_surv.spend(g_surv.tuning().jump_cost)) g_jump_window = 0.25f;
+                }
+                jump = g_jump_window > 0.0f;
+                g_jump_window -= float(dt);
+            }
+            g_jump_was_down = space;
             // Ctrl dives. Space is both jump and swim-up, so the way out of
             // the water is the key you would already be pressing.
             const float swim = (GetAsyncKeyState(VK_CONTROL) & 0x8000) ? -1.0f : 0.0f;
@@ -6351,6 +6945,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             }
             if (!g_walk) g_camera.update(static_cast<float>(dt));
         }
+        survival_frame(float(dt), walk_moving, walk_sprinting);
+
         // The camera follows the character after the mouse has turned it, so
         // the orbit never lags the look by a frame.
         if (g_walk && !g_paused) place_walk_camera(float(dt));
@@ -6359,6 +6955,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // Trees: colliders round the player, logs posed by physics; then any
         // swing, save or load the window asked for this frame.
         g_felling.update(g_walk ? g_feet[0] : g_camera.x, g_walk ? g_feet[2] : g_camera.z);
+        if (g_want_chop && g_surv_run) {
+            if (g_surv.hand() != engine::player::ToolUse::Axe) {
+                g_want_chop = false;
+                hud_say("Equip the axe to chop (1-8)");
+            } else if (g_walk && !g_surv.spend(g_surv.tuning().axe_cost)) {
+                g_want_chop = false;
+                hud_say("Too tired to swing");
+            }
+        }
         if (g_want_chop) {
             g_want_chop = false;
             float fwd[3], right[3], up[3];
@@ -6376,24 +6981,33 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             const int r = g_felling.chop(eye, fwd, t, &id, &hits, &need);
             if (r == 0) std::snprintf(g_tree_msg, sizeof g_tree_msg, "nothing in reach");
             else if (r == 1) std::snprintf(g_tree_msg, sizeof g_tree_msg, "chop %d/%d", hits, need);
-            else std::snprintf(g_tree_msg, sizeof g_tree_msg, "TIMBER (%zu felled)", g_felling.felled());
+            else hud_say("Timber!");
         }
         if (g_want_pick) {
             g_want_pick = false;
-            float fwd[3], right[3], up[3];
-            g_camera.basis(fwd, right, up);
-            const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
-            float hand[3];
-            chop_origin(hand);
-            if (g_renderer.pick_mushroom(eye, fwd, hand, kPickReach))
-                std::snprintf(g_tree_msg, sizeof g_tree_msg, "picked a glowing mushroom (%zu)",
-                              g_renderer.mushrooms().picked());
-            else
-                std::snprintf(g_tree_msg, sizeof g_tree_msg, "nothing to pick up in reach");
+            if (g_surv_ok) {
+                pick_up();
+            } else {
+                float fwd[3], right[3], up[3];
+                g_camera.basis(fwd, right, up);
+                const float eye[3] = {g_camera.x, g_camera.y, g_camera.z};
+                float hand[3];
+                chop_origin(hand);
+                if (g_renderer.pick_mushroom(eye, fwd, hand, kPickReach))
+                    std::snprintf(g_tree_msg, sizeof g_tree_msg, "picked a glowing mushroom (%zu)",
+                                  g_renderer.mushrooms().picked());
+                else
+                    std::snprintf(g_tree_msg, sizeof g_tree_msg, "nothing to pick up in reach");
+            }
         }
+        update_prompt();
         if (g_dig_held && g_captured && !g_paused) {
             g_dig_timer += float(dt);
             if (g_dig_timer >= kDigRepeat) { g_dig_timer = 0.0f; g_want_dig = true; }
+        }
+        if (g_want_dig && g_surv_run && g_walk && !g_surv.spend(g_surv.tuning().dig_cost)) {
+            g_want_dig = false;
+            hud_say("Too tired to dig");
         }
         if (g_want_dig) {
             g_want_dig = false;
@@ -6426,12 +7040,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             bool ok = true, mismatch = false;
             if (g_want_save) {
                 ok = g_renderer.save_edits("build/edits.bin", err) &&
-                     g_felling.save("build/trees.bin", g_renderer.world().field_id(), err);
-                std::snprintf(g_tree_msg, sizeof g_tree_msg, ok ? "saved" : "save FAILED");
+                     g_felling.save("build/trees.bin", g_renderer.world().field_id(), err) &&
+                     g_renderer.forage().save("build/forage.bin", g_renderer.world().field_id(), err) &&
+                     (!g_surv_ok || g_surv.save("build/player.txt", err));
+                hud_say(ok ? "Saved" : "Save FAILED: " + err);
             } else {
                 ok = g_renderer.load_edits("build/edits.bin", err, mismatch);
                 const bool ok2 = g_felling.load("build/trees.bin", g_renderer.world().field_id(), err, mismatch);
-                std::snprintf(g_tree_msg, sizeof g_tree_msg, (ok || ok2) ? "loaded" : "nothing to load");
+                const bool ok3 = g_renderer.forage().load("build/forage.bin", g_renderer.world().field_id(), err);
+                const bool ok4 = g_surv_ok && g_surv.load("build/player.txt", err);
+                if (ok4) { g_surv.reset_fall(); g_jump_window = 0.0f; }
+                hud_say((ok || ok2 || ok3 || ok4) ? "Loaded" : "Nothing to load");
             }
             g_want_save = g_want_load = false;
         }
@@ -6448,7 +7067,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             g_renderer.capture(view, "build/shot.bmp", err);
         }
 
-        if (g_time_lapse) g_renderer.set_time_of_day(g_renderer.time_of_day() + float(dt) * 0.1f);
+        if (g_time_lapse && !g_surv_run) g_renderer.set_time_of_day(g_renderer.time_of_day() + float(dt) * 0.1f);
         const double frame_ms = wall_dt * 1000.0;
         if (frame_ms > worst_frame_ms) worst_frame_ms = frame_ms;
         fps_accum += wall_dt;

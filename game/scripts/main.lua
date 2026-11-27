@@ -19,6 +19,7 @@ end
 
 local settings = require("settings")
 require("hud")
+require("inventory")
 require("menu")
 require("tuning")
 
@@ -26,14 +27,28 @@ local ctx = rmlui.contexts["main"]
 
 game = {}
 
--- Esc, F1 and ` reach here before anything else sees them. Return true to
--- consume the key.
+-- Esc, F1, `, Tab and 1-9 reach here before anything else sees them.
+-- Return true to consume the key.
 function game.on_key(name)
 	if name == "escape" then
-		if menu.is_open() then menu.back() else menu.open() end
+		if inventory.is_open() then inventory.close()
+		elseif menu.is_open() then menu.back()
+		else menu.open() end
 		return true
 	elseif name == "f1" or name == "grave" then
 		tuning.toggle()
+		return true
+	end
+	-- The rest are play's: behind the menu they are the menu's.
+	if menu.is_open() then return false end
+	if name == "tab" then
+		inventory.toggle()
+		return true
+	end
+	local n = tonumber(name)
+	if n and n >= 1 and n <= 8 then
+		engine.use_slot(n)
+		if inventory.is_open() then inventory.refresh() end
 		return true
 	end
 	return false
@@ -43,11 +58,14 @@ end
 function game.on_update(dt)
 	tuning.update(dt)
 	menu.update()
+	if menu.is_open() and inventory.is_open() then inventory.close(false) end
+	inventory.update()
 	hud.update(menu.is_open())
 end
 
 -- First, so the menu and the panel draw over it.
 hud.init(ctx)
+inventory.init(ctx)
 if not menu.init(ctx) then error("the pause menu did not load") end
 tuning.init(ctx)
 settings.apply(settings.load())

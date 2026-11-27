@@ -75,6 +75,11 @@ struct BiomeArchetype {
     float    rock_boulders = 0.0f;
     float    rock_outcrops = 0.0f;
     float    rock_cover    = 0.0f;
+
+    // --- forage (layer 10) ---
+    // Chance a candidate cell holds a patch, per species, indexed like
+    // ForageTable::species. All 0 when the biome has no forage block.
+    std::vector<float> forage;
 };
 
 // One tree species. `form` and everything the engine reads under "shape" are
@@ -144,6 +149,27 @@ struct RockTable {
     bool  present       = false;   // the table had a rocks block
 };
 
+// One kind of foragable plant (layer 10): patches of a few plants, one patch
+// at most per candidate cell. Placement reads only these; what a plant gives
+// and how fast it grows back are the engine's (archetypes.json's "item",
+// "yield", "regrow_days"), never the hash's.
+struct ForageSpecies {
+    std::string name;              // diagnostics, and the key biomes refer to it by
+    float cell         = 40.0f;    // candidate spacing, metres
+    int   plants_min   = 1;        // plants a patch tries for
+    int   plants_max   = 3;
+    float patch_radius = 2.5f;     // metres from the patch's middle a plant may stand
+    float spacing      = 0.7f;     // metres between two plants of a patch
+    float max_slope    = 0.5f;     // rise over run; the keep chance falls to 0 there
+    float shore        = 1.0f;     // metres above sea level a patch needs
+};
+
+struct ForageTable {
+    std::vector<ForageSpecies> species;
+    int  blend_sharpen = 4;        // biome blend weights to this power, as trees
+    bool present       = false;
+};
+
 // Placed caves, the shared part (each biome's shape is in BiomeArchetype).
 struct CaveTable {
     int   tries       = 12;     // spots tried inside a cell before it holds none
@@ -166,6 +192,7 @@ struct ArchetypeTable {
     DetailTable detail;
     FlatTable flats;
     CaveTable caves;
+    ForageTable forage;
 
     size_t size() const { return biomes.size(); }
     const BiomeArchetype& operator[](size_t i) const { return biomes[i]; }

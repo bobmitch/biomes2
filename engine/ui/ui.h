@@ -5,7 +5,7 @@
 // game/scripts/main.lua is the entry point. It defines a global `game` table
 // whose hooks this class calls:
 //
-//   game.on_key(name) -> bool   "escape", "f1", "grave" -- true if consumed
+//   game.on_key(name) -> bool   "escape", "f1", "grave", "tab", "1".."9" -- true if consumed
 //   game.on_update(dt)          every frame, with the WALL clock's dt
 //
 // Input: while the game is paused the UI takes the keyboard and the mouse.

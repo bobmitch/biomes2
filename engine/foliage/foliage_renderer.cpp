@@ -502,13 +502,16 @@ void FoliageRenderer::record(ID3D12GraphicsCommandList* cmd, UINT frame, const F
             float* o = et + b * kEditTops;
             const TileKey k = slot_tile_[bake_now_[b]];
             for (UINT i = 0; i < kEditTops; ++i) o[i] = -1.0e30f;
-            if (!edits_ || edits_->brick_count() == 0) continue;
             const int sx0 = k.x * int(kTileM) * 2, sz0 = k.z * int(kTileM) * 2;
-            for (int hz = 0; hz < 32; ++hz)
-                for (int hx = 0; hx < 32; ++hx) {
-                    float top;
-                    if (edits_->column_top(sx0 + hx, sz0 + hz, top)) o[hz * 32 + hx] = top;
-                }
+            if (edits_ && edits_->brick_count() != 0) {
+                for (int hz = 0; hz < 32; ++hz)
+                    for (int hx = 0; hx < 32; ++hx) {
+                        float top;
+                        if (edits_->column_top(sx0 + hx, sz0 + hz, top)) o[hz * 32 + hx] = top;
+                    }
+            }
+            // Ground kept bare by something standing on it (forage plants).
+            if (bare_fn_) bare_fn_(sx0, sz0, o);
         }
     }
     FoliageFrame fr = {};

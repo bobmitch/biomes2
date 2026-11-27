@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -69,6 +70,10 @@ public:
     // surface. `invalidate_box` re-bakes the resident tiles under a world
     // box (a dig), next update.
     void set_edits(const BrickStore* e) { edits_ = e; }
+    // Columns kept bare by things standing on the ground: called for each
+    // tile baked with its 32 x 32 tops (half-metre columns from sx0, sz0),
+    // after the edits; a top set past the ground bares it.
+    void set_bare_fn(std::function<void(int sx0, int sz0, float* tops)> fn) { bare_fn_ = fn; }
     void invalidate_box(const float lo[3], const float hi[3]);
     void invalidate_all();
 
@@ -103,6 +108,7 @@ private:
     ComPtr<ID3D12Resource> pool_, lists_[4], counters_, args_, ib_, ground_;
     ComPtr<ID3D12Resource> slots_up_[2], bake_up_[2], cb_[2], edit_up_[2];
     void* edit_cpu_[2] = {};
+    std::function<void(int, int, float*)> bare_fn_;
     const BrickStore* edits_ = nullptr;
     std::vector<TileKey> rebake_;
     void* slots_cpu_[2] = {};

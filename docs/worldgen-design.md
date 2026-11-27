@@ -315,6 +315,19 @@ The cell's FIRST spot decides whether it owes the biome a cave at all: a uniform
 
 **Not done.** Two caves from different biomes' grids can overlap (rare: cells are 700-1000 m apart); a floor is the capsules' rounded bottom, not levelled; nothing places resources or danger in them yet.
 
+### Layer 10 — forage (v20)
+
+Plants to pick, under the golden hash in the shape of layers 8 and 9 (trees
+and rocks, which CLAUDE.md documents): per species a grid of candidate
+cells, at most one patch of a few plants per cell, each plant a pure
+function of its cell and identified by `forage_id(species, plant, i, j)`.
+A biome gives each species the chance a cell holds a patch; a slope lowers
+it linearly to nothing at the species' `max_slope`. Plants stand on the real
+surface and give way to trunks, rocks, rivers, flat sites and cave mouths.
+What a plant yields and when it bears again are the engine's, outside the
+hash: a save records only which plants were picked and when, so the world
+the plants stand in is never stored.
+
 ## Area budget and the equal-measure problem
 
 Disc area grows as r², so radial bands of equal *width* have wildly unequal *area*. With five linear bands the innermost gets 4% of the world and the outermost 36% — a ninefold difference, and the calm starting biomes are the ones that lose.

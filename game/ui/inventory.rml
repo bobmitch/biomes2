@@ -1,0 +1,78 @@
+<rml>
+<!--
+  The inventory (Tab): 8 x 4 slots, the top row the hotbar (1-8), and what
+  the slot under the mouse holds. game/scripts/inventory.lua builds the slots
+  and decides what a click does. The game keeps running behind it.
+-->
+<head>
+	<title>Inventory</title>
+	<link type="text/rcss" href="common.rcss"/>
+	<style>
+		body {
+			width: 100%;
+			height: 100%;
+			display: flex;
+			justify-content: center;
+			align-items: center;
+		}
+		#panel {
+			display: flex;
+			flex-direction: row;
+			padding: 18dp;
+			background-color: #0c1016e8;
+			border: 1dp #ffffff30;
+			border-radius: 6dp;
+		}
+		#left { width: 552dp; }
+		h1 { font-size: 24dp; margin-bottom: 10dp; }
+		#grid { display: flex; flex-direction: row; flex-wrap: wrap; width: 552dp; }
+		.islot {
+			box-sizing: border-box;
+			position: relative;
+			width: 62dp;
+			height: 62dp;
+			margin: 0 6dp 6dp 0;
+			background-color: #ffffff0c;
+			border: 2dp #ffffff22;
+			border-radius: 5dp;
+		}
+		.islot.hot { background-color: #ffffff16; }
+		.islot:hover { border-color: #ffffff80; }
+		.islot.equipped { border-color: #f0c860; background-color: #3a3018c0; }
+		.islot.held { border-color: #70c8ff; background-color: #183040d0; }
+		.islot img { position: absolute; left: 6dp; top: 6dp; width: 46dp; height: 46dp; }
+		.islot .key { position: absolute; left: 4dp; top: 1dp; font-size: 13dp; color: #ffffff90; }
+		.islot .count {
+			position: absolute;
+			right: 4dp;
+			bottom: 1dp;
+			font-size: 15dp;
+			font-weight: bold;
+			color: #ffffff;
+		}
+		#gap { height: 8dp; width: 100%; }
+		#info {
+			width: 260dp;
+			margin-left: 16dp;
+			padding: 10dp 12dp;
+			background-color: #ffffff08;
+			border-radius: 4dp;
+		}
+		#info h2 { font-size: 21dp; margin-bottom: 6dp; color: #fff4d8; }
+		#info p { font-size: 15dp; color: #d0d6de; margin-bottom: 8dp; }
+		#info .stat { font-size: 15dp; color: #ffffff; }
+		#info .stat span { color: #ffd070; }
+		#hint { margin-top: 8dp; font-size: 13dp; color: #ffffff90; }
+	</style>
+</head>
+<body>
+	<div id="panel">
+		<div id="left">
+			<h1>Inventory</h1>
+			<div id="grid"></div>
+			<div id="hint">Click: take / place &nbsp; Shift + click: split &nbsp; Right click: eat / equip &nbsp; Tab: close</div>
+		</div>
+		<div id="info"></div>
+	</div>
+</body>
+</rml>

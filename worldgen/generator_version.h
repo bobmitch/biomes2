@@ -100,7 +100,14 @@ namespace worldgen {
 //      outside the wall. Meadows 1/km2 (shallow, big mouth), forest 2/km2
 //      (long tunnel, a cavern). Trees and rocks keep off a mouth. The shafts
 //      and the ridged tunnels stay off. Hashed by their buffer and ids.
-static const int kGeneratorVersion = 19;
+//  20  layer 10, forage: plants to pick. Per species a grid of candidate
+//      cells (strawberries: 40 m, meadows 0.35), each holding at most one
+//      patch of 1-3 plants within 2.5 m of its middle, on the real ground,
+//      clear of trunks, rocks, rivers, flat sites and cave mouths, kept less
+//      often on a slope. Its own feature seed; no other layer moves. Plants
+//      are smaller than the hash grid, so they are hashed by their instances
+//      at the 24 land sites the trees and rocks use.
+static const int kGeneratorVersion = 20;
 
 }  // namespace worldgen
 

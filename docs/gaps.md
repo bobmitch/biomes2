@@ -7,6 +7,31 @@ priority.
 
 Last gathered: 2026-11-21, after the exploration fog.
 
+## Gameplay: survival, the inventory, forage
+
+- **The window loop's play has not been played.** Every rule is tested
+  headless (`--survival-test`) and the HUD and inventory are checked in
+  stills, but the live parts -- Tab and 1-8 through the script, sprint
+  drain and a jump's cost under real physics, fall damage from a real
+  landing (`character_supported()` as "on the ground"), the respawn, the
+  clock running -- have not been driven by hand. [Survival]
+- **Death keeps the inventory** and drops nothing: Valheim leaves a
+  tombstone. No death screen either: the player wakes at once. [Survival]
+- **Snapshots (F8) carry neither the player nor the picks**, and nothing
+  saves on quit: F6 only. [Survival]
+- **Tools have no models in hand** -- the axe swings an empty fist, and the
+  torch is a light over the fist -- and no durability. [Survival]
+- **Only two foods exist** (strawberries, glowing mushrooms), so the third
+  food slot and "too full" are reachable only in the test table. [Survival]
+- **Forage plants cast no shadow and do not sway**; they pop between ripe
+  and flowering (no growth stages). The flowers are the only cue a picked
+  plant will bear again. [Forage]
+- **Nothing collides with a plant**, and a dig under one leaves it floating
+  (rocks and trees settle; plants do not). [Forage]
+- **The engine's draw of a species is one generator** (a berry rosette);
+  a second species that should not look like a strawberry needs a `form`.
+  [Forage]
+
 ## Visibility and atmosphere
 
 - **The exploration fog is off by default (2026-11-26): it blows out at

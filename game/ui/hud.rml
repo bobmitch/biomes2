@@ -1,9 +1,11 @@
 <rml>
 <!--
-  The in-game HUD: a crosshair at the screen centre (where a dig lands) and
-  the dig radius. Markup only; game/scripts/hud.lua fills the label and hides
-  it all behind the pause menu. Nothing here takes the mouse
-  (pointer-events: none), so a click still falls through to the game.
+  The in-game HUD: the crosshair (where a dig lands and E picks), what E
+  would do, the hotbar (slots 1-8), health with the foods eaten over it,
+  stamina, the day and the hour, the message line, and the dig radius.
+  Markup only; game/scripts/hud.lua fills it and hides it all behind the
+  pause menu. Nothing here takes the mouse (pointer-events: none), so a
+  click still falls through to the game.
 -->
 <head>
 	<title>HUD</title>
@@ -17,35 +19,192 @@
 			justify-content: center;
 			align-items: center;
 		}
+		div { pointer-events: none; }
 		#cross {
 			width: 4dp;
 			height: 4dp;
 			background-color: #ffffffd0;
 			border: 1dp #000000a0;
 			border-radius: 3dp;
-			pointer-events: none;
+		}
+		#prompt {
+			position: absolute;
+			left: 0;
+			right: 0;
+			top: 54%;
+			text-align: center;
+			font-size: 19dp;
+			color: #fff4d8;
+		}
+		#prompt span {
+			display: inline-block;
+			padding: 3dp 10dp;
+			background-color: #00000070;
+			border-radius: 3dp;
 		}
 		#dig {
 			position: absolute;
 			left: 0;
 			right: 0;
-			bottom: 18dp;
+			bottom: 10dp;
 			text-align: center;
 			font-family: "Roboto Mono";
-			font-size: 15dp;
-			color: #ffffffe0;
-			pointer-events: none;
+			font-size: 13dp;
+			color: #ffffffa0;
 		}
-		#dig span {
-			display: inline-block;
-			padding: 3dp 10dp;
-			background-color: #00000080;
+
+		/* ---- the hotbar ---- */
+		#hotbar {
+			position: absolute;
+			left: 18dp;
+			top: 18dp;
+			display: flex;
+			flex-direction: row;
+		}
+		.slot {
+			box-sizing: border-box;
+			position: relative;
+			width: 58dp;
+			height: 58dp;
+			margin-right: 5dp;
+			background-color: #10141ab0;
+			border: 2dp #ffffff22;
+			border-radius: 5dp;
+		}
+		.slot.equipped { border-color: #f0c860; background-color: #3a3018c0; }
+		.slot img { position: absolute; left: 5dp; top: 5dp; width: 44dp; height: 44dp; }
+		.slot .key {
+			position: absolute;
+			left: 4dp;
+			top: 1dp;
+			font-size: 13dp;
+			color: #ffffffa0;
+		}
+		.slot .count {
+			position: absolute;
+			right: 4dp;
+			bottom: 1dp;
+			font-size: 14dp;
+			font-weight: bold;
+			color: #ffffff;
+		}
+
+		/* ---- health and food ---- */
+		#vitals {
+			position: absolute;
+			left: 18dp;
+			bottom: 22dp;
+			width: 300dp;
+		}
+		#foods { display: flex; flex-direction: row; height: 62dp; margin-bottom: 6dp; }
+		.food {
+			box-sizing: border-box;
+			position: relative;
+			width: 52dp;
+			height: 60dp;
+			margin-right: 6dp;
+			background-color: #10141ab0;
+			border: 2dp #ffffff22;
+			border-radius: 5dp;
+		}
+		.food.hungry { border-color: #ffb040; }
+		.food img { position: absolute; left: 6dp; top: 2dp; width: 36dp; height: 36dp; }
+		.food .time {
+			position: absolute;
+			left: 0;
+			right: 0;
+			bottom: 9dp;
+			text-align: center;
+			font-size: 12dp;
+			color: #ffffffd0;
+		}
+		.food .left {
+			position: absolute;
+			left: 4dp;
+			bottom: 3dp;
+			height: 4dp;
+			background-color: #ffd070;
+			border-radius: 2dp;
+		}
+		.bar {
+			position: relative;
+			height: 20dp;
+			background-color: #10141ac0;
+			border: 1dp #ffffff30;
+			border-radius: 4dp;
+		}
+		.bar .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3dp; }
+		.bar .text {
+			position: absolute;
+			left: 0;
+			right: 0;
+			top: 0;
+			text-align: center;
+			font-size: 14dp;
+			line-height: 20dp;
+			color: #ffffff;
+		}
+		#health .fill { background-color: #c8343c; }
+		#stamina-box {
+			position: absolute;
+			left: 50%;
+			margin-left: -160dp;
+			width: 320dp;
+			bottom: 34dp;
+		}
+		#stamina .fill { background-color: #e8c440; }
+		#stamina.empty { border-color: #ff6040; }
+
+		/* ---- the clock and the message line ---- */
+		#clock {
+			position: absolute;
+			right: 18dp;
+			top: 18dp;
+			font-size: 18dp;
+			padding: 4dp 10dp;
+			background-color: #10141a90;
+			border-radius: 4dp;
+		}
+		#msgs {
+			position: absolute;
+			left: 18dp;
+			top: 96dp;
+			width: 520dp;
+		}
+		#msgs div {
+			font-size: 17dp;
+			color: #ffffff;
+			margin-bottom: 3dp;
+		}
+		#msgs div span {
+			padding: 2dp 8dp;
+			background-color: #00000070;
 			border-radius: 3dp;
+		}
+		#dead {
+			position: absolute;
+			left: 0;
+			right: 0;
+			top: 38%;
+			text-align: center;
+			font-size: 40dp;
+			color: #ff8070;
 		}
 	</style>
 </head>
 <body>
 	<div id="cross"></div>
+	<div id="prompt"></div>
+	<div id="hotbar"></div>
+	<div id="msgs"></div>
+	<div id="clock"></div>
+	<div id="vitals">
+		<div id="foods"></div>
+		<div id="health" class="bar"><div id="health-fill" class="fill"></div><div id="health-text" class="text"></div></div>
+	</div>
+	<div id="stamina-box">
+		<div id="stamina" class="bar"><div id="stamina-fill" class="fill"></div><div id="stamina-text" class="text"></div></div>
+	</div>
 	<div id="dig"></div>
 </body>
 </rml>

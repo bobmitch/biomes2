@@ -317,6 +317,17 @@ void RenderD3D12::ReleaseGeometry(Rml::CompiledGeometryHandle handle) {
 }
 
 Rml::TextureHandle RenderD3D12::LoadTexture(Rml::Vector2i& dimensions, const Rml::String& source) {
+    // "icon:<name>", wherever the document's path put it in front.
+    const size_t at = source.find("icon:");
+    if (at != Rml::String::npos && image_source_) {
+        std::vector<unsigned char> rgba;
+        int w = 0, h = 0;
+        if (image_source_(source.substr(at + 5), rgba, w, h) && w > 0 && h > 0 &&
+            rgba.size() >= size_t(w) * size_t(h) * 4) {
+            dimensions = Rml::Vector2i(w, h);
+            return reinterpret_cast<Rml::TextureHandle>(make_texture(rgba.data(), w, h));
+        }
+    }
     // No image decoder yet: the menus are text and boxes.
     dimensions = Rml::Vector2i(0, 0);
     Rml::Log::Message(Rml::Log::LT_WARNING, "ui: image files are not supported yet (%s)", source.c_str());
