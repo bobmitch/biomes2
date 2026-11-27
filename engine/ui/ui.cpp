@@ -99,6 +99,7 @@ bool Ui::init(HWND hwnd, ID3D12Device* device, UINT width, UINT height, Host* ho
         impl_.reset();
         return false;
     }
+    if (host_ && host_->image) impl_->render.set_image_source(host_->image);
     Rml::SetSystemInterface(&impl_->system);
     Rml::SetRenderInterface(&impl_->render);
     Rml::SetTextInputHandler(&impl_->ime);
@@ -165,7 +166,11 @@ bool Ui::on_message(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, bool mouse_captur
 
     // The keys the script owns, whatever else is going on.
     if (msg == WM_KEYDOWN) {
-        const char* name = wp == VK_ESCAPE ? "escape" : wp == VK_F1 ? "f1" : wp == VK_OEM_3 ? "grave" : nullptr;
+        // Tab and 1-8 too: the inventory and the hotbar are the script's.
+        static const char* kDigits[9] = {"1", "2", "3", "4", "5", "6", "7", "8", "9"};
+        const char* name = wp == VK_ESCAPE ? "escape" : wp == VK_F1 ? "f1" : wp == VK_OEM_3 ? "grave"
+                         : wp == VK_TAB ? "tab"
+                         : (wp >= '1' && wp <= '9') ? kDigits[wp - '1'] : nullptr;
         if (name && !(lp & (1 << 30)) && call_on_key(name)) return true;   // not on auto-repeat
     }
 

@@ -122,6 +122,7 @@ bool GlowMushrooms::load_config(const char* path, std::string& error) {
             num("nits", cfg_.nits);
             num("lumens_each", cfg_.lumens_each);
             num("range", cfg_.range);
+            if (g.has("item")) cfg_.item = g.string("item");
         }
     } catch (const std::exception& e) {
         error = std::string("archetypes.json glow_mushrooms: ") + e.what();

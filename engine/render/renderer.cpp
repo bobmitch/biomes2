@@ -3038,11 +3038,19 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
         if (!mushrooms_.init(device_.Get(), queue_.Get(), mesh_root_.Get(), "worldgen/data/archetypes.json", error))
             return false;
         mushrooms_.set_world(&world_.world());
+        // Layer 10's plants: their meshes, and one placement worker.
+        if (!forage_.init(device_.Get(), queue_.Get(), mesh_root_.Get(), "worldgen/data/archetypes.json", error))
+            return false;
+        forage_.set_world(&world_.world(), &world_.params(), &world_.table());
     }
     startup_log().push_back(std::make_pair(std::string("phase: tree models + impostor bake"), startup_now_ms() - t0));
     t0 = startup_now_ms();
     if (!foliage_.init(device_.Get(), &world_, "worldgen/data/archetypes.json", error)) return false;
     foliage_.set_edits(&edits_);
+    // No grass grows up through a forage plant: the bake bares its foot.
+    foliage_.set_bare_fn([this](int sx0, int sz0, float* tops) {
+        if (forage_on_) forage_.clear_tops(sx0, sz0, tops);
+    });
     startup_log().push_back(std::make_pair(std::string("phase: foliage pipelines"), startup_now_ms() - t0));
     t0 = startup_now_ms();
     if (!create_fog(error)) return false;
@@ -3077,6 +3085,10 @@ void Renderer::update_trees(const ViewConstants& view, bool settle) {
         mushrooms_.update(view.cam_pos,
                           [this](float x, float z, float from_y) { return ground_below(x, z, from_y, true); },
                           settle ? 1 << 20 : 1);
+    // The plants to pick round the camera; the grass under a new one re-bakes.
+    if (forage_on_)
+        forage_.update(view.cam_pos[0], view.cam_pos[2], settle,
+                       [this](const float lo[3], const float hi[3]) { foliage_.invalidate_box(lo, hi); });
     if (settle) {
         // A still waits for every tile, the way it waits for every chunk.
         for (int i = 0; i < 4000 && !tree_field_.settled(); ++i) {
@@ -4108,6 +4120,11 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         build_view_proj(view, mvp);
         mushrooms_.prepare(UINT(frame_), view.cam_pos, mvp);
     }
+    if (forage_on_ && forage_.ready() && mode_ != Mode::Wireframe) {
+        float fvp[16];
+        build_view_proj(view, fvp);
+        forage_.prepare(UINT(frame_), view.cam_pos, fvp, game_time_);
+    }
     // The character's pose for this frame, before the cascades draw it.
     character_.prepare(UINT(frame_));
     // Local lights (ADR-004 L3): their list, their clusters and their shadow
@@ -4327,6 +4344,7 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         if (rocks_on_ && rocks_.ready() && !wire) rocks_.record(cmd_.Get(), UINT(frame_));
         prof_.mark(cmd_.Get(), "rocks");
         if (mushrooms_on_ && mushrooms_.ready() && !wire) mushrooms_.record(cmd_.Get(), UINT(frame_));
+        if (forage_on_ && forage_.ready() && !wire) forage_.record(cmd_.Get(), UINT(frame_));
         // The player's character, on the same root.
         if (!wire) character_.record(cmd_.Get(), UINT(frame_));
     }
@@ -5954,6 +5972,14 @@ bool Renderer::pick_mushroom(const float eye[3], const float dir[3], const float
     return mushrooms_.pick(eye, dir, hand, reach, occ);
 }
 
+bool Renderer::aim_forage(const float eye[3], const float dir[3], const float hand[3], float reach,
+                          Forage::Hit& out) {
+    if (!forage_on_) return false;
+    float hit[3], occ = 1e30f;
+    if (!aim_terrain(eye, dir, 60.0f, hit, occ)) occ = 1e30f;
+    return forage_.aim(eye, dir, hand, reach, occ, game_time_, out);
+}
+
 float Renderer::ground_below(float x, float z, float from_y, bool with_edits) const {
     // The edited field, or the generated one alone (what stood there first).
     auto dens = [&](float y) {
@@ -6207,6 +6233,7 @@ void Renderer::slot_report(const char* path) {
 void Renderer::shutdown() {
     if (ready_) wait_for_gpu();
     near_.shutdown();   // the flood's worker, before the world it reads
+    forage_.shutdown();
     tree_field_.shutdown();
     trees_.shutdown();
     ready_ = false;

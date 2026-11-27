@@ -19,6 +19,7 @@
 #include <wrl/client.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,11 @@ public:
     bool init(ID3D12Device* device, DXGI_FORMAT target_format, std::string& error);
     // The caller has waited for the GPU.
     void shutdown();
+    // Where "icon:<name>" images come from (the item icons): RGBA8,
+    // premultiplied sRGB. Anything else is not loaded (no image decoder).
+    void set_image_source(std::function<bool(const std::string&, std::vector<unsigned char>&, int&, int&)> fn) {
+        image_source_ = fn;
+    }
 
     // Brackets one frame's Context::Render().
     void begin_frame(ID3D12GraphicsCommandList* cmd, D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT width, UINT height);
@@ -50,6 +56,7 @@ public:
     void SetTransform(const Rml::Matrix4f* transform) override;
 
 private:
+    std::function<bool(const std::string&, std::vector<unsigned char>&, int&, int&)> image_source_;
     struct Geometry {
         ComPtr<ID3D12Resource> buf;    // upload heap: vertices, then indices
         D3D12_VERTEX_BUFFER_VIEW vbv = {};

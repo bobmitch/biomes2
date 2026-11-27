@@ -227,6 +227,11 @@ if(BIOMES2_ENGINE)
     engine/rocks/rock_field.cpp
     engine/rocks/rock_renderer.cpp
     engine/props/glow_mushrooms.cpp
+    engine/props/forage.cpp
+    engine/player/items.cpp
+    engine/player/inventory.cpp
+    engine/player/survival.cpp
+    engine/player/icons.cpp
     engine/character/character_model.cpp
     engine/character/character_renderer.cpp
     engine/ui/ui.cpp

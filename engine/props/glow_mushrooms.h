@@ -67,6 +67,7 @@ public:
         float nits = 3.0f;               // the gills' glow; the cap shows about half
         float lumens_each = 4.0f;
         float range = 5.0f;              // m
+        std::string item = "glow_mushroom";   // what a picked one gives (game/data/items.json)
     };
 
     // The cluster's floor, marched down from `from_y` through the edited

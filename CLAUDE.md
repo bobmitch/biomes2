@@ -19,7 +19,9 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `engine/character/` | The player's character: the packed model, the procedural animator, the skinned draw. |
 | `tools/models/` | `pack_character.py`: the rigged glTF characters and the animation library in `assets/models/` (not in git) to `assets/models/packed/` (`*.chr`, `ual.anim`). |
 | `engine/rocks/` | Layer 9's rocks: procedural meshes, the CPU tile streamer, instanced drawing on the terrain's root signature, static colliders. |
-| `engine/props/` | Things to pick up. So far the caves' glowing mushrooms (`glow_mushrooms.h`): placement, drawing, a light per cluster, picking with E. |
+| `engine/props/` | Things to pick up: the caves' glowing mushrooms (`glow_mushrooms.h`), and layer 10's forage plants (`forage.h`): streaming in 64 m zones, picks and regrowth, drawing, picking with E. |
+| `engine/player/` | The player's survival: items (`items.h`), the 8 x 4 inventory, health / stamina / food / the game clock (`survival.h`), item icons painted from data (`icons.h`). No GPU. |
+| `game/data/` | `items.json`: every item, the player's numbers, the clock, the start inventory. Gameplay data, outside the hash. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32), Windows only: seeds as maps plus their gameplay numbers. See "The world viewer". |
 | `tools/shared/` | Presentation (`render.h`) and gameplay measures of a seed (`seed_metrics.h`), shared by the harness and the viewer. |
@@ -128,7 +130,8 @@ pipeline statistics and the trees' overdraw, `<shot>.gpu.txt`; see Trees),
 `--leak-test`
 (ADR-004 L6: a sealed chamber, unlit and torch-lit, the heightfield GI against
 the bare fallback), `--lights-report` (ADR-004 L3: local lights at night, six
-configurations timed), `--fell` (with `--fell-save` / `--fell-verify`) and `--dig-settle`.
+configurations timed), `--fell` (with `--fell-save` / `--fell-verify`), `--dig-settle` and
+`--survival-test` (the player's rules and the forage layer; see Survival).
 Every mode takes `--seed <n>` (which world; 0 by default, and every view
 measured in this file is seed 0), `--character male|female` (which pack; male by default) and
 `--time <hours>` (ADR-004 L2: 14 by default, which is the
@@ -1286,9 +1289,130 @@ and picks are not saved.
   probes they wake in sealed air (1,674 -> 2,253 live). Nothing where no
   cave is near.
 
+### Survival: health, stamina, food and the inventory
+
+Valheim's rules, deliberately (`engine/player/`, data in
+`game/data/items.json`, never in the golden hash):
+
+- **Health 25 and stamina 50 at base; food raises the MAXIMUM.** Up to three
+  foods at once, each a different one; a food's value is (time left /
+  duration)^0.3 of its full amounts, so near full for most of its time and
+  falling away at the end. The same food can be eaten again only below half
+  its time (it refreshes); with all three slots full, a new food replaces
+  one under half, otherwise "too full". Health regenerates in 10 s ticks by
+  the foods' regen; stamina continuously, 1 s after its last use, not while
+  swimming.
+- **Stamina**: sprint 10 a second, swimming under way 6, a jump 10 (paid on
+  the press, from the ground), a swing of the axe 8, a dig 5 -- on foot
+  only; flying spends nothing. With none: no sprint, jump, swing or dig
+  (an action needs at least half its cost), and swimming drowns, 5 health
+  a second. **A fall** over 4 m hurts, linearly to 100 at 20 m; into water,
+  nothing. At 0 health the player wakes at the spawn with no food (the
+  inventory is kept for now: no tombstone).
+- **The inventory** is 8 x 4; the top row is the hotbar. A pick-up stacks
+  onto the same item, then fills the first empty slot from the top left, so
+  new kinds land in the hotbar. **1-8** use a slot: eat a food, equip or put
+  away a tool. **Tools**: the axe (left click chops only with it in hand)
+  and the torch (in hand = the carried light; `F` still toggles the light
+  directly, for debugging). A new game starts with both (`start` in
+  items.json). **Tab** opens the inventory (the old fly/walk toggle is
+  **F10**, a system key: `WM_SYSKEYDOWN`): click takes a stack, click again
+  places it (merge or swap), Shift + click splits into an empty slot, right
+  click uses. The game runs on behind it.
+- **The clock** runs in the window: a day is 30 real minutes (`clock`
+  `day_length_min`), day 1 at `--time`'s hour. `Survival` owns it (game
+  seconds since day 1, 00:00); the renderer's hour is set from it in steps
+  of 6 game seconds -- the sky's hemisphere integral (~0.3 ms) re-runs on
+  any change of the hour, and at 48x that was every frame. PgUp / PgDn move
+  it, H runs it 360x. Headless modes never run it: their clock is `--time`.
+- **C++ routes, Lua decides, as before**: `ui.cpp` hands Tab and 1-9 to
+  `game.on_key`; `inventory.lua` and `hud.lua` decide what a click does and
+  what is shown, through `engine.player()`, `engine.inventory()`,
+  `engine.item(id)`, `engine.use_slot`, `move_slot`, `split_slot`,
+  `engine.prompt()` (what E would do), `engine.messages()` and
+  `engine.captured()` (script_api.h). Without a UI, 1-8 still use the
+  hotbar.
+- **Icons are data**: each item's `icon` is a list of ellipses, rectangles
+  and polygons in a unit square, painted at 64 x 64 with 4 x 4 samples
+  (`icons.cpp`) when RmlUi asks for the image `icon:<id>` (the UI renderer's
+  `LoadTexture`, which still decodes no files).
+- **The HUD** (`hud.rml`, `hud.lua`): hotbar top left, messages under it,
+  the day and hour top right, the foods (icon, time left, a bar; the border
+  lights when it can be eaten again) over the health bar bottom left,
+  stamina bottom centre (fading out once full), and what E would pick under
+  the crosshair. It touches an element only when its text changed.
+- **F6 / F9** save and load the player (`build/player.txt`, text, items by
+  id) and the picked plants (`build/forage.bin`) beside the edits and trees.
+  A snapshot (F8) does not carry either yet.
+- **`engine.exe --survival-test`** (`build/survival_test.txt`, exit code =
+  failures): the rules on a test table it writes itself
+  (`build/survival_test_items.json`), so retuning items.json moves nothing
+  there -- eating, refreshing, replacing, wearing off, the decay curve,
+  regen, the stamina delay, sprint, drowning, falls into ground and water,
+  death and respawn, equipping through a move, stacks and splits, a save's
+  round trip; then the shipping seed's forage at the spawn (the nearest
+  plant picked, ripe again exactly regrow_days later, picks saved, another
+  world's refused); then stills: `build/forage_ripe.bmp`,
+  `forage_picked.bmp`, `survival_hud.bmp`, `survival_inventory.bmp`.
+- **Cost**: walking at 1440p with the plants 6.22 / 6.09 ms against 6.06 /
+  6.10 without (`--no-forage`) -- within noise.
+- **Not done**: see gaps.md -- the window loop itself (keys, the clock
+  running, sprint drain, a jump's cost, fall damage, the respawn) has only
+  been run through its parts headlessly, not played.
+
+### Forage (layer 10): things to pick, and the zones they live in
+
+**Placement is layer 10, in `worldgen/`, under the golden hash (v20)**, in
+layer 8's shape: per species (archetypes.json `forage.species`) a grid of
+candidate cells (strawberries 40 m), each holding at most one PATCH of 1-3
+plants within 2.5 m of its middle, 0.8 m apart. A biome's `forage` block is
+each species' chance a cell holds a patch (meadows: strawberries 0.5),
+blended across borders with the weights sharpened as trees sharpen them; a
+patch on a slope is kept with that chance times (1 - slope / max_slope).
+Plants stand on the real ground (`real_ground`), clear of trunks (1.4 m:
+the root flare), rocks, rivers, flat sites and cave mouths, with no roof.
+`forage_id(species, plant, i, j)` is a plant's save identity. Rolls are
+keyed by plant and try, never by how many came before. `validate`'s
+`forage` check: configured biomes grow patches (meadows 103 /km2, ~2 plants
+each), unconfigured ones no more than a trace, every pinned plant seated;
+the hash pins them by instances at the trees' 24 sites, 5 x 5 cells each.
+
+**Zones, not a world list** (`engine/props/forage.h`). Valheim generates a
+64 m zone's contents when a player first comes near and keeps what changed
+as per-object records. Here generation is free -- a plant is a pure function
+of its cell -- so 64 m tiles round the player are built on a worker as they
+come within 150 m and dropped when they leave (RockField's shape), and the
+only record is what the player CHANGED: `picked_`, id -> the game time it
+was picked. A BVH would buy nothing: every query is "near the player",
+which the tile grid answers by construction. **Regrowth** is a comparison,
+not a timer: ripe when the clock is `regrow_days` game days past the pick
+(strawberries 3 -- 90 real minutes).
+
+- **What a plant gives** is the engine's half of its archetypes.json entry:
+  `item` (an items.json id), `yield` [min, max] per plant from its id's
+  hash, `regrow_days`, and `look` (size across, leaf / berry / flower sRGB).
+- **Drawn** like the mushrooms, on the terrain's root after them: procedural
+  meshes built at startup (`build_models`), three variants a species, each
+  in three parts -- a rosette of trifoliate leaves on arching stalks (every
+  plant), berries hanging at the rim with a calyx (ripe), white flowers on
+  stalks (growing back). Leaves are lit as leaves (wrap, through), berries
+  glossy and seeded by the BRDF; local lights, the wet world and the flash
+  reach them; no shadow cast. A dithered fade over the last 15% of 90 m.
+- **The grass clears from under them**: `FoliageRenderer::set_bare_fn`
+  lets the bake mark columns bare where a plant stands (the bake's existing
+  edit mask), and a newly streamed tile re-bakes the grass under its
+  plants. Without it 25-60 cm of meadow hid a 20 cm plant.
+- **E** picks the ripe plant under the crosshair within 2.5 m of the head
+  (`Renderer::aim_forage`: the plants first, and a terrain ray only when one
+  is in reach, so the per-frame prompt is free when none is), into the
+  inventory; a full inventory refuses before the plant is picked.
+  Mushrooms (E in caves) go into the inventory too: archetypes.json
+  `glow_mushrooms.item`.
+- `--no-forage` for A/B.
+
 ### The player character
 
-Walk mode (Tab) is third person: Quaternius's **Universal Base Character**
+Walk mode (F10; the window opens walking at the spawn) is third person: Quaternius's **Universal Base Character**
 (CC0, `assets/models/Universal Base Characters[Standard]`), male by default,
 `--character female`. Chosen over the low-poly girl beside it, which has 36
 clips but no licence file, for its UE5-mannequin skeleton (65 joints): the
@@ -3038,6 +3162,9 @@ inside it, a 2 m tunnel pinched shut under 20-30 m of rock).
   1.5 s (`build/cave_walk.txt`); `--post-debug 6|7` the direct and ambient
   targets alone. `BIOMES_L0="caves=0"` builds the world without them.
   `view.exe` draws them with the flat sites.
+
+**Forage is pinned the same way** (v20): at the same 24 sites, 5 x 5 cells
+of each species, by its plants (the sixth per-layer hash).
 
 **Rocks are pinned the same way** (v14): at the same 24 sites, boulders over
 a 64 m tile and outcrops over 3 x 3 of their cells, with their own

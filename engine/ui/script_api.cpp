@@ -169,6 +169,120 @@ int l_time(lua_State* L) {
     return 1;
 }
 
+void set_num(lua_State* L, const char* k, double v) { lua_pushnumber(L, v); lua_setfield(L, -2, k); }
+void set_str(lua_State* L, const char* k, const std::string& v) { lua_pushstring(L, v.c_str()); lua_setfield(L, -2, k); }
+void set_bool(lua_State* L, const char* k, bool v) { lua_pushboolean(L, v); lua_setfield(L, -2, k); }
+
+int l_player(lua_State* L) {
+    Host* h = host_of(L);
+    if (!h || !h->player) { lua_pushnil(L); return 1; }
+    const PlayerView p = h->player();
+    lua_newtable(L);
+    set_num(L, "health", p.health);
+    set_num(L, "max_health", p.max_health);
+    set_num(L, "stamina", p.stamina);
+    set_num(L, "max_stamina", p.max_stamina);
+    set_num(L, "since_stamina", p.since_stamina);
+    set_bool(L, "dead", p.dead);
+    set_bool(L, "walking", p.walking);
+    set_num(L, "day", p.day);
+    set_num(L, "hour", p.hour);
+    set_num(L, "equipped", p.equipped);
+    lua_newtable(L);
+    for (size_t i = 0; i < p.foods.size(); ++i) {
+        const FoodView& f = p.foods[i];
+        lua_newtable(L);
+        set_str(L, "id", f.id);
+        set_str(L, "name", f.name);
+        set_num(L, "value", f.value);
+        set_num(L, "share", f.share);
+        set_num(L, "time_left", f.time_left);
+        set_bool(L, "can_eat", f.can_eat);
+        lua_rawseti(L, -2, lua_Integer(i + 1));
+    }
+    lua_setfield(L, -2, "foods");
+    return 1;
+}
+
+int l_inventory(lua_State* L) {
+    Host* h = host_of(L);
+    lua_newtable(L);
+    if (!h || !h->inventory) return 1;
+    const std::vector<SlotView> v = h->inventory();
+    for (size_t i = 0; i < v.size(); ++i) {
+        lua_newtable(L);
+        set_str(L, "id", v[i].id);
+        set_str(L, "name", v[i].name);
+        set_num(L, "count", v[i].count);
+        lua_rawseti(L, -2, lua_Integer(i + 1));
+    }
+    return 1;
+}
+
+int l_item(lua_State* L) {
+    Host* h = host_of(L);
+    const char* id = luaL_checkstring(L, 1);
+    if (!h || !h->item) { lua_pushnil(L); return 1; }
+    const ItemView v = h->item(id);
+    if (!v.found) { lua_pushnil(L); return 1; }
+    lua_newtable(L);
+    set_str(L, "id", v.id);
+    set_str(L, "name", v.name);
+    set_str(L, "description", v.description);
+    set_str(L, "kind", v.kind);
+    set_num(L, "stack", v.stack);
+    set_num(L, "health", v.health);
+    set_num(L, "stamina", v.stamina);
+    set_num(L, "regen", v.regen);
+    set_num(L, "duration", v.duration);
+    return 1;
+}
+
+int l_use_slot(lua_State* L) {
+    Host* h = host_of(L);
+    const int i = int(luaL_checkinteger(L, 1));
+    if (h && h->use_slot) h->use_slot(i - 1);
+    return 0;
+}
+
+int l_move_slot(lua_State* L) {
+    Host* h = host_of(L);
+    const int a = int(luaL_checkinteger(L, 1)), b = int(luaL_checkinteger(L, 2));
+    lua_pushboolean(L, h && h->move_slot && h->move_slot(a - 1, b - 1));
+    return 1;
+}
+
+int l_split_slot(lua_State* L) {
+    Host* h = host_of(L);
+    const int a = int(luaL_checkinteger(L, 1)), b = int(luaL_checkinteger(L, 2));
+    lua_pushboolean(L, h && h->split_slot && h->split_slot(a - 1, b - 1));
+    return 1;
+}
+
+int l_prompt(lua_State* L) {
+    Host* h = host_of(L);
+    lua_pushstring(L, h && h->prompt ? h->prompt().c_str() : "");
+    return 1;
+}
+
+int l_messages(lua_State* L) {
+    Host* h = host_of(L);
+    lua_newtable(L);
+    if (!h || !h->messages) return 1;
+    const std::vector<std::string> m = h->messages();
+    for (size_t i = 0; i < m.size(); ++i) {
+        lua_pushstring(L, m[i].c_str());
+        lua_rawseti(L, -2, lua_Integer(i + 1));
+    }
+    return 1;
+}
+
+int l_captured(lua_State* L) {
+    Host* h = host_of(L);
+    lua_pushboolean(L, h && h->captured && h->captured());
+    return 1;
+}
+
 }  // namespace
 
 void open_engine_module(lua_State* L, Host* host) {
@@ -187,6 +301,15 @@ void open_engine_module(lua_State* L, Host* host) {
         {"apply_display", l_apply_display},
         {"log", l_log},
         {"time", l_time},
+        {"player", l_player},
+        {"inventory", l_inventory},
+        {"item", l_item},
+        {"use_slot", l_use_slot},
+        {"move_slot", l_move_slot},
+        {"split_slot", l_split_slot},
+        {"prompt", l_prompt},
+        {"messages", l_messages},
+        {"captured", l_captured},
         {nullptr, nullptr},
     };
     luaL_newlib(L, fns);

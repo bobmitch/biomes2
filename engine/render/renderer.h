@@ -35,6 +35,7 @@
 #include "engine/rocks/rock_field.h"
 #include "engine/rocks/rock_renderer.h"
 #include "engine/props/glow_mushrooms.h"
+#include "engine/props/forage.h"
 #include "engine/character/character_renderer.h"
 
 #include <functional>
@@ -306,6 +307,18 @@ public:
     // Picks the mushroom nearest along the camera's ray within `reach` of
     // `hand` and in front of the terrain the ray meets: true if one was.
     bool pick_mushroom(const float eye[3], const float dir[3], const float hand[3], float reach);
+    // Layer 10's plants to pick (engine/props/forage.h; --no-forage):
+    // streamed round the camera, ripe by the game clock below.
+    Forage&                forage() { return forage_; }
+    void set_forage(bool on) { forage_on_ = on; }
+    bool forage_on() const { return forage_on_; }
+    // The game's clock, game seconds since day 1 at 00:00 (the window loop's,
+    // engine/player/survival.h): what the plants ripen by.
+    void   set_game_time(double s) { game_time_ = s; }
+    double game_time() const { return game_time_; }
+    // The ripe plant the camera's ray is on, within `reach` of `hand`, in
+    // front of whatever terrain the ray meets.
+    bool aim_forage(const float eye[3], const float dir[3], const float hand[3], float reach, Forage::Hit& out);
     // The player's character (engine/character/): the pack is chosen before
     // init (--character), and the caller poses it every frame.
     void set_character_pack(const std::string& path) { character_pack_ = path; }
@@ -951,6 +964,9 @@ private:
     bool             rocks_on_ = true;
     GlowMushrooms    mushrooms_;
     bool             mushrooms_on_ = true;
+    Forage           forage_;
+    bool             forage_on_ = true;
+    double           game_time_ = 14.0 * 3600.0;
     CharacterRenderer character_;
     std::string      character_pack_ = "assets/models/packed/male.chr";
     TreeRenderer     trees_;

@@ -20,6 +20,20 @@
 //   engine.apply_display{width=, height=, mode=, vsync=}
 //   engine.log(text)
 //   engine.time() -> seconds since start (wall clock, runs while paused)
+//
+// The player (engine/player/survival.h). Slots are 1..32, the hotbar 1..8:
+//   engine.player() -> {health, max_health, stamina, max_stamina, since_stamina,
+//                       dead, walking, day, hour, equipped (slot or 0),
+//                       foods = { {id, name, value, share, time_left, can_eat}, ... }}
+//   engine.inventory() -> { {id, name, count}, ... } 32 of them, id "" empty
+//   engine.item(id) -> {id, name, description, kind, stack, health, stamina,
+//                       regen, duration} or nil
+//   engine.use_slot(i)            eat a food, equip or put away a tool
+//   engine.move_slot(from, to) -> bool, engine.split_slot(from, to) -> bool
+//   engine.prompt() -> text       what E would do now, "" for nothing
+//   engine.messages() -> { text, ... }  what happened since the last call
+//   engine.captured() -> bool     whether the mouse is captured for looking
+// An item's icon is the image "icon:<id>" (ui_render_d3d12.cpp).
 // ---------------------------------------------------------------------------
 #ifndef ENGINE_UI_SCRIPT_API_H
 #define ENGINE_UI_SCRIPT_API_H
@@ -54,6 +68,37 @@ struct DisplayState {
     bool forced = false;   // --res on the command line: saved settings must not override it
 };
 
+struct FoodView {
+    std::string id, name;
+    float value = 0.0f, share = 0.0f, time_left = 0.0f;
+    bool can_eat = false;
+};
+
+struct PlayerView {
+    float health = 0.0f, max_health = 0.0f, stamina = 0.0f, max_stamina = 0.0f;
+    float since_stamina = 0.0f;
+    bool dead = false, walking = false;
+    int day = 1;
+    float hour = 0.0f;
+    int equipped = 0;   // 1-based slot, 0 for empty hands
+    std::vector<FoodView> foods;
+};
+
+struct SlotView {
+    std::string id, name;
+    int count = 0;
+};
+
+struct ItemView {
+    bool found = false;
+    std::string id, name, description, kind;
+    int stack = 1;
+    float health = 0.0f, stamina = 0.0f, regen = 0.0f, duration = 0.0f;
+};
+
+// An image the UI asks for by name ("icon:<id>"): RGBA8, premultiplied sRGB.
+using ImageSource = std::function<bool(const std::string& name, std::vector<unsigned char>& rgba, int& w, int& h)>;
+
 struct Host {
     std::vector<Tunable> tunables;
     std::function<void()> quit;
@@ -63,6 +108,17 @@ struct Host {
     std::function<DisplayState()> display;
     std::function<std::vector<std::pair<int, int> >()> display_modes;
     std::function<void(const DisplayState&)> apply_display;
+    // The player. Unset: the functions return nothing.
+    std::function<PlayerView()> player;
+    std::function<std::vector<SlotView>()> inventory;
+    std::function<ItemView(const std::string&)> item;
+    std::function<void(int)> use_slot;                 // 0-based
+    std::function<bool(int, int)> move_slot;           // 0-based
+    std::function<bool(int, int)> split_slot;
+    std::function<std::string()> prompt;
+    std::function<std::vector<std::string>()> messages;
+    std::function<bool()> captured;
+    ImageSource image;
 
     const Tunable* find(const std::string& id) const {
         for (const Tunable& t : tunables)
