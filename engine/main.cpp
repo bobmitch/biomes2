@@ -48,6 +48,7 @@
 #include "engine/ui/ui.h"
 #include "engine/player/icons.h"
 #include "engine/player/survival.h"
+#include "engine/mobs/creatures.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -634,6 +635,143 @@ void stealth_frame(float dt) {
     }
     g_ev_jumped = g_ev_swung = g_ev_dug = false;
     g_stealth.update(dt, in);
+}
+
+// --- Creatures (engine/mobs, ADR-007) -----------------------------------------
+// The table (game/data/creatures.json), the zones and their creatures, and an
+// animator per drawn creature (presentation: not saved, made on first sight).
+engine::mobs::CreatureTable g_creature_table;
+engine::mobs::Creatures     g_creatures;
+bool  g_creatures_ok = false;
+std::unordered_map<uint32_t, engine::CharacterAnimator> g_mob_anim;
+
+// The blended weight of biome b at (x, z): layer 4's own weights.
+float biome_weight_at(float x, float z, int b) {
+    const engine::WorldGpu& wg = g_renderer.world();
+    int bio[4];
+    float bw[4];
+    const int n = worldgen::biome_mix(wg.world(), wg.params(), x, z, bio, bw);
+    float s = 0.0f;
+    for (int i = 0; i < n; ++i)
+        if (bio[i] == b) s += bw[i];
+    return s;
+}
+
+// Ground a creature can stand on at (x, z): dry, under a 0.6 slope, out of
+// channels and cave mouths, and not on a trunk or rock where physics has
+// them (within 40 m of the player). The 2.5D generated height: phase 3's
+// navmesh, built from the edited field, replaces this.
+bool creature_ground(float x, float z, float& y) {
+    const engine::WorldGpu& wg = g_renderer.world();
+    y = wg.height(x, z);
+    if (y < wg.table().sea_level + 0.3f) return false;
+    const float e = 1.0f;
+    const float gx = (wg.height(x + e, z) - wg.height(x - e, z)) / (2.0f * e);
+    const float gz = (wg.height(x, z + e) - wg.height(x, z - e)) / (2.0f * e);
+    if (gx * gx + gz * gz > 0.36f) return false;
+    float rw = 0.0f, rd = 0.0f;
+    const float rdist = worldgen::nearest_river(wg.world(), wg.params(), x, z, rw, rd);   // rw set by the call: read after
+    if (rdist < rw + 1.5f) return false;
+    if (worldgen::cave_mouth_near(wg.world(), x, z, 4.0f)) return false;
+    const float from[3] = {x, y + 3.0f, z}, down[3] = {0.0f, -1.0f, 0.0f};
+    int prop = 0;
+    if (g_physics.probe_ray(from, down, 6.0f, prop) >= 0.0f && prop) return false;
+    return true;
+}
+
+// Whether the player could see a body with these feet and head from `cam`:
+// in the view widened by 10 degrees, and a clear physics ray to either.
+bool player_could_see(const engine::Camera& cam, float aspect, const float feet[3], const float head[3]) {
+    float f[3], r[3], u[3];
+    cam.basis(f, r, u);
+    const float eye[3] = {cam.x, cam.y, cam.z};
+    const float kWiden = 10.0f * 0.017453293f;
+    const float tv = std::tan(std::atan(0.5773503f) + kWiden);        // 60 degrees vertical (fill_view)
+    const float th = std::tan(std::atan(0.5773503f * aspect) + kWiden);
+    auto in_view = [&](const float p[3]) {
+        const float d[3] = {p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]};
+        const float zf = d[0] * f[0] + d[1] * f[1] + d[2] * f[2];
+        if (zf <= 0.0f) return false;
+        const float xr = (d[0] * r[0] + d[1] * r[1] + d[2] * r[2]) / zf;
+        const float yu = (d[0] * u[0] + d[1] * u[1] + d[2] * u[2]) / zf;
+        return std::fabs(xr) <= th && std::fabs(yu) <= tv;
+    };
+    if (!in_view(feet) && !in_view(head)) return false;
+    auto clear = [&](const float p[3]) {
+        const float d[3] = {p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]};
+        const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (len < 0.5f) return true;
+        const float dir[3] = {d[0] / len, d[1] / len, d[2] / len};
+        int prop = 0;
+        return g_physics.probe_ray(eye, dir, len - 0.3f, prop) < 0.0f;
+    };
+    return clear(head) || clear(feet);
+}
+
+engine::mobs::SpawnEnv creature_env(const engine::Camera& cam, float aspect) {
+    engine::mobs::SpawnEnv env;
+    env.ground = creature_ground;
+    env.biome_weight = biome_weight_at;
+    env.visible = [cam, aspect](const float feet[3], const float head[3]) {
+        return player_could_see(cam, aspect, feet, head);
+    };
+    return env;
+}
+
+// The nearest live creatures, posed (idle for now: they stand where they
+// spawned) and handed to the character renderer.
+void publish_creatures(float dt, const float from[3]) {
+    engine::CharacterRenderer& cr = g_renderer.character();
+    if (!g_creatures_ok || !cr.ready()) return;
+    const std::vector<engine::mobs::Mob>& live = g_creatures.live();
+    std::vector<size_t> order(live.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    auto d2 = [&](size_t i) {
+        const float dx = live[i].pos[0] - from[0], dz = live[i].pos[2] - from[2];
+        return dx * dx + dz * dz;
+    };
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return d2(a) < d2(b); });
+    size_t n = (std::min)(order.size(), size_t((std::max)(0, g_creature_table.zones.max_drawn)));
+    n = (std::min)(n, size_t(engine::CharacterRenderer::kMaxBodies - 1));
+    static std::vector<float> bones, tints, one;
+    bones.clear();
+    tints.clear();
+    std::unordered_map<uint32_t, bool> seen;
+    for (size_t i = 0; i < n; ++i) {
+        const engine::mobs::Mob& m = live[order[i]];
+        seen[m.id] = true;
+        auto it = g_mob_anim.find(m.id);
+        float first = 0.0f;
+        if (it == g_mob_anim.end()) {
+            it = g_mob_anim.emplace(m.id, engine::CharacterAnimator()).first;
+            it->second.bind(&cr.model(), g_anim.clips() ? &g_anim_lib : nullptr);
+            first = float(m.id % 97u) * 0.031f;   // out of step with its neighbours
+        }
+        engine::LocomotionInput in;
+        in.dt = dt + first;
+        in.grounded = true;
+        it->second.update(in);
+        it->second.skin(m.pos, m.yaw, one);
+        bones.insert(bones.end(), one.begin(), one.end());
+        const float* t = g_creature_table.kinds[size_t(m.kind)].tint;
+        tints.insert(tints.end(), t, t + 3);
+    }
+    for (auto it = g_mob_anim.begin(); it != g_mob_anim.end();)
+        it = seen.count(it->first) ? std::next(it) : g_mob_anim.erase(it);
+    cr.set_creatures(bones, tints, n);
+}
+
+// A frame of the creatures: zones round the player wake and freeze, spawns
+// come due on the game clock, the nearest are drawn.
+void creatures_frame(float dt, bool paused, float aspect) {
+    if (!g_creatures_ok) return;
+    const float player[3] = {g_walk ? g_feet[0] : g_camera.x, g_walk ? g_feet[1] : g_camera.y,
+                             g_walk ? g_feet[2] : g_camera.z};
+    if (!paused) {
+        const double now = g_surv_ok ? g_surv.game_seconds() : double(g_renderer.time_of_day()) * 3600.0;
+        g_creatures.update(now, player, creature_env(g_camera, aspect));
+    }
+    publish_creatures(dt, player);
 }
 
 // A frame of the player's survival in the window: the clock, the drains,
@@ -1423,6 +1561,175 @@ void setup_ui(HWND hwnd) {
 //      build/forage_picked.bmp), and the HUD and the inventory over the
 //      world with a few foods eaten (build/survival_hud.bmp,
 //      build/survival_inventory.bmp).
+// --mob-test (ADR-007, phase 2): spawning, freezing, saving and thawing,
+// against the shipping creatures.json at the spawn. build/mob_test.txt, and
+// build/mob_test.bmp (the nearest creature from 5 m); the exit code is the
+// number of failures.
+int run_mob_test() {
+    std::remove("build/mob_test.txt");
+    FILE* f = std::fopen("build/mob_test.txt", "w");
+    if (!f) return 1;
+    int fails = 0;
+    auto check = [&](bool ok, const std::string& what) {
+        std::fprintf(f, "%s  %s\n", ok ? "PASS" : "FAIL", what.c_str());
+        if (!ok) ++fails;
+    };
+    char buf[400];
+    using engine::mobs::Mob;
+    using engine::mobs::ZoneKey;
+    check(g_creatures_ok, "game/data/creatures.json loads");
+    if (!g_creatures_ok) { std::fclose(f); return fails; }
+    const engine::mobs::CreatureTable& T = g_creature_table;
+    const int mimic = T.find("mimic");
+    check(mimic >= 0 && !T.spawns.empty(), "the mimic and its spawn rule");
+    if (mimic < 0 || T.spawns.empty()) { std::fclose(f); return fails; }
+    const engine::mobs::SpawnRule& R = T.spawns[0];
+
+    // Stand at the spawn and let the world and physics settle round it.
+    g_walk = true;
+    g_physics.place_character(g_spawn.x, g_spawn.ground + 1.0f, g_spawn.z);
+    for (int i = 0; i < 240; ++i) {
+        MSG m = {};
+        while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+        step_window_physics(1.0f / 60.0f, float(i) / 60.0f, 0.0f, 0.0f, false, 0.0f);
+        g_camera.x = g_feet[0]; g_camera.y = g_feet[1] + 1.6f; g_camera.z = g_feet[2];
+        g_camera.yaw = 0.0f; g_camera.pitch = 0.0f;
+        engine::ViewConstants v = {};
+        fill_view(g_camera, g_res_w, g_res_h, float(i) / 60.0f, v);
+        g_renderer.render(v);
+    }
+    const float aspect = g_res_w / g_res_h;
+    const engine::mobs::SpawnEnv env = creature_env(g_camera, aspect);
+    const float home[3] = {g_feet[0], g_feet[1], g_feet[2]};
+    std::snprintf(buf, sizeof buf, "player at (%.1f, %.1f, %.1f), facing +z; %s weight here %.2f\n", home[0], home[1],
+                  home[2], R.biome_name.c_str(), biome_weight_at(home[0], home[2], R.biome));
+    std::fputs(buf, f);
+
+    // A. A day of spawning, a game minute a step.
+    std::fprintf(f, "\nA. 24 game hours at the spawn\n");
+    engine::mobs::Creatures& C = g_creatures;
+    C.clear();
+    double now = 8.0 * 3600.0;
+    int bad_dist = 0, bad_biome = 0, bad_seen = 0, bad_zone = 0, bad_cap = 0, born = 0;
+    std::unordered_map<uint32_t, bool> known;
+    for (int step = 0; step < 24 * 60; ++step) {
+        now += 60.0;
+        C.update(now, home, env);
+        for (const Mob& m : C.live()) {
+            if (known.count(m.id)) continue;
+            known[m.id] = true;
+            ++born;
+            const float dx = m.pos[0] - home[0], dz = m.pos[2] - home[2];
+            if (dx * dx + dz * dz < R.min_player_m * R.min_player_m) ++bad_dist;
+            if (biome_weight_at(m.pos[0], m.pos[2], R.biome) < R.min_weight) ++bad_biome;
+            const float head[3] = {m.pos[0], m.pos[1] + 1.7f, m.pos[2]};
+            if (player_could_see(g_camera, aspect, m.pos, head)) ++bad_seen;
+            std::fprintf(f, "      #%u at (%.1f, %.1f, %.1f), %.1f m away, %s %.2f, %02d:%02d\n", m.id, m.pos[0],
+                         m.pos[1], m.pos[2], std::sqrt(dx * dx + dz * dz), R.biome_name.c_str(),
+                         biome_weight_at(m.pos[0], m.pos[2], R.biome), int(std::fmod(now / 3600.0, 24.0)),
+                         int(std::fmod(now / 60.0, 60.0)));
+        }
+        if (C.live_of_kind(mimic) > R.max_active) ++bad_cap;
+        for (const Mob& m : C.live())
+            if (C.in_zone(C.zone_of(m.pos[0], m.pos[2]), mimic) > R.max_per_zone) ++bad_zone;
+    }
+    const engine::mobs::Creatures::Stats& st = C.stats();
+    std::snprintf(buf, sizeof buf, "      %zu zones awake; %llu attempts, %llu rolls won, %llu spawned, %llu capped, "
+                  "%llu with no point\n", C.active_zones(), (unsigned long long)st.attempts,
+                  (unsigned long long)st.rolls_won, (unsigned long long)st.spawned, (unsigned long long)st.capped,
+                  (unsigned long long)st.no_point);
+    std::fputs(buf, f);
+    check(born > 0, "mimics spawned: " + std::to_string(born));
+    check(bad_dist == 0, "none within " + std::to_string(int(R.min_player_m)) + " m of the player");
+    check(bad_biome == 0, "every one where " + R.biome_name + " weighs at least the rule's minimum");
+    check(bad_seen == 0, "none where the player could see it");
+    check(bad_cap == 0 && C.live_of_kind(mimic) <= R.max_active,
+          "never more than " + std::to_string(R.max_active) + " awake at once (now " +
+              std::to_string(C.live_of_kind(mimic)) + ")");
+    check(bad_zone == 0, "never more than " + std::to_string(R.max_per_zone) + " in a zone");
+
+    // B. Walk away: every one freezes as it stands, and its zone's clock stops.
+    std::fprintf(f, "\nB. the player leaves (2 km east)\n");
+    const std::vector<Mob> before = C.live();
+    const ZoneKey kz = C.zone_of(home[0], home[2]);
+    const float away[3] = {home[0] + 2000.0f, home[1], home[2]};
+    now += 60.0;
+    C.update(now, away, env);
+    bool none_left = true;
+    for (const Mob& m : C.live())
+        for (const Mob& b : before) none_left = none_left && m.id != b.id;
+    check(none_left && C.frozen_count() >= before.size(),
+          "all " + std::to_string(before.size()) + " freeze (" + std::to_string(C.frozen_count()) + " frozen)");
+    const double wait0 = C.zone_wait(kz, 0);
+    for (int step = 0; step < 10 * 60; ++step) { now += 60.0; C.update(now, away, env); }
+    const double wait1 = C.zone_wait(kz, 0);
+    std::snprintf(buf, sizeof buf, "the spawn's zone's clock stands while frozen: %.1f s to wait, then %.1f after 10 game hours",
+                  wait0, wait1);
+    check(wait0 >= 0.0 && wait0 == wait1, buf);
+
+    // C. Save, load into a fresh copy: every creature where it was.
+    std::fprintf(f, "\nC. save and load\n");
+    std::string err;
+    const bool saved = C.save("build/mob_test.bin", err);
+    engine::mobs::Creatures D;
+    D.set_table(&T);
+    D.set_world(g_renderer.world().field_id());
+    const bool loaded = saved && D.load("build/mob_test.bin", err);
+    check(saved && loaded, "build/mob_test.bin written and read back " + err);
+    engine::mobs::Creatures other;
+    other.set_table(&T);
+    other.set_world(g_renderer.world().field_id() ^ 1u);
+    check(saved && !other.load("build/mob_test.bin", err), "a save of another world is refused");
+
+    // D. Come back (with the loaded copy): the same creatures, as they were.
+    std::fprintf(f, "\nD. the player returns\n");
+    now += 60.0;
+    D.update(now, home, env);
+    int same = 0;
+    for (const Mob& b : before)
+        for (const Mob& m : D.live())
+            if (m.id == b.id && m.kind == b.kind && m.pos[0] == b.pos[0] && m.pos[1] == b.pos[1] &&
+                m.pos[2] == b.pos[2] && m.yaw == b.yaw && m.health == b.health && m.born == b.born)
+                ++same;
+    check(same == int(before.size()), std::to_string(same) + " of " + std::to_string(before.size()) +
+                                           " back exactly where and as they were");
+    std::snprintf(buf, sizeof buf, "the zone's clock resumes where it stood: %.1f s (frozen at %.1f)",
+                  D.zone_wait(kz, 0), wait0);
+    check(D.zone_wait(kz, 0) == wait0, buf);
+
+    // E. A still of the nearest one from 5 m.
+    if (!D.live().empty()) {
+        C = D;
+        const Mob* nearest_mob = nullptr;
+        float best = 1e30f;
+        for (const Mob& m : C.live()) {
+            const float dx = m.pos[0] - home[0], dz = m.pos[2] - home[2];
+            if (dx * dx + dz * dz < best) { best = dx * dx + dz * dz; nearest_mob = &m; }
+        }
+        const Mob m = *nearest_mob;
+        // Face it: the camera 5 m off along its own facing, looking back.
+        const float fx = std::sin(m.yaw), fz = std::cos(m.yaw);
+        g_camera.x = m.pos[0] + fx * 5.0f;
+        g_camera.z = m.pos[2] + fz * 5.0f;
+        g_camera.y = (std::max)(g_renderer.world().height(g_camera.x, g_camera.z), m.pos[1]) + 1.6f;
+        g_camera.yaw = std::atan2(-fx, -fz);
+        g_camera.pitch = -0.12f;
+        g_walk = false;   // the player's own body out of the picture
+        for (int i = 0; i < 30; ++i) publish_creatures(1.0f / 30.0f, home);
+        engine::ViewConstants v = {};
+        fill_view(g_camera, g_res_w, g_res_h, 0.0f, v);
+        err.clear();
+        const bool shot = g_renderer.capture(v, "build/mob_test.bmp", err);
+        std::snprintf(buf, sizeof buf, "build/mob_test.bmp: #%u from 5 m, --cam %.2f %.2f %.2f %.4f %.4f (%zu bodies) %s",
+                      m.id, g_camera.x, g_camera.y, g_camera.z, g_camera.yaw, g_camera.pitch,
+                      g_renderer.character().creatures(), err.c_str());
+        check(shot && g_renderer.character().creatures() > 0, buf);
+    }
+    std::fprintf(f, "\n%s: %d failed\n", fails ? "FAILURES" : "ALL PASSED", fails);
+    std::fclose(f);
+    return fails;
+}
+
 int run_survival_test(HWND hwnd) {
     using namespace engine::player;
     std::remove("build/survival_test.txt");
@@ -2319,8 +2626,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     const bool leak_mode = hl.find("--leak-test") != std::string::npos;
     const bool pit_mode = hl.find("--dig-water") != std::string::npos;
     const bool survival_mode = hl.find("--survival-test") != std::string::npos;
+    const bool mob_mode = hl.find("--mob-test") != std::string::npos;
     const bool headless = report_mode || fell_mode || dig_tree_mode || lights_mode || leak_mode ||
-                          pit_mode || survival_mode ||
+                          pit_mode || survival_mode || mob_mode ||
                           !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
@@ -2411,6 +2719,23 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         const double ts = engine::startup_now_ms();
         const engine::WorldGpu& wg = g_renderer.world();
         g_spawn = worldgen::find_spawn(wg.world(), wg.params(), wg.table());
+        {
+            // The creatures (ADR-007): their table, against this world's biomes.
+            std::string cerr;
+            g_creatures_ok = g_creature_table.load("game/data/creatures.json", wg.table(), cerr);
+            if (g_creatures_ok) {
+                g_creatures.set_table(&g_creature_table);
+                g_creatures.set_world(wg.field_id());
+            }
+            if (FILE* sf = std::fopen("build/startup.txt", "a")) {
+                if (g_creatures_ok)
+                    std::fprintf(sf, "           creatures: %zu kinds, %zu spawn rules (game/data/creatures.json)\n",
+                                 g_creature_table.kinds.size(), g_creature_table.spawns.size());
+                else
+                    std::fprintf(sf, "           creatures NOT loaded: %s\n", cerr.c_str());
+                std::fclose(sf);
+            }
+        }
         // The window opens over the start, 40 m up, looking along +z at it.
         g_camera.x = g_spawn.x;
         g_camera.z = g_spawn.z - 60.0f;
@@ -5171,6 +5496,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (mob_mode) {
+        const int r = run_mob_test();
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return r;
+    }
+
     if (survival_mode) {
         const int r = run_survival_test(hwnd);
         g_renderer.shutdown();
@@ -6429,7 +6761,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // per pose to build/pose_sheet.txt.
         g_walk = true;
         g_cam_dist = g_cam_dist_now = 4.5f;
-        const float sx = 0.0f, sz = 0.0f;
+        const float sx = g_spawn.x, sz = g_spawn.z;
         g_physics.place_character(sx, Spawn::above(sx, sz), sz);
         g_physics.character_position(g_feet);
         for (int i = 0; i < 240; ++i) {
@@ -7190,6 +7522,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                                kDigRadii[g_dig_size], d.dist, d.voxels, d.ms);
         }
         stealth_frame(float(dt));
+        creatures_frame(float(dt), g_paused, w / h);
         if (g_snap_walk_frames >= 0 && --g_snap_walk_frames < 0) {
             g_walk = true;
             g_physics.place_character(g_snap_feet[0], g_snap_feet[1] + 0.2f, g_snap_feet[2]);
@@ -7212,7 +7545,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 ok = g_renderer.save_edits("build/edits.bin", err) &&
                      g_felling.save("build/trees.bin", g_renderer.world().field_id(), err) &&
                      g_renderer.forage().save("build/forage.bin", g_renderer.world().field_id(), err) &&
-                     (!g_surv_ok || g_surv.save("build/player.txt", err));
+                     (!g_surv_ok || g_surv.save("build/player.txt", err)) &&
+                     (!g_creatures_ok || g_creatures.save("build/mobs.bin", err));
                 hud_say(ok ? "Saved" : "Save FAILED: " + err);
             } else {
                 ok = g_renderer.load_edits("build/edits.bin", err, mismatch);
@@ -7220,7 +7554,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 const bool ok3 = g_renderer.forage().load("build/forage.bin", g_renderer.world().field_id(), err);
                 const bool ok4 = g_surv_ok && g_surv.load("build/player.txt", err);
                 if (ok4) { g_surv.reset_fall(); g_jump_window = 0.0f; }
-                hud_say((ok || ok2 || ok3 || ok4) ? "Loaded" : "Nothing to load");
+                const bool ok5 = g_creatures_ok && g_creatures.load("build/mobs.bin", err);
+                if (ok5) g_mob_anim.clear();
+                hud_say((ok || ok2 || ok3 || ok4 || ok5) ? "Loaded" : "Nothing to load");
             }
             g_want_save = g_want_load = false;
         }

@@ -186,7 +186,8 @@ bool CharacterRenderer::init(ID3D12Device* device, ID3D12CommandQueue* queue, ID
     device->CreateShaderResourceView(tex_b_.Get(), &sv, {h.ptr + SIZE_T(kSrvB) * inc});
 
     for (UINT f = 0; f < kFrames; ++f) {
-        bones_[f] = buffer(device, UINT64(kMaxJoints) * 48, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        bones_[f] = buffer(device, UINT64(kMaxBodies) * kMaxJoints * 48, D3D12_HEAP_TYPE_UPLOAD,
+                           D3D12_RESOURCE_STATE_GENERIC_READ);
         if (!bones_[f]) { error = hr_text("character bone buffer (device removed?)", device->GetDeviceRemovedReason()); return false; }
         bones_[f]->Map(0, nullptr, reinterpret_cast<void**>(&bones_cpu_[f]));
     }
@@ -303,45 +304,90 @@ bool CharacterRenderer::bounds(float c[3], float& r) const {
     return true;
 }
 
-void CharacterRenderer::prepare(UINT frame) {
-    drawn_[frame] = false;
-    if (!ready_ || !visible_) return;
-    std::memcpy(bones_cpu_[frame], pose_.data(), pose_.size() * sizeof(float));
-    drawn_[frame] = true;
+void CharacterRenderer::set_creatures(const std::vector<float>& bones, const std::vector<float>& tints, size_t n) {
+    const size_t per = model_.joints.size() * 12;
+    if (n > kMaxBodies - 1) n = kMaxBodies - 1;
+    if (!ready_ || bones.size() < n * per || tints.size() < n * 3) n = 0;
+    creature_n_ = n;
+    creature_bones_.assign(bones.begin(), bones.begin() + std::ptrdiff_t(n * per));
+    creature_tints_.assign(tints.begin(), tints.begin() + std::ptrdiff_t(n * 3));
 }
 
-void CharacterRenderer::bind(ID3D12GraphicsCommandList* cmd, UINT frame) {
+bool CharacterRenderer::creature_near(const float p[3], float r) const {
+    const size_t per = model_.joints.size() * 12;
+    for (size_t i = 0; i < creature_n_; ++i) {
+        const float* m = &creature_bones_[i * per];   // joint 0's rows: its translation in [3], [7], [11]
+        const float dx = m[3] - p[0], dy = m[7] - p[1], dz = m[11] - p[2];
+        if (dx * dx + dy * dy + dz * dz < r * r) return true;
+    }
+    return false;
+}
+
+void CharacterRenderer::prepare(UINT frame) {
+    drawn_[frame] = false;
+    bodies_[frame] = 0;
+    if (!ready_) return;
+    const size_t per = model_.joints.size() * 12;
+    const size_t block = size_t(kMaxJoints) * 12;
+    // Block 0 is the player's, drawn or not; creatures from block 1.
+    auto write = [&](UINT b, const float* bones, const float tint[3]) {
+        float* dst = bones_cpu_[frame] + size_t(b) * block;
+        std::memcpy(dst, bones, per * sizeof(float));
+        float* t = dst + size_t(kMaxJoints - 1) * 12;
+        t[0] = tint[0]; t[1] = tint[1]; t[2] = tint[2]; t[3] = 0.0f;
+    };
+    const float white[3] = {1.0f, 1.0f, 1.0f};
+    if (visible_) {
+        write(0, pose_.data(), white);
+        drawn_[frame] = true;
+    }
+    for (size_t i = 0; i < creature_n_; ++i)
+        write(UINT(i + 1), &creature_bones_[i * per], &creature_tints_[i * 3]);
+    bodies_[frame] = UINT(creature_n_ + 1);
+}
+
+void CharacterRenderer::bind(ID3D12GraphicsCommandList* cmd) {
     cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cmd->IASetVertexBuffers(0, 1, &vbv_);
     cmd->IASetIndexBuffer(&ibv_);
-    cmd->SetGraphicsRootShaderResourceView(1, bones_[frame]->GetGPUVirtualAddress());
+}
+
+// Every body this frame: the player's block if it is drawn, then each
+// creature's, root SRV t0 moved to the block.
+void CharacterRenderer::draw_bodies(ID3D12GraphicsCommandList* cmd, UINT frame) {
+    const D3D12_GPU_VIRTUAL_ADDRESS base = bones_[frame]->GetGPUVirtualAddress();
+    const UINT64 stride = UINT64(kMaxJoints) * 48;
+    for (UINT b = drawn_[frame] ? 0u : 1u; b < bodies_[frame]; ++b) {
+        cmd->SetGraphicsRootShaderResourceView(1, base + stride * b);
+        cmd->DrawIndexedInstanced(UINT(model_.indices.size()), 1, 0, 0, 0);
+    }
 }
 
 void CharacterRenderer::record(ID3D12GraphicsCommandList* cmd, UINT frame) {
-    if (!drawn_[frame]) return;
+    if (!ready_ || (!drawn_[frame] && bodies_[frame] <= 1)) return;
     cmd->SetPipelineState(pso_.Get());
-    bind(cmd, frame);
-    cmd->DrawIndexedInstanced(UINT(model_.indices.size()), 1, 0, 0, 0);
+    bind(cmd);
+    draw_bodies(cmd, frame);
 }
 
 void CharacterRenderer::record_shadow(ID3D12GraphicsCommandList* cmd, UINT frame) {
-    if (!drawn_[frame]) return;
+    if (!ready_ || (!drawn_[frame] && bodies_[frame] <= 1)) return;
     cmd->SetPipelineState(shadow_pso_.Get());
-    bind(cmd, frame);
-    cmd->DrawIndexedInstanced(UINT(model_.indices.size()), 1, 0, 0, 0);
+    bind(cmd);
+    draw_bodies(cmd, frame);
 }
 
 void CharacterRenderer::record_light_shadow(ID3D12GraphicsCommandList* cmd, UINT frame, const float light_pos[3],
                                             float clear) {
-    if (!drawn_[frame]) return;
+    if (!ready_ || (!drawn_[frame] && bodies_[frame] <= 1)) return;
     // MeshConstants: cam_pos at 16, far_plane at 19 -- the light and the
     // clear radius for ps_character_light_shadow. The next face sets the
     // whole block again.
     const float c[4] = {light_pos[0], light_pos[1], light_pos[2], clear};
     cmd->SetGraphicsRoot32BitConstants(0, 4, c, 16);
     cmd->SetPipelineState(light_shadow_pso_.Get());
-    bind(cmd, frame);
-    cmd->DrawIndexedInstanced(UINT(model_.indices.size()), 1, 0, 0, 0);
+    bind(cmd);
+    draw_bodies(cmd, frame);
 }
 
 }  // namespace engine

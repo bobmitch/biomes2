@@ -374,9 +374,20 @@ Last gathered: 2026-11-21, after the exploration fog; creatures added
 
 ## Creatures (ADR-007)
 
-- **Only phase 1 is built** (crouch, the player's sound and sight). Zones,
-  spawning, freezing and saving, the navmesh, movement and the mimic are
-  the ADR's phases 2-5. [Creatures and stealth]
+- **Phases 1-2 are built** (the player's sound and sight; zones, spawning,
+  freezing, saving, drawing). Creatures stand still: the navmesh, movement
+  and the mimic's behaviour are phases 3-5. [Creatures and stealth]
+- **Spawn ground is the 2.5D generated height**: edits, overhangs and
+  trunks or rocks past physics' 40 m are not seen, and a creature dug
+  under does not settle. Phase 3's navmesh replaces the test.
+  [Creatures and stealth]
+- **A moving creature does not redraw a cached light face**: it is drawn
+  into faces redrawn anyway, so a torch's shadow of a creature that has
+  walked can lag up to 240 frames. Only the player's body has the
+  bookkeeping. [Creatures and stealth]
+- **No culling of creature bodies**: all drawn (up to 31) in every pass and
+  cascade. Fine at the mimic's cap of 4. [Creatures and stealth]
+- **Snapshots (F8) do not carry creatures.** [Creatures and stealth]
 - **Crouching keeps the capsule's height**: no crawling under a low roof.
   [Creatures and stealth]
 - **The light on the player is approximate**: the cloud cover's mean
@@ -389,9 +400,6 @@ Last gathered: 2026-11-21, after the exploration fog; creatures added
 - **Creatures that cannot bear light** (blinded by a torch, hiding by day)
   need a gain CURVE, not `dark_gain`; foliage and crowns do not block a
   creature's sight. [ADR-007]
-- **`--pose-sheet` stands the character under the sea** on v18's world
-  (its spot predates the archipelago); the poses still read, through
-  water. [The player character]
 
 ## Future design: NPC simulation by distance (nothing built)
 

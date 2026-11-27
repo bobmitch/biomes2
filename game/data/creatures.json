@@ -1,0 +1,19 @@
+{
+  "_note": "Creatures (docs/adr-007-creatures-perception-navigation.md). Gameplay data, never in the golden hash. A KIND is what a creature is: its body (model 'player' is the player's own pack, tinted), how it moves, how it hears and sees (hear_range_m and hear_threshold_db against the player's dB at 1 m; view_range_m x the player's visibility x the light on them, inside view_cone_deg, the TOTAL width; dark_gain multiplies that light: night vision), its size class for the navmesh, and its script. A SPAWN RULE says where and how often: per 64 m zone that is active (centre within zones.active_m of the player), every interval_h game hours an attempt with `chance`, under max_per_zone (counted in the zone) and max_active (over every active zone), within `hours` of the day, at least min_player_m from the player, min_same_m from another of its kind, and out of the player's sight. biome is a name from worldgen/data/archetypes.json, kept where its blended weight is at least min_weight.",
+  "zones": {"size_m": 64, "active_m": 128, "release_m": 160, "max_drawn": 31},
+  "kinds": [
+    {"id": "mimic", "name": "Mimic",
+     "model": "player", "tint": [0.50, 0.62, 0.85],
+     "move": "amphibious", "size": "human",
+     "health": 40, "walk_speed": 1.4, "run_speed": 5.0,
+     "hear_range_m": 20, "hear_threshold_db": 34,
+     "view_range_m": 50, "view_cone_deg": 45, "dark_gain": 1.0,
+     "script": "creatures/mimic.lua"}
+  ],
+  "spawns": [
+    {"kind": "mimic", "biome": "meadows", "min_weight": 0.6,
+     "max_per_zone": 2, "max_active": 4,
+     "interval_h": 1.0, "chance": 0.35, "hours": [0, 24], "group": [1, 1],
+     "min_player_m": 20, "min_same_m": 24}
+  ]
+}

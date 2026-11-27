@@ -21,7 +21,7 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `engine/rocks/` | Layer 9's rocks: procedural meshes, the CPU tile streamer, instanced drawing on the terrain's root signature, static colliders. |
 | `engine/props/` | Things to pick up: the caves' glowing mushrooms (`glow_mushrooms.h`), and layer 10's forage plants (`forage.h`): streaming in 64 m zones, picks and regrowth, drawing, picking with E. |
 | `engine/player/` | The player's survival: items (`items.h`), the 8 x 4 inventory, health / stamina / food / the game clock (`survival.h`), item icons painted from data (`icons.h`), the player as heard and seen (`stealth.h`). No GPU. |
-| `engine/mobs/` | Creatures (ADR-007, being built): `perception.h`, the arithmetic of hearing (dB) and sight (cone, range, light). |
+| `engine/mobs/` | Creatures (ADR-007, being built): `perception.h`, the arithmetic of hearing (dB) and sight (cone, range, light); `creature_table.h` (`game/data/creatures.json`); `creatures.h`, the zones that spawn, freeze, save and thaw them. No GPU. |
 | `game/data/` | `items.json`: every item, the player's numbers, the clock, the start inventory. Gameplay data, outside the hash. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32), Windows only: seeds as maps plus their gameplay numbers. See "The world viewer". |
@@ -122,6 +122,7 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--shot`, `--flight <s>`, `--walk <s>`, `--overhang`, `--dig`, `--dig-save`,
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
 `--band-report`, `--sea-report`, `--swim`, `--dig-water`, `--blend-report`, `--tab-test`,
+`--mob-test` (creatures: spawning, freezing, saving, thawing; see Creatures and stealth),
 `--clock-jump` (with `--shot`: the light under the ground after the clock
 jumps or runs, `build/time_jump.txt`; see The near field),
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
@@ -1369,8 +1370,10 @@ that spawn, simulate and FREEZE their creatures (saved, so leaving does not
 shake a chase), per-zone spawn rules with an area cap, perception by sound
 and sight, Recast/Detour navmeshes built from the field, simulation by
 distance, behaviour in Lua. Data in `game/data/creatures.json` (to come)
-and items.json's `stealth` block; never in the golden hash. **Phase 1 is
-built: the player's side.**
+and items.json's `stealth` block; never in the golden hash. **Phases 1
+(the player's side) and 2 (zones, spawning, freezing, saving, drawing) are
+built; creatures stand still until the navmesh (phase 3) and movement
+(phase 4).**
 
 - **Crouch**: Left Ctrl toggles it on land (in the water Ctrl still dives
   while held; Right Ctrl does nothing); 1.4 m/s (`stealth.crouch_speed`),
@@ -1406,6 +1409,41 @@ built: the player's side.**
   hearing distances, the visibility table, the light curve, the cone and
   the sight ranges against the mimic's numbers, on the default tuning (so
   retuning items.json moves nothing there).
+- **Zones** (`engine/mobs/creatures.h`): 64 m, the forage and rock tiles'
+  grid. A zone whose centre is within `zones.active_m` (128 m) of the
+  player wakes -- 11 at the spawn -- and freezes past `release_m` (160 m,
+  hysteresis). Freezing takes every creature standing in it out of the
+  live list as it is, with its rules' remaining waits; its clock stands
+  still while frozen, and thawing puts back exactly what was there. A
+  creature that walks into a sleeping zone freezes with that zone.
+- **Spawning**: per awake zone and rule, an attempt every `interval_h` game
+  hours (each zone's first somewhere in its first interval), at most one
+  per call (a clock jump fires no burst), with `chance`, under
+  `max_per_zone` and `max_active`, within `hours`. A point: up to 12
+  random spots in the zone, on dry ground under a 0.6 slope (the 2.5D
+  generated height), out of channels and cave mouths, not on a prop where
+  physics has them, where the rule's biome weighs `min_weight`, 20 m from
+  the player and `min_same_m` from its own kind, and NOT visible -- outside
+  the view widened by 10 degrees, or both rays from the eye (to feet and
+  head) blocked (`player_could_see`). Rolls hash the field id, the zone,
+  the rule and the zone's attempt count. Measured at the spawn
+  (`--mob-test`): the area cap (4) is reached in ~1.5 game hours (~2 real
+  minutes), every mimic 61-94 m off, out of view.
+- **Saving**: F6 / F9 write and read `build/mobs.bin` beside the edits
+  (live creatures written into their zones as frozen; kinds by id, so the
+  table may change under a save; another world's save is refused).
+- **Drawing**: the character renderer draws up to 31 creatures (nearest
+  first, `zones.max_drawn`) on the player's mesh, each its own block of the
+  bone buffer -- root SRV t0's address moved per draw -- with its kind's
+  TINT in the block's last record (`kTintBone` 254), in the main pass,
+  every cascade, and every light face being redrawn within 2 m of one. An
+  animator each (idle for now), made when first drawn.
+- `--mob-test` (`build/mob_test.txt`, exit code = failures): 24 game hours
+  at the spawn (spawns, distances, biome, unseen, both caps), the player
+  2 km away (all freeze, the zone's clock stands for 10 game hours), a save
+  read back and another world's refused, the return (every creature back
+  bit for bit, the clock where it stood), and `build/mob_test.bmp`, the
+  nearest from 5 m.
 
 ### Forage (layer 10): things to pick, and the zones they live in
 

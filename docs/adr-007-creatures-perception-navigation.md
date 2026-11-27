@@ -1,7 +1,8 @@
 # ADR-007: Creatures -- zones, spawning, perception and navigation
 
-Status: **accepted**, 2026-11-27. Phase 1 (the player's sound and sight)
-is being built; the rest is the plan. Gameplay follows Valheim by default,
+Status: **accepted**, 2026-11-27. Phases 1 (the player's sound and sight)
+and 2 (zones, spawning, freezing, saving, drawing) are built -- CLAUDE.md,
+"Creatures and stealth", has what was measured; the rest is the plan. Gameplay follows Valheim by default,
 as the survival rules do; every number below is data, in
 `game/data/creatures.json` or `game/data/items.json`, never in the golden
 hash.
@@ -43,8 +44,9 @@ Facts that shape the design:
 One shared grid of 64 m zones (the forage and rock tiles' grid; they move
 onto it in phase 2).
 
-- **Active zones**: centre within 128 m of the player (about 5 x 5, as
-  Valheim's active area). Only active zones spawn and simulate.
+- **Active zones**: centre within 128 m of the player (about a dozen; 11
+  at the spawn), released past 160 m so a walk along the edge does not
+  thrash. Valheim's active area is about 5 x 5. Only active zones spawn and simulate.
 - **A zone that leaves the active set FREEZES** its creatures exactly as
   they are -- position, facing, health, AI state, target, home -- and
   keeps them in its record. Coming back resumes them. The records are
@@ -74,11 +76,12 @@ A rule in `creatures.json`:
 | `min_same_m` | never nearer one of the same kind | 24 |
 
 Starting values for the mimic, replacing "up to 3 a zone, 1 an hour": with
-~20 active meadow zones, 1 an hour per zone at a cap of 3 would put a
-mimic every ~4 s of play into the active area until ~60 stood round the
-player. With the values above a given zone sees its first mimic after ~3
-game hours (~4 real minutes) on average, and the active area never holds
-more than 4. Both caps and the rate are data; they are a first guess.
+a dozen active meadow zones, 1 an hour per zone at a cap of 3 would put a
+mimic into the active area about every 6 s of play until ~36 stood round
+the player. With the values above a given zone sees its first mimic after
+~3 game hours on average, but a dozen zones together reach the area cap of
+4 in about 1.5 game hours (~2 real minutes; measured), and it is the cap
+that holds the number. Both caps and the rate are data; a first guess.
 
 **Where**: a random point in the zone, on dry or wadeable ground the
 creature's movement can use (its navmesh, phase 3; until then the

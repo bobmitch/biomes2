@@ -2549,7 +2549,9 @@ void Renderer::record_lights(const ViewConstants& view) {
         if (rocks_on_ && rocks_.ready() && mode_ != Mode::Wireframe) rocks_.record_shadow(cmd_.Get(), UINT(frame_));
         // The player's body, last on the terrain's root: it overwrites the
         // constants' cam_pos and far_plane, which nothing after it reads.
-        if (d.body) {
+        // Creatures (ADR-007) go into any face redrawn near one; their own
+        // movement does not redraw a cached face (only the player's does).
+        if (d.body || character_.creature_near(d.pos, d.range + 2.0f)) {
             character_.record_light_shadow(cmd_.Get(), UINT(frame_), d.pos, d.clear);
             ++light_stats_.body_faces;
         }
