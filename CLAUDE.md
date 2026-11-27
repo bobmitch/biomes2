@@ -3213,12 +3213,70 @@ the terrain and the trees and received by both through one function,
   it never changes size); the far two to a sphere round the CAMERA, so a
   turn between their redraws cannot leave the view outside them. Centres
   snapped to whole texels, so edges do not crawl.
-- **Resolution per cascade, in one 4096^2 x 4 array**: each draws into a
-  corner of its slice at its own size (`kCascadeRes` = 2048, 2048, 4096,
-  4096; `shadow_scale` maps uv). The near two at 2048 are already 1.8 and
-  4.9 cm a texel, about the sun's own penumbra; the far two at 2048 were
-  38 cm and 1.6 m. 4096 everywhere cost +0.65 ms walking, nearly all of it
-  the near cascades' leaf cards.
+- **Resolution per cascade, in one array**: each draws into a corner of its
+  slice at its own size (`shadow_scale` maps uv), so the ATLAS is the
+  biggest cascade and the memory is atlas^2 x 4 B x 4 slices.
+  **Graphics, "Shadow resolution"** (`Renderer::set_shadow_quality`,
+  `--shadow-quality <0..4>`, saved; live -- the atlas is rebuilt and every
+  cascade redrawn):
+
+  | | cascades | atlas | VRAM | texels | wood |
+  | --- | --- | --- | --- | --- | --- |
+  | low | 1024 1024 2048 2048 | 2048 | 64 MB | 6.6 / 23.6 / 38.7 / 160 cm | 5.75 |
+  | **medium** | 2048 2048 4096 4096 | 4096 | 256 MB | 3.3 / 11.8 / 19.3 / 80 cm | 6.49 |
+  | high | 4096 4096 4096 4096 | 4096 | 256 MB | 1.7 / 5.9 / 19.3 / 80 cm | 9.18 |
+  | very high | 6144 6144 6144 6144 | 6144 | 576 MB | 1.1 / 3.9 / 12.9 / 53 cm | 13.63 |
+  | ultra | 8192 8192 8192 8192 | 8192 | 1024 MB | 0.8 / 3.0 / 9.7 / 40 cm | 19.48 |
+
+  Texels are what one holds on the ground at the spawn wood; ms are
+  `--walk 15 --uncapped` at 2560 x 1440 there (the same still in the open
+  meadow at (808.9, 26.6, -873.8) is 6.00 at medium against 6.91 at high).
+  Cracks 0 at every level. The shot report's `shadows:` line prints the
+  level, the atlas, its memory and every cascade's resolution and texel --
+  read it rather than working them out, and note the texels are about twice
+  what this file claimed before they were printed.
+- **Above medium every cascade is raised together, because the far ones are
+  free.** They are drawn every fourth frame and mostly as impostors, and
+  the atlas is the biggest cascade however the others are set, so once it is
+  paid for there is nothing to save by leaving them behind: 6144 everywhere
+  walks the wood in 13.78 ms against 13.73 for 6144 6144 4096 4096, at the
+  same 576 MB.
+- **The cost above high is FILL, not the memory**, which is worth knowing
+  before anyone tries to buy resolution back by shrinking the atlas. Two
+  measurements say so. `--no-trees` leaves the atlas and its VRAM exactly
+  as they were and collapses the high-to-ultra gap from 10.1 ms to 1.09
+  (3.92 against 5.01): nine tenths of it was leaf cards. And
+  8192 4096 4096 4096 holds the SAME 1024 MB atlas as ultra -- the atlas is
+  the biggest cascade either way -- yet walks in 17.3 ms against 19.4, so
+  the allocation is not what is being paid for. There is no VRAM pressure
+  at any level on a 20 GB card; the scans (247 MB), the slot pool (~440 MB)
+  and the lights' atlas (144 MB) sit beside it.
+- **It was NOT at its limit, and high is worth knowing about.** The sun's
+  penumbra under a crown 15-20 m up is about 14 cm, and medium's near
+  cascade is 3.3 cm -- four texels across the filter, which smears a
+  canopy's leaf shadows into soft blobs. At high (1.7 cm) individual leaves
+  read on a trunk and the dappling on the ground is leaf-shaped rather than
+  cloudy. **High costs no more memory than medium** -- the near two draw
+  into a 4096 slice either way and medium uses a quarter of it.
+- **The cost is all cascade 0, and it scales with its texel count.**
+  Per-cascade walks (`BIOMES_CASCADE_RES="a,b,c,d"` overrides the level's
+  mix, for sweeping it), cascade 0 against the rest at 4096: 2048 6.43 ms;
+  4096 9.13; 5120 11.02; 6144 13.09; 8192 17.29. Cascade 1 is worth +0.40
+  doubled -- it is drawn every second frame and mostly as LOD 1 cards --
+  and 2 and 3 are free. It is a smooth curve in texels, which is what makes
+  6144 a real level rather than a label. `--gpu-profile`
+  at the wood: `shadow c0 trees lod0` 0.940 -> 2.815 ms, its PS invocations
+  44.0 M -> 169.3 M, exactly 4x. At 2048 that is **10.5 invocations per
+  shadow texel**: the crowns overdraw each other and the leaf test runs on
+  every layer, with no early-Z to stop it because the test `discard`s. The
+  cost therefore follows how much canopy is in cascade 0 -- +2.8 ms in a
+  dense wood, +0.9 in the open.
+- **Not done, the next lever if high is wanted for free**: cascade 0's
+  split is 28 m and its map is fitted to a sphere round that whole slice.
+  Pulling the split in would make its texels finer AND its caster draw
+  smaller, both for nothing, at the price of handing 18-28 m to cascade 1's
+  coarser map. Untried; it changes the shadows everywhere, not just where
+  the resolution is short.
 - **Time-sliced** (`cascades_due`): cascade 0 every frame, 1 every second,
   2 and 3 every fourth, interleaved -- two drawn a frame. Each keeps the
   matrix its map was drawn with. **A moving caster past 28 m therefore

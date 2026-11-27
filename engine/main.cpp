@@ -1474,6 +1474,13 @@ void register_tunables() {
                                              "Anisotropic 16x"},
            [&] { return std::floor(std::log2(R.scan_aniso()) + 0.5f); },
            [&](float v) { R.set_scan_aniso(std::exp2(std::floor(v + 0.5f))); });
+    // The sun's cascades. What it buys is the near two: a dappled wood's
+    // sunflecks and how close a shadow stays to its caster's foot. The
+    // labels carry the atlas's memory, since that is the thing a player
+    // with a small card is choosing against.
+    choice("shadow_quality", G, "Shadow resolution",
+           {"Low (64 MB)", "Medium (256 MB)", "High (256 MB)", "Very high (576 MB)", "Ultra (1024 MB)"},
+           [&] { return R.shadow_quality(); }, [&](float v) { R.set_shadow_quality(v); });
 
     // Time.
     range("time", "Time", "Time of day", 0.0f, 24.0f, 0.05f, "h",
@@ -4952,6 +4959,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             // The scans' anisotropic filtering (1 trilinear, 2, 4, 8, 16).
             const size_t an = c2.find("--aniso ");
             if (an != std::string::npos) g_renderer.set_scan_aniso(float(std::atof(c2.c_str() + an + 8)));
+            // Sun shadow resolution: 0 low, 1 medium, 2 high, 3 very high, 4 ultra.
+            const size_t sq = c2.find("--shadow-quality ");
+            if (sq != std::string::npos) g_renderer.set_shadow_quality(float(std::atof(c2.c_str() + sq + 17)));
         }
         if (c2.find("--no-rocks") != std::string::npos) g_renderer.set_rocks(false);
         if (c2.find("--no-mushrooms") != std::string::npos) g_renderer.set_mushrooms(false);
@@ -6029,6 +6039,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             write_rock_report(f, g_camera.x, g_camera.z, false);
             write_mushroom_report(f, g_camera.x, g_camera.y, g_camera.z);
             {
+                // The cascades as configured, and what a texel of each
+                // covers: the near one against the sun's own penumbra
+                // (0.0093 x the caster's height) is what says whether more
+                // resolution can still buy anything.
+                static const char* kShadowQ[5] = {"low", "medium", "high", "very high", "ultra"};
+                const int sq = int(g_renderer.shadow_quality() + 0.5f);
+                std::fprintf(f, "shadows: %s, atlas %u^2 x %u (%.0f MB); cascade res/texel",
+                             kShadowQ[sq < 0 ? 0 : (sq > 4 ? 4 : sq)], g_renderer.shadow_atlas_res(),
+                             engine::Renderer::cascade_count(),
+                             double(g_renderer.shadow_bytes()) / (1024.0 * 1024.0));
+                for (UINT c = 0; c < engine::Renderer::cascade_count(); ++c)
+                    std::fprintf(f, " %u/%.1fcm", g_renderer.cascade_res(c),
+                                 100.0 * double(g_renderer.cascade_texel(c)));
+                std::fprintf(f, "\n");
                 const engine::Renderer::CrackCount& cc = g_renderer.last_cracks();
                 std::fprintf(f, "cracks below the horizon: %zu undrawn (far depth, scene targets clear); "
                                 "far depth alone %zu; of %zu pixels below it\n",

@@ -336,13 +336,26 @@ float halton(int i, int b) {
 // Far edges 28, 100, 380 m and 1.6 km. The last used to be 520 m with a
 // 52 m fade: shadows switched on in front of the player as he walked.
 const float kCascadeSplit[5] = {0.2f, 28.0f, 100.0f, 380.0f, 1600.0f};
-// Each cascade draws into a corner of its 4096 slice at its own resolution.
-// The near two are drawn often and are already as fine as the sun's
-// penumbra at 2048 (1.8 and 4.9 cm texels); the far two are fitted round
-// the camera and drawn every fourth frame, and at 2048 their texels were
-// 38 cm and 1.6 m. 4096 everywhere cost +0.65 ms walking, nearly all of it
-// the near cascades' leaf cards.
-const UINT kCascadeRes[4] = {2048, 2048, 4096, 4096};
+// Each cascade draws into a corner of its slice at its own resolution, and
+// the atlas is the biggest of them. Four levels (Renderer::set_shadow_
+// quality); the near two are what a dappled wood is limited by, the far two
+// are fitted round the camera and drawn every fourth frame.
+//   0 low        1024 1024 2048 2048, atlas 2048 --   64 MB
+//   1 medium     2048 2048 4096 4096, atlas 4096 --  256 MB  (the default)
+//   2 high       4096 4096 4096 4096, atlas 4096 --  256 MB  (same memory)
+//   3 very high  6144 6144 6144 6144, atlas 6144 --  576 MB
+//   4 ultra      8192 8192 8192 8192, atlas 8192 -- 1024 MB
+// Past medium every cascade is raised together: the far two are drawn
+// every fourth frame and mostly as impostors, so once the atlas is paid
+// for they are free -- 6144 everywhere walks the spawn wood in 13.78 ms
+// against 13.73 for 6144 6144 4096 4096, the same memory either way.
+const UINT kCascadeResByQuality[5][4] = {
+    {1024, 1024, 2048, 2048},
+    {2048, 2048, 4096, 4096},
+    {4096, 4096, 4096, 4096},
+    {6144, 6144, 6144, 6144},
+    {8192, 8192, 8192, 8192},
+};
 // How far towards the sun a caster may be and still shadow a cascade: the
 // tallest relief between here and the slice. Depth precision is not the
 // constraint at D32.
@@ -1079,13 +1092,41 @@ bool Renderer::create_mesh_pipeline(std::string& error) {
     return true;
 }
 
-bool Renderer::create_shadow_resources(std::string& error) {
+// What the quality level sets. The atlas is the biggest cascade, since
+// they share one array's slices.
+void Renderer::apply_shadow_quality(int q) {
+    if (q < 0) q = 0;
+    if (q > 4) q = 4;
+    shadow_quality_ = q;
+    shadow_atlas_ = 0;
+    // BIOMES_CASCADE_RES="a,b,c,d" overrides the level, for tuning the mix:
+    // what the near cascade costs and what the far ones are worth are very
+    // different questions, and the levels are a guess until swept.
+    static const char* mix = std::getenv("BIOMES_CASCADE_RES");
+    const char* p = mix;
+    for (UINT c = 0; c < kCascades; ++c) {
+        UINT r = kCascadeResByQuality[q][c];
+        if (p && *p) {
+            const UINT v = UINT(std::atoi(p));
+            if (v >= 256u && v <= 16384u) r = v;
+            while (*p && *p != ',') ++p;
+            if (*p == ',') ++p;
+        }
+        cascade_res_[c] = r;
+        if (r > shadow_atlas_) shadow_atlas_ = r;
+    }
+}
+
+// The atlas and its views. Called at init and again whenever the quality
+// changes; the SRV is rewritten in place at heap [0], so nothing that binds
+// the table has to know.
+bool Renderer::create_shadow_map(std::string& error) {
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = kShadowRes;
-    rd.Height = kShadowRes;
+    rd.Width = shadow_atlas_;
+    rd.Height = shadow_atlas_;
     rd.DepthOrArraySize = kCascades;
     rd.MipLevels = 1;
     rd.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -1096,16 +1137,22 @@ bool Renderer::create_shadow_resources(std::string& error) {
     cv.DepthStencil.Depth = 1.0f;
     // Starts readable: every frame begins with it a shader resource, so a
     // frame that skips the shadow pass still binds a valid (cleared) map.
+    // Made into a temporary first: a level the card cannot hold must leave
+    // the old atlas and its views exactly as they were.
+    ComPtr<ID3D12Resource> made;
     HRESULT hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
                                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
-                                                  IID_PPV_ARGS(&shadow_map_));
+                                                  IID_PPV_ARGS(&made));
     if (FAILED(hr)) { error = hr_text("shadow map", hr); return false; }
+    shadow_map_ = made;
 
-    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    hd.NumDescriptors = kCascades;
-    hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&shadow_dsv_heap_));
-    if (FAILED(hr)) { error = hr_text("shadow dsv heap", hr); return false; }
+    if (!shadow_dsv_heap_) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        hd.NumDescriptors = kCascades;
+        hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&shadow_dsv_heap_));
+        if (FAILED(hr)) { error = hr_text("shadow dsv heap", hr); return false; }
+    }
     const UINT dinc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     for (UINT c = 0; c < kCascades; ++c) {
         D3D12_DEPTH_STENCIL_VIEW_DESC dv = {};
@@ -1117,7 +1164,47 @@ bool Renderer::create_shadow_resources(std::string& error) {
         h.ptr += SIZE_T(c) * dinc;
         device_->CreateDepthStencilView(shadow_map_.Get(), &dv, h);
     }
+    if (srv_heap_) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = DXGI_FORMAT_R32_FLOAT;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2DArray.MipLevels = 1;
+        sd.Texture2DArray.ArraySize = kCascades;
+        device_->CreateShaderResourceView(shadow_map_.Get(), &sd,
+                                          srv_heap_->GetCPUDescriptorHandleForHeapStart());
+    }
+    for (UINT c = 0; c < kCascades; ++c) cascade_valid_[c] = false;
+    return true;
+}
 
+// Live, from the options screen or --shadow-quality. The GPU may still be
+// reading the old atlas, so wait before it goes.
+void Renderer::set_shadow_quality(float q) {
+    const int want = int(q + (q < 0.0f ? -0.5f : 0.5f));
+    if (!device_) { apply_shadow_quality(want); return; }   // before init: the level is all there is to set
+    if (want == shadow_quality_) return;
+    const int had = shadow_quality_;
+    apply_shadow_quality(want);
+    wait_for_gpu();
+    std::string err;
+    if (!create_shadow_map(err)) {
+        // The card would not hold it. The old atlas and its views are
+        // untouched, so go back to the level that describes them rather
+        // than leave the viewport bigger than the map it draws into.
+        apply_shadow_quality(had);
+    }
+}
+
+bool Renderer::create_shadow_resources(std::string& error) {
+    // Settle the level first: the members start at medium, but the level
+    // decides the atlas, and BIOMES_CASCADE_RES can override the mix.
+    apply_shadow_quality(shadow_quality_);
+    // The atlas and its DSVs; its SRV is written once the shared heap below
+    // exists, and again by create_shadow_map whenever the quality changes.
+    if (!create_shadow_map(error)) return false;
+    HRESULT hr = S_OK;
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     // [0] shadow, [1..2] impostor atlases, [3..11] post SRVs (the last two the
     // sky-view table and the aerial-perspective volume), [12..15] post UAVs,
@@ -1237,7 +1324,7 @@ void Renderer::compute_cascades(const ViewConstants& view, const bool due[]) {
         r = std::ceil(r * 1.02f);
         float ctr[3];
         for (int k = 0; k < 3; ++k) ctr[k] = view.cam_pos[k] + view.cam_fwd[k] * zc;
-        const float texel = 2.0f * r / float(kCascadeRes[c]);
+        const float texel = 2.0f * r / float(cascade_res_[c]);
         float cx = ctr[0] * R[0] + ctr[1] * R[1] + ctr[2] * R[2];
         float cy = ctr[0] * U[0] + ctr[1] * U[1] + ctr[2] * U[2];
         cx = std::floor(cx / texel) * texel;
@@ -1281,7 +1368,7 @@ void Renderer::compute_cascades(const ViewConstants& view, const bool due[]) {
 
 void Renderer::record_shadows(const ViewConstants& view) {
     ShadowConstants sc = {};
-    sc.res = float(kShadowRes);
+    sc.res = float(shadow_atlas_);
     for (int k = 0; k < 3; ++k) sc.cam[k] = view.cam_pos[k];
     for (UINT c = 0; c < kCascades; ++c) sc.split[c] = kCascadeSplit[c + 1];
     const bool on = shadows_on_ && mode_ != Mode::Wireframe;
@@ -1369,7 +1456,7 @@ void Renderer::record_shadows(const ViewConstants& view) {
             std::memcpy(sc.light_vp[c], cascades_[c].vp, sizeof sc.light_vp[c]);
             sc.texel[c] = cascades_[c].texel;
             sc.depth_range[c] = cascades_[c].depth_range;
-            sc.scale[c] = float(kCascadeRes[c]) / float(kShadowRes);
+            sc.scale[c] = float(cascade_res_[c]) / float(shadow_atlas_);
         }
     }
     std::memcpy(shadow_cb_cpu_[frame_], &sc, sizeof sc);
@@ -1384,10 +1471,10 @@ void Renderer::record_shadows(const ViewConstants& view) {
     cmd_->ResourceBarrier(1, &b);
 
     D3D12_VIEWPORT vp = {};
-    vp.Width = float(kShadowRes);
-    vp.Height = float(kShadowRes);
+    vp.Width = float(shadow_atlas_);
+    vp.Height = float(shadow_atlas_);
     vp.MaxDepth = 1.0f;
-    D3D12_RECT sr = {0, 0, LONG(kShadowRes), LONG(kShadowRes)};
+    D3D12_RECT sr = {0, 0, LONG(shadow_atlas_), LONG(shadow_atlas_)};
     D3D12_INDEX_BUFFER_VIEW ibv = {};
     ibv.BufferLocation = mesher_.indices()->GetGPUVirtualAddress();
     ibv.SizeInBytes = kSlots * kSlotIndices * 4;
@@ -1398,8 +1485,8 @@ void Renderer::record_shadows(const ViewConstants& view) {
         if (!due[c]) continue;
         cascade_valid_[c] = true;
         // The cascade's corner of its slice; the rest stays cleared (lit).
-        vp.Width = vp.Height = float(kCascadeRes[c]);
-        sr.right = sr.bottom = LONG(kCascadeRes[c]);
+        vp.Width = vp.Height = float(cascade_res_[c]);
+        sr.right = sr.bottom = LONG(cascade_res_[c]);
         D3D12_CPU_DESCRIPTOR_HANDLE dsv = shadow_dsv_heap_->GetCPUDescriptorHandleForHeapStart();
         dsv.ptr += SIZE_T(c) * dinc;
         cmd_->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
