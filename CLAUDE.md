@@ -2145,6 +2145,16 @@ back as they were.
   through the cascades. Old against new at noon and 07:00 (from 120 m up)
   differ by under 1% in the meter; the composite costs the same (1440p
   1.013-1.017 ms against 1.001-1.011).
+- **Thinner while the sun is low** (an aesthetic choice, not physics):
+  every layer's density x0.5 while the sun is within 5 degrees of the
+  horizon, either side, easing back to x1 by 15 degrees
+  (`fog.layers.low_sun` [scale, full within, gone by]; `FogMap::
+  low_sun_factor`, by the sun's ELEVATION, so it follows sunrise and sunset
+  through the year). 18:30 x0.50, 06:00 and 18:00 x0.72, 07:00 and 17:00
+  on x1; the shot report's `height fog:` line prints it. The spawn wood
+  looking west at 18:30 meters 73 nits against 106 at x1; from 120 m up
+  2057 against 2423. The froxel mist is untouched: its own dawn and dusk
+  bumps still veil a wood's floor.
 - **The valley layer** follows the mist's dawn and dusk bumps over a midday
   floor of 8% (`valley_noon`) and is blown away by wind, (1 - U / 6 m/s)^2
   (`valley_wind`). Rain thickens every layer as it does the mist.

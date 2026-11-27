@@ -2632,7 +2632,7 @@ void Renderer::height_fog_constants(float out[3][4], bool on) const {
     for (int r = 0; r < 3; ++r) for (int k = 0; k < 4; ++k) out[r][k] = 0.0f;
     if (!on || !hfog_on_ || !fog_on_ || !fog_map_.built()) return;
     const FogSettings& fs = fog_map_.settings();
-    const float wet = fog_density_ * (1.0f + 1.5f * rain_intensity());
+    const float wet = fog_density_ * (1.0f + 1.5f * rain_intensity()) * height_fog_low_sun();
     const float valley = fog_map_.valley_factor(time_hours_, weather_now_.wind_speed);
     out[0][0] = fs.ground[0] * wet * hfog_scale_;
     out[0][1] = fs.ground[1];

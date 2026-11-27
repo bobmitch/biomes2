@@ -40,6 +40,10 @@ struct FogSettings {
     float valley_noon = 0.08f;            // the valley layer's share left in the middle of the day
     float valley_wind = 6.0f;             // m/s of wind that blows the valley fog away
     float glow_from = 150.0f;             // metres of height fog lit by the horizon's mean before the sun's angle (haze.hlsli)
+    // The height fog's density while the sun is low (an aesthetic choice):
+    // this scale within low_sun[1] degrees of the horizon, either side,
+    // easing back to 1 by low_sun[2] degrees.
+    float low_sun[3] = {0.5f, 5.0f, 15.0f};
     float mist_top[2] = {80.0f, 250.0f};  // the froxel mist thins above this altitude, e-folding this
 };
 
@@ -59,6 +63,8 @@ public:
     // The valley fog's strength 0..1 at this hour and wind: full a little
     // after dawn, a trace by midday, some back at dusk, gone in a wind.
     float valley_factor(float hours, float wind_mps) const;
+    // The height fog's density scale for the sun at this elevation (low_sun).
+    float low_sun_factor(float sun_elevation_deg) const;
     // The exploration fog's extinction at an altitude (1/m), all layers, at
     // this valley factor -- for the shot report's visibility.
     float height_sigma(float y, float sea_level, float valley) const;

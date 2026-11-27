@@ -231,8 +231,11 @@ public:
         if (!hfog_on_ || !fog_on_ || !fog_map_.built()) return 0.0f;
         return fog_map_.height_sigma(y, world_.params().sea_level,
                                      fog_map_.valley_factor(time_hours_, weather_now_.wind_speed)) *
-               fog_density_ * (1.0f + 1.5f * rain_intensity()) * hfog_scale_;
+               fog_density_ * (1.0f + 1.5f * rain_intensity()) * hfog_scale_ * height_fog_low_sun();
     }
+    // Its density scale for the sun's elevation now: thinner at dawn and dusk
+    // (archetypes.json fog.layers.low_sun).
+    float height_fog_low_sun() const { return fog_map_.low_sun_factor(sky_frame().sun_elevation_deg); }
     float height_fog_valley() const { return fog_map_.valley_factor(time_hours_, weather_now_.wind_speed); }
     // Strikes seen since start (distinct), ground strikes among them, and
     // frames drawn with a flash lit -- the schedule's instrument.

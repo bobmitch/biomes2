@@ -46,6 +46,8 @@ bool FogMap::build(const WorldGpu& world, const char* archetypes_path, std::stri
                 if (l.has("valley_noon")) settings_.valley_noon = float(l.number("valley_noon"));
                 if (l.has("valley_wind")) settings_.valley_wind = float(l.number("valley_wind"));
                 if (l.has("glow_from")) settings_.glow_from = float(l.number("glow_from"));
+                if (l.has("low_sun"))
+                    for (int i = 0; i < 3; ++i) settings_.low_sun[i] = float(l.array("low_sun").at(i).num);
             }
         }
     } catch (const std::exception& e) {
@@ -113,6 +115,15 @@ float FogMap::valley_factor(float hours, float wind_mps) const {
     float w = 1.0f - wind_mps / settings_.valley_wind;
     w = w < 0.0f ? 0.0f : w;
     return f * w * w;
+}
+
+float FogMap::low_sun_factor(float sun_elevation_deg) const {
+    const float a = settings_.low_sun[1], b = settings_.low_sun[2];
+    const float e = sun_elevation_deg < 0.0f ? -sun_elevation_deg : sun_elevation_deg;
+    float t = b > a ? (e - a) / (b - a) : (e > a ? 1.0f : 0.0f);
+    t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+    t = t * t * (3.0f - 2.0f * t);
+    return settings_.low_sun[0] + (1.0f - settings_.low_sun[0]) * t;
 }
 
 float FogMap::height_sigma(float y, float sea_level, float valley) const {

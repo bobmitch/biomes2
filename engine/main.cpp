@@ -3065,9 +3065,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                         if (!g_renderer.height_fog())
                             std::fprintf(f, "  height fog: off (--no-height-fog, or the tuning panel's Fog group)\n");
                         else
-                        std::fprintf(f, "  height fog: valley %.2f; level visibility at the eye (%.0f m) %.0f m, at 20 m "
+                        std::fprintf(f, "  height fog: valley %.2f, low sun x%.2f; level visibility at the eye (%.0f m) %.0f m, at 20 m "
                                         "%.0f m, at 300 m %.0f m, at 600 m %.0f m\n",
-                                     g_renderer.height_fog_valley(), g_camera.y - sl, vis(g_camera.y), vis(sl + 20.0f),
+                                     g_renderer.height_fog_valley(), g_renderer.height_fog_low_sun(), g_camera.y - sl, vis(g_camera.y), vis(sl + 20.0f),
                                      vis(sl + 300.0f), vis(sl + 600.0f));
                     }
                     float wet_now = 0.0f, puddle_now = 0.0f;
