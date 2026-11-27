@@ -42,7 +42,8 @@ cbuffer ShadowConstants : register(b2) {
     float4 l_hf;
     // The shadow filter's frame (x), for its rotation to walk under TAA;
     // y parallax on; z the first cascade drawn -- 2 under RT shadows, which
-    // skip the near two (their readers start at the first drawn).
+    // skip the near two (their readers start at the first drawn); w the
+    // filter's rotation mode (BIOMES_PCSS, an A/B -- see cascade_pcss).
     float4 l_shadow_frame;
     // Each cascade's corner of its slice: its resolution over the slice's.
     float4 shadow_scale;
@@ -132,12 +133,22 @@ float cascade_pcss(float3 world, float3 n, uint c) {
     const float zr = lp.z - 0.12f / range;
     const float res = abs(shadow_res);
     const float uv_per_m = 1.0f / (texel * res);
-    // A rotation per shadow texel that also walks frame to frame: fixed, the
-    // 16 taps left a speckle of dark dots in every penumbra that TAA could
-    // not average; walking, TAA integrates them into a smooth edge.
-    const float2 st = floor(uv * res);
-    const float ang = 6.2831853f * frac(52.9829189f * frac(dot(st, float2(0.06711056f, 0.00583715f))) +
-                                        0.618034f * l_shadow_frame.x);
+    // The rotation the 16 taps are turned by. Under a canopy the map is
+    // dappled at the texel, the penumbra is metres of it, and 16 taps are a
+    // coarse Monte Carlo estimate of that coverage -- so WHERE its error
+    // lands decides whether TAA can average it away or not. Per shadow
+    // TEXEL (mode 0) every screen pixel over one texel shares one estimate,
+    // so the error comes in blocks wider than TAA's 3x3 neighbourhood: the
+    // clamp then locks on to the block and the history is thrown away.
+    // Per PIXEL (mode 2, the default) each pixel draws its own, the
+    // neighbourhood spans many draws, and the history survives to be
+    // averaged. Mode 1 is the old fixed-per-texel rotation, kept for the
+    // A/B; it is stable and speckled. BIOMES_PCSS picks one.
+    const float mode = l_shadow_frame.w;
+    const float grid = mode > 1.5f ? 32.0f : 1.0f;
+    const float2 st = floor(uv * (res * grid));
+    const float walk = (mode > 0.5f && mode < 1.5f) ? 0.0f : 0.618034f * l_shadow_frame.x;
+    const float ang = 6.2831853f * frac(52.9829189f * frac(dot(st, float2(0.06711056f, 0.00583715f))) + walk);
     const float ca = cos(ang), sa = sin(ang);
     // Blocker search: casters up to ~30 m above, whose penumbra is ~0.28 m.
     const float search = clamp(30.0f * kKeyLightDiameter, 2.0f * texel, 48.0f * texel) * uv_per_m;

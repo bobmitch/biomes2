@@ -548,6 +548,28 @@ public:
     // at. --aniso <n>, Graphics.
     void set_scan_aniso(float k);
     float scan_aniso() const { return scan_aniso_; }
+    // Sun shadow quality: 0 low, 1 medium (the default), 2 high, 3 very
+    // high, 4 ultra. It sets the cascades' resolution, which is what a
+    // dappled wood is limited by, and with it the atlas and its memory --
+    // 64, 256, 256, 576 and 1024 MB. High is the same memory as medium:
+    // the near two draw into a 4096 slice either way and only use half of
+    // it at medium. Above high the cost is leaf-card FILL in cascade 0,
+    // not the memory -- see the table in CLAUDE.md.
+    // Live: the atlas is rebuilt and every cascade redrawn.
+    // --shadow-quality <0..3>, Graphics.
+    void set_shadow_quality(float q);
+    float shadow_quality() const { return float(shadow_quality_); }
+    // Its cost in bytes, for the options screen and startup.txt.
+    size_t shadow_bytes() const {
+        return size_t(shadow_atlas_) * shadow_atlas_ * 4u * kCascades;
+    }
+    // The cascades as configured: the atlas's side, a cascade's own
+    // resolution inside its slice, and the metres one of its texels covers
+    // (its last fit; 0 before the first frame). The shot report prints them.
+    UINT shadow_atlas_res() const { return shadow_atlas_; }
+    UINT cascade_res(UINT c) const { return cascade_res_[c < kCascades ? c : 0]; }
+    float cascade_texel(UINT c) const { return cascades_[c < kCascades ? c : 0].texel; }
+    static UINT cascade_count() { return kCascades; }
     // The scans' sampler for the current setting, for s5's table.
     D3D12_GPU_DESCRIPTOR_HANDLE scan_sampler() const;
     bool hfgi() const { return hfgi_on_; }
@@ -731,9 +753,10 @@ private:
 
 
     // --- sun shadows ---
-    // 4096: twice the old resolution in each axis. Four cascades: the fourth
-    // reaches 1.6 km, where shadows used to stop at 520 m.
-    static const UINT kShadowRes = 4096;
+    // Four cascades: the fourth reaches 1.6 km, where shadows used to stop
+    // at 520 m. Each draws into a corner of its slice of one array, so the
+    // ATLAS is the biggest cascade and the memory is atlas^2 x 4 B x 4.
+    // Both are set by the shadow quality (set_shadow_quality).
     static const UINT kCascades = 4;
     struct Cascade {
         float vp[16];
@@ -742,6 +765,7 @@ private:
         float texel, depth_range;
     };
     bool create_shadow_resources(std::string& error);
+    bool create_shadow_map(std::string& error);
     // Fits the cascades `due` marks (the rest keep the matrix their map was
     // drawn with).
     void compute_cascades(const ViewConstants& view, const bool due[]);
@@ -751,6 +775,12 @@ private:
     void cascades_due(bool due[]) const;
     void record_shadows(const ViewConstants& view);
     Cascade cascades_[kCascades];
+    // The quality level (0 low .. 3 ultra) and what it sets: the atlas's
+    // side and each cascade's own resolution inside its slice.
+    int  shadow_quality_ = 1;
+    UINT shadow_atlas_ = 4096;
+    UINT cascade_res_[kCascades] = {2048, 2048, 4096, 4096};
+    void apply_shadow_quality(int q);
     ComPtr<ID3D12Resource>       shadow_map_;
     ComPtr<ID3D12DescriptorHeap> shadow_dsv_heap_;
     // The one shader-visible heap: [0] the shadow map, [1..2] the tree
