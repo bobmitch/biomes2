@@ -20,7 +20,7 @@ uint64_t mix64(uint64_t x) {
 float u01(uint64_t h) { return float(h >> 40) / float(1ull << 24); }
 
 const uint32_t kMagic = 0x31424F4Du;   // "MOB1"
-const uint32_t kVersion = 2;   // 2: gait and goal
+const uint32_t kVersion = 3;   // 2: gait and goal; 3: mark
 
 bool in_hours(float hour, float from, float to) {
     if (from <= 0.0f && to >= 24.0f) return true;
@@ -282,6 +282,7 @@ void put_mob(FILE* f, const Mob& m, uint16_t kind) {
     put(f, m.born);
     put(f, int32_t(m.gait));
     for (int k = 0; k < 3; ++k) put(f, m.goal[k]);
+    for (int k = 0; k < 3; ++k) put(f, m.mark[k]);
 }
 
 bool get_mob(FILE* f, Mob& m, uint16_t& kind, uint32_t version) {
@@ -296,6 +297,8 @@ bool get_mob(FILE* f, Mob& m, uint16_t& kind, uint32_t version) {
         ok = ok && get(f, gait);
         for (int k = 0; k < 3 && ok; ++k) ok = get(f, m.goal[k]);
         m.gait = gait;
+        if (version >= 3)
+            for (int k = 0; k < 3 && ok; ++k) ok = get(f, m.mark[k]);
     } else {
         std::memcpy(m.goal, m.pos, sizeof m.goal);
     }

@@ -50,6 +50,7 @@
 #include "engine/player/survival.h"
 #include "engine/mobs/creatures.h"
 #include "engine/mobs/locomotion.h"
+#include "engine/mobs/minds.h"
 #include "engine/nav/nav_world.h"
 #include <array>
 #include <memory>
@@ -650,7 +651,9 @@ engine::mobs::Creatures     g_creatures;
 bool  g_creatures_ok = false;
 std::unordered_map<uint32_t, engine::CharacterAnimator> g_mob_anim;
 engine::mobs::Locomotion    g_loco;          // paths, bodies near the player, the mesh beyond
-bool  g_mob_wander = true;                   // the stand-in behaviour until scripts (phase 5)
+bool  g_mob_wander = true;                   // the stand-in behaviour for kinds with no script
+engine::mobs::Minds g_minds;                 // perception and the Lua behaviours
+bool  g_minds_ok = false;
 
 // --- The navmesh (engine/nav, ADR-007 decision 4) ------------------------------
 // Tiles within kNavRadius of the player, built from the field on workers.
@@ -875,6 +878,27 @@ void publish_creatures(float dt, const float from[3]) {
     cr.set_creatures(bones, tints, n);
 }
 
+// The player as creatures perceive them (none while flying), and the ray
+// their sight is blocked by.
+engine::mobs::Minds::Player minds_player() {
+    engine::mobs::Minds::Player p;
+    p.present = g_walk;
+    for (int k = 0; k < 3; ++k) p.feet[k] = g_feet[k];
+    p.level_db = g_stealth.level_db();
+    p.visibility = g_stealth.visibility();
+    p.lux = g_stealth.lux();
+    return p;
+}
+
+bool minds_clear(const float a[3], const float b[3]) {
+    const float d[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+    const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (len < 0.5f) return true;
+    const float dir[3] = {d[0] / len, d[1] / len, d[2] / len};
+    int prop = 0;
+    return g_physics.probe_ray(a, dir, len - 0.3f, prop) < 0.0f;
+}
+
 // A frame of the creatures: zones round the player wake and freeze, spawns
 // come due on the game clock, the nearest are drawn.
 void creatures_frame(float dt, bool paused, float aspect) {
@@ -884,6 +908,7 @@ void creatures_frame(float dt, bool paused, float aspect) {
     if (!paused) {
         const double now = g_surv_ok ? g_surv.game_seconds() : double(g_renderer.time_of_day()) * 3600.0;
         g_creatures.update(now, player, creature_env(g_camera, aspect));
+        g_minds.update(dt, minds_player(), minds_clear);
         if (g_mob_wander) g_loco.wander(dt, g_creatures.live(), now);
         g_loco.update(dt, g_creatures.live(), player);
     }
@@ -2077,6 +2102,389 @@ int run_nav_report() {
                         "(magenta), white the swim.\n");
     }
     g_nav_extra.clear();
+    std::fprintf(f, "\n%s: %d failed\n", fails ? "FAILURES" : "ALL PASSED", fails);
+    std::fclose(f);
+    return fails;
+}
+
+// --mimic-test (ADR-007, phase 5): the mimic's script against a player whose
+// sound, visibility and light the test sets, at places along a line of clear
+// sight from it: heard and turned to, unheard, seen and walked to, run at,
+// stared at; out of the cone; lost, searched for, given up; by moonlight
+// and by torchlight; a chase through a save. build/mimic_test.txt and the
+// stare from behind the player, build/mimic_stare.bmp.
+int run_mimic_test() {
+    std::remove("build/mimic_test.txt");
+    FILE* f = std::fopen("build/mimic_test.txt", "w");
+    if (!f) return 1;
+    int fails = 0;
+    auto check = [&](bool ok, const std::string& what) {
+        std::fprintf(f, "%s  %s\n", ok ? "PASS" : "FAIL", what.c_str());
+        if (!ok) ++fails;
+    };
+    char buf[500];
+    check(g_nav_ok && g_creatures_ok && g_minds_ok, "the navmesh, the creature table and the scripts");
+    if (!g_nav_ok || !g_creatures_ok || !g_minds_ok) { std::fclose(f); return fails; }
+    const int mimic = g_creature_table.find("mimic");
+    const engine::WorldGpu& wg = g_renderer.world();
+    using engine::mobs::Mob;
+    static const char* kState[] = {"IDLE", "ALERT", "APPROACH", "CHASE", "STARE", "SEARCH", "LOOK", "RETURN"};
+    auto sname = [](int st) { return st >= 0 && st < 8 ? kState[st] : "?"; };
+    enum { IDLE, ALERT, APPROACH, CHASE, STARE, SEARCH, LOOK, RETURN };
+    engine::mobs::Creatures& C = g_creatures;
+    C.clear();
+    float tsim = 0.0f;
+
+    // Settle at the spawn.
+    g_walk = true;
+    g_physics.place_character(g_spawn.x, g_spawn.ground + 1.0f, g_spawn.z);
+    for (int i = 0; i < 20000; ++i) {
+        MSG m = {};
+        while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+        step_window_physics(1.0f / 60.0f, tsim, 0.0f, 0.0f, false, 0.0f);
+        tsim += 1.0f / 60.0f;
+        g_camera.x = g_feet[0]; g_camera.y = g_feet[1] + 1.6f; g_camera.z = g_feet[2];
+        engine::ViewConstants v = {};
+        fill_view(g_camera, g_res_w, g_res_h, tsim, v);
+        g_renderer.render(v);
+        g_nav.update(g_spawn.x, g_spawn.z, kNavRadius);
+        if (i >= 90 && g_nav.settled()) break;
+    }
+    const unsigned short walk = engine::nav::kFlagWalk;
+    auto on_mesh = [&](float x, float z, float out[3]) {
+        const float p[3] = {x, wg.height(x, z), z}, ext[3] = {0.6f, 4.0f, 0.6f};
+        return g_nav.nearest(p, ext, walk, out) && std::fabs(out[0] - x) < 0.6f && std::fabs(out[2] - z) < 0.6f;
+    };
+    // Trunk colliders round a point, then a clear ray from a mimic's eyes to
+    // a player's chest.
+    auto sight_clear = [&](const float m[3], const float p[3]) {
+        const float eye[3] = {m[0], m[1] + 1.6f, m[2]}, chest[3] = {p[0], p[1] + 1.2f, p[2]};
+        return minds_clear(eye, chest);
+    };
+    // A mimic's place and a line both ways of clear sight over the mesh, out
+    // to 48 m ahead and 16 m behind, with points 30 m out 15 and 30 degrees
+    // off the line.
+    float M[3] = {0, 0, 0}, dir[2] = {0, 1};
+    bool found = false;
+    for (int ring = 0; ring < 6 && !found; ++ring)
+        for (int k = 0; k < 12 && !found; ++k) {
+            const float ra = float(k) * 0.5235988f + float(ring) * 0.3f, rr = 20.0f + 15.0f * float(ring);
+            float m0[3];
+            if (!on_mesh(g_spawn.x + std::sin(ra) * rr, g_spawn.z + std::cos(ra) * rr, m0)) continue;
+            g_felling.update(m0[0], m0[2]);
+            for (int j = 0; j < 16 && !found; ++j) {
+                const float a = float(j) * 0.3926991f, dx = std::sin(a), dz = std::cos(a);
+                bool ok = true;
+                const float dists[] = {-16.0f, -15.0f, -3.0f, -0.8f, 2.0f, 10.0f, 20.0f, 25.0f, 30.0f, 38.0f, 45.0f, 48.0f};
+                for (float d : dists) {
+                    float q[3];
+                    if (!on_mesh(m0[0] + dx * d, m0[2] + dz * d, q) || !sight_clear(m0, q)) { ok = false; break; }
+                }
+                for (float off : {0.2617994f, 0.5235988f}) {
+                    float q[3];
+                    const float b = a + off;
+                    if (ok && (!on_mesh(m0[0] + std::sin(b) * 30.0f, m0[2] + std::cos(b) * 30.0f, q) || !sight_clear(m0, q)))
+                        ok = false;
+                }
+                if (ok) { std::memcpy(M, m0, sizeof M); dir[0] = dx; dir[1] = dz; found = true; }
+            }
+        }
+    std::snprintf(buf, sizeof buf, "a place for the mimic with clear sight 48 m ahead and 16 behind: (%.1f, %.1f, %.1f) facing (%.2f, %.2f)",
+                  M[0], M[1], M[2], dir[0], dir[1]);
+    check(found, buf);
+    if (!found) { std::fclose(f); return fails; }
+    const float face_yaw = std::atan2(dir[0], dir[1]);
+    auto at = [&](float ahead, float off_deg, float out[3]) {
+        const float b = face_yaw + off_deg * 0.017453293f;
+        return on_mesh(M[0] + std::sin(b) * ahead, M[2] + std::cos(b) * ahead, out);
+    };
+
+    // The player: where, how loud and visible, in what light.
+    struct Act { float speed = 0.0f; bool crouch = false; float lux = 50000.0f; };
+    Act act;
+    float player[3] = {0, 0, 0};
+    auto put_player = [&](const float p[3]) {
+        g_physics.place_character(p[0], p[1] + 0.05f, p[2]);
+        g_physics.character_position(g_feet);
+        std::memcpy(player, p, sizeof player);
+    };
+    struct Seen { std::vector<std::pair<float, int> > states; };
+    uint32_t mid = 0;
+    auto run = [&](float seconds, Seen* seen, const std::function<bool()>& until) {
+        const float dt = 1.0f / 60.0f;
+        float t = 0.0f;
+        for (; t < seconds; t += dt) {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+            g_physics.place_character(player[0], player[1] + 0.05f, player[2]);   // standing where put
+            step_window_physics(dt, tsim, 0.0f, 0.0f, false, 0.0f);
+            g_physics.character_position(g_feet);
+            tsim += dt;
+            g_felling.update(g_feet[0], g_feet[2]);
+            engine::player::StealthInput si;
+            si.body = true;
+            si.grounded = true;
+            si.speed = act.speed;
+            si.crouching = act.crouch;
+            si.lux = act.lux;
+            g_stealth.update(dt, si);
+            g_minds.update(dt, minds_player(), minds_clear);
+            g_loco.update(dt, C.live(), g_feet);
+            const Mob* w = C.find_live(mid);
+            if (seen && w && (seen->states.empty() || seen->states.back().second != w->state))
+                seen->states.push_back(std::make_pair(t, w->state));
+            if (until && until()) break;
+        }
+        return t;
+    };
+    auto fresh = [&]() {
+        // The last scenario's player out of the way and quiet before the new
+        // mimic wakes, or it starts out alerted or chasing.
+        float away[3] = {M[0] - dir[0] * 150.0f, 0.0f, M[2] - dir[1] * 150.0f};
+        away[1] = wg.height(away[0], away[2]);
+        put_player(away);
+        act = Act();
+        C.clear();
+        run(0.2f, nullptr, nullptr);    // bodies and minds go
+        mid = C.spawn_at(mimic, M, face_yaw, 10.0 * 3600.0);
+        run(0.3f, nullptr, nullptr);    // it wakes
+    };
+    auto trace = [&](const Seen& s) {
+        std::string t;
+        for (const auto& e : s.states) {
+            char b[48];
+            std::snprintf(b, sizeof b, "%s%s at %.1f s", t.empty() ? "" : ", ", sname(e.second), e.first);
+            t += b;
+        }
+        return t.empty() ? std::string("no change") : t;
+    };
+    auto state = [&]() { const Mob* w = C.find_live(mid); return w ? w->state : -1; };
+    auto gait = [&]() { const Mob* w = C.find_live(mid); return w ? w->gait : -1; };
+    auto has = [](const Seen& s, int st) {
+        for (const auto& e : s.states) if (e.second == st) return true;
+        return false;
+    };
+    auto first_t = [](const Seen& s, int st) {
+        for (const auto& e : s.states) if (e.second == st) return e.first;
+        return -1.0f;
+    };
+
+    // 1. Heard from behind: stops, turns, sees, runs.
+    std::fprintf(f, "\n1. a jog 15 m behind it (60 dB: it hears to its 20 m)\n");
+    {
+        fresh();
+        float p[3];
+        at(-15.0f, 0.0f, p);
+        put_player(p);
+        act = Act();
+        act.speed = 5.0f;
+        Seen s;
+        int gait_alert = -1;
+        run(8.0f, &s, [&] {
+            if (state() == ALERT && gait_alert < 0) gait_alert = gait();
+            return state() == CHASE;
+        });
+        std::snprintf(buf, sizeof buf, "%s; standing when alerted: %s", trace(s).c_str(), gait_alert == 0 ? "yes" : "no");
+        check(has(s, ALERT) && first_t(s, ALERT) < 1.5f && gait_alert == 0 && state() == CHASE && first_t(s, CHASE) < 6.0f, buf);
+    }
+    // 2. A walk 15 m behind (50 dB: heard to 6.3 m) and a crouch-walk 3 m
+    // behind (35 dB: 1.1 m): nothing. A crouch-walk 0.8 m behind: heard.
+    std::fprintf(f, "\n2. quieter\n");
+    {
+        fresh();
+        float p[3];
+        at(-15.0f, 0.0f, p);
+        put_player(p);
+        act = Act();
+        act.speed = 1.4f;
+        Seen s;
+        run(3.0f, &s, nullptr);
+        check(!has(s, ALERT) && !has(s, CHASE), "a walk 15 m behind: " + trace(s));
+        fresh();
+        at(-3.0f, 0.0f, p);
+        put_player(p);
+        act.speed = 1.4f;
+        act.crouch = true;
+        Seen s2;
+        run(3.0f, &s2, nullptr);
+        check(!has(s2, ALERT), "a crouch-walk 3 m behind: " + trace(s2));
+        fresh();
+        at(-0.8f, 0.0f, p);
+        put_player(p);
+        act.speed = 1.4f;
+        act.crouch = true;
+        Seen s3;
+        run(2.0f, &s3, [&] { return state() == ALERT; });
+        check(has(s3, ALERT), "a crouch-walk 0.8 m behind: " + trace(s3));
+    }
+    // 3. Seen ahead: not standing still at 45 m (0.7 x 50 = 35 m), but
+    // sprinting (50 m); walks, runs inside 40 m, stares at 2.2 m.
+    std::fprintf(f, "\n3. ahead, 45 m\n");
+    float stare_yaw_err = 99.0f;
+    {
+        fresh();
+        float p[3];
+        at(45.0f, 0.0f, p);
+        put_player(p);
+        act = Act();
+        Seen s0;
+        run(3.0f, &s0, nullptr);
+        check(!has(s0, APPROACH) && !has(s0, CHASE), "standing still at 45 m by day: " + trace(s0));
+        act.speed = 8.0f;
+        Seen s;
+        int gait_approach = -1, gait_chase = -1;
+        float chase_dist = -1.0f;
+        run(40.0f, &s, [&] {
+            const Mob* w = C.find_live(mid);
+            if (state() == APPROACH && gait_approach < 0) gait_approach = gait();
+            if (state() == CHASE && gait_chase < 0) {
+                gait_chase = gait();
+                chase_dist = std::sqrt((w->pos[0] - player[0]) * (w->pos[0] - player[0]) + (w->pos[2] - player[2]) * (w->pos[2] - player[2]));
+            }
+            return state() == STARE;
+        });
+        run(1.0f, nullptr, nullptr);   // it turns to face
+        const Mob* w = C.find_live(mid);
+        const float want = std::atan2(player[0] - w->pos[0], player[2] - w->pos[2]);
+        float e = want - w->yaw;
+        e -= 6.2831853f * std::floor((e + 3.14159265f) / 6.2831853f);
+        stare_yaw_err = std::fabs(e) * 57.29578f;
+        const float d = std::sqrt((w->pos[0] - player[0]) * (w->pos[0] - player[0]) + (w->pos[2] - player[2]) * (w->pos[2] - player[2]));
+        std::snprintf(buf, sizeof buf, "sprinting: %s; walking when approaching %s, running from %.1f m %s; stares %.1f m off, "
+                      "%.0f degrees off facing the player",
+                      trace(s).c_str(), gait_approach == 1 ? "yes" : "NO", chase_dist, gait_chase == 2 ? "yes" : "NO", d,
+                      stare_yaw_err);
+        check(has(s, APPROACH) && gait_approach == 1 && gait_chase == 2 && chase_dist <= 40.5f && state() == STARE &&
+                  gait() == 0 && d < 3.0f && stare_yaw_err < 25.0f, buf);
+        // The still: from the side of the pair, wherever a camera sees both
+        // (a trunk stood behind the player's shoulder).
+        const float bx = player[0] - w->pos[0], bz = player[2] - w->pos[2], bl = std::sqrt(bx * bx + bz * bz);
+        const float mx = 0.5f * (player[0] + w->pos[0]), mz = 0.5f * (player[2] + w->pos[2]);
+        for (int k = 0; k < 12; ++k) {
+            const float a = std::atan2(bz, -bx) + float(k) * 0.5235988f;   // round the pair from its side
+            const float cx = mx + std::cos(a) * 5.0f, cz = mz + std::sin(a) * 5.0f;
+            const float cam[3] = {cx, (std::max)(wg.height(cx, cz), player[1]) + 1.6f, cz};
+            const float head_m[3] = {w->pos[0], w->pos[1] + 1.5f, w->pos[2]}, head_p[3] = {player[0], player[1] + 1.5f, player[2]};
+            g_camera.x = cam[0]; g_camera.y = cam[1]; g_camera.z = cam[2];
+            if (minds_clear(cam, head_m) && minds_clear(cam, head_p)) break;
+        }
+        g_camera.yaw = std::atan2(mx - g_camera.x, mz - g_camera.z);
+        g_camera.pitch = -0.1f;
+        const bool walk_was = g_walk;
+        g_walk = true;     // the player's body drawn beside it
+        g_feet[0] = player[0]; g_feet[1] = player[1]; g_feet[2] = player[2];
+        g_char_yaw = std::atan2(-bx, -bz);
+        g_cam_dist = 4.5f;
+        g_have_prev_feet = false;
+        for (int i = 0; i < 20; ++i) update_character(1.0f / 60.0f, tsim, 0.0f, 0.0f);
+        publish_character();
+        for (int i = 0; i < 20; ++i) publish_creatures(1.0f / 60.0f, player);
+        engine::ViewConstants v = {};
+        fill_view(g_camera, g_res_w, g_res_h, tsim, v);
+        std::string err;
+        g_renderer.capture(v, "build/mimic_stare.bmp", err);
+        g_walk = walk_was;
+        std::fprintf(f, "      build/mimic_stare.bmp: the stare, from behind the player\n");
+    }
+    // 4. The cone: 30 m out, 30 degrees off (outside its 22.5) and 15 off.
+    std::fprintf(f, "\n4. the cone (45 degrees wide)\n");
+    {
+        fresh();
+        float p[3];
+        at(30.0f, 30.0f, p);
+        put_player(p);
+        act = Act();
+        act.speed = 8.0f;
+        Seen s;
+        run(3.0f, &s, nullptr);
+        check(!has(s, APPROACH) && !has(s, CHASE), "sprinting 30 m out, 30 degrees off its facing: " + trace(s));
+        fresh();
+        at(30.0f, 15.0f, p);
+        put_player(p);
+        act.speed = 8.0f;
+        Seen s2;
+        run(3.0f, &s2, [&] { return state() == CHASE; });
+        {
+            const Mob* w = C.find_live(mid);
+            const float eye[3] = {w->pos[0], w->pos[1] + 1.6f, w->pos[2]};
+            const float chest[3] = {g_feet[0], g_feet[1] + 1.2f, g_feet[2]};
+            const float ang = std::atan2(chest[0] - eye[0], chest[2] - eye[2]) - w->yaw;
+            std::fprintf(f, "      mimic at (%.1f, %.1f, %.1f) yaw %.3f (set %.3f); player feet (%.1f, %.1f, %.1f) put at (%.1f, %.1f, %.1f); "
+                         "%.1f m, %.1f deg off, ray clear %d, visibility %.2f lux %.0f\n",
+                         w->pos[0], w->pos[1], w->pos[2], w->yaw, face_yaw, g_feet[0], g_feet[1], g_feet[2], p[0], p[1], p[2],
+                         std::sqrt((chest[0] - eye[0]) * (chest[0] - eye[0]) + (chest[2] - eye[2]) * (chest[2] - eye[2])),
+                         ang * 57.29578f, int(minds_clear(eye, chest)), g_stealth.visibility(), g_stealth.lux());
+        }
+        check(has(s2, CHASE), "15 degrees off: " + trace(s2));
+    }
+    // 5. Lost mid-chase: searches where it last saw them, looks about, goes home.
+    std::fprintf(f, "\n5. lost\n");
+    {
+        fresh();
+        float p[3];
+        at(30.0f, 0.0f, p);
+        put_player(p);
+        act = Act();
+        act.speed = 8.0f;
+        Seen s;
+        run(3.0f, &s, [&] { return state() == CHASE; });
+        run(1.5f, &s, nullptr);
+        float mark[3];
+        std::memcpy(mark, player, sizeof mark);
+        // Gone: 150 m behind it, silent.
+        float far_p[3] = {M[0] - dir[0] * 150.0f, 0.0f, M[2] - dir[1] * 150.0f};
+        far_p[1] = wg.height(far_p[0], far_p[2]);
+        put_player(far_p);
+        act.speed = 0.0f;
+        float look_dist = -1.0f;
+        run(90.0f, &s, [&] {
+            const Mob* w = C.find_live(mid);
+            if (state() == LOOK && look_dist < 0.0f)
+                look_dist = std::sqrt((w->pos[0] - mark[0]) * (w->pos[0] - mark[0]) + (w->pos[2] - mark[2]) * (w->pos[2] - mark[2]));
+            return state() == IDLE && first_t(s, RETURN) >= 0.0f;
+        });
+        const Mob* w = C.find_live(mid);
+        const float home = std::sqrt((w->pos[0] - M[0]) * (w->pos[0] - M[0]) + (w->pos[2] - M[2]) * (w->pos[2] - M[2]));
+        std::snprintf(buf, sizeof buf, "%s; looked about %.1f m from where it lost them; home again %.1f m off", trace(s).c_str(),
+                      look_dist, home);
+        check(has(s, SEARCH) && has(s, LOOK) && has(s, RETURN) && state() == IDLE && look_dist >= 0.0f && look_dist < 1.5f &&
+                  home < 1.5f, buf);
+    }
+    // 6. By moonlight (0.19 lx: 15% of its sight) a sprinter 25 m off is not
+    // seen; by torchlight (60 lx on them: 79%) they are. A save keeps the chase.
+    std::fprintf(f, "\n6. night\n");
+    {
+        fresh();
+        float p[3];
+        at(25.0f, 0.0f, p);
+        put_player(p);
+        act = Act();
+        act.speed = 8.0f;
+        act.lux = 0.19f;
+        Seen s;
+        run(3.0f, &s, nullptr);
+        check(!has(s, APPROACH) && !has(s, CHASE), "a sprinter 25 m off by moonlight: " + trace(s));
+        act.lux = 60.0f;
+        Seen s2;
+        run(3.0f, &s2, [&] { return state() == CHASE; });
+        check(has(s2, CHASE), "the same with a torch: " + trace(s2));
+        // Through a save.
+        std::string err;
+        C.save("build/mimic_test.bin", err);
+        engine::mobs::Creatures D;
+        D.set_table(&g_creature_table);
+        D.set_world(wg.field_id());
+        const bool loaded = D.load("build/mimic_test.bin", err);
+        D.update(10.0 * 3600.0, player, engine::mobs::SpawnEnv());
+        const Mob* a = C.find_live(mid);
+        const Mob* b = D.find_live(mid);
+        check(loaded && a && b && b->state == CHASE && b->gait == a->gait && b->mark[0] == a->mark[0] && b->mark[2] == a->mark[2],
+              "a chase saved and read back: state, gait and the place it saw them");
+    }
+    C.clear();
+    run(0.05f, nullptr, nullptr);
+    std::snprintf(buf, sizeof buf, "no script errors (%zu; build/creature_log.txt)", g_minds.errors());
+    check(g_minds.errors() == 0, buf);
     std::fprintf(f, "\n%s: %d failed\n", fails ? "FAILURES" : "ALL PASSED", fails);
     std::fclose(f);
     return fails;
@@ -3488,8 +3896,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     const bool mob_mode = hl.find("--mob-test") != std::string::npos;
     const bool nav_mode = hl.find("--nav-report") != std::string::npos;
     const bool move_mode = hl.find("--move-test") != std::string::npos;
+    const bool mimic_mode = hl.find("--mimic-test") != std::string::npos;
     const bool headless = report_mode || fell_mode || dig_tree_mode || lights_mode || leak_mode ||
-                          pit_mode || survival_mode || mob_mode || nav_mode || move_mode ||
+                          pit_mode || survival_mode || mob_mode || nav_mode || move_mode || mimic_mode ||
                           !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
@@ -3591,6 +4000,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             std::string nerr;
             g_nav_ok = g_nav.init(&wg.world(), &wg.params(), &wg.table(), g_creature_table.zones.size_m, 3, nerr);
             g_loco.set(&g_creature_table, g_nav_ok ? &g_nav : nullptr, &g_physics, wg.table().sea_level);
+            if (g_creatures_ok) {
+                std::string merr;
+                g_minds_ok = g_minds.init(&g_creature_table, &g_creatures, &g_loco, g_nav_ok ? &g_nav : nullptr, merr);
+                if (g_surv_ok) g_minds.light() = g_items.stealth.light;
+                g_loco.skip_wander.assign(g_creature_table.kinds.size(), false);
+                for (size_t k = 0; k < g_creature_table.kinds.size(); ++k) g_loco.skip_wander[k] = g_minds.scripted(int(k));
+                if (FILE* sf = std::fopen("build/startup.txt", "a")) {
+                    std::fprintf(sf, "           creature scripts: %s\n", g_minds_ok ? "loaded" : merr.c_str());
+                    std::fclose(sf);
+                }
+            }
             if (g_nav_ok) {
                 g_nav.set_gather(gather_nav);
                 g_nav.set_ready([] {
@@ -6370,6 +6790,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (mimic_mode) {
+        const int r = run_mimic_test();
+        g_minds.shutdown();
+        g_loco.clear();
+        g_nav.shutdown();
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return r;
+    }
+
     if (move_mode) {
         const int r = run_move_test();
         g_loco.clear();
@@ -8448,7 +8878,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 const bool ok4 = g_surv_ok && g_surv.load("build/player.txt", err);
                 if (ok4) { g_surv.reset_fall(); g_jump_window = 0.0f; }
                 const bool ok5 = g_creatures_ok && g_creatures.load("build/mobs.bin", err);
-                if (ok5) { g_mob_anim.clear(); g_loco.clear(); }
+                if (ok5) { g_mob_anim.clear(); g_loco.clear(); g_minds.clear(); }
                 if (g_nav_ok) g_nav.invalidate_all();
                 hud_say((ok || ok2 || ok3 || ok4 || ok5) ? "Loaded" : "Nothing to load");
             }

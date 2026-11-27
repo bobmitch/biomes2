@@ -374,10 +374,17 @@ Last gathered: 2026-11-21, after the exploration fog; creatures added
 
 ## Creatures (ADR-007)
 
-- **Phases 1-4 are built** (the player's sound and sight; zones, spawning,
-  freezing, saving, drawing; the navmesh; movement). The mimic's behaviour
-  is phase 5; until then creatures wander near home. Nothing has been
-  played in the window. [Creatures and stealth]
+- **Every phase of ADR-007 is built**, and none of it has been PLAYED in
+  the window: each part is tested headless (`--mob-test`, `--nav-report`,
+  `--move-test`, `--mimic-test`). [Creatures and stealth]
+- **Sound passes through rock**: hearing is distance and level only, so a
+  creature hears a jog through a hill. Sight is blocked by terrain,
+  trunks and rocks (physics), not by crowns, bushes or grass.
+  [Creatures and stealth]
+- **A behaviour's session memory is lost on a freeze** (the mimic's
+  listening and looking timers, its 3 s grace): it resumes its saved state
+  and mark, and starts those afresh. The body turns to look; no head turn.
+  [Creatures and stealth]
 - **Movement**: no jumping, climbing or turning on the spot (the body
   turns as it walks); far-off creatures ignore a rolling log until it
   rests and is stamped, and do not avoid the player; a far-off swimmer

@@ -1,8 +1,8 @@
 # ADR-007: Creatures -- zones, spawning, perception and navigation
 
 Status: **accepted**, 2026-11-27. Phases 1 (the player's sound and sight)
-2 (zones, spawning, freezing, saving, drawing), 3 (the navmesh) and 4
-(movement) are built -- CLAUDE.md,
+2 (zones, spawning, freezing, saving, drawing), 3 (the navmesh), 4
+(movement) and 5 (perception and behaviour) are built: all of it -- CLAUDE.md,
 "Creatures and stealth", has what was measured; the rest is the plan. Gameplay follows Valheim by default,
 as the survival rules do; every number below is data, in
 `game/data/creatures.json` or `game/data/items.json`, never in the golden
@@ -132,8 +132,9 @@ already, at 0.
 width; the mimic's 45 is 22.5 each side) and `dark_gain` (night vision).
 It sees the player when, all of:
 
-- the angle from its facing is within half the cone (from its head joint,
-  horizontal and vertical together);
+- the HORIZONTAL angle from its facing is within half the cone, and the
+  vertical within 60 degrees (as built: a 3D cone lost a player on a slope
+  close by, or lower down far off);
 - d <= view_range x **visibility** x **light**;
 - a physics ray from its eyes to the player's chest and head is clear
   (terrain, trunks, rocks; foliage and crowns do not block yet).
@@ -229,7 +230,8 @@ built in the engine block like Jolt; worldgen and validate never see it.
 ### 6. Behaviour is Lua; the engine routes
 
 As the UI: C++ routes, Lua decides. A creature kind names a script
-(`game/scripts/creatures/mimic.lua`) with hooks -- `on_spawn`,
+(`game/scripts/creatures/mimic.lua`) with hooks -- `on_wake` (built
+under that name: it runs on every waking, thaw and load included),
 `on_think(dt)` at a rate by distance (5 Hz near, 1 Hz mid), `on_hear(ev)`,
 `on_see(ev)`, `on_lose(ev)` -- and calls on the engine: `move_to(p,
 gait)`, `stop()`, `look_at(p)`, `face(p)`, `play(clip)`, `home()`,
@@ -245,8 +247,10 @@ numbers planned (tens, not hundreds) Lua at these rates costs little.
 - SEES the player within 50 m (its range x visibility x light) -> walks
   towards them; within 40 m -> runs;
 - reaches them -> stops at ~2 m and STARES (no combat yet);
-- loses sight -> goes to the last place it saw them, looks round, then
-  goes home.
+- loses sight -> keeps on to where it saw them for 3 s (as built: weaving
+  round trees, a pursuer has its quarry out of a 45 degree cone every few
+  steps), then goes to the last place it saw them, looks round, then goes
+  home.
 
 ### 7. Drawing
 

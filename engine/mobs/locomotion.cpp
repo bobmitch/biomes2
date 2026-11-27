@@ -179,17 +179,29 @@ void Locomotion::update(float dt, std::vector<Mob>& live, const float player[3])
             b.corners.clear();
             b.stuck = 0.0f;
         }
-        // Face where it is going.
-        if (v > 0.2f) {
-            const float want_yaw = std::atan2(m.pos[0] - before[0], m.pos[2] - before[2]);
+        // Face where it is going; standing, where it was told to look.
+        // Only a creature asked to move turns to its travel: a body settling
+        // on a slope slid fast enough to swing a standing mimic 8 degrees.
+        const bool travelling = asked && v > 0.2f;
+        if (travelling || (b.facing && m.gait == 0)) {
+            const float want_yaw = travelling ? std::atan2(m.pos[0] - before[0], m.pos[2] - before[2]) : b.face_yaw;
+            if (travelling) b.facing = false;
             float d = want_yaw - m.yaw;
             d -= 6.2831853f * std::floor((d + 3.14159265f) / 6.2831853f);
             const float step = tuning_.turn_rate * dt;
             m.yaw += d > step ? step : (d < -step ? -step : d);
         }
-        if (m.gait == 0) m.state_t += dt;
-        else m.state_t = 0.0f;
+        m.state_t += dt;   // the behaviour's clock: time in its state
+        b.idle = m.gait == 0 ? b.idle + dt : 0.0f;
     }
+}
+
+void Locomotion::face(const Mob& m, float x, float z) {
+    Body& b = bodies_[m.id];
+    const float dx = x - m.pos[0], dz = z - m.pos[2];
+    if (dx * dx + dz * dz < 1e-4f) return;
+    b.face_yaw = std::atan2(dx, dz);
+    b.facing = true;
 }
 
 void Locomotion::wander(float dt, std::vector<Mob>& live, double now) {
@@ -197,14 +209,16 @@ void Locomotion::wander(float dt, std::vector<Mob>& live, double now) {
     if (!nav_) return;
     for (Mob& m : live) {
         if (m.gait != 0) continue;
+        if (m.kind >= 0 && size_t(m.kind) < skip_wander.size() && skip_wander[size_t(m.kind)]) continue;
         const float wait = 5.0f + 10.0f * u01(mix(m.id));
-        if (m.state_t < wait) continue;
+        Body& b = bodies_[m.id];
+        if (b.idle < wait) continue;
         const uint64_t h = mix(uint64_t(m.id) * 0x9E37u ^ uint64_t(now));
         const float a = u01(h) * 6.2831853f, r = 3.0f + 12.0f * u01(mix(h));
         const float p[3] = {m.home[0] + std::sin(a) * r, m.home[1], m.home[2] + std::cos(a) * r};
         const float ext[3] = {2.0f, 6.0f, 2.0f};
         float q[3];
-        m.state_t = 0.0f;
+        b.idle = 0.0f;
         if (!nav_->nearest(p, ext, include_for(m.kind) & nav::kFlagWalk, q)) continue;
         m.goal[0] = q[0];
         m.goal[1] = q[1];

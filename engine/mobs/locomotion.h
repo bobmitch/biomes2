@@ -56,6 +56,9 @@ public:
         float speed = 0.0f, vertical = 0.0f;
         bool  grounded = true, swimming = false;
         float stuck = 0.0f;             // seconds asked to move and not moving
+        float idle = 0.0f;              // seconds standing (the stand-in wander's clock)
+        bool  facing = false;           // turning, standing, to face_yaw
+        float face_yaw = 0.0f;
     };
 
     void set(const CreatureTable* t, nav::NavWorld* nav, PhysicsWorld* physics, float sea_level) {
@@ -71,6 +74,10 @@ public:
     // Until behaviour scripts exist (phase 5): a creature standing still
     // for 5-15 s walks to a random point of the mesh within 15 m of home.
     void wander(float dt, std::vector<Mob>& live, double now);
+    // Turn a creature, standing, to face (x, z) (a behaviour's "look").
+    void face(const Mob& m, float x, float z);
+    // Kinds whose behaviour is a script: wander() leaves them alone.
+    std::vector<bool> skip_wander;
     // Every body back to physics (a load, a new world).
     void clear();
 

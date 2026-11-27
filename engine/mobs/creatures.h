@@ -51,6 +51,9 @@ struct Mob {
     // running, towards `goal`. Saved, so a frozen chase resumes.
     int   gait = 0;
     float goal[3] = {0, 0, 0};
+    // A remembered place, the behaviour's (phase 5): where the player was
+    // last seen or heard. Saved with the rest.
+    float mark[3] = {0, 0, 0};
 };
 
 struct ZoneKey {

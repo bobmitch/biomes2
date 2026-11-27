@@ -22,7 +22,7 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `engine/props/` | Things to pick up: the caves' glowing mushrooms (`glow_mushrooms.h`), and layer 10's forage plants (`forage.h`): streaming in 64 m zones, picks and regrowth, drawing, picking with E. |
 | `engine/player/` | The player's survival: items (`items.h`), the 8 x 4 inventory, health / stamina / food / the game clock (`survival.h`), item icons painted from data (`icons.h`), the player as heard and seen (`stealth.h`). No GPU. |
 | `engine/nav/` | The navmesh (ADR-007): `nav_tile.h` builds one Recast/Detour tile from the field's solid spans, the water and the obstacles; `nav_world.h` streams tiles round the player on workers and answers queries. Recast/Detour is the `third_party/recastnavigation` submodule (v1.6.0, zlib). |
-| `engine/mobs/` | Creatures (ADR-007, being built): `perception.h`, the arithmetic of hearing (dB) and sight (cone, range, light); `creature_table.h` (`game/data/creatures.json`); `creatures.h`, the zones that spawn, freeze, save and thaw them; `locomotion.h`, how they move. No GPU. |
+| `engine/mobs/` | Creatures (ADR-007, being built): `perception.h`, the arithmetic of hearing (dB) and sight (cone, range, light); `creature_table.h` (`game/data/creatures.json`); `creatures.h`, the zones that spawn, freeze, save and thaw them; `locomotion.h`, how they move; `minds.h`, what they notice (perception on a think tick) and the Lua host for their behaviours (`game/scripts/creatures/*.lua`). No GPU. |
 | `game/data/` | `items.json`: every item, the player's numbers, the clock, the start inventory. Gameplay data, outside the hash. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32), Windows only: seeds as maps plus their gameplay numbers. See "The world viewer". |
@@ -126,6 +126,7 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--mob-test` (creatures: spawning, freezing, saving, thawing; see Creatures and stealth),
 `--nav-report` (the navmesh round the spawn: tiles, coverage, trunks, paths, a swim, a log, a dig, and a map),
 `--move-test` (creatures walking, running, swimming, handed from the mesh to physics, frozen mid-walk),
+`--mimic-test` (the mimic's script: heard, unheard, seen, chased, stared, lost, by moonlight and torchlight),
 `--clock-jump` (with `--shot`: the light under the ground after the clock
 jumps or runs, `build/time_jump.txt`; see The near field),
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
@@ -1375,9 +1376,8 @@ and sight, Recast/Detour navmeshes built from the field, simulation by
 distance, behaviour in Lua. Data in `game/data/creatures.json` (to come)
 and items.json's `stealth` block; never in the golden hash. **Phases 1
 (the player's side) and 2 (zones, spawning, freezing, saving, drawing) are
-built, and phases 3 (the navmesh) and 4 (movement). What a creature
-DECIDES -- the mimic's hearing, seeing and chasing -- is phase 5; until
-then each wanders near home.**
+built, and phases 3 (the navmesh), 4 (movement) and 5 (perception and
+behaviour scripts): every phase of the ADR.**
 
 - **Crouch**: Left Ctrl toggles it on land (in the water Ctrl still dives
   while held; Right Ctrl does nothing); 1.4 m/s (`stealth.crouch_speed`),
@@ -1499,8 +1499,44 @@ then each wanders near home.**
 - **Animated** from what it did -- measured speed, supported, swimming,
   vertical speed -- through the player's animator, so walk, jog, sprint,
   swim and the air come from the same clips.
-- **Until behaviours** (phase 5), `Locomotion::wander`: a creature that has
-  stood 5-15 s walks to a random point of the mesh within 15 m of home.
+- **Perception** (`engine/mobs/minds.h`), on a think tick -- 5 a second
+  for a creature with a body, 1 further out, staggered: it HEARS the
+  player (their level through `perception::hears`) and SEES them (its
+  range x their visibility x the light on them, the cone HORIZONTAL and
+  60 degrees up or down, a clear physics ray eye to chest). As a 3D cone,
+  a player on a slope 2 m off, or lower down 30 m away, fell out of 45
+  degrees. No player while flying.
+- **Behaviour is Lua**: a kind's `script` returns hooks -- `on_wake`,
+  `on_see(c, ev)` every tick it sees them, `on_lose` the tick it stops,
+  `on_hear` every tick it hears them unseen, then `on_think(c, dt)` --
+  called with a handle whose methods are listed in `minds.h` (state and
+  mark are saved; `move_to`, `stop`, `face`, `random_point`, ...). One Lua
+  state for every creature, apart from the UI's (a UI that fails to start
+  does not stop them). Errors go to `build/creature_log.txt` and leave
+  the creature standing. A kind with no script wanders
+  (`Locomotion::wander`).
+- **The mimic** (`game/scripts/creatures/mimic.lua`): IDLE wanders near
+  home; HEARD, it stops, turns to the sound and listens (ALERT, 4 s after
+  the last sound) -- turned, it often then sees; SEEN within its sight it
+  walks over (APPROACH), within 40 m runs (CHASE), at 2.2 m stops and
+  stares (STARE) until they step 3.5 m off. Out of view it keeps on to
+  where it saw them for 3 s (a pursuer weaving round trees has them out of
+  its 45 degrees every few steps; without the grace it flipped to
+  searching and back), then SEARCHes there, LOOKs about for 6 s and
+  RETURNs home.
+- **A standing creature keeps its facing**: only a creature asked to move
+  turns to its travel. A body settling on a slope slid fast enough to swing
+  an idle mimic 8 degrees, and a player 15 degrees off its facing fell out
+  of the cone.
+- `--mimic-test` (`build/mimic_test.txt`): a player whose speed, crouch and
+  light the test sets, at places along a line of clear sight: a jog 15 m
+  behind (ALERT 0.7 s, standing, CHASE at 1.2 s as it turns and sees); a
+  walk 15 m behind and a crouch-walk 3 m behind unheard, a crouch-walk 0.8
+  m heard; standing still 45 m ahead by day unseen, sprinting seen (walks,
+  runs from 39 m, stares, facing them); 30 degrees off unseen, 15 seen; a
+  chase lost, searched, looked about 0.6 m from where it lost them, home;
+  a sprinter 25 m off unseen by moonlight, seen by torchlight; a chase
+  through a save. `build/mimic_stare.bmp` is the stare.
 - `--move-test` (`build/move_test.txt`): a walk near the player (1.40 m/s
   measured against 1.4; feet within 0.10 m of the mesh; a body all the
   way), a run back (5.19 against 5.0), a walk 70 m out (on the mesh, no

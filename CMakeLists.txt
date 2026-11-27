@@ -250,6 +250,7 @@ if(BIOMES2_ENGINE)
     engine/mobs/creature_table.cpp
     engine/mobs/creatures.cpp
     engine/mobs/locomotion.cpp
+    engine/mobs/minds.cpp
     engine/nav/nav_tile.cpp
     engine/nav/nav_world.cpp
     engine/player/icons.cpp
@@ -261,7 +262,7 @@ if(BIOMES2_ENGINE)
     third_party/RmlUi/Backends/RmlUi_Platform_Win32.cpp)
   target_include_directories(engine PRIVATE ${PROJECT_SOURCE_DIR}
                              ${PROJECT_SOURCE_DIR}/third_party/RmlUi/Backends)
-  target_link_libraries(engine PRIVATE RmlUi::RmlUi imm32 biomes2_recast)
+  target_link_libraries(engine PRIVATE RmlUi::RmlUi imm32 biomes2_recast biomes2_lua)
   # M1: the engine links the generator now. Track B was built against the
   # trivial field precisely so a pipeline bug could never be confused with a
   # worldgen bug; that separation ends here, which is what the milestone is.
