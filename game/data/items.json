@@ -1,11 +1,11 @@
 {
-  "_note": "Gameplay data (engine/player/items.h): the player's numbers, the clock, what a new game starts with and every item. Never in the golden hash. Foods follow Valheim: health and stamina raise the MAXIMUM of each while the food lasts (its value is (time left / duration)^food_decay_power of the full amounts), regen is health a tick (every regen_interval_s), duration_s is seconds of play, and a food can be eaten again once below food_refresh_at of its time. A tool's `tool` block is what it does to a creature: damage a hit, reach_m from the eye along the swing (engine/mobs/combat.h). Icons are shapes in a unit square, y down, painted in order: e [cx, cy, rx, ry] an ellipse, r [x0, y0, x1, y1] a rectangle turned rot degrees, p [x, y, ...] a polygon; c #rrggbb[aa], sRGB.",
+  "_note": "Gameplay data (engine/player/items.h): the player's numbers, the clock, what a new game starts with and every item. Never in the golden hash. Foods follow Valheim: health and stamina raise the MAXIMUM of each while the food lasts (its value is (time left / duration)^food_decay_power of the full amounts), regen is health a tick (every regen_interval_s), duration_s is seconds of play, and a food can be eaten again once below food_refresh_at of its time. A tool's `tool` block is what it does to a creature and when: damage a hit, reach_m from the eye along the swing (engine/mobs/combat.h), and the swing's timing (engine/player/swing.h) -- impact_s after the press the blow LANDS, at the point in the animation where the head meets the wood, and recover_s after that the next swing may start. A click arriving inside a swing is kept if the swing is within the player block's swing_buffer_s of ending, and swung as it frees up. anim is the clip the upper body plays and anim_s how much of it (0 for all): the axe takes 0.78 s of UAL's 1.533 s Sword_Attack, whose strike runs 0.33-0.50 s and which holds a second swing after it. Icons are shapes in a unit square, y down, painted in order: e [cx, cy, rx, ry] an ellipse, r [x0, y0, x1, y1] a rectangle turned rot degrees, p [x, y, ...] a polygon; c #rrggbb[aa], sRGB.",
   "player": {
     "base_health": 25, "base_stamina": 50,
     "regen_interval_s": 10, "regen_base": 0,
     "stamina_regen": 6, "stamina_regen_delay_s": 1.0,
     "sprint_drain": 10, "swim_drain": 6,
-    "jump_cost": 10, "axe_cost": 8, "dig_cost": 5,
+    "jump_cost": 10, "axe_cost": 8, "dig_cost": 5, "swing_buffer_s": 0.3,
     "drown_damage": 5,
     "fall_safe_m": 4, "fall_lethal_m": 20, "fall_max_damage": 100,
     "food_slots": 3, "food_decay_power": 0.3, "food_refresh_at": 0.5
@@ -61,7 +61,8 @@
      ]},
     {"id": "axe", "name": "Axe", "kind": "tool", "use": "axe",
      "description": "Equip it to fell trees and fight (left click). Each swing costs stamina.",
-     "tool": {"damage": 15, "reach_m": 2.6},
+     "tool": {"damage": 15, "reach_m": 2.6, "impact_s": 0.47, "recover_s": 0.33,
+              "anim": "Sword_Attack", "anim_s": 0.78},
      "icon": [
        {"p": [0.20, 0.86, 0.27, 0.92, 0.74, 0.26, 0.67, 0.20], "c": "#8a5a2b"},
        {"p": [0.22, 0.88, 0.25, 0.91, 0.72, 0.25, 0.69, 0.22], "c": "#a87440"},

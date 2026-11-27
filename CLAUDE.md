@@ -1320,7 +1320,8 @@ Valheim's rules, deliberately (`engine/player/`, data in
   onto the same item, then fills the first empty slot from the top left, so
   new kinds land in the hotbar. **1-8** use a slot: eat a food, equip or put
   away a tool. **Tools**: the axe (left click chops, and fights, only with
-  it in hand: a creature in the swing's way takes it instead of the tree)
+  it in hand: a creature in the swing's way takes it instead of the tree,
+  at the swing's impact -- see Creatures and stealth)
   and the torch (in hand = the carried light; `F` still toggles the light
   directly, for debugging). A new game starts with both (`start` in
   items.json). **Left Ctrl** crouches (see Creatures and stealth).
@@ -1565,14 +1566,36 @@ behaviour scripts): every phase of the ADR.**
   `recover_s` before the next. The windup is session state, not saved: a
   creature frozen mid-swing thaws and swings again. Health IS on the Mob, so
   one frozen half dead thaws half dead.
-- **The player's swing is one ray from the eye**, as a chop is: a creature
+- **The player's swing is in two parts as well, and lands at the ANIMATION'S
+  IMPACT** (`engine/player/swing.h`). The press starts the clip; `impact_s`
+  later the blow lands, aimed from where the player stands and looks THEN,
+  so a turn away mid-swing is a miss -- their side of the rule a creature's
+  windup gives them -- and `recover_s` after that the next swing may start.
+  Before this the tree lost a chop and the mimic its health on the button,
+  a third of a second before the axe reached either. The timing is per TOOL, in items.json's `tool`
+  block: the axe `impact_s` 0.47 and `recover_s` 0.33, measured from UAL's
+  `Sword_Attack` -- its hand accelerates from 0.33 s and stops at 0.50,
+  which is the bite. A heavier weapon lands later; a knife at once
+  (`impact_s` 0, which lands on its first frame).
+- **A click inside a swing is KEPT, not dropped**, if the swing is within
+  `swing_buffer_s` (items.json's `player` block, 0.3 s) of ending: it is
+  swung the moment the swing frees up, through the loop's own gates (the
+  axe in hand, the stamina) run afresh then, since half a second has
+  passed since the click. One press only -- a second inside the window
+  replaces it -- so holding the button cannot stack swings up. Chopping a
+  tree is click after click, and without this a click that lands during
+  the swing reads as a dead button.
+- **The blow itself is one ray from the eye**, as a chop is: a creature
   whose body capsule (the navmesh's agent sizes) it enters within the tool's
   `reach_m` takes the tool's `damage` (items.json's `tool` block: the axe 15
   against the mimic's 40, so three swings), and the tree behind it does not
   -- one swing, one target. A creature at zero health leaves the live list
   (`Creatures::kill`); nothing drops. The blow calls `on_hurt(c, ev)` at
   once, not on its tick, so a creature cannot be killed from behind without
-  ever turning round: the mimic turns on whoever struck it and chases.
+  ever turning round: the mimic turns on whoever struck it and chases. The
+  axe is HEARD where it bites (the 82 dB spike, stealth.h), not on the
+  press. The swing is session state, like a creature's windup: a death
+  drops one in flight, and nothing saves it.
 - **Being hit**: health and stamina go (`Survival::drain` takes what is
   there and never refuses, where `spend` would), the HUD's `#hurt` reddens
   and fades over 0.8 s (`engine.player().hurt`), and death is the survival
@@ -1582,11 +1605,21 @@ behaviour scripts): every phase of the ADR.**
 - `--combat-test` (`build/combat_test.txt`, exit code = failures): section A
   is the arithmetic on a table of its own, so retuning creatures.json moves
   nothing there -- the windup, a step out of reach, a step round behind, the
-  recovery, and the ray against a body, in front and behind. Section B is
+  recovery, and the ray against a body, in front and behind; then the
+  player's own swing clock on a tool of its own (nothing at 0.38 s of a
+  0.4 s impact, one impact and only one at 0.4, no second swing inside the
+  recovery, a tool with `impact_s` 0 landing on its first frame, and the
+  click buffer: thrown away early in a swing, kept within
+  `swing_buffer_s` of its end, replaced rather than queued, handed back
+  once as the swing ends, and cleared with it).
+  Section B is
   the shipping world at the spawn: a mimic 10 m off sees the player, walks
   up and lands a blow in 2.3 s (health 25 -> 17, stamina 50 -> 44), does not
-  swing again inside its recovery and does once it is over; three swings of
-  the axe kill it; a wounded one comes back wounded through a save.
+  swing again inside its recovery and does once it is over; the player's
+  first blow lands 0.48 s after the press (the axe's impact_s 0.47) through
+  the window's own path -- the camera aimed as a player aims it and
+  `land_swing` at the impact -- and three swings of the axe kill it; a
+  wounded one comes back wounded through a save.
   `build/combat_hit.bmp` is the pair, from off the player's shoulder.
 - `--mimic-test` (`build/mimic_test.txt`): a player whose speed, crouch and
   light the test sets, at places along a line of clear sight: a jog 15 m
@@ -1703,9 +1736,16 @@ Universal Animation Library[Standard]`, 43 clips on the same joint names).
   the blended stride so feet do not skate; `Jump_Loop` in the air;
   `Jump_Land` after a fall of more than 0.35 s, faded out by speed;
   `Swim_Idle_Loop` to `Swim_Fwd_Loop` by speed. Masked layers over that:
-  `Idle_Torch_Loop` on the right arm while a torch is carried, and
-  `Sword_Attack` on the upper body (spine up) for a swing of the axe, the
-  legs carrying on. The lowest heel or ball is planted on the capsule's
+  `Idle_Torch_Loop` on the right arm while a torch is carried, and the
+  TOOL'S OWN clip on the upper body (spine up) for a swing, the legs
+  carrying on: `trigger_action(clip, len)` takes it from items.json
+  (`tool.anim`, `tool.anim_s`), so a weapon can swing differently, and
+  `len` plays only part of a clip -- UAL's `Sword_Attack` is 1.533 s and
+  holds a SECOND strike after the first, which an axe should not show, so
+  the axe plays 0.78 s of it. A library that lacks the named clip falls
+  back to `Sword_Attack`; with no library at all the procedural gait plays
+  nothing and the blow still lands on time, which is the swing's business,
+  not the animator's. The lowest heel or ball is planted on the capsule's
   ground (`foot_drop`), no IK -- capped at 2 cm down with clips: uncapped it
   pulled a run's flight phase 18 cm down and glued a foot to the ground. In
   the water the head joint rides 1.3 m over the capsule's feet (buoyancy

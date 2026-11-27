@@ -121,8 +121,12 @@ public:
     void bind(const CharacterModel* m, const AnimLibrary* lib = nullptr);
     bool ready() const { return model_ != nullptr; }
     bool clips() const { return lib_ != nullptr; }
-    // A swing of the axe: the upper body plays it over the legs.
-    void trigger_action() { action_t_ = 0.0f; }
+    // A swing of the tool in hand: the upper body plays a clip over the
+    // legs. `clip` names it (the tool's own, items.json `tool.anim`;
+    // nullptr for the default axe swing) and `len` how much of it to play
+    // (0 for all of it) -- UAL's Sword_Attack holds a second strike after
+    // the first, which an axe should not show.
+    void trigger_action(const char* clip = nullptr, float len = 0.0f);
     // Instruments: how far into the swing, and the landing; -1 when idle.
     void set_action_time(float t) { action_t_ = t; }
 
@@ -156,6 +160,8 @@ private:
     // Clips by role, -1 if the library lacks one.
     int c_idle_ = -1, c_walk_ = -1, c_jog_ = -1, c_sprint_ = -1, c_air_ = -1, c_land_ = -1;
     int c_swim_idle_ = -1, c_swim_fwd_ = -1, c_torch_ = -1, c_action_ = -1;
+    int action_clip_ = -1;         // this swing's clip, -1 for c_action_
+    float action_len_ = 0.0f;      // how much of it to play, 0 for all
     int c_crouch_idle_ = -1, c_crouch_fwd_ = -1;
     std::vector<uint8_t> upper_mask_, right_arm_mask_;
     AnimPose pose_a_, pose_b_, pose_c_;

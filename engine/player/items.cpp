@@ -66,6 +66,7 @@ bool ItemTable::load(const char* path, std::string& error) {
             num("swim_drain", t.swim_drain);
             num("jump_cost", t.jump_cost);
             num("axe_cost", t.axe_cost);
+            num("swing_buffer_s", t.swing_buffer_s);
             num("dig_cost", t.dig_cost);
             num("drown_damage", t.drown_damage);
             num("fall_safe_m", t.fall_safe_m);
@@ -150,8 +151,14 @@ bool ItemTable::load(const char* path, std::string& error) {
                     const jsonlite::Value& t = e.at("tool");
                     if (t.has("damage")) d.tool.damage = float(t.number("damage"));
                     if (t.has("reach_m")) d.tool.reach_m = float(t.number("reach_m"));
+                    if (t.has("impact_s")) d.tool.impact_s = float(t.number("impact_s"));
+                    if (t.has("recover_s")) d.tool.recover_s = float(t.number("recover_s"));
+                    if (t.has("anim")) d.tool.anim = t.string("anim");
+                    if (t.has("anim_s")) d.tool.anim_s = float(t.number("anim_s"));
                     if (d.tool.damage < 0.0f || d.tool.reach_m <= 0.0f)
                         throw std::runtime_error(d.id + ": tool damage >= 0, reach_m > 0");
+                    if (d.tool.impact_s < 0.0f || d.tool.recover_s < 0.0f)
+                        throw std::runtime_error(d.id + ": tool impact_s and recover_s >= 0");
                 }
             }
             if (e.has("icon")) {
