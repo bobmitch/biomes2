@@ -1990,10 +1990,29 @@ still, `--no-trample` is the A/B.
 - **A still can show no trail**, because a trail is history and nothing
   walks during one: `--trample` HOLDS a path, re-pressed every frame, the
   way `--dig-row` digs before it shoots.
-- **Not done**: creatures and resting logs do not stamp yet (the player
-  does); the forage plants read nothing (they are a different renderer);
-  the fade is a plain exponential, so grass starts recovering at once
-  rather than holding and then springing back; nothing is saved, by choice.
+- **What stamps it**, all from `stamp_trample` in main.cpp, which
+  `publish_character` calls once a frame in every mode that has a player:
+  the player's feet, the twelve nearest creatures within 60 m (blades draw
+  no further, and past that a trail is under a pixel), and every felled log
+  and stump within 70 m. A creature's width is the body capsule combat and
+  the navmesh already use (`body_capsule`: small 0.3 m, human 0.4, large
+  0.6), so a bigger one lays a wider path with no number of its own. A log
+  presses at the full lean every frame it lies there, so the grass under it
+  stays flat while it is there and comes back when it is moved.
+  **The order is the budget**: 64 capsules a frame, player first, because
+  `add` stops when it is full and the player's own trail is the one nobody
+  would forgive missing. Fell twenty trees in one place and the creatures
+  stop stamping before the player does.
+- **A rolling log needs no sweep, a creature does.** A log moves
+  centimetres a frame, well inside its own radius, so consecutive stamps of
+  its axis overlap; a creature at a run moves 8 cm against a 0.4 m radius
+  and is swept from last frame's place, as the player is. A creature that
+  froze and thawed elsewhere would otherwise draw a line across everything
+  between, so a jump over 3 m stamps a point instead.
+- **Not done**: the forage plants read nothing (they are a different
+  renderer); the fade is a plain exponential, so grass starts recovering at
+  once rather than holding and then springing back; nothing is saved, by
+  choice.
 
 **Half of every meadow was drawn BLACK, and it read as "the grass is laid
 out in a grid".** `vs_blade` tilts each blade's normal up by 0.9 so a sward

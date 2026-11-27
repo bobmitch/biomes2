@@ -211,16 +211,16 @@ bool g_trample = true;           // --no-trample, for A/B
 float g_last_feet[2] = {0.0f, 0.0f};
 bool  g_have_last_feet = false;
 
+// Defined below, where the creature globals are.
+void stamp_trample();
+
 // Hand the renderer this frame's pose (or nothing), and the torch's hand.
 void publish_character() {
-    // What the player is standing in, pressed into the trample map. A
-    // capsule from last frame's feet to this frame's, so a sprint leaves a
-    // continuous trail rather than a dotted line of stamps.
-    if (g_walk && g_trample) {
-        const float x0 = g_have_last_feet ? g_last_feet[0] : g_feet[0];
-        const float z0 = g_have_last_feet ? g_last_feet[1] : g_feet[2];
-        g_renderer.trample().add(x0, z0, g_feet[0], g_feet[2], kPushRadius, kPushStrength);
-    }
+    // What is standing in the ground cover, pressed into the trample map
+    // (trample.h): the player, the creatures near them, and every felled log
+    // and stump. In that order, because the map takes 64 capsules a frame
+    // and the player's own trail is the one nobody will forgive missing.
+    if (g_trample) stamp_trample();
     g_last_feet[0] = g_feet[0];
     g_last_feet[1] = g_feet[2];
     g_have_last_feet = true;
@@ -854,6 +854,82 @@ engine::mobs::SpawnEnv creature_env(const engine::Camera& cam, float aspect) {
         return player_could_see(cam, aspect, feet, head);
     };
     return env;
+}
+
+// Everything standing in the ground cover this frame. A capsule each, swept
+// from last frame's place to this one where the thing moves fast enough to
+// leave gaps between stamps.
+void stamp_trample() {
+    engine::TrampleMap& tm = g_renderer.trample();
+    if (!tm.ready()) return;
+
+    // The player. Their feet move up to 13 cm a frame at a sprint, which is
+    // a quarter of the stamp's own width, so the sweep is what makes a trail
+    // rather than a dotted line.
+    if (g_walk) {
+        const float x0 = g_have_last_feet ? g_last_feet[0] : g_feet[0];
+        const float z0 = g_have_last_feet ? g_last_feet[1] : g_feet[2];
+        tm.add(x0, z0, g_feet[0], g_feet[2], kPushRadius, kPushStrength);
+    }
+
+    // Creatures, nearest first, as far out as blades draw -- past that the
+    // clump cards carry the ground and a trail is under a pixel. Their width
+    // is the body capsule combat and the navmesh use, so a large one lays a
+    // wider path than a small one without a number of its own.
+    if (g_creatures_ok) {
+        static std::unordered_map<uint32_t, std::pair<float, float> > last;
+        std::unordered_map<uint32_t, std::pair<float, float> > now;
+        const std::vector<engine::mobs::Mob>& live = g_creatures.live();
+        std::vector<size_t> order(live.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        const float* from = g_walk ? g_feet : nullptr;
+        if (from) {
+            auto d2 = [&](size_t i) {
+                const float dx = live[i].pos[0] - from[0], dz = live[i].pos[2] - from[2];
+                return dx * dx + dz * dz;
+            };
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return d2(a) < d2(b); });
+        }
+        int done = 0;
+        for (size_t k = 0; k < order.size(); ++k) {
+            const engine::mobs::Mob& m = live[order[k]];
+            if (m.kind < 0 || size_t(m.kind) >= g_creature_table.kinds.size()) continue;
+            if (from) {
+                const float dx = m.pos[0] - from[0], dz = m.pos[2] - from[2];
+                if (dx * dx + dz * dz > 60.0f * 60.0f) break;   // sorted: the rest are further
+            }
+            float r = 0.4f, h = 1.8f;
+            engine::mobs::body_capsule(g_creature_table.kinds[size_t(m.kind)].size, r, h);
+            const auto it = last.find(m.id);
+            const float x0 = it == last.end() ? m.pos[0] : it->second.first;
+            const float z0 = it == last.end() ? m.pos[2] : it->second.second;
+            // A creature that was frozen, or thawed somewhere else, would
+            // otherwise sweep a line across everything in between.
+            const float jx = m.pos[0] - x0, jz = m.pos[2] - z0;
+            const bool jumped = jx * jx + jz * jz > 9.0f;
+            tm.add(jumped ? m.pos[0] : x0, jumped ? m.pos[2] : z0, m.pos[0], m.pos[2], r, kPushStrength);
+            now[m.id] = std::make_pair(m.pos[0], m.pos[2]);
+            if (++done >= 12) break;    // the map's budget is 64 capsules a frame
+        }
+        last.swap(now);                 // a creature that left takes its place with it
+    }
+
+    // Felled logs and their stumps, which lie on the grass rather than walk
+    // over it: stamped every frame at full strength, so the ground under one
+    // stays flat for as long as it is there and comes back when it is moved.
+    // A rolling log needs no sweep -- it moves centimetres a frame, well
+    // inside its own radius, so consecutive stamps overlap.
+    {
+        static std::vector<engine::TreeFelling::Shape> sh;
+        g_felling.shapes(sh);
+        for (const engine::TreeFelling::Shape& f : sh) {
+            if (g_walk) {
+                const float dx = f.a[0] - g_feet[0], dz = f.a[2] - g_feet[2];
+                if (dx * dx + dz * dz > 70.0f * 70.0f) continue;
+            }
+            tm.add(f.a[0], f.a[2], f.b[0], f.b[2], f.r, engine::TrampleMap::kMaxLean);
+        }
+    }
 }
 
 // The nearest live creatures, posed (idle for now: they stand where they
