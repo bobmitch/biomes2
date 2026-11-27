@@ -223,6 +223,7 @@ if(BIOMES2_ENGINE)
     engine/trees/tree_renderer.cpp
     engine/trees/felling.cpp
     engine/foliage/foliage_renderer.cpp
+    engine/foliage/trample.cpp
     engine/render/sky.cpp
     engine/render/fog.cpp
     engine/render/weather.cpp

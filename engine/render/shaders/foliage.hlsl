@@ -39,6 +39,7 @@ cbuffer FoliageFrame : register(b0) {
     float  blade_width; float tuft;      // width multiplier; blades a blade instance draws, fanned from one root (1-3)
     float4 wind_v;                       // weather.h: direction x, z; mean m/s; gustiness
     float2 wind_drift;  float2 wind_pad; // metres the air has moved
+    float  trample_m;   float3 trample_pad;  // the trample map's reach, 0 for none
 };
 
 cbuffer DrawConst : register(b3) { uint g_segments; };
@@ -69,6 +70,12 @@ StructuredBuffer<float4>  g_ground   : register(t2);   // 4 per biome
 // Per baked tile, 32 x 32 half-metre columns: the highest lattice point the
 // player's edits wrote there (BrickStore::column_top), or -1e30.
 StructuredBuffer<float>   g_edit_top : register(t3);
+// The trample map (engine/foliage/trample.h): where something has stood in
+// the cover, as a push vector -- the fast pair (xy) for what springs back,
+// the slow pair (zw) for what stays laid over. Toroidal, so a WRAP sampler
+// over frac(world / trample_m) IS the torus and there is no origin to pass.
+Texture2D<float4>         g_trample  : register(t4);
+SamplerState              g_trample_s : register(s0);
 RWStructuredBuffer<Blade> g_hi       : register(u1);
 RWStructuredBuffer<Blade> g_lo       : register(u2);
 RWStructuredBuffer<Blade> g_cards    : register(u3);
@@ -81,6 +88,23 @@ static const uint kCaps[4] = {400000u, 400000u, 160000u, 40000u};
 // Index ranges in the shared index buffer, set by FoliageRenderer. A blade
 // instance's range holds kTuftMax blades; vs_blade collapses those past `tuft`.
 static const uint kTuftMax = 3u;
+// Per-blade variety, applied in vs_blade from the blade's own seed rather
+// than packed: `b.a` has all 32 of its bits spoken for and `pad` carries the
+// trample push, so there is nowhere to put either, and a hash is free.
+//
+// kTallMax: the most a blade overtops what its biome asked for, skewed by
+// the CUBE so most stand as they did and a handful tower -- a meadow reads
+// as grass by its stragglers, and a uniform lift would just be a taller lawn.
+// Applied after the height is unpacked, so the 255 cm the byte holds is not
+// a ceiling on it.
+// kWideMin/kWideMax: every blade in a biome used to be exactly as wide as
+// every other (only `narrow` and the distance widening moved it), so a sward
+// had one stem thickness in it.
+static const float kTallMax = 2.0f;
+static const float kWideMin = 1.5f, kWideMax = 2.0f;
+// What the clump cards stand in for, so the sward does not lose height at
+// the hand-over: the blades' mean boost, 1 + (kTallMax - 1) / 4.
+static const float kCardTall = 1.25f;
 static const uint kIdxFirst[4] = {0u, 81u, 108u, 120u};
 static const uint kIdxCount[4] = {81u, 27u, 12u, 144u};
 
@@ -88,6 +112,27 @@ uint pack8(float v) { return uint(saturate(v) * 255.0f + 0.5f); }
 float unpack8(uint v, uint shift) { return float((v >> shift) & 0xFFu) / 255.0f; }
 uint pack_rgb(float3 c) { return pack8(c.r) | (pack8(c.g) << 8) | (pack8(c.b) << 16); }
 float3 unpack_rgb(uint v) { return float3(unpack8(v, 0), unpack8(v, 8), unpack8(v, 16)); }
+
+// The push, as two snorm16 in a Blade's spare word. `b.a` has all 32 of its
+// bits spoken for and `pad` had none, which is exactly the room this needs,
+// so no list grew and the vertex shaders only unpack.
+static const float kMaxLean = 1.5f;
+uint pack_push(float2 v) {
+    const float2 q = clamp(v * (1.0f / kMaxLean), -1.0f, 1.0f) * 32767.0f;
+    return (uint(int(q.x)) & 0xFFFFu) | ((uint(int(q.y)) & 0xFFFFu) << 16);
+}
+float2 unpack_push(uint p) {
+    const int x = int(p << 16) >> 16, y = int(p) >> 16;
+    return float2(float(x), float(y)) * (kMaxLean / 32767.0f);
+}
+
+// `fast` is what a bush reads and `!fast` what grass does: one field, two
+// recovery rates, which is the whole of "pushed" against "stays flat".
+float2 trample_at(float2 p, bool fast) {
+    if (trample_m <= 0.0f) return 0.0f;
+    const float4 v = g_trample.SampleLevel(g_trample_s, p / trample_m, 0);
+    return fast ? v.xy : v.zw;
+}
 
 uint fhash(uint a, uint b) {
     uint h = a * 0x9E3779B1u ^ (b + 0x7F4A7C15u) * 0x85EBCA77u;
@@ -272,7 +317,10 @@ void cs_emit(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
     const float d = length(centre - cam_pos);
     if (d > card_far + 2.0f) return;
     const float hhi = unpack8(c.look, 8) * 2.0f;
-    if (!sphere_visible(centre + float3(0, 0.5f * hhi, 0), 1.0f + hhi)) return;
+    // The bound has to hold the tallest blade the cell can grow, not the
+    // tallest the biome asked for, or a straggler pops at the screen's edge.
+    const float hbound = hhi * kTallMax;
+    if (!sphere_visible(centre + float3(0, 0.5f * hbound, 0), 1.0f + hbound)) return;
 
     const float grass = unpack8(c.dens, 0);
     const float flowers = unpack8(c.dens, 8) * 0.25f;
@@ -300,6 +348,12 @@ void cs_emit(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
         const float widen = clamp(sqrt(1.0f / max(thin, 0.02f)), 1.0f, 4.0f);
         const uint list = d < 22.0f ? 0u : 1u;
         const uint flower_n = funit(fhash(seed, 77u)) < flowers * 6.0f ? 3u + (seed & 3u) : 0u;
+        // Blades scatter over the cell's OWN square and no wider. It looks
+        // like a jittered grid and is not one spectrally: a scatter whose
+        // jitter is exactly one cell cancels at the lattice frequency
+        // (sinc(1) = 0), so there is no row to see. Spilling them over 1.5
+        // cells to "break the grid" breaks that cancellation instead, and
+        // tools/profile/scatter.py read the lattice 4x stronger for it.
         for (uint k = 0; k < n; ++k) {
             const uint h = fhash(seed, k + 1u);
             const float ox = funit(h), oz = funit(fhash(h, 3u));
@@ -315,7 +369,7 @@ void cs_emit(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
             b.color = c.color | (c.look & 0x00FF0000u) << 8;
             b.dryc = c.dryc;
             b.seed = h;
-            b.pad = 0u;
+            b.pad = pack_push(trample_at(b.pos.xz, false));
             put(list, b);
         }
     }
@@ -327,16 +381,20 @@ void cs_emit(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
         Blade b;
         const uint h = fhash(seed, 103u);
         b.pos = float3(float(cx) + 0.5f, c.y - 0.08f, float(cz) + 0.5f);
-        b.a = (h & 0xFFu) | (min(uint(hhi * 1.1f * 100.0f), 255u) << 8) | ((narrow > 0.5f ? 1u : 0u) << 25);
+        b.a = (h & 0xFFu) | (min(uint(hhi * 1.1f * kCardTall * 100.0f), 255u) << 8) |
+              ((narrow > 0.5f ? 1u : 0u) << 25);
         b.color = c.color | (c.look & 0x00FF0000u) << 8;
         b.dryc = c.dryc;
         b.seed = h;
-        b.pad = 0u;
+        b.pad = pack_push(trample_at(b.pos.xz, false));
         put(2u, b);
     }
 
     // Bushes: more of them under a canopy, which is where undergrowth is.
-    if (c.bare == 0u && d < 130.0f && funit(fhash(seed, 211u)) < bushes * (1.0f + canopy)) {
+    // Bushes reach with the rest of the ground cover (130 m of the shipped
+    // 150), so the option does not leave bushes standing in bare ground.
+    if (c.bare == 0u && d < card_far * (130.0f / 150.0f) &&
+        funit(fhash(seed, 211u)) < bushes * (1.0f + canopy)) {
         Blade b;
         const uint h = fhash(seed, 213u);
         b.pos = float3(float(cx) + 0.3f + 0.4f * funit(h), c.y - 0.1f, float(cz) + 0.3f + 0.4f * funit(fhash(h, 1u)));
@@ -347,7 +405,7 @@ void cs_emit(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
         b.color = c.color | (c.look & 0x00FF0000u) << 8;
         b.dryc = c.dryc;
         b.seed = h;
-        b.pad = 0u;
+        b.pad = pack_push(trample_at(b.pos.xz, true));   // a bush springs back
         put(3u, b);
     }
 }
@@ -429,7 +487,10 @@ FolOut vs_blade(uint vid_all : SV_VertexID, uint iid : SV_InstanceID) {
         const uint hs = fhash(b.seed, 31u + bi);
         const float oa = funit(hs) * 6.2831853f;
         lean_dir = float3(cos(oa), 0.0f, sin(oa));
-        b.pos += lean_dir * (0.025f + 0.045f * funit(fhash(hs, 1u)));
+        // How far a tuft's blades stand off its root, skewed small: every
+        // clump the same size across is as regular as a grid of them.
+        const float ou = funit(fhash(hs, 1u));
+        b.pos += lean_dir * (0.02f + 0.11f * ou * ou);
         b.a = (b.a & ~0xFFu) | (fhash(hs, 2u) & 0xFFu);
         b.seed = fhash(hs, 3u);
         hmul = 0.65f + 0.4f * funit(fhash(hs, 4u));
@@ -439,19 +500,29 @@ FolOut vs_blade(uint vid_all : SV_VertexID, uint iid : SV_InstanceID) {
     const float side = (vid & 1u) ? 0.5f : -0.5f;
     const float tt = float(row) / float(S);
     const float ang = float(b.a & 0xFFu) / 255.0f * 6.2831853f;
-    const float hgt = float((b.a >> 8) & 0xFFu) * 0.01f * hmul;
+    const float tu = funit(fhash(b.seed, 43u));
+    const float hgt = float((b.a >> 8) & 0xFFu) * 0.01f * hmul *
+                      (1.0f + (kTallMax - 1.0f) * tu * tu * tu);
     const float widen = 1.0f + float((b.a >> 16) & 0xFu) / 5.0f;
     const bool narrow = ((b.a >> 25) & 1u) != 0u;
     const float scale = float((b.a >> 26) & 63u) / 63.0f;
     const float3 f = float3(cos(ang), 0.0f, sin(ang));
     const float3 rt = float3(-f.z, 0.0f, f.x);
     const float curl = 0.15f + 0.35f * funit(b.seed);
-    const float2 w = wind_at(b.pos.xz);
+    float2 w = wind_at(b.pos.xz) + unpack_push(b.pad);
+    // The stem shortens as lean^2 below, which puts the tip UNDER the root
+    // past 1 / sqrt(0.35) = 1.69 -- a blade driven into the ground. The wind
+    // alone cannot reach it (its bend caps at 1.4 by construction), but the
+    // wind with a boot on it can, so the sum is what has to be said.
+    const float wl = length(w);
+    if (wl > 1.5f) w *= 1.5f / wl;
     // Tip displacement as a fraction of the height; the stem shortens so the
     // blade bends rather than stretches.
     const float3 D = (f * curl + lean_dir * lean_out + float3(w.x, 0.0f, w.y)) * hgt;
     const float lean2 = dot(D, D) / max(hgt * hgt, 1e-4f);
-    const float width = (narrow ? 0.009f : 0.016f) * blade_width * widen * (row == S ? 0.0f : pow(1.0f - tt, 0.6f));
+    const float wrnd = lerp(kWideMin, kWideMax, funit(fhash(b.seed, 41u)));
+    const float width = (narrow ? 0.009f : 0.016f) * blade_width * widen * wrnd *
+                        (row == S ? 0.0f : pow(1.0f - tt, 0.6f));
     const float h = hgt * max(scale, 0.05f);
     const float3 p = b.pos + float3(0.0f, h * tt * (1.0f - 0.35f * lean2 * tt), 0.0f) + D * (tt * tt) * max(scale, 0.05f)
                    + rt * (side * width);
@@ -522,7 +593,13 @@ SceneOut ps_blade(FolOut i, bool front : SV_IsFrontFace) {
     const float d = length(i.world - cam_pos);
     if (dither(i.clip.xy) >= blade_fade(d)) discard;
     float3 n = normalize(i.nrm);
+    // A blade is double sided, so its normal is turned to face the eye -- but
+    // vs_blade tilts every normal UP by 0.9 so a sward is lit as a surface,
+    // and negating the whole vector turned that tilt DOWNWARD on every blade
+    // the camera sees from behind: no sun, no sky, half a meadow drawn black
+    // beside the other half. Turn the horizontal part only.
     if (!front) n = -n;
+    n.y = abs(n.y);   // the length is kept: nothing to renormalise
     // Dry blades go straw from the tip down.
     const float dryness = saturate(i.dry + 0.35f * (funit(i.seed) - 0.5f)) * smoothstep(0.1f, 0.9f, i.uv.y + 0.3f * i.dry);
     float3 albedo = lerp(i.col, i.dcol, dryness);
@@ -552,7 +629,7 @@ FolOut vs_card(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     const float wdt = 0.75f;
     const float u = (k == 1u || k == 2u) ? 1.0f : 0.0f;
     const float v = k >= 2u ? 1.0f : 0.0f;
-    const float2 w = wind_at(b.pos.xz) * 0.5f;
+    const float2 w = (wind_at(b.pos.xz) + unpack_push(b.pad)) * 0.5f;
     float3 p = b.pos + ax * ((u - 0.5f) * 2.0f * wdt) + float3(0.0f, v * hgt, 0.0f) + float3(w.x, 0.0f, w.y) * hgt * v;
     FolOut o;
     o.clip = mul(float4(p, 1.0f), view_proj);
@@ -641,7 +718,10 @@ FolOut vs_bush(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     const BushShape s = bush_shape(b.seed);
     const float cu = (k == 1u || k == 2u) ? 1.0f : 0.0f;
     const float cv = k >= 2u ? 1.0f : 0.0f;
-    const float2 wind = wind_at(b.pos.xz) * 0.08f;
+    // A bush takes the map's FAST pair, so it is shoved aside while something
+    // is in it and back upright a moment after. Its lean is in metres, not a
+    // fraction of a blade, so it goes with the bush's own size.
+    const float2 wind = wind_at(b.pos.xz) * 0.08f + unpack_push(b.pad) * (rad * 0.4f);
     const float3 base = b.pos + float3(0.0f, 0.05f, 0.0f);
     // The bush's own tint.
     const float tsel = funit(fhash(b.seed, 80u));

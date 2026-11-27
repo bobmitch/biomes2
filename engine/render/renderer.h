@@ -17,6 +17,7 @@
 #include "engine/trees/tree_field.h"
 #include "engine/trees/tree_renderer.h"
 #include "engine/foliage/foliage_renderer.h"
+#include "engine/foliage/trample.h"
 #include "engine/render/sky.h"
 #include "engine/render/local_lights.h"
 #include "engine/render/fog.h"
@@ -357,6 +358,9 @@ public:
     void set_foliage(bool on) { foliage_on_ = on; }
     bool foliage_on() const { return foliage_on_; }
     FoliageSettings& foliage_settings() { return foliage_settings_; }
+    // Where something has stood in the ground cover (trample.h). Add this
+    // frame's capsules to it; the renderer records and fades it.
+    TrampleMap& trample() { return trample_; }
     const FoliageRenderer& foliage() const { return foliage_; }
     bool foliage_counts(uint32_t out[5], std::string& error) {
         wait_for_gpu();
@@ -988,6 +992,7 @@ private:
     std::function<float(const float from[3], const float dir[3], float len)> ray_query_;
     float light_presence_ = 0.0f, light_lux_eye_ = 0.0f;
     float post_dt_override_ = -1.0f;
+    unsigned long long last_trample_tick_ = 0;
     float live_expo_[8] = {};   // u_expo[0] (adapted, exposure, EV100, target) and [1] (the band in nits)
     ComPtr<ID3D12Resource> expo_live_rb_[kFrameCount];
     void* expo_live_cpu_[kFrameCount] = {};
@@ -1013,6 +1018,7 @@ private:
     GpuProfiler      prof_;
     TreeDrawSettings tree_settings_;
     FoliageRenderer  foliage_;
+    TrampleMap       trample_;
     FoliageSettings  foliage_settings_;
     bool foliage_on_ = true;
     std::vector<TreeGpuInstance> tree_extras_;

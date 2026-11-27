@@ -202,8 +202,28 @@ void update_character(float dt, float t, float vx, float vz) {
     g_anim.update(in);
 }
 
+// How wide the player lays the ground cover over, and how far -- a tip
+// displacement as a fraction of a blade's height, where ~1 is lying over.
+// Both were tuned on stills by the analytic spike this replaced.
+const float kPushRadius = 0.5f;
+const float kPushStrength = 1.4f;
+bool g_trample = true;           // --no-trample, for A/B
+float g_last_feet[2] = {0.0f, 0.0f};
+bool  g_have_last_feet = false;
+
+// Defined below, where the creature globals are.
+void stamp_trample();
+
 // Hand the renderer this frame's pose (or nothing), and the torch's hand.
 void publish_character() {
+    // What is standing in the ground cover, pressed into the trample map
+    // (trample.h): the player, the creatures near them, and every felled log
+    // and stump. In that order, because the map takes 64 capsules a frame
+    // and the player's own trail is the one nobody will forgive missing.
+    if (g_trample) stamp_trample();
+    g_last_feet[0] = g_feet[0];
+    g_last_feet[1] = g_feet[2];
+    g_have_last_feet = true;
     const bool show = g_walk && g_anim.ready() && !first_person();
     if (show) g_anim.skin(g_feet, g_char_yaw, g_bones);
     g_renderer.character().set_pose(g_bones, show);
@@ -834,6 +854,82 @@ engine::mobs::SpawnEnv creature_env(const engine::Camera& cam, float aspect) {
         return player_could_see(cam, aspect, feet, head);
     };
     return env;
+}
+
+// Everything standing in the ground cover this frame. A capsule each, swept
+// from last frame's place to this one where the thing moves fast enough to
+// leave gaps between stamps.
+void stamp_trample() {
+    engine::TrampleMap& tm = g_renderer.trample();
+    if (!tm.ready()) return;
+
+    // The player. Their feet move up to 13 cm a frame at a sprint, which is
+    // a quarter of the stamp's own width, so the sweep is what makes a trail
+    // rather than a dotted line.
+    if (g_walk) {
+        const float x0 = g_have_last_feet ? g_last_feet[0] : g_feet[0];
+        const float z0 = g_have_last_feet ? g_last_feet[1] : g_feet[2];
+        tm.add(x0, z0, g_feet[0], g_feet[2], kPushRadius, kPushStrength);
+    }
+
+    // Creatures, nearest first, as far out as blades draw -- past that the
+    // clump cards carry the ground and a trail is under a pixel. Their width
+    // is the body capsule combat and the navmesh use, so a large one lays a
+    // wider path than a small one without a number of its own.
+    if (g_creatures_ok) {
+        static std::unordered_map<uint32_t, std::pair<float, float> > last;
+        std::unordered_map<uint32_t, std::pair<float, float> > now;
+        const std::vector<engine::mobs::Mob>& live = g_creatures.live();
+        std::vector<size_t> order(live.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        const float* from = g_walk ? g_feet : nullptr;
+        if (from) {
+            auto d2 = [&](size_t i) {
+                const float dx = live[i].pos[0] - from[0], dz = live[i].pos[2] - from[2];
+                return dx * dx + dz * dz;
+            };
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return d2(a) < d2(b); });
+        }
+        int done = 0;
+        for (size_t k = 0; k < order.size(); ++k) {
+            const engine::mobs::Mob& m = live[order[k]];
+            if (m.kind < 0 || size_t(m.kind) >= g_creature_table.kinds.size()) continue;
+            if (from) {
+                const float dx = m.pos[0] - from[0], dz = m.pos[2] - from[2];
+                if (dx * dx + dz * dz > 60.0f * 60.0f) break;   // sorted: the rest are further
+            }
+            float r = 0.4f, h = 1.8f;
+            engine::mobs::body_capsule(g_creature_table.kinds[size_t(m.kind)].size, r, h);
+            const auto it = last.find(m.id);
+            const float x0 = it == last.end() ? m.pos[0] : it->second.first;
+            const float z0 = it == last.end() ? m.pos[2] : it->second.second;
+            // A creature that was frozen, or thawed somewhere else, would
+            // otherwise sweep a line across everything in between.
+            const float jx = m.pos[0] - x0, jz = m.pos[2] - z0;
+            const bool jumped = jx * jx + jz * jz > 9.0f;
+            tm.add(jumped ? m.pos[0] : x0, jumped ? m.pos[2] : z0, m.pos[0], m.pos[2], r, kPushStrength);
+            now[m.id] = std::make_pair(m.pos[0], m.pos[2]);
+            if (++done >= 12) break;    // the map's budget is 64 capsules a frame
+        }
+        last.swap(now);                 // a creature that left takes its place with it
+    }
+
+    // Felled logs and their stumps, which lie on the grass rather than walk
+    // over it: stamped every frame at full strength, so the ground under one
+    // stays flat for as long as it is there and comes back when it is moved.
+    // A rolling log needs no sweep -- it moves centimetres a frame, well
+    // inside its own radius, so consecutive stamps overlap.
+    {
+        static std::vector<engine::TreeFelling::Shape> sh;
+        g_felling.shapes(sh);
+        for (const engine::TreeFelling::Shape& f : sh) {
+            if (g_walk) {
+                const float dx = f.a[0] - g_feet[0], dz = f.a[2] - g_feet[2];
+                if (dx * dx + dz * dz > 70.0f * 70.0f) continue;
+            }
+            tm.add(f.a[0], f.a[2], f.b[0], f.b[2], f.r, engine::TrampleMap::kMaxLean);
+        }
+    }
 }
 
 // The nearest live creatures, posed (idle for now: they stand where they
@@ -1485,6 +1581,26 @@ void register_tunables() {
     toggle("hfgi", G, "Terrain bounce light", [&] { return R.hfgi(); }, [&](bool b) { R.set_hfgi(b); });
     toggle("canopy", G, "Canopy shade", [&] { return R.canopy(); }, [&](bool b) { R.set_canopy(b); });
     toggle("foliage", G, "Grass and flowers", [&] { return R.foliage_on(); }, [&](bool b) { R.set_foliage(b); });
+    // The sward, live: what cs_emit places per square metre inside
+    // near_radius, how wide vs_blade draws a blade, and how many blades one
+    // placement fans into. Density is the cost: the near list is per blade
+    // INSTANCE, and each instance draws `tuft` of them.
+    range("grass_density", G, "Grass density", 16.0f, 192.0f, 4.0f, "/m2",
+          [&] { return R.foliage_settings().max_blades; },
+          [&](float v) { R.foliage_settings().max_blades = v; });
+    range("grass_width", G, "Grass thickness", 0.5f, 3.0f, 0.05f, "x",
+          [&] { return R.foliage_settings().blade_width; },
+          [&](float v) { R.foliage_settings().blade_width = v; });
+    range("grass_tuft", G, "Blades per clump", 1.0f, 3.0f, 1.0f, "",
+          [&] { return R.foliage_settings().tuft; },
+          [&](float v) { R.foliage_settings().tuft = std::floor(v + 0.5f); });
+    // Where ground cover stops, clump cards and bushes included -- the whole
+    // chain in proportion (FoliageSettings::set_range), as "Tree draw
+    // distance" is the trees' reach with their impostors in it. The top is
+    // what the tile pool holds.
+    range("grass_distance", G, "Grass draw distance", 50.0f, 300.0f, 10.0f, "m",
+          [&] { return R.foliage_settings().range(); },
+          [&](float v) { R.foliage_settings().set_range(v); });
     toggle("trees", G, "Trees", [&] { return R.trees_on(); }, [&](bool b) { R.set_trees(b); });
     // The player's Brightness: a display gamma (dark vision's last step).
     range("brightness", G, "Brightness", 0.6f, 1.8f, 0.05f, "", [&] { return R.dark_vision().brightness; },
@@ -5152,6 +5268,29 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (gt != std::string::npos) g_renderer.foliage_settings().tuft = float(std::atof(c2.c_str() + gt + 13));
             const size_t gd = c2.find("--grass-density ");
             if (gd != std::string::npos) g_renderer.foliage_settings().max_blades = float(std::atof(c2.c_str() + gd + 16));
+            // "--grass-dist" would also match inside "--grass-distance"; the
+            // two full names diverge at the 10th character, so neither finds
+            // the other.
+            const size_t gr = c2.find("--grass-distance ");
+            if (gr != std::string::npos) g_renderer.foliage_settings().set_range(float(std::atof(c2.c_str() + gr + 17)));
+            // --grass-push <x> <z> <radius m> <strength>: one thing standing
+            // in the grass, for a still. A trail is history and no stray
+            // camera can show one, so the spike's curve is judged on a
+            // capsule the command line places -- the same reason --dig-row
+            // digs before it shoots.
+            if (c2.find("--no-trample") != std::string::npos) {
+                g_trample = false;
+                g_renderer.foliage_settings().trample_m = 0.0f;
+            }
+            // --trample <x0> <z0> <x1> <z1> <radius m> <strength>: a path
+            // held down for a still. Nothing walks during one.
+            const size_t tp = c2.find("--trample ");
+            if (tp != std::string::npos) {
+                float v[6] = {0, 0, 0, 0, 0, 0};
+                if (std::sscanf(c2.c_str() + tp + 10, "%f %f %f %f %f %f",
+                                &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6)
+                    g_renderer.trample().hold(v[0], v[1], v[2], v[3], v[4], v[5]);
+            }
         }
         // Where LOD 0 hands over to LOD 1, in metres: 0 shows LOD 1 up close.
         const size_t tl = c2.find("--tree-lod0");

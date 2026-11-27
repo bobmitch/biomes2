@@ -106,7 +106,10 @@ static_assert(sizeof(WaterConstants) == 672, "WaterConstants must match water.hl
 const UINT kWaterSceneSrv = 79, kWaterDepthSrv = 80, kPuddleSrv = Clouds::kHeapEnd,
            kFogOpenUav = NearField::kHeapEnd, kFogOpenAvgUav = kFogOpenUav + 1, kFogOpenAvgSrv = kFogOpenUav + 2,
            kFoamSrv = kFogOpenUav + 3,   // the foam's bubbles (FoamPattern), t7 in the sea's table
-           kHeapSlots = kFogOpenUav + 4;
+           // [.. +1, +2] the trample map (TrampleMap), read by the foliage
+           // bake's t4 and written by its own passes.
+           kTrampleSrv = kFogOpenUav + 4, kTrampleUav = kFogOpenUav + 5,
+           kHeapSlots = kFogOpenUav + 6;
 static_assert(NearField::kFirst == CharacterRenderer::kSrvB + 1, "the near field follows the character's textures");
 static_assert(CharacterRenderer::kSrvA == kPuddleSrv + 1, "the character's textures follow the puddle mask");
 
@@ -3189,6 +3192,8 @@ bool Renderer::init(HWND hwnd, std::string& error, bool debug_layer) {
     t0 = startup_now_ms();
     if (!foliage_.init(device_.Get(), &world_, "worldgen/data/archetypes.json", error)) return false;
     foliage_.set_edits(&edits_);
+    if (!trample_.init(device_.Get(), srv_heap_.Get(), kTrampleSrv, kTrampleUav, error)) return false;
+    foliage_settings_.trample_m = TrampleMap::kMapMetres;
     // No grass grows up through a forage plant: the bake bares its foot.
     foliage_.set_bare_fn([this](int sx0, int sz0, float* tops) {
         if (forage_on_) forage_.clear_tops(sx0, sz0, tops);
@@ -4509,7 +4514,27 @@ void Renderer::record_scene(const ViewConstants& view, D3D12_CPU_DESCRIPTOR_HAND
         fi.far_plane = kFarPlane;
         fi.shadow_cb = shadow_cb_[frame_]->GetGPUVirtualAddress();
         fi.shadow_table = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+        if (trample_.ready()) {
+            const UINT tinc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            fi.trample_table = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+            fi.trample_table.ptr += UINT64(kTrampleSrv) * tinc;
+        }
         bind_shader_heaps(cmd_.Get());
+        // Where things have stood, before the bake reads it. Its own passes
+        // leave it readable; the bake samples it per blade root.
+        if (trample_.ready() && foliage_settings_.trample_m > 0.0f) {
+            LARGE_INTEGER now, freq;
+            QueryPerformanceCounter(&now);
+            QueryPerformanceFrequency(&freq);
+            const unsigned long long t = static_cast<unsigned long long>(now.QuadPart);
+            double dt = last_trample_tick_ ? double(t - last_trample_tick_) / double(freq.QuadPart) : 0.0;
+            last_trample_tick_ = t;
+            if (post_dt_override_ >= 0.0f) dt = post_dt_override_;
+            trample_.record(cmd_.Get(), frame_, view.cam_pos[0], view.cam_pos[2], float(dt));
+            // After its own closing transition: a stamp with no barrier in
+            // front of it is written while the dispatches still run.
+            prof_.mark(cmd_.Get(), "trample");
+        }
         prof_.stat_begin(cmd_.Get(), "foliage");
         foliage_.record(cmd_.Get(), frame_, fi, foliage_settings_);
         prof_.stat_end(cmd_.Get());
