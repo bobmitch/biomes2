@@ -867,6 +867,44 @@ bark 1.5-3 cm.
   from a grazing view; that is the effect working, and Rock029's 20 cm made
   it look like a smudge, so it is 15 cm.
 
+**Hardware tessellation was built, measured and REMOVED (2026-11-27), and
+nothing in the engine tessellates.** A hull/domain pair on the terrain
+displaced the near LOD 0 chunks along their normals by two octaves of value
+noise, per biome, in the band below the 0.5 m voxel that the scans'
+parallax (3-18 cm) does not reach. It worked -- crack-free, no shimmer,
+flight holes 0 -- and **it was not worth seeing**: +0.34 ms at 1440p
+(terrain 1.275 ms against 0.985, its prepass 0.120 against 0.086), walking
+6.35 against 6.08 ms, for ground that reads almost the same, because the
+scans' normal maps and POM already carry everything at that scale. What it
+taught, so the next attempt starts further on:
+
+- **The amplitude is capped at a boot sole by everything else.** Physics,
+  the navmesh, the grass bake, rocks, trees and forage all stand on the
+  UNDISPLACED ground, and only the camera's two passes were tessellated
+  (the cascades and the rest keep `vs_main`, which is only honest while the
+  displacement stays inside the shadow bias). 2-9 cm is what that allows,
+  and 2-9 cm at a 0.5 m period is not visible against the scans.
+- **Halving the subdivision kept 96% of the image change**, because the
+  look came from the analytic gradient of the noise turning the shading
+  normal, not from the triangles. Geometric displacement only buys the
+  silhouette and real self-occlusion, which at this amplitude is nothing.
+  **Any detail at or below the scan's own scale belongs in the pixel
+  shader or in a better height map, not in geometry.**
+- **The band that is actually empty is 1-18 m, not sub-voxel** (below), and
+  that one belongs in `layer4_detail`, where collision and the navmesh
+  would get it too.
+- Two mechanics are worth remembering if geometry ever is displaced: a
+  patch edge's tessellation factor must come from that edge's two endpoints
+  alone, through their midpoint (`(a + b) * 0.5` is commutative in IEEE, so
+  both patches compute the same float), and with that plus a displacement
+  that is a pure function of world position, skirt curtains need no special
+  case -- a curtain quad's top edge IS a surface edge.
+- **Check which biome a test site actually weighs before judging ground.**
+  The first site, an open-looking "meadow" at (808.9, 26.6, -873.8), is
+  about 90% SEABED by vertex weight -- an ocean cell's share of the blend
+  is what makes coasts sandy -- so with the seabed amplitude at 0 the
+  effect was invisible there and the feature looked broken for an hour.
+
 ### Trees
 
 **Placement is layer 8, in `worldgen/`, under the golden hash (v12, fixed
@@ -1121,7 +1159,7 @@ EXPECTATION rather than its draw.
   skyline from the air) -- the shell was expected to carry most of it, and
   does; no altitude gate was needed.
 
-### Micro-relief and flat sites (v17)
+### Micro-relief and flat sites (v17, the fine band v21)
 
 Calm land read as one smooth sheet: the profiles' finest octave is ~110 m,
 so meadows and wetland were long even slopes. `validate --flatness` is the
@@ -1141,6 +1179,39 @@ the median.
   in the world constants. Meadows' 20 m pads level to 0.5 m went 1.2% ->
   0.3% of the land, 10 m pads 9.0% -> 1.9%; the median over a 10 m pad
   1.4 -> 2.2 m. Rolling, not hills.
+- **The fine band is a SECOND field (v21)**, 16 / 8 / 4 m
+  (`detail.fine_period`, `fine_octaves`), its own feature seed
+  (`FEATURE_DETAIL_FINE`), each biome scaling it by its own `detail_fine`
+  metres: meadows 0.75, forest 0.70, wetland 0.85, highland 1.1, badlands
+  1.4, taiga 0.9, ashlands 1.2, rift 1.2, **glacier 0.35** (snow should
+  read smooth, and at albedo 0.9 any relief in it shouts). Note the six
+  biomes that carry no `detail` at all carry this one: their profiles are
+  loud at 37-110 m and were still glass underfoot.
+  **Two fields, not more octaves on one**: `gain` would otherwise tie the
+  two bands' amplitudes together, and v17 tuned the coarse band by eye --
+  six octaves at gain 0.5 put only 11% of the amplitude below 18 m, and
+  buying more by raising `gain` changes the look from a hilltop as well.
+  The last octave is 4 m, eight voxels at LOD 0, which is resolved where it
+  matters and fades early enough that **LOD agreement did not move** (0.73
+  of a voxel, limit 1.00). `g_arch` grew to six rows for the amplitude
+  (`kArchRows` 6, `kArchFloats` 24 -- keep them equal; `--probe-field` is
+  the check, 31 um at the spawn, unchanged).
+  Measured: meadows' median range over a 10 m pad 2.2 -> 4.0 m; the
+  capsule's feet against the field 2.4 -> 4.3 cm worst (0.7 -> 3.0 mm mean
+  beyond what the capsule radius explains, so it is riding bumps, not
+  sinking); the navmesh still covers 98.0% of walkable dry land; validate's
+  throughput and the walking frame time both within run-to-run noise (the
+  extra fbm is one more call in a function that already holds six).
+- **The flat sites' shoulder is what caps it.** `validate`'s flat-sites
+  check measures the steepest eased ring at 0.54 rise/run against a limit
+  of 0.6, where v20 was 0.51: bumpier land round a pad makes the ring that
+  eases down to it steeper. meadows 0.9 / forest 0.8 / wetland 1.0 took it
+  to 0.58, which passes and has no headroom, so those three are the values
+  above instead. Raising them further means bounding the shoulder in
+  `build_flats` first -- its placement test is an end-to-end `dh` against
+  `max_grade * outer` and does not bound the local gradient at all. Sites
+  went 2.8 -> 2.6 a seed, slope budget 67.3% -> 67.0% of land under 30
+  degrees.
 - **Flat sites are layer 5b** (`build_flats`, after the rivers): one
   candidate per 320 m cell, jittered inside its middle 56% so no two touch
   (the load checks that), kept by the blended biome's `flats` chance where
@@ -2078,6 +2149,18 @@ and keeps AgX's hue handling, which a torch's orange will need.
   MESHER blends them per vertex with layer 4's own warp, four cells and
   `blend_weight`, so a material boundary sits where the shape changes; an
   ocean cell's share goes to the seabed, which is what makes coasts sandy.
+  **That share is faded out with HEIGHT above sea level** (`seabed.above_sea`,
+  [full up to, gone by] metres, 1 and 10). The cell weights say nothing about
+  altitude, and since v18 made the world an archipelago a landmass is rarely
+  a kilometre across, so ocean cells sit among the four nearest almost
+  everywhere: at the spawn, 41.6 m up under a closed birch wood, three of the
+  four nearest cells were ocean and the ground came out **70% seabed** --
+  trunks standing on a tidal flat, and the sward reading as stems on pale
+  sand. A beach is low ground by definition, so height is the honest test and
+  it costs one smoothstep. It moves the vertex WEIGHTS too, so the scans
+  follow the colour and the shore stops reaching inland in both; beaches keep
+  their sand (checked at the waterline), and the golden gate confirmed it is
+  presentation.
   They ride in `g_arch` rows 3-4 (`kArchRows` = 5 in `real_field.hlsl`,
   `kArchFloats` = 20 in `world_gpu.cpp` -- keep them equal; `--probe-field`
   is the check, 6 um after the change) and come out in `g_vertex_mat`, a

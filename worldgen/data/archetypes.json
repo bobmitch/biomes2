@@ -31,11 +31,11 @@
      "look": {"size": 0.7, "leaf": [0.22, 0.42, 0.12], "berry": [0.84, 0.07, 0.09], "flower": [0.97, 0.96, 0.92]}}
   ]},
   "_note_detail": "Layer 4's micro-relief, under the golden hash: ONE noise field shared by every biome -- period is its coarsest octave in metres, then octaves halving at gain -- which each biome scales by its own 'detail' (metres; absent is 0). Hummocks, swales and low banks below the profile's finest octave, so calm land stops reading as one smooth sheet and naturally level ground becomes rare. Scaling a shared field and blending is blending heights, never noise parameters.",
-  "detail": {"period": 72.0, "octaves": 3, "gain": 0.5},
+  "detail": {"period": 72.0, "octaves": 3, "gain": 0.5, "fine_period": 16.0, "fine_octaves": 3},
   "_note_flats": "Layer 5b, flat sites, under the golden hash: rare level ground to build on. One candidate per cell (metres), jittered inside its middle 56% so no two touch; a biome's 'flats' is the chance its candidate holds a site (absent is 0). A site's pad radius is drawn from radius; its shoulder, where the ground eases back to the terrain, is shoulder x radius but never under shoulder_min. Kept only where the land is already gentle -- no steeper than max_grade (rise over run) across the pad and out to the shoulder -- dry (shore metres above sea), and river_clear metres from any channel. The pad is pulled level to the mean of its own heights. Trees and rocks keep tree_clear metres past the shoulder, so each site is a glade.",
   "flats": {"cell": 320.0, "radius": [14.0, 36.0], "shoulder": 0.6, "shoulder_min": 10.0, "max_grade": 0.08, "river_clear": 15.0, "shore": 2.0, "tree_clear": 3.0},
   "_note_ground": "Ground cover -- grass, flowers, bushes -- drawn by the engine on the GPU from the seed. Presentation only: nothing here reaches the golden hash or a save, and a missing block means bare ground. grass is blade density at full patch (1 = the engine's maximum), cover the share of the biome inside a grass patch, dry how far the colour leans to dry_color, narrow 1 for reeds; flowers and bushes are chances per 1 m cell. Grass thins under a tree canopy by the same patch noise layer 8 plants trees with.",
-  "_note_materials": "Terrain surface materials (ADR-004 L1), indexed by each biome's material_id. Presentation only, like ground: nothing here reaches the golden hash or a save. The engine blends them per mesh vertex with the same four-cell weights layer 4 blends heights with, so a material boundary falls where the terrain's shape changes. ground is level ground -- what shows between and under the grass, so it leans the grass's way where there is grass; rock is anything steeper than about 40 degrees. Colours are sRGB-encoded, as authored; the engine linearises them. Roughness is perceptual, 0 mirror to 1 chalk. seabed is what an ocean cell's share of the blend becomes, so coasts fade to sand. ground_scan and rock_scan name CC0 scan sets in assets/textures/scans.json: the terrain shader takes their detail -- normal, roughness, occlusion, height -- and retints their albedo to the colour given here, so ground and rock set the colour and the scan the texture.",
+  "_note_materials": "Terrain surface materials (ADR-004 L1), indexed by each biome's material_id. Presentation only, like ground: nothing here reaches the golden hash or a save. The engine blends them per mesh vertex with the same four-cell weights layer 4 blends heights with, so a material boundary falls where the terrain's shape changes. ground is level ground -- what shows between and under the grass, so it leans the grass's way where there is grass; rock is anything steeper than about 40 degrees. Colours are sRGB-encoded, as authored; the engine linearises them. Roughness is perceptual, 0 mirror to 1 chalk. seabed is what an ocean cell's share of the blend becomes, so coasts fade to sand; its above_sea is [full up to, gone by] metres over sea level, which is what keeps that share on the shore -- the cell weights know nothing about altitude, and on an archipelago's small landmasses ocean cells sit among the four nearest everywhere, so without it a wooded hilltop 40 m up comes out 70% sand. ground_scan and rock_scan name CC0 scan sets in assets/textures/scans.json: the terrain shader takes their detail -- normal, roughness, occlusion, height -- and retints their albedo to the colour given here, so ground and rock set the colour and the scan the texture.",
   "materials": [
     {"id": 0, "ground": [0.36, 0.45, 0.21], "ground_roughness": 0.92, "rock": [0.50, 0.46, 0.40], "rock_roughness": 0.78, "ground_scan": "Ground037", "rock_scan": "Rock030"},
     {"id": 1, "ground": [0.31, 0.33, 0.18], "ground_roughness": 0.95, "rock": [0.42, 0.42, 0.35], "rock_roughness": 0.80, "ground_scan": "Ground078", "rock_scan": "Rock051"},
@@ -47,7 +47,7 @@
     {"id": 7, "ground": [0.90, 0.92, 0.95], "ground_roughness": 0.60, "rock": [0.58, 0.64, 0.70], "rock_roughness": 0.40, "ground_scan": "Snow010A", "rock_scan": "Rock058"},
     {"id": 8, "ground": [0.47, 0.42, 0.35], "ground_roughness": 0.92, "rock": [0.34, 0.31, 0.28], "rock_roughness": 0.78, "ground_scan": "Ground110", "rock_scan": "Rock061"}
   ],
-  "seabed": {"ground": [0.62, 0.57, 0.45], "ground_roughness": 0.85, "rock": [0.45, 0.43, 0.38], "rock_roughness": 0.75, "ground_scan": "Ground093A", "rock_scan": "Rock060"},
+  "seabed": {"ground": [0.62, 0.57, 0.45], "ground_roughness": 0.85, "rock": [0.45, 0.43, 0.38], "rock_roughness": 0.75, "ground_scan": "Ground093A", "rock_scan": "Rock060", "above_sea": [1.0, 10.0]},
   "_note_fog": "Mist (ADR-004 L4). Presentation only, like ground and materials: nothing here reaches the golden hash or a save. A biome's fog block is the MIDDAY mist's extinction per metre at the surface (visibility is about 3.9 / density: 0.0012 is 3 km, 0.004 one km, 0.04 a hundred metres) -- morning multiplies it -- and the height in metres over which it thins by e; the engine blends them with the weights layer 4 blends heights with and bakes a map once per seed. sea_fog is the same over open water. The central, safe biomes and the sea are the misty ones on purpose: the wider map should be found, not seen. haze is a thin floor everywhere; morning multiplies the mist round dawn; the patches drift on the weather's wind (weather.mist_drift); patch is the size of the patches in metres; phase_g how forward the droplets scatter; albedo the share of light they scatter rather than absorb.",
   "glow_mushrooms": {"_note": "Presentation (engine/props/glow_mushrooms.h): glowing blue mushrooms on the floors of the placed caves, a collectable for testing emitters (E picks one). per_chamber clusters per chamber capsule and tunnel_chance per tunnel capsule (fractions are chances); cluster the mushrooms in one, min and max; cluster_radius m; size a scale range on a ~15 cm mushroom; colour sRGB as typed; nits the gills glow at (the cap about half); each cluster is one local light of lumens_each per mushroom left, reaching range m; item is what a picked one gives (game/data/items.json).", "per_chamber": 3.0, "tunnel_chance": 0.3, "cluster": [3, 9], "cluster_radius": 0.6, "size": [0.7, 1.5], "colour": [0.35, 0.75, 1.0], "nits": 1.2, "lumens_each": 4.0, "range": 5.0, "item": "glow_mushroom"},
   "underground": {"_note": "Presentation (engine/render/sky_access.h): sky_falloff_m, metres of path through air over which daylight falls by e down a cave (live: the tuning panel, --sky-falloff); sky_reach_m, how far by path the flood looks for the sky (at most 254; its cost is the air within it). Past it a cave has no daylight.", "sky_falloff_m": 12.0, "sky_reach_m": 96.0},
@@ -71,7 +71,7 @@
       "adjacency_forbid": ["glacier", "rift"], "allow_island": true,
       "base_elevation": 12.0, "amplitude": 18.0, "octaves": 4, "lacunarity": 2.0, "gain": 0.50, "ridge_blend": 0.05, "flatness": 1.30, "detail": 4.0, "flats": 0.5,
       "overhang_strength": 0.00, "cave_density": 0.00, "cave_depth_band": [8.0, 120.0],
-      "fog": {"density": 0.0012, "height": 90.0}, "material_id": 0, "water_level_offset": 0.0,
+      "fog": {"density": 0.0012, "height": 90.0}, "detail_fine": 0.75, "material_id": 0, "water_level_offset": 0.0,
       "rocks": {"boulders": 0.04, "outcrops": 0.05, "cover": 0.25},
       "forage": {"strawberry": 0.5},
       "ground": {"grass": 1.00, "cover": 0.85, "height": [0.25, 0.60], "color": [0.28, 0.44, 0.11], "dry_color": [0.58, 0.52, 0.26], "dry": 0.15, "narrow": 0, "flowers": 0.10, "bushes": 0.012},
@@ -84,7 +84,7 @@
       "adjacency_forbid": [], "allow_island": true,
       "base_elevation": 20.0, "amplitude": 38.0, "octaves": 5, "lacunarity": 2.0, "gain": 0.50, "ridge_blend": 0.20, "flatness": 1.25, "detail": 2.4, "flats": 0.2,
       "overhang_strength": 0.10, "cave_density": 0.00, "cave_depth_band": [10.0, 160.0],
-      "fog": {"density": 0.0009, "height": 60.0}, "material_id": 1, "water_level_offset": 0.0,
+      "fog": {"density": 0.0009, "height": 60.0}, "detail_fine": 0.70, "material_id": 1, "water_level_offset": 0.0,
       "rocks": {"boulders": 0.06, "outcrops": 0.05, "cover": 0.35},
       "ground": {"grass": 0.55, "cover": 0.70, "height": [0.15, 0.40], "color": [0.20, 0.35, 0.09], "dry_color": [0.45, 0.42, 0.20], "dry": 0.10, "narrow": 0, "flowers": 0.015, "bushes": 0.09},
       "trees": {"density": 0.55, "cover": 0.80, "species": {"oak": 3, "maple": 2.5, "beech": 2.5, "birch": 2, "pine": 0.6, "fir": 0.4}},
@@ -96,7 +96,7 @@
       "adjacency_forbid": [], "allow_island": true,
       "base_elevation": 3.0, "amplitude": 8.0, "octaves": 4, "lacunarity": 2.1, "gain": 0.45, "ridge_blend": 0.00, "flatness": 1.80, "detail": 2.8, "flats": 0.3,
       "overhang_strength": 0.00, "cave_density": 0.00, "cave_depth_band": [6.0, 60.0],
-      "fog": {"density": 0.0025, "height": 60.0}, "material_id": 2, "water_level_offset": 0.0,
+      "fog": {"density": 0.0025, "height": 60.0}, "detail_fine": 0.85, "material_id": 2, "water_level_offset": 0.0,
       "rocks": {"boulders": 0.02, "outcrops": 0.00, "cover": 0.20},
       "ground": {"grass": 0.95, "cover": 0.80, "height": [0.55, 1.15], "color": [0.30, 0.42, 0.15], "dry_color": [0.55, 0.50, 0.28], "dry": 0.25, "narrow": 1, "flowers": 0.02, "bushes": 0.03},
       "trees": {"density": 0.35, "cover": 0.60, "species": {"willow": 3, "alder": 3, "birch": 2}}
@@ -107,7 +107,7 @@
       "adjacency_forbid": [], "allow_island": false,
       "base_elevation": 90.0, "amplitude": 140.0, "octaves": 6, "lacunarity": 2.0, "gain": 0.52, "ridge_blend": 0.70, "flatness": 0.85,
       "overhang_strength": 0.35, "cave_density": 0.00, "cave_depth_band": [20.0, 260.0],
-      "fog": {"density": 0.0005, "height": 150.0}, "material_id": 3, "water_level_offset": 0.0,
+      "fog": {"density": 0.0005, "height": 150.0}, "detail_fine": 1.10, "material_id": 3, "water_level_offset": 0.0,
       "rocks": {"boulders": 0.20, "outcrops": 0.35, "cover": 0.60},
       "ground": {"grass": 0.65, "cover": 0.65, "height": [0.10, 0.30], "color": [0.34, 0.42, 0.16], "dry_color": [0.55, 0.48, 0.26], "dry": 0.45, "narrow": 0, "flowers": 0.04, "bushes": 0.05},
       "trees": {"density": 0.22, "cover": 0.40, "species": {"pine": 3, "fir": 2, "birch": 1}}
@@ -118,7 +118,7 @@
       "adjacency_forbid": [], "allow_island": true,
       "base_elevation": 45.0, "amplitude": 70.0, "octaves": 5, "lacunarity": 2.2, "gain": 0.48, "ridge_blend": 0.55, "flatness": 1.10,
       "overhang_strength": 0.45, "cave_density": 0.00, "cave_depth_band": [12.0, 180.0],
-      "fog": {"density": 0.0, "height": 0.0}, "material_id": 4, "water_level_offset": 0.0,
+      "fog": {"density": 0.0, "height": 0.0}, "detail_fine": 1.40, "material_id": 4, "water_level_offset": 0.0,
       "rocks": {"boulders": 0.12, "outcrops": 0.30, "cover": 0.50},
       "ground": {"grass": 0.18, "cover": 0.30, "height": [0.15, 0.35], "color": [0.42, 0.42, 0.20], "dry_color": [0.62, 0.54, 0.30], "dry": 0.80, "narrow": 0, "flowers": 0.0, "bushes": 0.02},
       "trees": {"density": 0.08, "cover": 0.25, "species": {"scrub": 3, "snag": 1}}
@@ -129,7 +129,7 @@
       "adjacency_forbid": [], "allow_island": false,
       "base_elevation": 55.0, "amplitude": 60.0, "octaves": 5, "lacunarity": 2.0, "gain": 0.50, "ridge_blend": 0.30, "flatness": 1.20,
       "overhang_strength": 0.15, "cave_density": 0.00, "cave_depth_band": [10.0, 150.0],
-      "fog": {"density": 0.0007, "height": 90.0}, "material_id": 5, "water_level_offset": 0.0,
+      "fog": {"density": 0.0007, "height": 90.0}, "detail_fine": 0.90, "material_id": 5, "water_level_offset": 0.0,
       "rocks": {"boulders": 0.10, "outcrops": 0.15, "cover": 0.50},
       "ground": {"grass": 0.35, "cover": 0.50, "height": [0.12, 0.30], "color": [0.24, 0.34, 0.14], "dry_color": [0.48, 0.44, 0.26], "dry": 0.30, "narrow": 0, "flowers": 0.01, "bushes": 0.08},
       "trees": {"density": 0.55, "cover": 0.75, "species": {"spruce": 4, "fir": 3, "pine": 1.5, "birch": 0.5}}
@@ -140,7 +140,7 @@
       "adjacency_forbid": [], "allow_island": true,
       "base_elevation": 35.0, "amplitude": 85.0, "octaves": 5, "lacunarity": 2.3, "gain": 0.55, "ridge_blend": 0.80, "flatness": 0.95,
       "overhang_strength": 0.55, "cave_density": 0.00, "cave_depth_band": [15.0, 220.0],
-      "fog": {"density": 0.0012, "height": 120.0}, "material_id": 6, "water_level_offset": 0.0,
+      "fog": {"density": 0.0012, "height": 120.0}, "detail_fine": 1.20, "material_id": 6, "water_level_offset": 0.0,
       "rocks": {"boulders": 0.15, "outcrops": 0.25, "cover": 0.55},
       "trees": {"density": 0.08, "cover": 0.35, "species": {"snag": 1}}
     },
@@ -150,7 +150,7 @@
       "adjacency_forbid": ["meadows"], "allow_island": true,
       "base_elevation": 110.0, "amplitude": 95.0, "octaves": 5, "lacunarity": 2.0, "gain": 0.48, "ridge_blend": 0.45, "flatness": 1.05,
       "overhang_strength": 0.25, "cave_density": 0.00, "cave_depth_band": [18.0, 200.0],
-      "fog": {"density": 0.0008, "height": 100.0}, "material_id": 7, "water_level_offset": 0.0,
+      "fog": {"density": 0.0008, "height": 100.0}, "detail_fine": 0.35, "material_id": 7, "water_level_offset": 0.0,
       "rocks": {"boulders": 0.08, "outcrops": 0.20, "cover": 0.40}
     },
     {
@@ -159,7 +159,7 @@
       "adjacency_forbid": ["meadows"], "allow_island": false,
       "base_elevation": 70.0, "amplitude": 165.0, "octaves": 6, "lacunarity": 2.1, "gain": 0.56, "ridge_blend": 0.90, "flatness": 0.75,
       "overhang_strength": 0.70, "cave_density": 0.00, "cave_depth_band": [25.0, 320.0],
-      "fog": {"density": 0.0, "height": 0.0}, "material_id": 8, "water_level_offset": 0.0,
+      "fog": {"density": 0.0, "height": 0.0}, "detail_fine": 1.20, "material_id": 8, "water_level_offset": 0.0,
       "rocks": {"boulders": 0.15, "outcrops": 0.30, "cover": 0.60},
       "ground": {"grass": 0.05, "cover": 0.20, "height": [0.10, 0.25], "color": [0.40, 0.40, 0.22], "dry_color": [0.58, 0.52, 0.32], "dry": 0.90, "narrow": 0, "flowers": 0.0, "bushes": 0.0}
     }

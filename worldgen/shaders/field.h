@@ -230,6 +230,7 @@ struct BiomeProfile {
     float ridge_blend;
     float flatness;
     float detail_amp;    // metres of the shared micro-relief (layer4_detail)
+    float detail_fine_amp;  // ... and of the fine band, a second field of its own
     // layer 6
     float overhang_strength;
     float cave_density;

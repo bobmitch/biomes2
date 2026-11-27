@@ -107,7 +107,18 @@ namespace worldgen {
 //      often on a slope. Its own feature seed; no other layer moves. Plants
 //      are smaller than the hash grid, so they are hashed by their instances
 //      at the 24 land sites the trees and rocks use.
-static const int kGeneratorVersion = 20;
+//  21  layer 4 grows a FINE micro-relief band: a second shared detail field
+//      at 16 / 8 / 4 m (detail.fine_period, fine_octaves) beside the 72 m
+//      one, each biome scaling it by its own `detail_fine` metres. The band
+//      between the profiles' finest octave (18 m on the three biomes that
+//      carried `detail`, 37-110 m on the rest) and the 0.5 m voxel was
+//      empty, so the ground was an exact interpolation of a field that said
+//      nothing about it -- smooth underfoot however close you stood. Two
+//      fields rather than more octaves on one: `gain` would otherwise tie
+//      the two bands' amplitudes together, and v17 tuned the coarse one by
+//      eye. Its own feature seed (FEATURE_DETAIL_FINE), so no other layer
+//      moves, and g_arch grows to six rows.
+static const int kGeneratorVersion = 21;
 
 }  // namespace worldgen
 

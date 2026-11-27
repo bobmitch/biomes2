@@ -320,6 +320,51 @@ Last gathered: 2026-11-21, after the exploration fog; creatures added
 - **The forest map and canopy shell do not know the sites**: past the
   trees' draw distance a site's glade is covered by the shell's canopy
   (sites are 1-3 of its 20 m texels). [Micro-relief and flat sites]
+- **The 4-16 m band is filled (v21); 1-4 m is not.** The fine detail field
+  stops at a 4 m period, which is eight voxels at LOD 0 -- going finer
+  starts costing LOD agreement (0.73 of a voxel, limit 1.00, is where it
+  stands) and would have to be faded against the voxel more carefully than
+  another octave at gain 0.5 does for free. Below 1 m is the scans' and
+  POM's job, not geometry's; see why tessellation was removed.
+  [Micro-relief and flat sites; Bare ground]
+- **The fine band's amplitudes are capped by the flat sites' shoulder, not
+  by taste.** At 0.54 rise/run against a limit of 0.6 there is little
+  headroom, and the cap bites hardest in exactly the three biomes that
+  grow sites. `build_flats` tests the shoulder end-to-end (`dh` against
+  `max_grade * outer`) and does not bound its local gradient at all, so
+  bounding that is the prerequisite for a bumpier meadow.
+  [Micro-relief and flat sites]
+- **Nothing suppresses the fine band inside a flat site's pad.** It does
+  not need to -- `flat_apply` pulls the pad to its own mean afterwards --
+  but the pad's mean is computed from 33 samples of a now-bumpier surface,
+  so a site's level wanders a little more from seed to seed than it did.
+  Unmeasured. [Micro-relief and flat sites]
+
+- **Land exists where no biome cell does, and it is the bare sand.** Layer 0
+  decides land by noise; layer 3 assigns biomes to CELLS. On v18's
+  archipelago the two come apart: at (1099, 26.9, -252) -- dry ground 365 m
+  from the spawn, reachable on foot -- `--pick` finds all FOUR nearest cells
+  are ocean, and the viewer's inspector agrees, printing `biome none (sea)`.
+  Everything downstream then defaults: `terrain_height`'s `layer4_blend` gets
+  no land weight, so the shape is pure layer 0 (smooth, featureless, no
+  profile and no micro-relief); `terrain_material` takes its `wl == 0` branch
+  and paints the seabed whatever `seabed.above_sea` says; and the foliage
+  bake returns early, so nothing grows. That is what the hundreds of metres
+  of empty sand on the spawn island ARE -- not a material bug, a hole in the
+  biome coverage. It was invisible until the seabed fade greened the land
+  round it, and now reads as a hard stepped line where the fourth cell stops
+  being land. The levers: scatter or assign cells so every land point has a
+  land cell in reach, or let the blend fall back to the nearest land cell
+  however far (both move the heights, so a generator version bump).
+  [Terrain surface materials; Micro-relief and flat sites]
+- **An hour went into the wrong diagnosis of that line.** It is straight and
+  quantised to the mesh, so it read as an iso-height contour being
+  rasterised, and a wander term was added to the seabed fade's threshold to
+  break it up. The line did not move (a 30 m wander only scattered sandy
+  blobs through the grass elsewhere, which is how the term was shown to be
+  live at all). `--pick` on the sand side, printing the four nearest cells,
+  was what settled it in one run. The wander was removed. Pick the pixel
+  before theorising about the shader. [Terrain surface materials]
 
 ## Placed caves (v19)
 
