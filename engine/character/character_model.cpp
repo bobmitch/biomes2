@@ -472,6 +472,16 @@ void CharacterAnimator::bind(const CharacterModel* m, const AnimLibrary* lib) {
 // local' = local * (rest^-1 * q * rest). With the parents at rest, joint j's
 // global becomes q * rest -- the rotation about the model-space axis at the
 // joint -- and posed parents carry it along.
+// A swing of the tool in hand. The clip is the tool's own (items.json
+// `tool.anim`); a library that lacks it falls back to the axe's, and with
+// no library at all the procedural gait simply keeps walking -- the BLOW
+// still lands on time, which is the Swing's business, not the animator's.
+void CharacterAnimator::trigger_action(const char* clip, float len) {
+    action_clip_ = (lib_ && clip && clip[0]) ? lib_->find(clip) : -1;
+    action_len_ = len;
+    action_t_ = 0.0f;
+}
+
 void CharacterAnimator::apply(int j, const float q_model[4]) {
     if (j < 0) return;
     const float* rq = model_->joints[size_t(j)].rest_q;
@@ -679,15 +689,19 @@ void CharacterAnimator::pose_clips(const LocomotionInput& in) {
         sample(c_torch_, idle_t_, A);
         pose_blend(P, A, torch_, &right_arm_mask_, false);
     }
-    // The axe: the upper body swings, the legs keep going.
-    if (action_t_ >= 0.0f && c_action_ >= 0) {
+    // The axe: the upper body swings, the legs keep going. The clip is the
+    // tool's (trigger_action), cut short where it holds more than one strike.
+    const int act = action_clip_ >= 0 ? action_clip_ : c_action_;
+    if (action_t_ >= 0.0f && act >= 0) {
         action_t_ += dt;
-        const float d = L.clips[size_t(c_action_)].duration;
+        float d = L.clips[size_t(act)].duration;
+        if (action_len_ > 0.0f && action_len_ < d) d = action_len_;
+        const float out = d > 0.4f ? d - 0.3f : d * 0.25f;
         if (action_t_ >= d) {
             action_t_ = -1.0f;
         } else {
-            sample(c_action_, action_t_, A);
-            pose_blend(P, A, smooth(0.0f, 0.1f, action_t_) * (1.0f - smooth(d - 0.3f, d, action_t_)), &upper_mask_,
+            sample(act, action_t_, A);
+            pose_blend(P, A, smooth(0.0f, 0.1f, action_t_) * (1.0f - smooth(out, d, action_t_)), &upper_mask_,
                        false);
         }
     }

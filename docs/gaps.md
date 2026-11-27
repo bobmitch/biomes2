@@ -388,8 +388,19 @@ Last gathered: 2026-11-21, after the exploration fog; creatures added
     change that would most change how a fight feels.
   - **No blocking, dodging or parrying**, and no armour: the only defence
     is to be out of reach or behind it when the blow lands.
-  - **One weapon** (the axe, 15 damage, 2.6 m), no durability, no other
-    damage types, no hit location. A tool's `tool` block is the hook.
+  - **One weapon** (the axe, 15 damage, 2.6 m, impact 0.47 s, recover
+    0.33), no durability, no other damage types, no hit location. A tool's
+    `tool` block is the hook, and it already carries the swing's timing and
+    clip, so a second weapon is data: nothing has been tuned against the
+    axe's numbers, and no clip but `Sword_Attack` has been tried.
+  - **The dig (right mouse) still acts on the press**, with no swing, no
+    animation and no buffer -- only the swing of a tool is in two parts.
+    Clicks ARE buffered now (`swing_buffer_s` 0.3 s), but there is no
+    hold-to-swing: chopping a tree is still click after click.
+  - **The clip blends in over its first 0.1 s**, so the pose lags the
+    swing's own clock slightly; `impact_s` was measured on the clip, not
+    on what is drawn. Nothing marks the impact in the picture either (no
+    hit spark, no sound, no pause).
   - **Nothing drops**: a dead creature is simply removed -- no corpse, no
     trophy, no meat. The player's death still keeps the inventory
     (no tombstone, gaps above).

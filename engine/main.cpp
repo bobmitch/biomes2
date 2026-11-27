@@ -48,6 +48,7 @@
 #include "engine/ui/ui.h"
 #include "engine/player/icons.h"
 #include "engine/player/survival.h"
+#include "engine/player/swing.h"
 #include "engine/mobs/combat.h"
 #include "engine/mobs/creatures.h"
 #include "engine/mobs/locomotion.h"
@@ -656,6 +657,7 @@ bool  g_mob_wander = true;                   // the stand-in behaviour for kinds
 engine::mobs::Minds g_minds;                 // perception and the Lua behaviours
 bool  g_minds_ok = false;
 engine::mobs::Combat g_combat;               // blows: windups, what lands, what the axe hits
+engine::player::Swing g_swing;               // the player's own: it lands at the clip's impact
 float g_hurt = 0.0f;                         // the screen's red, 1 at a blow, fading over kHurtFade
 const float kHurtFade = 0.8f;                // seconds
 uint32_t g_killed = 0;                       // creatures killed this session (the reports)
@@ -921,11 +923,11 @@ engine::player::ToolStats hand_tool() {
     return g_items[sl.item].tool;
 }
 
-// The player's swing at a creature: the nearest its ray reaches. True if
-// one was hit (a tree is not chopped in the same swing).
-bool swing_at_creature(const float eye[3], const float dir[3]) {
+// The player's blow at a creature: the nearest its ray reaches. True if
+// one was hit (a tree is not chopped in the same swing). Called at the
+// swing's IMPACT, with the tool it began with.
+bool swing_at_creature(const float eye[3], const float dir[3], const engine::player::ToolStats& tool) {
     if (!g_creatures_ok) return false;
-    const engine::player::ToolStats tool = hand_tool();
     if (tool.damage <= 0.0f) return false;
     bool died = false;
     float point[3] = {0, 0, 0};
@@ -946,6 +948,27 @@ bool swing_at_creature(const float eye[3], const float dir[3]) {
         std::snprintf(g_tree_msg, sizeof g_tree_msg, "hit the %s", name.c_str());
     }
     return true;
+}
+
+// The swing's IMPACT: the moment in the animation where the head meets the
+// wood. Aimed from where the player stands and looks NOW, not from where
+// they were when the button went down, so a turn away mid-swing is a miss
+// -- the player's side of the rule a creature's windup gives them.
+void land_swing(float t) {
+    float fwd[3], right[3], up[3];
+    g_camera.basis(fwd, right, up);
+    float eye[3];
+    chop_origin(eye);
+    g_ev_swung = true;          // the axe is heard where it bites, not on the press
+    // A creature in the swing's way takes it; the tree behind it does not
+    // (one swing, one target).
+    if (swing_at_creature(eye, fwd, g_swing.tool())) return;
+    uint32_t id = 0;
+    int hits = 0, need = 0;
+    const int r = g_felling.chop(eye, fwd, t, &id, &hits, &need);
+    if (r == 0) std::snprintf(g_tree_msg, sizeof g_tree_msg, "nothing in reach");
+    else if (r == 1) std::snprintf(g_tree_msg, sizeof g_tree_msg, "chop %d/%d", hits, need);
+    else hud_say("Timber!");
 }
 
 // The creatures' blows: windups run on, and one that comes due takes health
@@ -1004,6 +1027,7 @@ void survival_frame(float dt, bool moving, bool sprinting) {
         g_have_prev_feet = false;
         g_surv.respawn();
         g_surv.reset_fall();
+        g_swing.clear();          // a swing in flight dies with them
         drain_survival_messages();
         hud_say("You wake where you began");
     }
@@ -2778,6 +2802,69 @@ int run_combat_test() {
         cb.strike(live, eye, fwd, 2.6f, 12.0f, died, where);
         std::snprintf(buf, sizeof buf, "a third kills it (health %.0f)", live[0].health);
         check(died && live[0].health == 0.0f, buf);
+
+        // The player's swing is in two parts too (engine/player/swing.h):
+        // the press starts the animation, the blow lands at its impact.
+        engine::player::ToolStats pt;       // the test's own tool, not items.json
+        pt.damage = 12.0f;
+        pt.impact_s = 0.4f;
+        pt.recover_s = 0.2f;
+        engine::player::Swing sw;
+        check(sw.begin(pt), "the player swings");
+        check(!sw.begin(pt), "... and not again while that one is in flight");
+        float waited = 0.0f;
+        int impacts = 0;
+        for (int i = 0; i < 23; ++i) {     // just short of 0.4 s at 1/60
+            if (sw.update(1.0f / 60.0f)) ++impacts;
+            waited += 1.0f / 60.0f;
+        }
+        std::snprintf(buf, sizeof buf, "nothing has landed %.2f s in (impacts %d)", waited, impacts);
+        check(impacts == 0 && sw.before_impact(), buf);
+        for (int i = 0; i < 3; ++i) {
+            if (sw.update(1.0f / 60.0f)) ++impacts;
+            waited += 1.0f / 60.0f;
+        }
+        std::snprintf(buf, sizeof buf, "the blow lands at impact_s (%.2f s in, impacts %d)", waited, impacts);
+        check(impacts == 1 && !sw.before_impact(), buf);
+        check(!sw.begin(pt), "it is recovering, and cannot swing again yet");
+        for (int i = 0; i < 11; ++i)
+            if (sw.update(1.0f / 60.0f)) ++impacts;
+        std::snprintf(buf, sizeof buf, "one impact a swing, no more (impacts %d)", impacts);
+        check(impacts == 1 && !sw.busy(), buf);
+        check(sw.begin(pt), "after recover_s it can swing again");
+        engine::player::ToolStats inst = pt;    // a tool that lands at once
+        inst.impact_s = 0.0f;
+        inst.recover_s = 0.0f;
+        engine::player::Swing fast;
+        check(fast.begin(inst), "a tool with no windup swings");
+        check(fast.update(1.0f / 60.0f) && !fast.busy(),
+              "... and lands on its first frame, free to swing again");
+
+        // A click inside a swing: kept only near its end, and swung the
+        // moment it frees up. The window loop's own rule.
+        engine::player::Swing bf;       // pt is 0.4 + 0.2 = 0.6 s of swing
+        bf.begin(pt);
+        bf.update(1.0f / 60.0f);
+        check(!bf.buffer(0.3f), "a click early in a swing is thrown away");
+        for (int i = 0; i < 24; ++i) bf.update(1.0f / 60.0f);    // ~0.18 s left
+        check(bf.buffer(0.3f), "one within swing_buffer_s of its end is kept");
+        check(bf.buffer(0.3f) && !bf.take_buffered(),
+              "a second replaces it, and nothing comes back while the swing runs");
+        bool came = false;
+        int steps = 0;
+        for (; steps < 30 && !came; ++steps) {
+            bf.update(1.0f / 60.0f);
+            came = bf.take_buffered();
+        }
+        std::snprintf(buf, sizeof buf, "the kept click comes back when the swing ends (%.2f s later)",
+                      float(steps) / 60.0f);
+        check(came && !bf.busy(), buf);
+        check(!bf.take_buffered(), "... once only, never a queue");
+        check(bf.begin(pt), "and it swings");
+        for (int i = 0; i < 25; ++i) bf.update(1.0f / 60.0f);
+        check(bf.buffer(0.3f), "another click is kept");
+        bf.clear();
+        check(!bf.buffered() && !bf.busy(), "... and dies with the swing, as a death clears both");
     }
 
     // ---- B. the shipping world, at the spawn ------------------------------
@@ -2918,17 +3005,47 @@ int run_combat_test() {
         check(mob() != nullptr, "the mimic is still alive");
         if (mob() && axe >= 0) {
             const float full = MK.health;
+            const engine::player::ToolStats axe_tool = g_items[axe].tool;
             int swings = 0;
             bool killed = false;
             for (; swings < 20 && !killed; ++swings) {
                 const Mob* cur = mob();
                 if (!cur) { killed = true; break; }
-                float eye[3], dir[3];
-                aim(*cur, eye, dir);
                 const float before = cur->health;
-                const bool hit = swing_at_creature(eye, dir);
+                // The press starts the swing; the blow lands impact_s later,
+                // at the axe's own impact in its clip.
+                g_swing.clear();
+                g_swing.begin(axe_tool);
+                float waited = 0.0f;
+                bool landed = false;
+                for (int i = 0; i < 240 && !landed; ++i) {
+                    landed = g_swing.update(1.0f / 60.0f);
+                    waited += 1.0f / 60.0f;
+                }
+                float eye[3], dir[3];
+                const Mob* now = mob();
+                bool hit = false;
+                const float was = now ? now->health : 0.0f;
+                if (now && swings == 0) {
+                    // The first one goes through the window's own path: the
+                    // camera aimed as a player aims it, and land_swing at
+                    // the impact (chop_origin, the ray, the tree behind).
+                    aim(*now, eye, dir);
+                    g_camera.yaw = std::atan2(dir[0], dir[2]);
+                    g_camera.pitch = std::asin(dir[1]);
+                    land_swing(tsim);
+                    const Mob* w2 = mob();
+                    hit = !w2 || w2->health < was;
+                } else if (now) {
+                    aim(*now, eye, dir);
+                    hit = swing_at_creature(eye, dir, g_swing.tool());
+                }
                 const Mob* after = mob();
                 if (swings == 0) {
+                    std::snprintf(buf, sizeof buf,
+                                  "the blow lands %.2f s after the press (impact_s %.2f), not on it",
+                                  waited, axe_tool.impact_s);
+                    check(landed && std::fabs(waited - axe_tool.impact_s) < 0.03f, buf);
                     std::snprintf(buf, sizeof buf, "the first swing hits: health %.0f -> %.0f of %.0f",
                                   before, after ? after->health : 0.0f, full);
                     check(hit && after && after->health < before, buf);
@@ -2961,7 +3078,9 @@ int run_combat_test() {
         if (const Mob* cur = C.find_live(id2)) {
             float eye[3], dir[3];
             aim(*cur, eye, dir);
-            swing_at_creature(eye, dir);
+            swing_at_creature(eye, dir, g_items.valid(g_items.find("axe"))
+                                            ? g_items[g_items.find("axe")].tool
+                                            : engine::player::ToolStats());
         }
         const Mob* hurt_mob = C.find_live(id2);
         const float left = hurt_mob ? hurt_mob->health : -1.0f;
@@ -9512,6 +9631,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // Trees: colliders round the player, logs posed by physics; then any
         // swing, save or load the window asked for this frame.
         g_felling.update(g_walk ? g_feet[0] : g_camera.x, g_walk ? g_feet[2] : g_camera.z);
+        // A swing in flight: the blow lands at the clip's impact, and
+        // nothing else may be swung until it has recovered. A click inside
+        // one is KEPT if the swing is near its end (the player's
+        // swing_buffer_s) and swung the moment it frees up -- chopping is
+        // click after click, and a dropped one reads as a dead button.
+        if (g_swing.update(float(dt))) land_swing(t);
+        if (g_want_chop && g_swing.busy()) {
+            g_swing.buffer(g_surv_run ? g_surv.tuning().swing_buffer_s : 0.3f);
+            g_want_chop = false;
+        }
+        if (g_swing.take_buffered()) g_want_chop = true;
         if (g_want_chop && g_surv_run) {
             if (g_surv.hand() != engine::player::ToolUse::Axe) {
                 g_want_chop = false;
@@ -9523,26 +9653,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         }
         if (g_want_chop) {
             g_want_chop = false;
-            float fwd[3], right[3], up[3];
-            g_camera.basis(fwd, right, up);
-            float eye[3];
-            chop_origin(eye);
-            // The swing: the character turns to where the camera looks and
-            // its upper body plays the axe over whatever the legs are doing.
+            // The swing starts: the character turns to where the camera
+            // looks and its upper body plays the tool's clip over whatever
+            // the legs are doing. What it hits is settled at the impact.
+            const engine::player::ToolStats tool = hand_tool();
+            g_swing.begin(tool);
             if (g_walk) {
                 g_char_yaw = g_camera.yaw;
-                g_anim.trigger_action();
-                g_ev_swung = true;
-            }
-            // A creature in the swing's way takes it; the tree behind it
-            // does not (one swing, one target).
-            if (!swing_at_creature(eye, fwd)) {
-                uint32_t id = 0;
-                int hits = 0, need = 0;
-                const int r = g_felling.chop(eye, fwd, t, &id, &hits, &need);
-                if (r == 0) std::snprintf(g_tree_msg, sizeof g_tree_msg, "nothing in reach");
-                else if (r == 1) std::snprintf(g_tree_msg, sizeof g_tree_msg, "chop %d/%d", hits, need);
-                else hud_say("Timber!");
+                g_anim.trigger_action(tool.anim.c_str(), tool.anim_s);
             }
         }
         if (g_want_pick) {

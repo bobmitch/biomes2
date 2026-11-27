@@ -40,11 +40,18 @@ struct IconShape {
     float col[4] = {1, 1, 1, 1};   // sRGB, alpha
 };
 
-// What a tool does to a creature (engine/mobs/combat.h). damage 0: it hurts
-// nothing, whatever it is for.
+// What a tool does to a creature (engine/mobs/combat.h) and how its swing
+// is timed (engine/player/swing.h). damage 0: it hurts nothing, whatever it
+// is for. A weapon's blow lands impact_s after the press -- where the head
+// meets the wood in its clip -- and nothing else may be swung until
+// recover_s after that.
 struct ToolStats {
     float damage = 0.0f;
     float reach_m = 2.6f;      // from the eye along the swing
+    float impact_s = 0.28f;    // press -> the blow lands, the clip's impact
+    float recover_s = 0.32f;   // ... and after that, before the next swing
+    std::string anim = "Sword_Attack";   // the clip the upper body plays
+    float anim_s = 0.0f;       // how much of that clip to play, 0 for all
 };
 
 struct ItemDef {
@@ -71,6 +78,7 @@ struct PlayerTuning {
     float swim_drain = 6.0f;            // a second, swimming under way
     float jump_cost = 10.0f;
     float axe_cost = 8.0f;              // a swing, hit or miss
+    float swing_buffer_s = 0.3f;        // a click this near the end of a swing is kept for the next
     float dig_cost = 5.0f;              // a dig
     float drown_damage = 5.0f;          // a second, swimming with no stamina left
     float fall_safe_m = 4.0f;           // a fall up to this does nothing ...
