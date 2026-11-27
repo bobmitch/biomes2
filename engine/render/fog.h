@@ -39,6 +39,7 @@ struct FogSettings {
     float deep[2] = {0.00015f, 1000.0f};
     float valley_noon = 0.08f;            // the valley layer's share left in the middle of the day
     float valley_wind = 6.0f;             // m/s of wind that blows the valley fog away
+    float glow_from = 150.0f;             // metres of height fog lit by the horizon's mean before the sun's angle (haze.hlsli)
     float mist_top[2] = {80.0f, 250.0f};  // the froxel mist thins above this altitude, e-folding this
 };
 

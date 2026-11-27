@@ -3063,7 +3063,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                             return s > 0.0f ? 3.912f / s : 0.0f;
                         };
                         if (!g_renderer.height_fog())
-                            std::fprintf(f, "  height fog: off (the default; --height-fog <k> turns it on)\n");
+                            std::fprintf(f, "  height fog: off (--no-height-fog, or the tuning panel's Fog group)\n");
                         else
                         std::fprintf(f, "  height fog: valley %.2f; level visibility at the eye (%.0f m) %.0f m, at 20 m "
                                         "%.0f m, at 300 m %.0f m, at 600 m %.0f m\n",

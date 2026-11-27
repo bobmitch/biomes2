@@ -45,6 +45,7 @@ bool FogMap::build(const WorldGpu& world, const char* archetypes_path, std::stri
                 pair("mist_top", settings_.mist_top);
                 if (l.has("valley_noon")) settings_.valley_noon = float(l.number("valley_noon"));
                 if (l.has("valley_wind")) settings_.valley_wind = float(l.number("valley_wind"));
+                if (l.has("glow_from")) settings_.glow_from = float(l.number("glow_from"));
             }
         }
     } catch (const std::exception& e) {

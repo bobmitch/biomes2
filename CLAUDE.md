@@ -134,11 +134,11 @@ measured in this file is seed 0), `--character male|female` (which pack; male by
 `--time <hours>` (ADR-004 L2: 14 by default, which is the
 pre-L2 sun), the weather's `--sea-state <0..1>`, `--wind <m/s>`,
 `--wind-dir <deg>` and `--swell <m>` (automatic weather otherwise), `--torch` (carry one), `--no-light-shadows`, `--no-fog` and
-`--fog-density <k>` (a multiplier on the authored mist, 1.3 by default), `--no-far-shadow`, `--no-pom`,
+`--fog-density <k>` (a multiplier on the authored mist, 1 by default), `--no-far-shadow`, `--no-pom`,
 `--aniso <1|2|4|8|16>` (the scans' filtering), `--no-terrain-prepass`, `--no-rocks`,
 `--no-forest-shell`, `--no-clouds`, `--no-rain`, `--rain <0..1>`, `--wet <0..1>`,
-`--no-lightning`, `--no-height-fog` and `--height-fog <k>` (turns the
-exploration fog on, off by default, at that multiplier); `--shot` also
+`--no-lightning`, `--no-height-fog` and `--height-fog <k>` (scales the
+exploration fog, on by default, and turns it on); `--shot` also
 takes `--lights <n>` (campfires round the camera), `--lightning <dist m>
 <bearing deg> [1]` (a strike for the still, at the peak of its first stroke,
 the bearing from the camera's forward; 1 in the cloud) and `--ground` (the
@@ -2099,15 +2099,11 @@ surface and to the sky (to infinity), and by the sea over itself and its sky
 reflection. archetypes.json `fog.layers`; `--no-height-fog`,
 `--height-fog <k>`.
 
-**OFF by default since 2026-11-26.** At dawn and dusk it blew out: its
-colour is the horizon's in that azimuth, and towards a low sun that is the
-Mie glow, so a sight line through the dense layer drew a glaring orange
-column over the scene (`--time 18.5` at spawn). Fine by day. In its place
-the froxel mist's density defaults to 1.3x (`fog_density_`). With it off the
-mist also stops thinning above 60 m (`mist_top` is tied to it), so hills
-are as misty as the plain. The tuning panel's Fog group turns it back on
-(its layers also take the mist multiplier); `--height-fog <k>` does too.
-Fixing the colour at low sun is the way back.
+**On by default.** It was off for a day (2026-11-26) while it blew out at
+dawn and dusk -- a glaring orange column over the scene at `--time 18.5`
+at spawn; see its colour below. With it off the froxel mist stood in at
+1.3x and stopped thinning above 60 m (`mist_top` is tied to it); both are
+back as they were.
 
 - **Extinction falls off with ALTITUDE above sea level, not with height
   above the ground.** Three layers, sigma at sea level x exp(-h / H):
@@ -2125,13 +2121,30 @@ Fixing the colour at low sun is the way back.
   the near field's patches, shafts and torch glow, and now thins above 60 m
   by e-folding 120 m (`mist_top`): left alone it fogged summits inside its
   6 km as thickly as the plain, and at dawn hid the far peak entirely.
-- **Its colour is the sky's own horizon in that azimuth**, so the land
-  fades into the horizon -- warm towards the sun (the table's Mie glow),
-  cool away, dark at night -- greyed by cover^2 x 0.9 and dimmed by
-  `storm_dim` as the sky light is. Looking DOWN it blends to the horizon
-  averaged over four azimuths: azimuth alone stood a pillar of the sun's
-  glow in the fog at dusk. Near the eye it takes the heightfield GI's share
-  of open sky (a sealed chamber does not glow).
+- **Its colour is the sky's own horizon**, so the land fades into the
+  horizon -- warm towards the sun (the table's Mie glow), cool away, dark
+  at night -- greyed by cover^2 x 0.9 and dimmed by `storm_dim` as the sky
+  light is. Near the eye it takes the heightfield GI's share of open sky
+  (a sealed chamber does not glow).
+- **The horizon is read by SCATTERING ANGLE, not azimuth** (`hfog_colour`):
+  at the azimuth whose angle to the sun is the ray's. Read at the ray's own
+  azimuth, every ray towards a low sun's azimuth -- 30 degrees down at the
+  grass included -- took the glow two degrees from the sun: the orange
+  column, green-tinged where AgX met it, at dawn and dusk, and over the sea
+  even looking AWAY from the sun at dusk. (The first fix blended rays
+  looking down towards a four-azimuth mean; a quarter of the aureole was
+  still a column.) A level ray keeps its own azimuth, so distant land still
+  fades into the sky behind it; the glow is now a disc round the sun.
+- **The first 150 m take the horizon's mean round the compass**
+  (`hfog_mean`, 30/90/150 degrees from the sun; `fog.layers.glow_from`,
+  carried in `hfog_b.w`), the sun's angle only past it. The fog has no
+  shadows, and with the angle fixed the air round the eye -- the shade of
+  a wood, the lee of a hill -- still glowed with the aureole: the spawn
+  wood at dusk looking west metered 216 nits against 39 with the fog off,
+  128 with this. The froxel mist draws that near stretch's sunlit air
+  through the cascades. Old against new at noon and 07:00 (from 120 m up)
+  differ by under 1% in the meter; the composite costs the same (1440p
+  1.013-1.017 ms against 1.001-1.011).
 - **The valley layer** follows the mist's dawn and dusk bumps over a midday
   floor of 8% (`valley_noon`) and is blown away by wind, (1 - U / 6 m/s)^2
   (`valley_wind`). Rain thickens every layer as it does the mist.

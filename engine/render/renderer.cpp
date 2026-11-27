@@ -2641,7 +2641,7 @@ void Renderer::height_fog_constants(float out[3][4], bool on) const {
     out[1][0] = fs.deep[0] * wet * hfog_scale_;
     out[1][1] = fs.deep[1];
     out[1][2] = world_.params().sea_level;
-    out[1][3] = 1.0f;
+    out[1][3] = fs.glow_from > 1.0f ? fs.glow_from : 1.0f;   // > 0.5: on
     const float cov = clouds_on_ && clouds_.ready() ? clouds_.coverage() : 0.0f;
     out[2][0] = cov * cov * 0.9f;
     out[2][1] = storm_dim();

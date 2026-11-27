@@ -9,12 +9,13 @@ Last gathered: 2026-11-21, after the exploration fog.
 
 ## Visibility and atmosphere
 
-- **The exploration fog is off by default (2026-11-26): it blows out at
-  dawn and dusk.** Its colour is the horizon's in each azimuth, which
-  towards a low sun is the Mie glow, so the dense layer draws a glaring
-  orange column over the view. The mist at 1.3x stands in for it, and the
-  mist no longer thins over hills while it is off. Fix the colour at low
-  sun (or cap its in-scatter) and turn it back on. [The exploration fog]
+- **The exploration fog has no shadows.** Its first 150 m (`glow_from`)
+  take the horizon's mean so the shade round the eye does not glow with
+  the sun's aureole; past that, a hill or a wood between the eye and a low
+  sun does not shade the fog behind it. At dawn and dusk the valley layer
+  still lays a warm veil over a wood's floor (the spawn wood at 18:30 meters
+  ~2.7x what it does with the fog off) -- by design, but judged only in
+  stills. [The exploration fog]
 - **The exploration fog's base is sea level everywhere.** A high plateau
   (highland, glacier: 90-110 m base, relief to 300 m and more) sits in clear
   air and sees further than the lowland. Next lever if it shows: a regional

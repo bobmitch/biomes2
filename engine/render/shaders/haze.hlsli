@@ -91,7 +91,8 @@ float4 mist(float2 uv, float z) {
 // pixel; the froxel mist keeps the near field's patches and light shafts.
 //
 //   hfog_a  ground sigma at the base (1/m), its scale height (m); valley the same
-//   hfog_b  deep sigma, its scale height; the base's altitude; w > 0.5 on
+//   hfog_b  deep sigma, its scale height; the base's altitude; w > 0.5 on, and
+//           the metres lit by the horizon's mean before the sun's angle
 //   hfog_c  the fog's colour: x how far towards grey (cloud cover), y its
 //           dimming (a storm deck), z the albedo, w the eye's sky share
 
@@ -124,38 +125,78 @@ float hfog_tau(float3 o, float3 d, float t) {
            hfog_layer(hfog_b.x, hfog_b.y, h0, d.y, t);
 }
 
-// What thick fog looks like along this direction: the sky's own horizon in
-// that azimuth -- warm and bright towards the sun (the atmosphere's Mie
-// glow is in the table), cool away from it, dark at night -- so the land
-// fades into the horizon rather than into a grey wall; greyed and dimmed as
-// the deck closes, as fill_light greys the sky light.
-float3 hfog_colour(float3 d) {
-    const float3 hz = normalize(float3(d.x, 0.04f, d.z) + float3(1e-4f, 0.0f, 0.0f));
-    float3 c = sky_view_at(hz);
-    // Looking DOWN into the fog, the light it sends up is the whole sky's
-    // round it, not the horizon's in one azimuth: taken alone, every ray
-    // towards the sun's azimuth -- straight down included -- carried the
-    // sun's glow, a pillar of light standing in the fog at dusk.
-    if (d.y < 0.0f) {
-        const float3 r = normalize(float3(-hz.z, 0.0f, hz.x));
-        const float3 a = 0.25f * (sky_view_at(normalize(float3(-hz.x, 0.04f, -hz.z))) +
-                                  sky_view_at(normalize(r + float3(0.0f, 0.04f, 0.0f))) +
-                                  sky_view_at(normalize(-r + float3(0.0f, 0.04f, 0.0f))) + c);
-        c = lerp(c, a, saturate(-d.y * 4.0f));
-    }
+// What thick fog looks like along this direction: the sky's own horizon --
+// warm and bright towards the sun (the atmosphere's Mie glow is in the
+// table), cool away from it, dark at night -- so the land fades into the
+// horizon rather than into a grey wall; greyed and dimmed as the deck
+// closes, as fill_light greys the sky light.
+//
+// The horizon is read at the azimuth whose angle to the sun is the RAY's
+// angle to the sun, not at the ray's own azimuth. What the air sends along
+// a ray depends on the scattering angle; the azimuth alone handed every
+// ray towards the sun's azimuth -- 30 degrees down at the grass included --
+// the glow two degrees from a low sun: a glaring orange column standing in
+// the fog at dawn and dusk. A level ray keeps its own azimuth exactly (the
+// land still fades into the horizon behind it); a ray down or up takes the
+// horizon as far round from the sun as its true angle says.
+// The albedo, then greyed and dimmed under the deck.
+float3 hfog_tint(float3 c) {
     c *= hfog_c.z;
     const float y = dot(c, float3(0.2126f, 0.7152f, 0.0722f));
     return lerp(c, float3(y, y, y), hfog_c.x) * hfog_c.y;
 }
 
+float3 hfog_colour(float3 d) {
+    // The horizon row read, e = 0.04 radians up.
+    const float ce = 0.99920011f, se = 0.03998933f;     // cos e, sin e
+    float2 sh = sky_sun_dir.xz;
+    const float ch = length(sh);                        // cos of the sun's elevation
+    sh = ch > 1e-4f ? sh / ch : float2(1.0f, 0.0f);
+    // cos(theta) = ce ch cos(phi) + se sun.y, solved for phi, the azimuth
+    // from the sun's: clamped where no level direction is that close to the
+    // sun (a ray up at a high sun) or that far.
+    const float cphi = clamp((dot(d, sky_sun_dir) - se * sky_sun_dir.y) / max(ce * ch, 1e-4f), -1.0f, 1.0f);
+    const float sphi = sqrt(max(1.0f - cphi * cphi, 0.0f));
+    // To the side of the sun the ray is on.
+    const float side = (sh.x * d.z - sh.y * d.x) < 0.0f ? -1.0f : 1.0f;
+    const float2 az = cphi * sh + (side * sphi) * float2(-sh.y, sh.x);
+    return hfog_tint(sky_view_at(float3(az.x * ce, se, az.y * ce)));
+}
+
+// The horizon's mean round the compass, away from the sun's own azimuth
+// (30, 90 and 150 degrees from it; the table is symmetric about it): the
+// fog's light with the sun's glow spread out of it.
+float3 hfog_mean() {
+    const float ce = 0.99920011f, se = 0.03998933f;
+    float2 sh = sky_sun_dir.xz;
+    const float ch = length(sh);
+    sh = ch > 1e-4f ? sh / ch : float2(1.0f, 0.0f);
+    const float2 sp = float2(-sh.y, sh.x);
+    const float2 a30 = 0.8660254f * sh + 0.5f * sp, a90 = sp, a150 = -0.8660254f * sh + 0.5f * sp;
+    const float3 c = (sky_view_at(float3(a30.x * ce, se, a30.y * ce)) + sky_view_at(float3(a90.x * ce, se, a90.y * ce)) +
+                      sky_view_at(float3(a150.x * ce, se, a150.y * ce))) * (1.0f / 3.0f);
+    return hfog_tint(c);
+}
+
 // (in-scattered light, transmittance) from the eye `o` along `d` for `t`
 // metres. Near the eye the air is lit as the eye is (hfog_c.w, the GI's
 // share of open sky), so a sealed chamber does not glow with daylit fog.
+//
+// The first hfog_b.w metres take the horizon's mean round the compass, not
+// the sun's angle: the fog has no shadows, and towards a low sun the air
+// round the eye -- the shade of a wood, the lee of a hill -- glowed with
+// the sun's whole aureole (the meter's mean 39 -> 216 nits at dusk in the
+// spawn wood). The froxel mist draws that stretch's sunlit air, through the
+// cascades. Past it the air is lit by angle, so distant land still fades
+// into the horizon behind it.
 float4 height_fog_lit(float3 o, float3 d, float t, float lit) {
     const float tau = hfog_tau(o, d, t);
     if (tau <= 1e-5f) return float4(0.0f, 0.0f, 0.0f, 1.0f);
     const float T = exp(-min(tau, 60.0f));
-    return float4(hfog_colour(d) * ((1.0f - T) * lit), T);
+    const float near_t = min(t, hfog_b.w);
+    const float Tn = exp(-min(hfog_tau(o, d, near_t), 60.0f));
+    const float3 L = hfog_mean() * (1.0f - Tn) + hfog_colour(d) * (Tn - T);
+    return float4(L * lit, T);
 }
 
 float4 height_fog(float3 o, float3 d, float t) {

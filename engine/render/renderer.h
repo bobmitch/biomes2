@@ -220,8 +220,8 @@ public:
     // cumulonimbus. Every sky term, the haze and the clouds' own ambient.
     float storm_dim() const;
     // The exploration fog (haze.hlsli): layered height fog that limits how
-    // far the low land can be seen. OFF by default; --height-fog <k> turns it on
-    // at that scale, --no-height-fog keeps it off.
+    // far the low land can be seen. On by default; --height-fog <k> scales it
+    // (and turns it on), --no-height-fog turns it off.
     void set_height_fog(bool on) { hfog_on_ = on; }
     void set_height_fog_scale(float k) { hfog_scale_ = k; }
     bool  height_fog() const { return hfog_on_; }
@@ -764,7 +764,7 @@ private:
     Strike strike_;
     bool flash_suppress_ = false;   // a still's warm-up frames, before a forced strike
     bool lightning_on_ = true;      // --no-lightning
-    bool hfog_on_ = false;   // off by default: blown out at dawn and dusk (2026-11-26)
+    bool hfog_on_ = true;
     float hfog_scale_ = 1.0f;
     void height_fog_constants(float out[3][4], bool on) const;
     uint32_t last_strike_id_ = 0xFFFFFFFFu;
@@ -850,7 +850,7 @@ private:
     UINT64 post_query_freq_ = 0;
     bool   post_query_pending_[kFrameCount] = {};
     bool   fog_on_ = true, fog_hist_valid_ = false, fog_uploaded_ = false;
-    float  fog_density_ = 1.3f;  // the mist a little thicker with the height fog off
+    float  fog_density_ = 1.0f;
     GroundLook ground_look_;
     RockLook rock_look_;
     UINT   fog_cur_ = 0;
