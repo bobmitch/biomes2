@@ -76,6 +76,10 @@ struct WorldConstants {
     int      detail_octaves;
     float    detail_gain;
     unsigned s_detail;
+    float    detail_fine_period;
+    int      detail_fine_octaves;
+    unsigned s_detail_fine;
+    float    detail_spare;   // keeps the block two whole rows; the cbuffer's layout follows this struct
 
     // Layer 0 prototype: SeedWorld::l0 (the seed's draws; land_offset above
     // is l0's, so the knee reaches the GPU too). Defaults evaluate nothing new.

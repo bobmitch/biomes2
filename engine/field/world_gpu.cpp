@@ -86,7 +86,7 @@ bool make_default(ID3D12Device* d, UINT64 bytes, ComPtr<ID3D12Resource>& out,
 
 // Floats per biome in the archetype buffer: 3 float4 of shape, 2 of
 // material. real_field.hlsl's kArchRows must agree.
-static const size_t kArchFloats = 20;
+static const size_t kArchFloats = 24;
 
 bool WorldGpu::diag_no_overhang = false;
 uint64_t WorldGpu::world_seed = 0;
@@ -194,6 +194,19 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
                     if (uint32_t(mats[m].number("id")) == id) put_material(&a[size_t(i) * kArchFloats], mats[m]);
             }
             put_material(&a[size_t(nbiomes) * kArchFloats], root.at("seabed"));
+            // The seabed's row 5: how far over sea level its share of the
+            // blend survives (surface_nets.hlsl terrain_material). Without
+            // it an island smaller than the blend width is sand all over,
+            // whatever its height -- see the comment there.
+            {
+                float* p = &a[size_t(nbiomes) * kArchFloats];
+                p[20] = 1.0f; p[21] = 10.0f;
+                const jsonlite::Value& sb = root.at("seabed");
+                if (sb.has("above_sea")) {
+                    const jsonlite::Array& h = sb.array("above_sea");
+                    for (size_t k = 0; k < 2 && k < h.size(); ++k) p[20 + k] = float(h[k].num);
+                }
+            }
         } catch (const std::exception& e) {
             error = std::string("archetypes.json materials: ") + e.what();
             return false;
@@ -212,6 +225,9 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
             p[9] = table_[i].cave_depth_min;
             p[10] = table_[i].cave_depth_max;
             p[11] = table_[i].detail_amp;
+            // Row 5: shape that did not fit in rows 0-2 (rows 3-4 are the
+            // surface material, which the mesher reads at a fixed offset).
+            p[20] = table_[i].detail_fine_amp;
         }
         UPLOAD(archetypes_, a.data(), a.size() * 4, "archetype buffer");
     }
@@ -333,6 +349,9 @@ bool WorldGpu::build(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
     constants_.detail_octaves = table_.detail.octaves;
     constants_.detail_gain = table_.detail.gain;
     constants_.s_detail = world_.s_detail;
+    constants_.detail_fine_period = table_.detail.fine_period;
+    constants_.detail_fine_octaves = table_.detail.fine_octaves;
+    constants_.s_detail_fine = world_.s_detail_fine;
     {
         const ::Layer0Params& l0 = world_.l0;
         constants_.fine_freq = l0.fine_freq;

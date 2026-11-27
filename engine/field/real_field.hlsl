@@ -58,6 +58,10 @@ cbuffer WorldConstants : register(b1) {
     int   w_detail_octaves;
     float w_detail_gain;
     uint  w_s_detail;
+    float w_detail_fine_period;
+    int   w_detail_fine_octaves;
+    uint  w_s_detail_fine;
+    float w_detail_spare;
 
     // Layer 0 prototype (docs/worldgen-design.md, "Layer 0, proposed"), this
     // seed's values: draws made, and w_land_offset is the knee's if it bit.
@@ -120,14 +124,17 @@ RWStructuredBuffer<uint>   g_ent_off      : register(u19);
 RWStructuredBuffer<uint>   g_ent_item     : register(u20);
 
 // Rows per biome in g_arch: three of shape, then two of surface material
-// (ADR-004 L1), which only the mesher reads. world_gpu.cpp's kArchFloats.
-static const int kArchRows = 5;
+// (ADR-004 L1), which only the mesher reads, then one more of shape that
+// did not fit in the first three. world_gpu.cpp's kArchFloats must agree;
+// --probe-field is the check that it does.
+static const int kArchRows = 6;
 
 BiomeProfile profile_of(int b) {
     BiomeProfile p;
     const float4 a0 = g_arch[b * kArchRows + 0];
     const float4 a1 = g_arch[b * kArchRows + 1];
     const float4 a2 = g_arch[b * kArchRows + 2];
+    const float4 a5 = g_arch[b * kArchRows + 5];
     p.base_elevation = a0.x;
     p.amplitude = a0.y;
     p.octaves = (int)a0.z;
@@ -140,6 +147,7 @@ BiomeProfile profile_of(int b) {
     p.cave_depth_min = a2.y;
     p.cave_depth_max = a2.z;
     p.detail_amp = a2.w;
+    p.detail_fine_amp = a5.x;
     return p;
 }
 
@@ -153,6 +161,7 @@ BiomeProfile empty_profile() {
     p.ridge_blend = 0.0f;
     p.flatness = 1.0f;
     p.detail_amp = 0.0f;
+    p.detail_fine_amp = 0.0f;
     p.overhang_strength = 0.0f;
     p.cave_density = 0.0f;
     p.cave_depth_min = 0.0f;
@@ -238,6 +247,8 @@ float real_terrain_base(float x, float z, float r, float voxel) {
     // The micro-relief once; each biome scales it (world.cpp's terrain_base).
     const float dn = layer4_detail(x, z, w_detail_period, w_detail_octaves, w_detail_gain,
                                    w_s_detail, voxel);
+    const float dnf = layer4_detail(x, z, w_detail_fine_period, w_detail_fine_octaves,
+                                    w_detail_gain, w_s_detail_fine, voxel);
 
     float h[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float wt[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -258,7 +269,8 @@ float real_terrain_base(float x, float z, float r, float voxel) {
         // interpolating octave counts produces mush exactly where the player
         // is looking.
         const BiomeProfile pb = profile_of(b);
-        h[k] = layer4_profile(x, z, w_biome_freq, pb, w_s_height, voxel) + pb.detail_amp * dn;
+        h[k] = layer4_profile(x, z, w_biome_freq, pb, w_s_height, voxel)
+             + pb.detail_amp * dn + pb.detail_fine_amp * dnf;
     }
 
     const float blended = layer4_blend(h[0], wt[0], h[1], wt[1], h[2], wt[2], h[3], wt[3], wall);

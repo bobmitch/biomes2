@@ -30,6 +30,10 @@ struct BiomeArchetype {
     // Metres of the shared micro-relief (DetailTable) this biome carries:
     // hummocks, swales and low banks below the profile's finest octave.
     float    detail_amp     = 0.0f;
+    // Metres of the FINE micro-relief (DetailTable's fine band, 4-16 m):
+    // hummocks and tussock-scale lumps under the detail field's own 18 m
+    // floor. Its own field and seed, so this and detail_amp are independent.
+    float    detail_fine_amp = 0.0f;
     // Chance a flat-site candidate cell (FlatTable) in this biome holds a
     // site, before the terrain tests. 0 = none.
     float    flat_chance    = 0.0f;
@@ -122,6 +126,16 @@ struct DetailTable {
     float period  = 72.0f;   // metres, the coarsest octave
     int   octaves = 3;
     float gain    = 0.5f;
+    // The fine band, a SECOND field of the same shape at a shorter period
+    // and with its own seed and its own per-biome amplitude. One field
+    // covering 72 m down to 4 m would tie the two bands' amplitudes to
+    // `gain`, and v17 tuned the coarse band by eye; two fields let the
+    // ground be bumpy underfoot without changing what it looks like from a
+    // hilltop. 16 / 8 / 4 m: the last is eight voxels at LOD 0, so it is
+    // resolved where it matters and fades early enough not to cost LOD
+    // agreement.
+    float fine_period  = 16.0f;
+    int   fine_octaves = 3;
 };
 
 // Layer 5b, flat sites: rare level ground, a pure function of a candidate

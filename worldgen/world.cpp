@@ -24,6 +24,7 @@ static BiomeProfile profile_of(const BiomeArchetype& a) {
     p.ridge_blend    = a.ridge_blend;
     p.flatness       = a.flatness;
     p.detail_amp     = a.detail_amp;
+    p.detail_fine_amp = a.detail_fine_amp;
     p.overhang_strength = a.overhang_strength;
     p.cave_density      = a.cave_density;
     p.cave_depth_min    = a.cave_depth_min;
@@ -132,6 +133,10 @@ float terrain_base(const SeedWorld& w, const WorldParams& wp,
     // detail_amp, so blending the heights blends the amplitudes exactly.
     const float dn = layer4_detail(x, z, table.detail.period, table.detail.octaves,
                                    table.detail.gain, w.s_detail, voxel);
+    // ... and the fine band under it, its own field so the two amplitudes
+    // are independent of each other and of `gain`.
+    const float dnf = layer4_detail(x, z, table.detail.fine_period, table.detail.fine_octaves,
+                                    table.detail.gain, w.s_detail_fine, voxel);
 
     float h[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float wt[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -148,7 +153,7 @@ float terrain_base(const SeedWorld& w, const WorldParams& wp,
         if (b < 0) continue;
         const BiomeArchetype& a = table[b];
         h[k] = layer4_profile(x, z, wp.biome_freq, profile_of(a), w.s_height, voxel)
-             + a.detail_amp * dn;
+             + a.detail_amp * dn + a.detail_fine_amp * dnf;
         wt[k] = wk;
     }
 
@@ -410,6 +415,7 @@ float terrain_density(const SeedWorld& w, const WorldParams& wp,
     p.ridge_blend = 0.0f;
     p.flatness = 1.0f;
     p.detail_amp = 0.0f;
+    p.detail_fine_amp = 0.0f;
     p.overhang_strength = 0.0f;
     p.cave_density = 0.0f;
     p.cave_depth_min = 0.0f;
@@ -1787,6 +1793,7 @@ SeedWorld build_world(uint64_t world_seed,
     w.s_rock_patch = feature_seed(world_seed, FEATURE_ROCK_PATCH);
     w.s_forage = feature_seed(world_seed, FEATURE_FORAGE);
     w.s_detail = feature_seed(world_seed, FEATURE_DETAIL);
+    w.s_detail_fine = feature_seed(world_seed, FEATURE_DETAIL_FINE);
     w.s_flats = feature_seed(world_seed, FEATURE_FLATS);
     const uint32_t s_dang = w.s_dang, s_wx = w.s_wx, s_wz = w.s_wz;
 

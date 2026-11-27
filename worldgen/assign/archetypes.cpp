@@ -167,9 +167,14 @@ ArchetypeTable load_archetypes(const std::string& path) {
         t.detail.period  = static_cast<float>(d.number("period"));
         t.detail.octaves = static_cast<int>(d.number("octaves"));
         t.detail.gain    = static_cast<float>(d.number("gain"));
+        if (d.has("fine_period")) t.detail.fine_period = static_cast<float>(d.number("fine_period"));
+        if (d.has("fine_octaves")) t.detail.fine_octaves = static_cast<int>(d.number("fine_octaves"));
         if (!(t.detail.period > 0.0f && t.detail.octaves >= 1 && t.detail.octaves <= 8 &&
               t.detail.gain > 0.0f && t.detail.gain < 1.0f))
             throw std::runtime_error("archetypes: detail needs period > 0, octaves 1..8, 0 < gain < 1");
+        if (!(t.detail.fine_period > 0.0f && t.detail.fine_period < t.detail.period &&
+              t.detail.fine_octaves >= 1 && t.detail.fine_octaves <= 8))
+            throw std::runtime_error("archetypes: detail needs 0 < fine_period < period and fine_octaves 1..8");
     }
     // Layer 10's species, before the biomes, which refer to them by name.
     // Optional: a table without a forage block grows nothing to pick.
@@ -274,9 +279,11 @@ ArchetypeTable load_archetypes(const std::string& path) {
         b.ridge_blend    = static_cast<float>(e.number("ridge_blend"));
         b.flatness       = static_cast<float>(e.number("flatness"));
         b.detail_amp     = e.has("detail") ? static_cast<float>(e.number("detail")) : 0.0f;
+        b.detail_fine_amp = e.has("detail_fine") ? static_cast<float>(e.number("detail_fine")) : 0.0f;
         b.flat_chance    = e.has("flats") ? static_cast<float>(e.number("flats")) : 0.0f;
-        if (b.detail_amp < 0.0f || b.flat_chance < 0.0f || b.flat_chance > 1.0f)
-            throw std::runtime_error("archetypes: " + b.name + " needs detail >= 0 and flats in [0, 1]");
+        if (b.detail_amp < 0.0f || b.detail_fine_amp < 0.0f || b.flat_chance < 0.0f || b.flat_chance > 1.0f)
+            throw std::runtime_error("archetypes: " + b.name +
+                                     " needs detail >= 0, detail_fine >= 0 and flats in [0, 1]");
 
         b.overhang_strength = static_cast<float>(e.number("overhang_strength"));
         b.cave_density      = static_cast<float>(e.number("cave_density"));

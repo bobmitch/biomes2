@@ -48,7 +48,8 @@ enum FeatureId : uint32_t {
     FEATURE_REGIME_MEAN  = 19u,    // per-seed draw: regime mean
     FEATURE_REGIME_AMP   = 20u,    // per-seed draw: regime amplitude
     FEATURE_CAVES        = 21u,    // placed caves: which spot in a cell, and the shape's rolls
-    FEATURE_FORAGE       = 22u     // layer 10: which cells hold a patch of foragables, and its rolls
+    FEATURE_FORAGE       = 22u,    // layer 10: which cells hold a patch of foragables, and its rolls
+    FEATURE_DETAIL_FINE  = 23u     // layer 4's fine micro-relief, the 4-16 m band
 };
 
 inline uint64_t hash64(uint64_t x) {
@@ -339,7 +340,7 @@ struct SeedWorld {
     uint32_t s_overhang = 0, s_cave = 0, s_entrance = 0;
     uint32_t s_trees = 0, s_tree_patch = 0;
     uint32_t s_rocks = 0, s_rock_patch = 0;
-    uint32_t s_detail = 0, s_flats = 0, s_caves = 0;
+    uint32_t s_detail = 0, s_detail_fine = 0, s_flats = 0, s_caves = 0;
     uint32_t s_forage = 0;
     float    land_fraction = 0.0f;
     // Layer 0 as this seed uses it: draws made, knee applied.

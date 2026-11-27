@@ -258,13 +258,23 @@ float3 field_normal(float3 p) {
 // goes to the seabed row after the last biome, which is what turns a coast
 // sandy. Once per vertex, at mesh time: per pixel it would be a cell search
 // for every fragment of a static world.
+//
+// That share is FADED OUT WITH HEIGHT above sea level (archetypes.json
+// seabed.above_sea). The cell weights alone say nothing about altitude, and
+// since v18 made the world an archipelago a landmass is rarely a kilometre
+// across, so ocean cells sit among the four nearest almost everywhere: at the
+// spawn, 41.6 m up under a closed wood, three of the four nearest cells were
+// ocean and the ground came out 70% seabed -- birch trunks on a tidal flat.
+// A beach is low ground by definition, so height is the honest test, and it
+// costs one smoothstep. It moves the vertex WEIGHTS too, so the scans follow
+// the colour and the shore stops reaching inland in both.
 // ---------------------------------------------------------------------------
 uint pack_material(float4 m) {
     const uint4 q = uint4(round(saturate(float4(sqrt(saturate(m.rgb)), m.a)) * 255.0f));
     return q.x | (q.y << 8) | (q.z << 16) | (q.w << 24);
 }
 
-uint2 terrain_material(float x, float z, out uint3 wts) {
+uint2 terrain_material(float x, float y, float z, out uint3 wts) {
     const float wx = x + w_warp_amp * fbm(x * w_warp_freq, z * w_warp_freq, 2, 2.0f, 0.5f, w_s_wx);
     const float wz = z + w_warp_amp * fbm(x * w_warp_freq, z * w_warp_freq, 2, 2.0f, 0.5f, w_s_wz);
     int4 idx; float4 dist; float d5;
@@ -288,7 +298,22 @@ uint2 terrain_material(float x, float z, out uint3 wts) {
     }
     const float4 sea_g = g_arch[w_biome_count * kArchRows + 3];
     const float4 sea_r = g_arch[w_biome_count * kArchRows + 4];
-    const float ocean = wall > 0.0f ? saturate(1.0f - wl / wall) : 1.0f;
+    // The seabed's own row 5 (world_gpu.cpp): x full up to this height over
+    // sea level, y gone by this one. Below the water it is the seabed and
+    // the fade is 1 anyway.
+    //
+    // A stepped diagonal where the sand met the grass sent an hour into a
+    // wander term on this threshold, on the theory that a clean iso-height
+    // contour was being quantised by the mesh. It was not: `--pick` on the
+    // sand side found all FOUR nearest cells ocean, so the branch below
+    // takes the seabed whatever this fade says, and the line is where the
+    // fourth cell stops being land. See gaps.md -- that land has no biome
+    // at all, and this fade only made it visible by greening everything
+    // round it. The wander moved nothing and was removed.
+    const float4 sea_h = g_arch[w_biome_count * kArchRows + 5];
+    const float beach = 1.0f - wg_smoothstep(sea_h.x, max(sea_h.y, sea_h.x + 0.01f),
+                                             y - w_sea_level);
+    const float ocean = (wall > 0.0f ? saturate(1.0f - wl / wall) : 1.0f) * beach;
     if (wl > 0.0f) { ground /= wl; rock /= wl; } else { ground = sea_g; rock = sea_r; }
     const float land = wl > 0.0f ? (1.0f - ocean) / wl : 0.0f;
     const uint sea = min(uint(w_biome_count), kMaxMaterials - 1u);
@@ -461,7 +486,7 @@ void cs_vertices(uint3 id : SV_DispatchThreadID) {
     v.nrm = nrm;
     g_vertices[vbase + local_slot] = v;
     uint3 wts;
-    uint2 mat = terrain_material(world.x, world.z, wts);
+    uint2 mat = terrain_material(world.x, world.y, world.z, wts);
     // The flag rides in the rock roughness byte's lowest bit (mesh.hlsl
     // vs_main masks it off): 1/127 of roughness is not a visible step.
     mat.y = (mat.y & ~(1u << 24)) | (dug ? (1u << 24) : 0u);
