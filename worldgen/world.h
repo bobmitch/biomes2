@@ -47,7 +47,8 @@ enum FeatureId : uint32_t {
     FEATURE_REGIME_SCALE = 18u,    // per-seed draw: regime feature size
     FEATURE_REGIME_MEAN  = 19u,    // per-seed draw: regime mean
     FEATURE_REGIME_AMP   = 20u,    // per-seed draw: regime amplitude
-    FEATURE_CAVES        = 21u     // placed caves: which spot in a cell, and the shape's rolls
+    FEATURE_CAVES        = 21u,    // placed caves: which spot in a cell, and the shape's rolls
+    FEATURE_FORAGE       = 22u     // layer 10: which cells hold a patch of foragables, and its rolls
 };
 
 inline uint64_t hash64(uint64_t x) {
@@ -339,6 +340,7 @@ struct SeedWorld {
     uint32_t s_trees = 0, s_tree_patch = 0;
     uint32_t s_rocks = 0, s_rock_patch = 0;
     uint32_t s_detail = 0, s_flats = 0, s_caves = 0;
+    uint32_t s_forage = 0;
     float    land_fraction = 0.0f;
     // Layer 0 as this seed uses it: draws made, knee applied.
     Layer0Params l0;
@@ -599,6 +601,44 @@ bool rock_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTabl
 // Every rock of `kind` whose cell lies in [i0, i1) x [j0, j1), in cell order.
 void rocks_in_cells(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
                     int kind, int i0, int j0, int i1, int j1, std::vector<RockInstance>& out);
+
+// --- layer 10: forage -----------------------------------------------------------
+// Plants to pick (berries, so far): per species a grid of candidate cells,
+// each holding at most one PATCH of a few plants a metre or two apart. Like a
+// tree, a plant is a pure function of its cell -- forage_id names it, and a
+// save records only which plants were picked and when. What a plant gives
+// and how long it takes to grow back are the engine's.
+struct ForageInstance {
+    float    x, y, z;        // the plant's foot, on the real ground
+    float    yaw01;          // [0, 1) of a full turn
+    float    size01;         // [0, 1), the engine's to interpret
+    uint32_t id;             // forage_id(species, plant, i, j)
+    uint16_t species;        // index into ForageTable::species
+    uint8_t  plant;          // which plant of its patch, 0..3
+    uint8_t  variant;        // which of the engine's meshes, 0..255
+};
+
+inline uint32_t forage_id(int species, int plant, int i, int j) {
+    return (static_cast<uint32_t>(species & 15) << 28) | (static_cast<uint32_t>(plant & 3) << 26) |
+           ((static_cast<uint32_t>(i + 4096) & 0x1FFFu) << 13) | (static_cast<uint32_t>(j + 4096) & 0x1FFFu);
+}
+
+enum ForageReject {
+    FORAGE_KEPT = 0, FORAGE_OUTSIDE, FORAGE_NO_LAND, FORAGE_NONE, FORAGE_ROLL, FORAGE_SLOPE,
+    FORAGE_SHORE, FORAGE_RIVER, FORAGE_CLEAR, FORAGE_SURFACE,
+    FORAGE_REJECT_COUNT
+};
+
+// The patch of `species` cell (i, j) holds, appended to `out` plant by plant
+// (none: false). Plants stand on the real surface, clear of trunks, rocks,
+// rivers, flat sites and cave mouths, and a patch on a slope is kept less
+// often, down to never at the species' max_slope.
+bool forage_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
+                    int species, int i, int j, std::vector<ForageInstance>& out, int* reason = nullptr);
+
+// Every plant of `species` whose cell lies in [i0, i1) x [j0, j1), in cell order.
+void forage_in_cells(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
+                     int species, int i0, int j0, int i1, int j1, std::vector<ForageInstance>& out);
 
 // Layer 6. Positive is rock, negative is air; the sign change is the surface.
 float terrain_density(const SeedWorld& w, const WorldParams& wp,

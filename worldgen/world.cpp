@@ -826,6 +826,178 @@ void rocks_in_cells(const SeedWorld& w, const WorldParams& wp, const ArchetypeTa
     }
 }
 
+// --- layer 10: forage -------------------------------------------------------------
+// Layer 8's shape again: hashed rolls per cell, the biome blend sharpened,
+// the real surface. Every roll a plant makes is keyed by the plant and its
+// try, never by how many came before, so rejecting one plant moves no other.
+// Each species keys its rolls from its own base: 128 per species.
+bool forage_at_cell(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
+                    int species, int i, int j, std::vector<ForageInstance>& out, int* reason) {
+#define FORAGE_NO(r) do { if (reason) *reason = (r); return false; } while (0)
+    const ForageTable& ft = table.forage;
+    if (!ft.present || species < 0 || static_cast<size_t>(species) >= ft.species.size()) FORAGE_NO(FORAGE_NO_LAND);
+    const ForageSpecies& sp = ft.species[static_cast<size_t>(species)];
+    const uint32_t k0 = static_cast<uint32_t>(species) * 128u;
+
+    // The patch's middle, inside the middle 70% of the cell: a patch never
+    // reaches its neighbour's (patch_radius is under a quarter cell).
+    const float u_x = tree_unit(tree_hash(i, j, w.s_forage, k0 + 0u));
+    const float u_z = tree_unit(tree_hash(i, j, w.s_forage, k0 + 1u));
+    const float cx = (static_cast<float>(i) + 0.15f + 0.7f * u_x) * sp.cell;
+    const float cz = (static_cast<float>(j) + 0.15f + 0.7f * u_z) * sp.cell;
+    if (cx * cx + cz * cz > wp.radius * wp.radius) FORAGE_NO(FORAGE_OUTSIDE);
+
+    int   bio[4];
+    float bw[4];
+    const int nb = biome_mix(w, wp, cx, cz, bio, bw);
+    if (nb == 0) FORAGE_NO(FORAGE_NO_LAND);
+    {
+        float land = 0.0f, sharp = 0.0f;
+        float sw[4];
+        for (int k = 0; k < nb; ++k) {
+            land = land + bw[k];
+            float p = 1.0f;
+            for (int e = 0; e < ft.blend_sharpen; ++e) p = p * bw[k];
+            sw[k] = p;
+            sharp = sharp + p;
+        }
+        if (sharp > 0.0f) {
+            for (int k = 0; k < nb; ++k) bw[k] = sw[k] / sharp * land;
+        }
+    }
+    float density = 0.0f;
+    for (int k = 0; k < nb; ++k) {
+        const BiomeArchetype& a = table[bio[k]];
+        if (static_cast<size_t>(species) < a.forage.size())
+            density = density + bw[k] * a.forage[static_cast<size_t>(species)];
+    }
+    if (density <= 0.0f) FORAGE_NO(FORAGE_NONE);
+    const float u_keep = tree_unit(tree_hash(i, j, w.s_forage, k0 + 2u));
+    if (u_keep >= density) FORAGE_NO(FORAGE_ROLL);
+    // Glades and cave mouths stay clear, as they do of trees.
+    if (flat_site_at(w, cx, cz, table.flats.tree_clear + sp.patch_radius) >= 0) FORAGE_NO(FORAGE_CLEAR);
+    if (cave_mouth_near(w, cx, cz, 4.0f + sp.patch_radius)) FORAGE_NO(FORAGE_CLEAR);
+
+    // The ground under the patch: shore, then slope over the patch's width.
+    const float r = std::sqrt(cx * cx + cz * cz) / wp.radius;
+    const float h = terrain_height(w, wp, table, cx, cz, r);
+    if (h < table.sea_level + sp.shore) FORAGE_NO(FORAGE_SHORE);
+    const float e = sp.patch_radius + 1.0f;
+    const float hx = terrain_height(w, wp, table, cx + e, cz, r) - terrain_height(w, wp, table, cx - e, cz, r);
+    const float hz = terrain_height(w, wp, table, cx, cz + e, r) - terrain_height(w, wp, table, cx, cz - e, r);
+    const float slope = std::sqrt((hx * hx + hz * hz) / (4.0f * e * e));
+    // Gentler ground holds more: the keep chance is density x (1 - slope / max).
+    const float fit = 1.0f - slope / sp.max_slope;
+    if (fit <= 0.0f) FORAGE_NO(FORAGE_SLOPE);
+    if (u_keep >= density * fit) FORAGE_NO(FORAGE_SLOPE);
+    float rw = 0.0f, rd = 0.0f;
+    // Two statements: see the river exclusion in tree_at_cell.
+    const float river_d = nearest_river(w, wp, cx, cz, rw, rd);
+    if (river_d < rw + sp.patch_radius + 1.0f) FORAGE_NO(FORAGE_RIVER);
+
+    // What a plant must keep clear of, gathered once for the patch: every
+    // trunk and rock whose footprint can reach it. Trees and rocks are
+    // pinned; a plant gives way.
+    // A trunk keeps 1.4 m: its root flare spreads to about twice its radius
+    // at the ground, and its roots further (engine/trees, root_flare).
+    const float kTrunkClear = 1.4f;
+    const float reach = sp.patch_radius + kTrunkClear + 0.2f;
+    std::vector<float> clear;   // x, z, radius
+    {
+        const float tc = table.trees.cell;
+        const int ti0 = static_cast<int>(std::floor((cx - reach) / tc));
+        const int ti1 = static_cast<int>(std::floor((cx + reach) / tc));
+        const int tj0 = static_cast<int>(std::floor((cz - reach) / tc));
+        const int tj1 = static_cast<int>(std::floor((cz + reach) / tc));
+        for (int tj = tj0; tj <= tj1; ++tj) {
+            for (int ti = ti0; ti <= ti1; ++ti) {
+                TreeInstance t;
+                if (!tree_at_cell(w, wp, table, ti, tj, t)) continue;
+                clear.push_back(t.x); clear.push_back(t.z); clear.push_back(kTrunkClear);
+            }
+        }
+    }
+    if (table.rocks.present) {
+        for (int kind = 0; kind < 2; ++kind) {
+            const RockClass& rc = kind == 0 ? table.rocks.boulder : table.rocks.outcrop;
+            const float rr = reach + 0.45f * rc.size_max;
+            const int ri0 = static_cast<int>(std::floor((cx - rr) / rc.cell));
+            const int ri1 = static_cast<int>(std::floor((cx + rr) / rc.cell));
+            const int rj0 = static_cast<int>(std::floor((cz - rr) / rc.cell));
+            const int rj1 = static_cast<int>(std::floor((cz + rr) / rc.cell));
+            for (int rj = rj0; rj <= rj1; ++rj) {
+                for (int ri = ri0; ri <= ri1; ++ri) {
+                    RockInstance rk;
+                    if (!rock_at_cell(w, wp, table, kind, ri, rj, rk)) continue;
+                    clear.push_back(rk.x); clear.push_back(rk.z); clear.push_back(0.5f * rk.size + 0.2f);
+                }
+            }
+        }
+    }
+
+    const uint32_t u_n = tree_hash(i, j, w.s_forage, k0 + 3u);
+    const int span = sp.plants_max - sp.plants_min + 1;
+    const int want = sp.plants_min + static_cast<int>(tree_unit(u_n) * static_cast<float>(span));
+    const size_t first = out.size();
+    float px[4], pz[4];
+    int placed = 0;
+    for (int p = 0; p < want && p < 4; ++p) {
+        const uint32_t kp = k0 + 8u + static_cast<uint32_t>(p) * 16u;
+        // A spot in the disc by rejection: two uniforms in the square, kept
+        // inside the circle and clear of the plants already placed.
+        bool ok = false;
+        float x = cx, z = cz;
+        for (int t = 0; t < 6 && !ok; ++t) {
+            const uint32_t kt = kp + static_cast<uint32_t>(t) * 2u;
+            const float dx = 2.0f * tree_unit(tree_hash(i, j, w.s_forage, kt)) - 1.0f;
+            const float dz = 2.0f * tree_unit(tree_hash(i, j, w.s_forage, kt + 1u)) - 1.0f;
+            if (dx * dx + dz * dz > 1.0f) continue;
+            x = cx + dx * sp.patch_radius;
+            z = cz + dz * sp.patch_radius;
+            ok = true;
+            for (int q = 0; q < placed && ok; ++q) {
+                const float ex = x - px[q], ez = z - pz[q];
+                if (ex * ex + ez * ez < sp.spacing * sp.spacing) ok = false;
+            }
+            for (size_t c = 0; c + 2 < clear.size() && ok; c += 3) {
+                const float ex = x - clear[c], ez = z - clear[c + 1], lim = clear[c + 2] + 0.2f;
+                if (ex * ex + ez * ez < lim * lim) ok = false;
+            }
+        }
+        if (!ok) continue;
+        const float hp = terrain_height(w, wp, table, x, z, r);
+        if (hp < table.sea_level + sp.shore) continue;
+        float ground = 0.0f;
+        if (!real_ground(w, wp, table, x, z, hp, nb, bio, bw, ground)) continue;
+        // No roof: a plant under an overhang would grow through it.
+        if (terrain_density(w, wp, table, x, ground + 1.5f, z) > 0.0f) continue;
+        ForageInstance f;
+        f.x = x;
+        f.y = ground;
+        f.z = z;
+        f.yaw01 = tree_unit(tree_hash(i, j, w.s_forage, kp + 12u));
+        f.size01 = tree_unit(tree_hash(i, j, w.s_forage, kp + 13u));
+        f.id = forage_id(species, p, i, j);
+        f.species = static_cast<uint16_t>(species);
+        f.plant = static_cast<uint8_t>(p);
+        f.variant = static_cast<uint8_t>(tree_hash(i, j, w.s_forage, kp + 14u) & 0xFFu);
+        out.push_back(f);
+        px[placed] = x;
+        pz[placed] = z;
+        ++placed;
+    }
+    if (out.size() == first) FORAGE_NO(FORAGE_SURFACE);
+    if (reason) *reason = FORAGE_KEPT;
+    return true;
+#undef FORAGE_NO
+}
+
+void forage_in_cells(const SeedWorld& w, const WorldParams& wp, const ArchetypeTable& table,
+                     int species, int i0, int j0, int i1, int j1, std::vector<ForageInstance>& out) {
+    for (int j = j0; j < j1; ++j)
+        for (int i = i0; i < i1; ++i) forage_at_cell(w, wp, table, species, i, j, out);
+}
+
 // Signed distance to the nearest shaft wall, through the XZ bin grid. Shafts
 // are near-vertical, so binning them in the plane the way the rivers are
 // leaves very few candidates per sample.
@@ -1613,6 +1785,7 @@ SeedWorld build_world(uint64_t world_seed,
     w.s_tree_patch = feature_seed(world_seed, FEATURE_TREE_PATCH);
     w.s_rocks = feature_seed(world_seed, FEATURE_ROCKS);
     w.s_rock_patch = feature_seed(world_seed, FEATURE_ROCK_PATCH);
+    w.s_forage = feature_seed(world_seed, FEATURE_FORAGE);
     w.s_detail = feature_seed(world_seed, FEATURE_DETAIL);
     w.s_flats = feature_seed(world_seed, FEATURE_FLATS);
     const uint32_t s_dang = w.s_dang, s_wx = w.s_wx, s_wz = w.s_wz;

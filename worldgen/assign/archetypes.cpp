@@ -171,6 +171,41 @@ ArchetypeTable load_archetypes(const std::string& path) {
               t.detail.gain > 0.0f && t.detail.gain < 1.0f))
             throw std::runtime_error("archetypes: detail needs period > 0, octaves 1..8, 0 < gain < 1");
     }
+    // Layer 10's species, before the biomes, which refer to them by name.
+    // Optional: a table without a forage block grows nothing to pick.
+    if (root.has("forage")) {
+        const jsonlite::Value& fr = root.obj.at("forage");
+        ForageTable& ft = t.forage;
+        ft.present = true;
+        if (fr.has("blend_sharpen")) ft.blend_sharpen = static_cast<int>(fr.number("blend_sharpen"));
+        if (ft.blend_sharpen < 1 || ft.blend_sharpen > 16)
+            throw std::runtime_error("archetypes: forage.blend_sharpen must be 1..16");
+        const jsonlite::Array& sp = fr.array("species");
+        if (sp.size() > 15) throw std::runtime_error("archetypes: forage holds at most 15 species");
+        for (size_t k = 0; k < sp.size(); ++k) {
+            const jsonlite::Value& e = sp[k];
+            ForageSpecies s;
+            s.name = e.string("name");
+            s.cell = static_cast<float>(e.number("cell"));
+            const jsonlite::Array& pl = e.array("plants");
+            if (pl.size() != 2) throw std::runtime_error("archetypes: forage " + s.name + ".plants needs 2 entries");
+            s.plants_min   = static_cast<int>(pl[0].num);
+            s.plants_max   = static_cast<int>(pl[1].num);
+            s.patch_radius = static_cast<float>(e.number("patch_radius"));
+            s.spacing      = static_cast<float>(e.number("spacing"));
+            s.max_slope    = static_cast<float>(e.number("max_slope"));
+            s.shore        = static_cast<float>(e.number("shore"));
+            if (!(s.cell > 0.0f && s.plants_min >= 1 && s.plants_min <= s.plants_max && s.plants_max <= 4 &&
+                  s.patch_radius >= 0.0f && 2.0f * s.patch_radius < 0.5f * s.cell && s.spacing >= 0.0f &&
+                  s.max_slope > 0.0f))
+                throw std::runtime_error("archetypes: forage " + s.name +
+                                         " needs cell > 0, 1 <= plants <= 4, patch_radius under a quarter cell, max_slope > 0");
+            for (size_t m = 0; m < ft.species.size(); ++m)
+                if (ft.species[m].name == s.name) throw std::runtime_error("archetypes: forage " + s.name + " twice");
+            ft.species.push_back(s);
+        }
+    }
+
     if (root.has("caves")) {
         const jsonlite::Value& c = root.obj.at("caves");
         CaveTable& ct = t.caves;
@@ -284,6 +319,21 @@ ArchetypeTable load_archetypes(const std::string& path) {
         b.water_level_offset = static_cast<float>(e.number("water_level_offset"));
 
         b.tree_species.assign(t.trees.species.size(), 0.0f);
+        b.forage.assign(t.forage.species.size(), 0.0f);
+        if (e.has("forage")) {
+            const jsonlite::Value& fb = e.obj.at("forage");
+            for (jsonlite::Object::const_iterator it = fb.obj.begin(); it != fb.obj.end(); ++it) {
+                if (it->first.size() > 0 && it->first[0] == '_') continue;
+                size_t k = t.forage.species.size();
+                for (size_t m = 0; m < t.forage.species.size(); ++m)
+                    if (t.forage.species[m].name == it->first) { k = m; break; }
+                if (k == t.forage.species.size())
+                    throw std::runtime_error("archetypes: " + b.name + " grows unknown forage " + it->first);
+                if (it->second.num < 0.0 || it->second.num > 1.0)
+                    throw std::runtime_error("archetypes: " + b.name + " forage " + it->first + " must be in [0, 1]");
+                b.forage[k] = static_cast<float>(it->second.num);
+            }
+        }
         if (e.has("trees")) {
             const jsonlite::Value& tb = e.obj.at("trees");
             b.tree_density = static_cast<float>(tb.number("density"));
