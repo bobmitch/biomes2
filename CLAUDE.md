@@ -13,7 +13,7 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `worldgen/data/` | `archetypes.json` — the biome table. All tuning lives here. |
 | `worldgen/golden/` | Pinned seed hashes. Changes must be deliberate. |
 | `engine/trees/` | Tree meshes (procedural, made here), the CPU tile streamer over layer 8, GPU culling and impostors, felling. |
-| `engine/foliage/` | Ground cover -- grass, flowers, bushes -- generated on the GPU each frame (`foliage.hlsl`). |
+| `engine/foliage/` | Ground cover -- grass, flowers, bushes -- generated on the GPU each frame (`foliage.hlsl`), and `trample.{h,cpp}`, the map of where something has stood in it. |
 | `engine/ui/` | The UI layer: RmlUi's D3D12 renderer, input routing, and the `engine` Lua module (tunables). |
 | `game/` | What the UI and scripts ARE: `scripts/*.lua` (entry `main.lua`) and `ui/*.rml`, `*.rcss`. |
 | `engine/character/` | The player's character: the packed model, the procedural animator, the skinned draw. |
@@ -1892,16 +1892,138 @@ temp registers (X4505). One call site per field function, each in a
 `[loop]`, the probes as one loop with a little state machine.
 
 **Tufts.** A placed blade draws THREE (`tuft`, `kTuftMax` in `foliage.hlsl`;
-the index ranges hold three strips each): the placed one and two more 2.5-7
-cm off its root, each with its own angle, 65-105% of its height, leaning
-out -- one placement reads as a clump. Blades are also 1.4x as wide. The
-spawn meadow went from stems over pale ground to a sward. `--grass-tuft
-1|2|3`, `--grass-width <k>`, `--grass-density <blades/m^2>` (96) for A/B.
+the index ranges hold three strips each): the placed one and two more 2-13
+cm off its root (skewed small by u^2 -- every clump the same size across is
+as regular as a grid of them), each with its own angle, 65-105% of its
+height, leaning out -- one placement reads as a clump. Blades are also 1.4x
+as wide. The spawn meadow went from stems over pale ground to a sward.
+`--grass-tuft 1|2|3`, `--grass-width <k>`, `--grass-density <blades/m^2>`
+(96) and `--grass-distance <m>` (150) for A/B, **and all four are player
+options** (Graphics, saved: "Grass density", "Grass thickness", "Blades
+per clump", "Grass draw distance").
+
+**Density is the cost; distance is not.** `--walk 15 --uncapped` at
+2560 x 1440 at the spawn: density 32 / 96 / 192 is 5.87 / 6.04 / 6.28 ms
+against 5.68 with `--no-foliage`, so the slider spans more than the whole
+of the default's 0.36 ms -- the near list holds one entry per blade
+INSTANCE and each draws `tuft` of them. The distance over its whole range,
+50 / 150 / 300 m, is 6.04 / 6.05 / 6.08: blades thin as 1/d^2 and the far
+ones are 2-segment and sub-pixel, so reach buys resident tiles (88 / 424 /
+1388 of the 1536 pool) and almost no frame time. It is a look knob here;
+on a smaller card it is not.
 Cost walking at 2560 x 1440: all ground cover ~1.0 ms (5.19 with
 `--no-foliage`, 6.23 before); tufts of 3 +0.26, with the width +0.32,
 tufts of 2 with the width +0.18. Tinting the terrain under grass toward
 the sward (a 256 m grass map from the cells, read by the terrain shader)
 was built and judged not to look right; left for a later quality pass.
+
+**The draw distance is ONE number and the near distances are CLAMPED, not
+scaled** (`FoliageSettings::set_range`): card_far is the slider, blade_range
+is min(60, m - 10) and card_near min(48, blade_range - 12). Where blades
+hand over to cards is tuned, not a ratio of the reach -- `cs_emit` thins
+them as (near_radius / d)^2 and widens each by the square root, and the
+widen caps at 4, so past ~40 m they stop covering the ground, which is what
+card_near 48 is for. Scaled proportionally (the first version, built and
+shot) 300 m stretched blades to 120 m where they are far too sparse, and
+50 m put the crossed cards at 16 m, where they read as dark Xs on the
+ground. Clamped, the near field is the shipped one from 70 m up -- 150 and
+300 m draw the same 7726 far blades and differ only in cards (4556 against
+10256) -- and under that the bands compress, the cross-fade keeping 12 m
+and the cards' own band 10. Setting `blade_range` alone is what the one
+number exists to prevent: at 30 it leaves the 30-48 m ring bare. Bushes
+reach with the rest (130 m of the shipped 150), and the slot pool is sized
+for the slider's top rather than the default (kPool 768 -> 1536, ~14 MB).
+
+**Things standing in the ground cover push it aside, and grass stays laid
+over** -- the trample map, `engine/foliage/trample.{h,cpp}`,
+`shaders/trample.hlsl`. `--trample x0 z0 x1 z1 r s` presses a path for a
+still, `--no-trample` is the A/B.
+
+- **The state lives in the WORLD, not in the blade.** A blade is a pure
+  function of its cell and nothing about one is stored, so the memory of
+  being trodden on is a texture: 2048^2 of RGBA16F at 10 cm texels, 204.8 m
+  across the camera, 33.5 MB. Each texel holds a push vector in the wind's
+  own measure -- a tip displacement as a fraction of a blade's height, ~1
+  being lying over -- so `vs_blade` bends, shortens and leans by it without
+  knowing which pushed it.
+- **TOROIDAL, which costs nothing on the reading side.** World texel w lives
+  at w mod N; N is a power of two, so the wrap is a mask in the kernels and
+  the read is `frac(world.xz / kMapMetres)` through a WRAP static sampler --
+  no origin is passed to a shader at all. Following the camera clears only
+  the strips that scrolled in. The near field's occupancy volume does the
+  same thing for the same reason.
+- **The push IS the flatten, read at age zero.** `cs_splat` writes the same
+  vector into both pairs of channels and `cs_decay` fades them at different
+  speeds: the fast pair (xy, tau 0.12 s) is what a bush reads, so it is
+  shoved aside and back upright a moment later; the slow pair (zw, tau 18 s)
+  is what grass and the clump cards read, so a trail stays. Something
+  standing still re-stamps its texel every frame and both stay full, which
+  is the "pushed while on them" case with no special handling. **Two decay
+  rates, not two systems.**
+- **The recovery time is bounded by the map, not by taste.** Anything that
+  scrolls past the edge is forgotten, so a trail that outlived the window
+  would pop. 102 m from the camera to the edge is ~20 s at a jog, which is
+  what tau 18 s sits under. Longer trails need saved world-space state,
+  which is a different and much larger feature.
+- **It rides in `Blade`'s spare word.** `cs_emit` samples the map at each
+  blade's root and packs the push into `pad` as two snorm16 -- `b.a`'s 32
+  bits were all spoken for and `pad` had none, which is exactly the room
+  needed -- so no list grew, the vertex shaders only unpack, and clump cards
+  and bushes get it free off the same struct. The push is a function of the
+  root, not of where you are up the blade.
+- **A stamp is a swept CAPSULE, not a disc.** The player's is last frame's
+  feet to this frame's. Stamped as a disc, a log at 10 m/s leaves 16 cm gaps
+  at 60 Hz -- a dotted line at 10 cm texels. The rain draws a streak as the
+  path over 45 ms for the same reason. A capsule longer than the splat's
+  fixed 6.4 m footprint (a felled log is ten metres) is cut into pieces on
+  the CPU, so the kernel keeps one dispatch per stamp.
+- **Two stamps can race for a texel** -- two feet 20 cm apart -- and the
+  answer differs by less than a pixel either way, so it is left alone
+  rather than paid for with atomics on a packed format.
+- **Cost: 0.025 ms** at 2560 x 1440. The map's own passes are 0.012 ms a
+  frame (max 0.082, the frame in eight the fade runs: a sweep of 4.2 M
+  texels is 34 MB read and written, which is more than the whole of the
+  ground cover if it ran every frame), and the read in `cs_emit` takes the
+  foliage pass 0.280 -> 0.293. Walking at 1440p 6.10 ms with and without; a
+  900 m flight at 60 m/s holds 0 holes, which is the toroidal scroll under
+  the worst movement there is.
+- **A still can show no trail**, because a trail is history and nothing
+  walks during one: `--trample` HOLDS a path, re-pressed every frame, the
+  way `--dig-row` digs before it shoots.
+- **Not done**: creatures and resting logs do not stamp yet (the player
+  does); the forage plants read nothing (they are a different renderer);
+  the fade is a plain exponential, so grass starts recovering at once
+  rather than holding and then springing back; nothing is saved, by choice.
+
+**Half of every meadow was drawn BLACK, and it read as "the grass is laid
+out in a grid".** `vs_blade` tilts each blade's normal up by 0.9 so a sward
+is lit as a surface rather than as a thicket of vertical strips each in its
+own shade; `ps_blade` then turned the normal to face the eye with
+`if (!front) n = -n`, which negated that tilt as well and pointed it DOWN on
+every blade the camera sees from behind. No sun, no sky: at 11:00 in the
+spawn meadow about half the blades came out near black, in the 3-blade fans
+they are placed in, which is exactly what rows of dark clumps look like.
+`n.y = abs(n.y)` after the flip -- the length is kept, so nothing is
+renormalised. Walking cost unchanged (6.02 / 6.05 ms against 6.05 / 6.05 at
+2560 x 1440). It was found by looking at a still, not by a metric; it had
+been there since the blades were written.
+
+**The placement is NOT a grid, and the obvious fix makes one.**
+`tools/profile/scatter.py` is the instrument -- `tiling.py` answers a
+different question (does the same CONTENT repeat, which a scatter never
+does, so it reads ~0 either way and cannot see this at all). From a
+straight-down still it reports the power on the lattice's axes against a
+ring of the same radius: 1 is nothing lined up. The shipped scatter --
+`ceil(want)` blades per 1 m cell, each uniform within its OWN cell -- reads
+3.91 on the axes against 3.70 on the diagonals, which is nothing. **A
+jitter of exactly one cell cancels at the lattice frequency** (the cell's
+box transform is sinc(1) = 0), so an equal count per cell is a blue-noise
+scatter, not a grid. Two "fixes" were built and measured and are gone:
+spilling the blades over 1.5 cells so neighbours overlap breaks that
+cancellation and reads **21.75**; a per-cell random density multiplier is a
+1 m square wave in its own right and reads **17.26**. What is left of the
+quilt under a sward is AO and the contact shadow pooling under each clump
+(`--no-ao --no-contact` removes it), which is the light being right.
 
 **Bushes have stems now** (`vs_bush`, 24 quads: six stems, eighteen leaf
 cards). They were fourteen cards round the inside of a ball -- a few

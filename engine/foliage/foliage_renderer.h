@@ -38,9 +38,39 @@ struct FoliageSettings {
     // z; mean speed m/s; gustiness. And the metres the air has moved.
     float wind_v[4] = {0.94f, 0.33f, 4.0f, 0.4f};
     float wind_drift[2] = {0.0f, 0.0f};
+    // The trample map's reach in metres (trample.h kMapMetres), 0 for none.
+    // `cs_emit` reads the push there and packs it into each Blade, so blades,
+    // clump cards and bushes all get it off the one struct and the vertex
+    // shaders need only unpack: the push is a function of the root, not of
+    // where you are up the blade. Blades and cards take the map's SLOW pair
+    // and stay laid over; bushes take the FAST one and spring back.
+    float trample_m = 0.0f;
     float debug = 0.0f;          // 1 tints by kind
     float blade_width = 1.4f;    // a multiplier on every blade's width (--grass-width)
     float tuft = 3.0f;           // blades per placed blade, fanned from one root, 1-3 (--grass-tuft)
+
+    // How far ground cover draws at all, in metres: ONE number moves the
+    // chain, so the blade-to-card cross-fade cannot open a band with
+    // neither in it (set `blade_range` alone to 30 and the 30-48 m ring is
+    // bare ground). `FoliageRenderer::update` keeps tiles out to card_far +
+    // 24 m, and the slot pool is sized for this one's top (see kPool).
+    //
+    // The two near distances are CLAMPED, not scaled. Where blades hand over
+    // to cards is tuned, not a ratio of the reach: `cs_emit` thins them as
+    // (near_radius / d)^2 and widens each by the square root, and the widen
+    // caps at 4 -- so past ~40 m they stop covering the ground, which is
+    // what card_near 48 is for. Scaled, 300 m stretched blades to 120 m
+    // where they are far too sparse, and 50 m put the crossed cards at 16 m,
+    // where they read as dark Xs on the ground. Clamped, the near field is
+    // the shipped one at every setting from 70 m up, and only the cards'
+    // reach moves; under that the bands compress, the cross-fade keeping
+    // 12 m and the cards' own band 10.
+    void set_range(float m) {
+        card_far = m;
+        blade_range = m - 10.0f < 60.0f ? m - 10.0f : 60.0f;
+        card_near = blade_range - 12.0f < 48.0f ? blade_range - 12.0f : 48.0f;
+    }
+    float range() const { return card_far; }
 };
 
 struct FoliageFrameInputs {
@@ -50,6 +80,8 @@ struct FoliageFrameInputs {
     float far_plane;
     D3D12_GPU_VIRTUAL_ADDRESS shadow_cb = 0;
     D3D12_GPU_DESCRIPTOR_HANDLE shadow_table = {};
+    // The trample map's SRV (TrampleMap), read by cs_emit.
+    D3D12_GPU_DESCRIPTOR_HANDLE trample_table = {};
 };
 
 class FoliageRenderer {

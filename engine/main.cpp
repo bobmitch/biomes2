@@ -202,8 +202,28 @@ void update_character(float dt, float t, float vx, float vz) {
     g_anim.update(in);
 }
 
+// How wide the player lays the ground cover over, and how far -- a tip
+// displacement as a fraction of a blade's height, where ~1 is lying over.
+// Both were tuned on stills by the analytic spike this replaced.
+const float kPushRadius = 0.5f;
+const float kPushStrength = 1.4f;
+bool g_trample = true;           // --no-trample, for A/B
+float g_last_feet[2] = {0.0f, 0.0f};
+bool  g_have_last_feet = false;
+
 // Hand the renderer this frame's pose (or nothing), and the torch's hand.
 void publish_character() {
+    // What the player is standing in, pressed into the trample map. A
+    // capsule from last frame's feet to this frame's, so a sprint leaves a
+    // continuous trail rather than a dotted line of stamps.
+    if (g_walk && g_trample) {
+        const float x0 = g_have_last_feet ? g_last_feet[0] : g_feet[0];
+        const float z0 = g_have_last_feet ? g_last_feet[1] : g_feet[2];
+        g_renderer.trample().add(x0, z0, g_feet[0], g_feet[2], kPushRadius, kPushStrength);
+    }
+    g_last_feet[0] = g_feet[0];
+    g_last_feet[1] = g_feet[2];
+    g_have_last_feet = true;
     const bool show = g_walk && g_anim.ready() && !first_person();
     if (show) g_anim.skin(g_feet, g_char_yaw, g_bones);
     g_renderer.character().set_pose(g_bones, show);
@@ -1485,6 +1505,26 @@ void register_tunables() {
     toggle("hfgi", G, "Terrain bounce light", [&] { return R.hfgi(); }, [&](bool b) { R.set_hfgi(b); });
     toggle("canopy", G, "Canopy shade", [&] { return R.canopy(); }, [&](bool b) { R.set_canopy(b); });
     toggle("foliage", G, "Grass and flowers", [&] { return R.foliage_on(); }, [&](bool b) { R.set_foliage(b); });
+    // The sward, live: what cs_emit places per square metre inside
+    // near_radius, how wide vs_blade draws a blade, and how many blades one
+    // placement fans into. Density is the cost: the near list is per blade
+    // INSTANCE, and each instance draws `tuft` of them.
+    range("grass_density", G, "Grass density", 16.0f, 192.0f, 4.0f, "/m2",
+          [&] { return R.foliage_settings().max_blades; },
+          [&](float v) { R.foliage_settings().max_blades = v; });
+    range("grass_width", G, "Grass thickness", 0.5f, 3.0f, 0.05f, "x",
+          [&] { return R.foliage_settings().blade_width; },
+          [&](float v) { R.foliage_settings().blade_width = v; });
+    range("grass_tuft", G, "Blades per clump", 1.0f, 3.0f, 1.0f, "",
+          [&] { return R.foliage_settings().tuft; },
+          [&](float v) { R.foliage_settings().tuft = std::floor(v + 0.5f); });
+    // Where ground cover stops, clump cards and bushes included -- the whole
+    // chain in proportion (FoliageSettings::set_range), as "Tree draw
+    // distance" is the trees' reach with their impostors in it. The top is
+    // what the tile pool holds.
+    range("grass_distance", G, "Grass draw distance", 50.0f, 300.0f, 10.0f, "m",
+          [&] { return R.foliage_settings().range(); },
+          [&](float v) { R.foliage_settings().set_range(v); });
     toggle("trees", G, "Trees", [&] { return R.trees_on(); }, [&](bool b) { R.set_trees(b); });
     // The player's Brightness: a display gamma (dark vision's last step).
     range("brightness", G, "Brightness", 0.6f, 1.8f, 0.05f, "", [&] { return R.dark_vision().brightness; },
@@ -5152,6 +5192,29 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (gt != std::string::npos) g_renderer.foliage_settings().tuft = float(std::atof(c2.c_str() + gt + 13));
             const size_t gd = c2.find("--grass-density ");
             if (gd != std::string::npos) g_renderer.foliage_settings().max_blades = float(std::atof(c2.c_str() + gd + 16));
+            // "--grass-dist" would also match inside "--grass-distance"; the
+            // two full names diverge at the 10th character, so neither finds
+            // the other.
+            const size_t gr = c2.find("--grass-distance ");
+            if (gr != std::string::npos) g_renderer.foliage_settings().set_range(float(std::atof(c2.c_str() + gr + 17)));
+            // --grass-push <x> <z> <radius m> <strength>: one thing standing
+            // in the grass, for a still. A trail is history and no stray
+            // camera can show one, so the spike's curve is judged on a
+            // capsule the command line places -- the same reason --dig-row
+            // digs before it shoots.
+            if (c2.find("--no-trample") != std::string::npos) {
+                g_trample = false;
+                g_renderer.foliage_settings().trample_m = 0.0f;
+            }
+            // --trample <x0> <z0> <x1> <z1> <radius m> <strength>: a path
+            // held down for a still. Nothing walks during one.
+            const size_t tp = c2.find("--trample ");
+            if (tp != std::string::npos) {
+                float v[6] = {0, 0, 0, 0, 0, 0};
+                if (std::sscanf(c2.c_str() + tp + 10, "%f %f %f %f %f %f",
+                                &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6)
+                    g_renderer.trample().hold(v[0], v[1], v[2], v[3], v[4], v[5]);
+            }
         }
         // Where LOD 0 hands over to LOD 1, in metres: 0 shows LOD 1 up close.
         const size_t tl = c2.find("--tree-lod0");

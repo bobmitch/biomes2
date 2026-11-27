@@ -18,7 +18,12 @@ namespace engine {
 namespace {
 
 const char* kShader = "engine/render/shaders/foliage.hlsl";
-const UINT kPool = 768;              // tile slots
+// Tile slots. `update` wants pi (card_far + 24 + 11) ^ 2 / 256 of them, so
+// the shipped 150 m reach takes ~424 and the option's top (300 m) ~1377.
+// A tile is 7 KB of pool and 4 KB of edit tops per frame in flight, so the
+// headroom for the slider costs ~14 MB, and an unused slot costs one slot
+// read in cs_emit -- it returns before it touches the pool.
+const UINT kPool = 1536;
 const UINT kTileCells = 256;         // 16 x 16 cells of 1 m
 const UINT kCellBytes = 28;
 const UINT kEditTops = 1024;         // 32 x 32 half-metre columns a tile
@@ -27,7 +32,8 @@ const UINT kCaps[4] = {400000u, 400000u, 160000u, 40000u};
 const UINT kBakePerFrame = 24;
 const float kTileM = 16.0f;
 
-// Matches cbuffer FoliageFrame: 272 bytes.
+// Matches cbuffer FoliageFrame (the static_assert below is the real check;
+// the byte count this comment used to carry had been stale for a while).
 struct FoliageFrame {
     float view_proj[16];
     float cam_pos[3];   float time;
@@ -44,8 +50,9 @@ struct FoliageFrame {
     float blade_width;  float tuft;
     float wind_v[4];
     float wind_drift[2]; float wind_pad[2];
+    float trample_m;     float trample_pad[3];
 };
-static_assert(sizeof(FoliageFrame) == 304, "FoliageFrame must match foliage.hlsl");
+static_assert(sizeof(FoliageFrame) == 320, "FoliageFrame must match foliage.hlsl");
 
 std::string hr_text(const char* what, HRESULT hr) {
     char buf[256];
@@ -155,7 +162,7 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
     {
         // Compute: frame CB, world CB, the ten world buffers (u11..u20, as the
         // mesher and the sea bind them), then this pass's own. 46 DWORDs.
-        D3D12_ROOT_PARAMETER p[23] = {};
+        D3D12_ROOT_PARAMETER p[24] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 1;
         for (int k = 0; k < 10; ++k) {
@@ -171,9 +178,27 @@ bool FoliageRenderer::init(ID3D12Device* device, const WorldGpu* world, const ch
             p[16 + k].Descriptor.ShaderRegister = 1 + k;
         }
         p[22].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[22].Descriptor.ShaderRegister = 3;   // edit tops
-        for (int k = 0; k < 23; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        // The trample map (t4), a table because it is a texture, and a static
+        // sampler to read it with -- WRAP, which is what makes the toroidal
+        // store a plain frac(world / map_m) on this side. +1 DWORD, 47 of 64.
+        D3D12_DESCRIPTOR_RANGE tr = {};
+        tr.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        tr.NumDescriptors = 1;
+        tr.BaseShaderRegister = 4;
+        p[23].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[23].DescriptorTable.NumDescriptorRanges = 1;
+        p[23].DescriptorTable.pDescriptorRanges = &tr;
+        for (int k = 0; k < 24; ++k) p[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_STATIC_SAMPLER_DESC ss = {};
+        ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        ss.MaxLOD = D3D12_FLOAT32_MAX;
+        ss.ShaderRegister = 0;
+        ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 23;
+        rsd.NumStaticSamplers = 1;
+        rsd.pStaticSamplers = &ss;
+        rsd.NumParameters = 24;
         rsd.pParameters = p;
         ComPtr<ID3DBlob> sig, err;
         HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
@@ -544,6 +569,7 @@ void FoliageRenderer::record(ID3D12GraphicsCommandList* cmd, UINT frame, const F
     fr.grass_freq = 1.0f / 45.0f;
     fr.near_radius = s.near_radius;
     fr.debug = s.debug;
+    fr.trample_m = s.trample_m;
     std::memcpy(cb_cpu_[f], &fr, sizeof fr);
     const D3D12_GPU_VIRTUAL_ADDRESS cb = cb_[f]->GetGPUVirtualAddress();
 
@@ -561,6 +587,7 @@ void FoliageRenderer::record(ID3D12GraphicsCommandList* cmd, UINT frame, const F
     cmd->SetComputeRootShaderResourceView(14, bake_up_[f]->GetGPUVirtualAddress());
     cmd->SetComputeRootShaderResourceView(15, ground_->GetGPUVirtualAddress());
     cmd->SetComputeRootShaderResourceView(22, edit_up_[f]->GetGPUVirtualAddress());
+    if (in.trample_table.ptr) cmd->SetComputeRootDescriptorTable(23, in.trample_table);
     for (int l = 0; l < 4; ++l) cmd->SetComputeRootUnorderedAccessView(16 + l, lists_[l]->GetGPUVirtualAddress());
     cmd->SetComputeRootUnorderedAccessView(20, counters_->GetGPUVirtualAddress());
     cmd->SetComputeRootUnorderedAccessView(21, args_->GetGPUVirtualAddress());
