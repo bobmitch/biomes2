@@ -374,13 +374,20 @@ Last gathered: 2026-11-21, after the exploration fog; creatures added
 
 ## Creatures (ADR-007)
 
-- **Phases 1-2 are built** (the player's sound and sight; zones, spawning,
-  freezing, saving, drawing). Creatures stand still: the navmesh, movement
-  and the mimic's behaviour are phases 3-5. [Creatures and stealth]
-- **Spawn ground is the 2.5D generated height**: edits, overhangs and
-  trunks or rocks past physics' 40 m are not seen, and a creature dug
-  under does not settle. Phase 3's navmesh replaces the test.
-  [Creatures and stealth]
+- **Phases 1-3 are built** (the player's sound and sight; zones, spawning,
+  freezing, saving, drawing; the navmesh). Creatures stand still: movement
+  and the mimic's behaviour are phases 4-5. [Creatures and stealth]
+- **Spawn ground falls back to the 2.5D generated height** where no nav
+  tile is in yet (a fresh start, the edge of the area), and a creature dug
+  under does not settle. [Creatures and stealth]
+- **Navmesh**: only the human size class is built; no in-engine overlay
+  (the report's map only); a tile costs ~335 ms of a worker, all field
+  evaluations -- sampling at 0.25 m for a finer mesh would cost 4x, and
+  interpolating the 0.5 m lattice instead is the cheaper road; crowns,
+  bushes and grass do not block; a flooded cave or a pit below sea level
+  gets no swim surface (only a column's top floor does); a tree that
+  settles into a dig is stamped where its tile last saw it; overhang and
+  cave floors are in the spans but no test walks one. [Creatures and stealth]
 - **A moving creature does not redraw a cached light face**: it is drawn
   into faces redrawn anyway, so a torch's shadow of a creature that has
   walked can lag up to 240 frames. Only the player's body has the

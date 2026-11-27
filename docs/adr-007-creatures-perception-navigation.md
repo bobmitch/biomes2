@@ -1,7 +1,8 @@
 # ADR-007: Creatures -- zones, spawning, perception and navigation
 
 Status: **accepted**, 2026-11-27. Phases 1 (the player's sound and sight)
-and 2 (zones, spawning, freezing, saving, drawing) are built -- CLAUDE.md,
+2 (zones, spawning, freezing, saving, drawing) and 3 (the navmesh) are
+built -- CLAUDE.md,
 "Creatures and stealth", has what was measured; the rest is the plan. Gameplay follows Valheim by default,
 as the survival rules do; every number below is data, in
 `game/data/creatures.json` or `game/data/items.json`, never in the golden
@@ -188,10 +189,17 @@ built in the engine block like Jolt; worldgen and validate never see it.
   a cylinder of the trunk's radius + the root flare) and every rock
   (layer 9, its footprint) in the tile, straight from their pure
   functions -- not only those within physics' 40 m.
-- **Fallen logs** are Detour TileCache box obstacles (centre, half
-  extents, yaw: a lying log is a yawed box) once their Jolt body sleeps,
-  removed if it wakes; while one rolls, creatures steer round it locally.
-  Creatures do not push or clear logs, and do not dig (for now).
+- **Fallen logs** are stamped into the tile as a capsule once their Jolt
+  body sleeps, and the tile is rebuilt (~350 ms on a worker), as a dig's
+  are; a log that wakes rebuilds it again without. TileCache's obstacles
+  were the plan, but they need a second, layered build pipeline, and
+  rebuilding the one tile is cheap enough at the rate trees are felled.
+  While one rolls, creatures steer round it locally. Creatures do not push
+  or clear logs, and do not dig (for now).
+- **The cells are 0.5 m, coarser than the agent (0.4 m)**, so eroding by
+  one cell is not enough near thin obstacles: every obstacle is stamped
+  inflated by a whole cell (measured: at least 0.46 m between any trunk's
+  bark and the mesh).
 - **Water**: a column whose walkable floor is more than `wade_depth`
   (1.0 m) under sea level gets a synthetic walkable span AT sea level,
   area SWIM; shallower, the floor is area WADE. A query filter per

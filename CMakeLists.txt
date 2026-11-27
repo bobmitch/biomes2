@@ -106,7 +106,7 @@ if(WIN32 AND EXISTS ${PROJECT_SOURCE_DIR}/engine/main.cpp)
   # Every submodule the engine links. Missing any one skips the engine, for
   # the reason above: the gate must never depend on them.
   set(_missing "")
-  foreach(_sub JoltPhysics/Build lua RmlUi freetype)
+  foreach(_sub JoltPhysics/Build lua RmlUi freetype recastnavigation)
     if(NOT EXISTS ${PROJECT_SOURCE_DIR}/third_party/${_sub}/CMakeLists.txt AND
        NOT EXISTS ${PROJECT_SOURCE_DIR}/third_party/${_sub}/lua.h)
       list(APPEND _missing ${_sub})
@@ -195,6 +195,21 @@ if(BIOMES2_ENGINE)
   set(RMLUI_SAMPLES OFF CACHE BOOL "" FORCE)
   add_subdirectory(third_party/RmlUi EXCLUDE_FROM_ALL)
 
+  # Recast/Detour (zlib licence; ADR-007's navmesh): the sources straight in,
+  # no demo, no install. DetourCrowd is for moving creatures (phase 4).
+  file(GLOB _recast_src
+    ${PROJECT_SOURCE_DIR}/third_party/recastnavigation/Recast/Source/*.cpp
+    ${PROJECT_SOURCE_DIR}/third_party/recastnavigation/Detour/Source/*.cpp
+    ${PROJECT_SOURCE_DIR}/third_party/recastnavigation/DetourCrowd/Source/*.cpp)
+  add_library(biomes2_recast STATIC ${_recast_src})
+  target_include_directories(biomes2_recast PUBLIC
+    ${PROJECT_SOURCE_DIR}/third_party/recastnavigation/Recast/Include
+    ${PROJECT_SOURCE_DIR}/third_party/recastnavigation/Detour/Include
+    ${PROJECT_SOURCE_DIR}/third_party/recastnavigation/DetourCrowd/Include)
+  if(MSVC)
+    target_compile_options(biomes2_recast PRIVATE /W0)
+  endif()
+
   add_executable(engine WIN32
     engine/main.cpp
     engine/render/renderer.cpp
@@ -234,6 +249,8 @@ if(BIOMES2_ENGINE)
     engine/player/stealth.cpp
     engine/mobs/creature_table.cpp
     engine/mobs/creatures.cpp
+    engine/nav/nav_tile.cpp
+    engine/nav/nav_world.cpp
     engine/player/icons.cpp
     engine/character/character_model.cpp
     engine/character/character_renderer.cpp
@@ -243,7 +260,7 @@ if(BIOMES2_ENGINE)
     third_party/RmlUi/Backends/RmlUi_Platform_Win32.cpp)
   target_include_directories(engine PRIVATE ${PROJECT_SOURCE_DIR}
                              ${PROJECT_SOURCE_DIR}/third_party/RmlUi/Backends)
-  target_link_libraries(engine PRIVATE RmlUi::RmlUi imm32)
+  target_link_libraries(engine PRIVATE RmlUi::RmlUi imm32 biomes2_recast)
   # M1: the engine links the generator now. Track B was built against the
   # trivial field precisely so a pipeline bug could never be confused with a
   # worldgen bug; that separation ends here, which is what the milestone is.

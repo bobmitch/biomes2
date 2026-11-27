@@ -204,7 +204,42 @@ void TreeFelling::fell(const Log& seed, const float away[3], bool asleep) {
     const float spin[3] = {away[2] * 0.35f, 0.0f, -away[0] * 0.35f};
     lg.body = physics_->add_log(lg.pos, lg.rot, (std::fmax)(r, 0.04f), y0, (std::fmax)(y1, y0 + 0.5f),
                                 m.crown_centre * s, m.crown_r * s * 0.85f, spin, asleep);
+    lg.r = (std::fmax)(r, 0.04f);
+    lg.y0 = y0;
+    lg.y1 = (std::fmax)(y1, y0 + 0.5f);
+    lg.stump_top = kCutHeight * s;
     logs_[lg.id] = lg;
+}
+
+void TreeFelling::shapes(std::vector<Shape>& out) const {
+    out.clear();
+    for (const auto& it : logs_) {
+        const Log& l = it.second;
+        Shape st;
+        st.id = l.id;
+        st.capsule = false;
+        st.a[0] = l.base[0]; st.a[1] = l.base[1] - 0.5f; st.a[2] = l.base[2];
+        st.b[0] = l.base[0]; st.b[1] = l.base[1] + l.stump_top; st.b[2] = l.base[2];
+        st.r = l.r / 0.85f;
+        out.push_back(st);
+        float pos[3], rot[4];
+        bool active = false;
+        if (!physics_->body_pose(l.body, pos, rot, active)) continue;
+        // The capsule's axis is the body's local y from y0 to y1: rotate it.
+        const float x = rot[0], y = rot[1], z = rot[2], w = rot[3];
+        const float ax = 2.0f * (x * y - w * z), ay = 1.0f - 2.0f * (x * x + z * z), az = 2.0f * (y * z + w * x);
+        Shape lg;
+        lg.id = l.id;
+        lg.capsule = true;
+        for (int k = 0; k < 3; ++k) {
+            const float axis = k == 0 ? ax : (k == 1 ? ay : az);
+            lg.a[k] = pos[k] + axis * l.y0;
+            lg.b[k] = pos[k] + axis * l.y1;
+        }
+        lg.r = l.r;
+        lg.resting = !active;
+        out.push_back(lg);
+    }
 }
 
 bool TreeFelling::log_pose(uint32_t id, float pos[3], float rot[4], bool& active) const {

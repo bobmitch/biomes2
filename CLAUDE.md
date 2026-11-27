@@ -21,6 +21,7 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `engine/rocks/` | Layer 9's rocks: procedural meshes, the CPU tile streamer, instanced drawing on the terrain's root signature, static colliders. |
 | `engine/props/` | Things to pick up: the caves' glowing mushrooms (`glow_mushrooms.h`), and layer 10's forage plants (`forage.h`): streaming in 64 m zones, picks and regrowth, drawing, picking with E. |
 | `engine/player/` | The player's survival: items (`items.h`), the 8 x 4 inventory, health / stamina / food / the game clock (`survival.h`), item icons painted from data (`icons.h`), the player as heard and seen (`stealth.h`). No GPU. |
+| `engine/nav/` | The navmesh (ADR-007): `nav_tile.h` builds one Recast/Detour tile from the field's solid spans, the water and the obstacles; `nav_world.h` streams tiles round the player on workers and answers queries. Recast/Detour is the `third_party/recastnavigation` submodule (v1.6.0, zlib). |
 | `engine/mobs/` | Creatures (ADR-007, being built): `perception.h`, the arithmetic of hearing (dB) and sight (cone, range, light); `creature_table.h` (`game/data/creatures.json`); `creatures.h`, the zones that spawn, freeze, save and thaw them. No GPU. |
 | `game/data/` | `items.json`: every item, the player's numbers, the clock, the start inventory. Gameplay data, outside the hash. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
@@ -123,6 +124,7 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
 `--band-report`, `--sea-report`, `--swim`, `--dig-water`, `--blend-report`, `--tab-test`,
 `--mob-test` (creatures: spawning, freezing, saving, thawing; see Creatures and stealth),
+`--nav-report` (the navmesh round the spawn: tiles, coverage, trunks, paths, a swim, a log, a dig, and a map),
 `--clock-jump` (with `--shot`: the light under the ground after the clock
 jumps or runs, `build/time_jump.txt`; see The near field),
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
@@ -1373,7 +1375,7 @@ distance, behaviour in Lua. Data in `game/data/creatures.json` (to come)
 and items.json's `stealth` block; never in the golden hash. **Phases 1
 (the player's side) and 2 (zones, spawning, freezing, saving, drawing) are
 built; creatures stand still until the navmesh (phase 3) and movement
-(phase 4).**
+(phase 4). Phase 3, the navmesh, is built.**
 
 - **Crouch**: Left Ctrl toggles it on land (in the water Ctrl still dives
   while held; Right Ctrl does nothing); 1.4 m/s (`stealth.crouch_speed`),
@@ -1438,6 +1440,44 @@ built; creatures stand still until the navmesh (phase 3) and movement
   TINT in the block's last record (`kTintBone` 254), in the main pass,
   every cascade, and every light face being redrawn within 2 m of one. An
   animator each (idle for now), made when first drawn.
+- **The navmesh** (`engine/nav/`): one Recast/Detour tile per 64 m zone
+  within 192 m of the player (`kNavRadius`), built on three workers,
+  dropped past 288 m. **Built from the field, not from triangles**: per
+  0.5 m column (cells CENTRED on the edit lattice) the density is sampled
+  at the lattice points down a band round the 2.5D height -- padded by
+  layer 6's overhang reach, down to any placed cave, over any edited brick
+  -- and every run of rock is handed to `rcAddSpan`, its ends where the
+  density crosses zero. Then Recast's pipeline (agent 0.4 m, 1.8 m, climb
+  0.5 m: 45 degrees over a cell). The main thread GATHERS the trunks
+  (radius widened 40% of the root flare), rocks, stumps, resting logs and
+  a copy of the edited bricks; the worker never touches engine state.
+  Obstacles are stamped as solid spans inflated by a whole cell. Areas:
+  ground; WADE where the floor is within 1 m under sea level; deeper the
+  floor is not walkable and a thin span at sea level - 0.5 m is SWIM (half
+  a metre down so the deepest wading floor connects). Flags walk / wade /
+  swim; a query includes what the creature can use, swimming costs 3x.
+- **Rebuilds**: a dig (`nav_invalidate_around`), a log coming to rest or
+  starting to roll (`nav_frame` watches `TreeFelling::shapes`), a load
+  (`invalidate_all`). The old tile stays until its replacement lands; a
+  stale result is thrown away. Tiles wait until the trees and rocks have
+  streamed in (`set_ready`).
+- **Spawning uses it**: where a tile is in, a spawn point must be on the
+  mesh, walkable and dry, and stands at the mesh's height.
+- **Measured** (`--nav-report`, seed 0, 224 m round the spawn): 49 tiles,
+  20,780 polys, ~335 ms a tile on a worker (max 608), ~203 thousand field
+  samples a tile, 5.6 s for all of them from a cold start; 97.8% of dry
+  land under 35 degrees on the mesh; every trunk within 100 m at least
+  0.46 m from the mesh past its bark; 7 of 8 paths 80 m out complete, 1.02-
+  1.22 x the straight line; a swim 182 m to 4 m of water that the
+  walkers' filter cannot complete; a 10 m log across a path rebuilt in one
+  tile (~350 ms) and passed 1.4 m off its axis; a 3 m dig leaves no mesh
+  in the hole. `build/nav_report.bmp` is the map: 256 m at 0.5 m a pixel.
+- **Two things that bit**: cells sampled at their corner put the whole
+  mesh a quarter cell off the world; and eroding by one 0.5 m cell clears
+  a blocked cell's sides, not its corners, so the mesh touched thin trunks
+  diagonally 0.1-0.2 m from the axis. A quarter cell of inflation left
+  0.09 m past the bark; a whole cell, 0.46. Contours are simplified to
+  0.35 m (Recast's demo allows 1.3 m, which cut corners through trunks).
 - `--mob-test` (`build/mob_test.txt`, exit code = failures): 24 game hours
   at the spawn (spawns, distances, biome, unseen, both caps), the player
   2 km away (all freeze, the zone's clock stands for 10 game hours), a save

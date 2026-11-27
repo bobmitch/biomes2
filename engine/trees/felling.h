@@ -52,6 +52,17 @@ public:
     size_t colliders() const { return colliders_.size(); }
     size_t felled() const { return logs_.size(); }
     bool log_pose(uint32_t id, float pos[3], float rot[4], bool& active) const;
+    // Every felled tree as solid shapes, for the navmesh (ADR-007): its stump,
+    // a short vertical cylinder, and its log, a capsule where physics has it
+    // now, with whether it has come to rest.
+    struct Shape {
+        uint32_t id = 0;
+        bool capsule = false;
+        float a[3] = {0, 0, 0}, b[3] = {0, 0, 0};
+        float r = 0.0f;
+        bool resting = true;
+    };
+    void shapes(std::vector<Shape>& out) const;
     // Base, height and hits a tree needs, for a test that wants one to fell.
     bool tree_info(uint32_t id, float base[3], float& height, float& trunk_r, int& hits) const;
 
@@ -66,6 +77,8 @@ private:
         float    rot[4] = {0, 0, 0, 1};
         uint32_t body = 0;
         uint32_t stump_body = 0;
+        float    r = 0.0f, y0 = 0.0f, y1 = 0.0f;   // the log's capsule along its local y
+        float    stump_top = 0.0f;                 // over the base
     };
     void fell(const Log& seed, const float away[3], bool asleep);
     int  hits_needed(float trunk_r) const;

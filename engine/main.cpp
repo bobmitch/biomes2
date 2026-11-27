@@ -49,6 +49,10 @@
 #include "engine/player/icons.h"
 #include "engine/player/survival.h"
 #include "engine/mobs/creatures.h"
+#include "engine/nav/nav_world.h"
+#include <array>
+#include <memory>
+#include "DetourNavMesh.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -645,6 +649,97 @@ engine::mobs::Creatures     g_creatures;
 bool  g_creatures_ok = false;
 std::unordered_map<uint32_t, engine::CharacterAnimator> g_mob_anim;
 
+// --- The navmesh (engine/nav, ADR-007 decision 4) ------------------------------
+// Tiles within kNavRadius of the player, built from the field on workers.
+engine::nav::NavWorld g_nav;
+bool  g_nav_ok = false;
+const float kNavRadius = 192.0f;   // the active zones' 128 m and room for a path out of them
+std::vector<engine::nav::Obstacle> g_nav_extra;     // obstacles a test lays (--nav-report)
+std::unordered_map<uint32_t, bool> g_nav_logs;      // felled log id -> at rest, as last seen
+
+// What a tile needs from engine state (main thread): the trunks, rocks,
+// stumps and resting logs in its box, and a copy of the edited bricks.
+void gather_nav(engine::nav::TileInput& in) {
+    const float x0 = float(in.tx) * in.size - 4.0f, x1 = float(in.tx + 1) * in.size + 4.0f;
+    const float z0 = float(in.tz) * in.size - 4.0f, z1 = float(in.tz + 1) * in.size + 4.0f;
+    auto inside = [&](float x, float z, float r) { return x + r >= x0 && x - r <= x1 && z + r >= z0 && z - r <= z1; };
+    if (g_renderer.trees_on() && g_renderer.trees().ready()) {
+        const engine::TreeRenderer& tr = g_renderer.trees();
+        for (const worldgen::TreeInstance& t : g_renderer.tree_field().standing()) {
+            if (!inside(t.x, t.z, 3.0f)) continue;
+            const engine::TreeLook& lk = tr.look(t.species);
+            const float sc = t.height / lk.nominal_height;
+            engine::nav::Obstacle o;
+            o.a[0] = o.b[0] = t.x;
+            o.a[2] = o.b[2] = t.z;
+            o.a[1] = t.y - 0.5f;
+            o.b[1] = t.y + 3.0f;
+            // The trunk, widened part way to the root flare at the ground.
+            o.r = tr.model(t.species, t.variant).trunk_radius * sc * (1.0f + 0.4f * lk.roots);
+            in.obstacles.push_back(o);
+        }
+    }
+    for (const worldgen::RockInstance& rk : g_renderer.rock_field().rocks()) {
+        if (!inside(rk.x, rk.z, rk.size)) continue;
+        engine::nav::Obstacle o;
+        o.a[0] = o.b[0] = rk.x;
+        o.a[2] = o.b[2] = rk.z;
+        o.a[1] = rk.ground - 0.5f;
+        // Boulders are flattened balls, outcrops wide low boxes.
+        o.b[1] = rk.y + rk.size * (rk.kind == 0 ? 0.6f : 0.45f);
+        o.r = rk.size * 0.5f;
+        in.obstacles.push_back(o);
+    }
+    std::vector<engine::TreeFelling::Shape> sh;
+    g_felling.shapes(sh);
+    for (const engine::TreeFelling::Shape& f : sh) {
+        if (f.capsule && !f.resting) continue;   // rolling: steered round, stamped when it stops
+        if (!inside(f.a[0], f.a[2], f.r + 20.0f)) continue;
+        engine::nav::Obstacle o;
+        o.capsule = f.capsule;
+        std::memcpy(o.a, f.a, sizeof o.a);
+        std::memcpy(o.b, f.b, sizeof o.b);
+        o.r = f.r;
+        in.obstacles.push_back(o);
+    }
+    for (const engine::nav::Obstacle& o : g_nav_extra) in.obstacles.push_back(o);
+    const float brick_m = float(engine::kBrickSide) * engine::kEditVoxel;
+    for (const auto& b : g_renderer.edits().all()) {
+        const float bx = float(b.first.x) * brick_m, bz = float(b.first.z) * brick_m;
+        if (bx + brick_m < x0 || bx > x1 || bz + brick_m < z0 || bz > z1) continue;
+        in.bricks.push_back(std::make_pair(b.first, std::make_shared<engine::Brick>(b.second)));
+    }
+}
+
+void nav_invalidate_around(const float c[3], float r) {
+    const float lo[3] = {c[0] - r, c[1] - r, c[2] - r}, hi[3] = {c[0] + r, c[1] + r, c[2] + r};
+    g_nav.invalidate_box(lo, hi);
+}
+
+// A frame of the navmesh: rebuild where a felled log came to rest or started
+// to roll, then stream the tiles round the player.
+void nav_frame() {
+    if (!g_nav_ok) return;
+    static std::vector<engine::TreeFelling::Shape> sh;
+    g_felling.shapes(sh);
+    std::unordered_map<uint32_t, bool> now;
+    for (const engine::TreeFelling::Shape& f : sh) {
+        if (!f.capsule) continue;
+        now[f.id] = f.resting;
+        const auto it = g_nav_logs.find(f.id);
+        if (it == g_nav_logs.end() || it->second != f.resting) {
+            const float lo[3] = {(std::min)(f.a[0], f.b[0]) - f.r, (std::min)(f.a[1], f.b[1]) - f.r,
+                                 (std::min)(f.a[2], f.b[2]) - f.r};
+            const float hi[3] = {(std::max)(f.a[0], f.b[0]) + f.r, (std::max)(f.a[1], f.b[1]) + f.r,
+                                 (std::max)(f.a[2], f.b[2]) + f.r};
+            g_nav.invalidate_box(lo, hi);
+        }
+    }
+    g_nav_logs.swap(now);
+    const float x = g_walk ? g_feet[0] : g_camera.x, z = g_walk ? g_feet[2] : g_camera.z;
+    g_nav.update(x, z, kNavRadius);
+}
+
 // The blended weight of biome b at (x, z): layer 4's own weights.
 float biome_weight_at(float x, float z, int b) {
     const engine::WorldGpu& wg = g_renderer.world();
@@ -664,6 +759,16 @@ float biome_weight_at(float x, float z, int b) {
 bool creature_ground(float x, float z, float& y) {
     const engine::WorldGpu& wg = g_renderer.world();
     y = wg.height(x, z);
+    // On the navmesh where it has a tile (walkable, dry): a creature spawns
+    // where it can walk, edits, trunks, rocks and logs included.
+    if (g_nav_ok && g_nav.has_tile(x, z)) {
+        const float p[3] = {x, y, z}, ext[3] = {0.3f, 4.0f, 0.3f};
+        float q[3];
+        if (!g_nav.nearest(p, ext, engine::nav::kFlagWalk, q)) return false;
+        if (std::fabs(q[0] - x) > 0.3f || std::fabs(q[2] - z) > 0.3f) return false;
+        y = q[1];
+        return true;
+    }
     if (y < wg.table().sea_level + 0.3f) return false;
     const float e = 1.0f;
     const float gx = (wg.height(x + e, z) - wg.height(x - e, z)) / (2.0f * e);
@@ -1561,6 +1666,411 @@ void setup_ui(HWND hwnd) {
 //      build/forage_picked.bmp), and the HUD and the inventory over the
 //      world with a few foods eaten (build/survival_hud.bmp,
 //      build/survival_inventory.bmp).
+// --nav-report (ADR-007, phase 3): the navmesh round the spawn. Tiles built
+// and their cost, how much walkable land the mesh covers, trunks kept out, a
+// path across the meadow, a swim, a log laid across that path, a dig under
+// the mesh; build/nav_report.txt and a top-down map, build/nav_report.bmp.
+namespace {
+
+void write_bmp24(const char* path, int w, int h, const std::vector<uint8_t>& rgb) {
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return;
+    const int row = (w * 3 + 3) & ~3;
+    const uint32_t size = 54u + uint32_t(row * h);
+    uint8_t hd[54] = {'B', 'M'};
+    auto put32 = [&](int at, uint32_t v) { for (int k = 0; k < 4; ++k) hd[at + k] = uint8_t(v >> (8 * k)); };
+    put32(2, size); put32(10, 54); put32(14, 40); put32(18, uint32_t(w)); put32(22, uint32_t(h));
+    hd[26] = 1; hd[28] = 24;
+    std::fwrite(hd, 1, 54, f);
+    std::vector<uint8_t> line(size_t(row), 0);
+    for (int y = h - 1; y >= 0; --y) {
+        for (int x = 0; x < w; ++x) {
+            const uint8_t* c = &rgb[(size_t(y) * w + x) * 3];
+            line[size_t(x) * 3] = c[2]; line[size_t(x) * 3 + 1] = c[1]; line[size_t(x) * 3 + 2] = c[0];
+        }
+        std::fwrite(line.data(), 1, line.size(), f);
+    }
+    std::fclose(f);
+}
+
+// Distance in plan from p to the segment a-b.
+float plan_dist(const float p[3], const float a[3], const float b[3]) {
+    const float sx = b[0] - a[0], sz = b[2] - a[2], l2 = sx * sx + sz * sz;
+    float u = l2 > 1e-6f ? ((p[0] - a[0]) * sx + (p[2] - a[2]) * sz) / l2 : 0.0f;
+    u = u < 0.0f ? 0.0f : (u > 1.0f ? 1.0f : u);
+    const float dx = p[0] - (a[0] + sx * u), dz = p[2] - (a[2] + sz * u);
+    return std::sqrt(dx * dx + dz * dz);
+}
+
+// Plan distance between segments p-q and a-b (sampled; fine for a check).
+float seg_dist(const float p[3], const float q[3], const float a[3], const float b[3]) {
+    float best = 1e30f;
+    for (int i = 0; i <= 64; ++i) {
+        const float u = float(i) / 64.0f;
+        const float x[3] = {p[0] + (q[0] - p[0]) * u, 0.0f, p[2] + (q[2] - p[2]) * u};
+        best = (std::min)(best, plan_dist(x, a, b));
+    }
+    return best;
+}
+
+}  // namespace
+
+int run_nav_report() {
+    std::remove("build/nav_report.txt");
+    FILE* f = std::fopen("build/nav_report.txt", "w");
+    if (!f) return 1;
+    int fails = 0;
+    auto check = [&](bool ok, const std::string& what) {
+        std::fprintf(f, "%s  %s\n", ok ? "PASS" : "FAIL", what.c_str());
+        if (!ok) ++fails;
+    };
+    char buf[400];
+    check(g_nav_ok, "the navmesh started");
+    if (!g_nav_ok) { std::fclose(f); return fails; }
+    const engine::WorldGpu& wg = g_renderer.world();
+    const float sea = wg.table().sea_level;
+    const float kR = 224.0f;   // the report reaches further than play (192 m) for the swim
+    using engine::nav::kFlagWalk;
+    using engine::nav::kFlagWade;
+    using engine::nav::kFlagSwim;
+    const unsigned short kGround = kFlagWalk | kFlagWade, kAll = kFlagWalk | kFlagWade | kFlagSwim;
+
+    // Stand at the spawn; stream the world, physics, trees and rocks, and the tiles.
+    g_walk = true;
+    g_physics.place_character(g_spawn.x, g_spawn.ground + 1.0f, g_spawn.z);
+    auto settle = [&](int min_frames, int max_frames) {
+        LARGE_INTEGER fq, a, b;
+        QueryPerformanceFrequency(&fq);
+        QueryPerformanceCounter(&a);
+        int i = 0;
+        for (; i < max_frames; ++i) {
+            MSG m = {};
+            while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageA(&m); }
+            step_window_physics(1.0f / 60.0f, float(i) / 60.0f, 0.0f, 0.0f, false, 0.0f);
+            g_camera.x = g_feet[0]; g_camera.y = g_feet[1] + 1.6f; g_camera.z = g_feet[2];
+            engine::ViewConstants v = {};
+            fill_view(g_camera, g_res_w, g_res_h, float(i) / 60.0f, v);
+            g_renderer.render(v);
+            g_nav.update(g_spawn.x, g_spawn.z, kR);
+            if (i >= min_frames && g_nav.settled()) break;
+        }
+        QueryPerformanceCounter(&b);
+        return std::make_pair(i, double(b.QuadPart - a.QuadPart) * 1000.0 / double(fq.QuadPart));
+    };
+    const auto first = settle(60, 20000);
+    const engine::nav::NavWorld::Stats st0 = g_nav.stats();
+    std::fprintf(f, "\nA. tiles within %.0f m of the spawn (%.0f, %.1f, %.0f)\n", kR, g_spawn.x, g_spawn.ground, g_spawn.z);
+    std::snprintf(buf, sizeof buf, "      %zu tiles with polys, %zu empty, %lld polys; built %zu, failed %zu; "
+                  "%.0f ms a tile (max %.0f), %.0f thousand field samples a tile; settled in %d frames, %.1f s",
+                  st0.tiles, st0.empty, st0.polys, st0.built, st0.failed, st0.built ? st0.ms_total / double(st0.built) : 0.0,
+                  st0.ms_max, st0.built ? double(st0.samples) / double(st0.built) / 1000.0 : 0.0, first.first,
+                  first.second / 1000.0);
+    std::fprintf(f, "%s\n", buf);
+    check(g_nav.settled() && st0.failed == 0 && st0.tiles > 0, "every tile built " + st0.last_error);
+
+    // B. Coverage: dry, gentle land within 100 m.
+    std::fprintf(f, "\nB. coverage\n");
+    uint64_t hs = 0x9E3779B97F4A7C15ull;
+    auto rnd = [&]() { hs ^= hs << 13; hs ^= hs >> 7; hs ^= hs << 17; return float(hs >> 40) / float(1u << 24); };
+    int land = 0, on = 0, near_trunk = 0;
+    std::vector<std::array<float, 3> > onmesh;
+    const auto& trees = g_renderer.tree_field().standing();
+    for (int i = 0; i < 4000 && land < 2000; ++i) {
+        const float a = rnd() * 6.2831853f, r = 100.0f * std::sqrt(rnd());
+        const float x = g_spawn.x + std::sin(a) * r, z = g_spawn.z + std::cos(a) * r;
+        const float y = wg.height(x, z);
+        if (y < sea + 0.3f) continue;
+        const float gx = (wg.height(x + 1.0f, z) - wg.height(x - 1.0f, z)) * 0.5f;
+        const float gz = (wg.height(x, z + 1.0f) - wg.height(x, z - 1.0f)) * 0.5f;
+        if (gx * gx + gz * gz > 0.5f) continue;   // under ~35 degrees
+        bool trunk = false;
+        for (const worldgen::TreeInstance& t : trees)
+            if ((t.x - x) * (t.x - x) + (t.z - z) * (t.z - z) < 2.25f) { trunk = true; break; }
+        if (trunk) { ++near_trunk; continue; }
+        ++land;
+        const float p[3] = {x, y, z}, ext[3] = {0.75f, 1.5f, 0.75f};
+        float q[3];
+        if (g_nav.nearest(p, ext, kGround, q) && std::fabs(q[0] - x) < 0.75f && std::fabs(q[2] - z) < 0.75f) {
+            ++on;
+            onmesh.push_back({q[0], q[1], q[2]});
+        }
+    }
+    std::snprintf(buf, sizeof buf, "%d of %d points on dry ground under 35 degrees (and 1.5 m from a trunk) are on the mesh: %.1f%%",
+                  on, land, land ? 100.0 * on / land : 0.0);
+    check(land > 0 && on * 100 >= land * 75, buf);
+
+    // C. Trunks: no tree's axis is on the mesh.
+    std::fprintf(f, "\nC. trunks\n");
+    int tested = 0, through = 0;
+    float worst = 1e30f;   // the least clearance past the trunk, over every tree
+    for (const worldgen::TreeInstance& t : trees) {
+        const float dx = t.x - g_spawn.x, dz = t.z - g_spawn.z;
+        if (dx * dx + dz * dz > 100.0f * 100.0f) continue;
+        const engine::TreeLook& lk = g_renderer.trees().look(t.species);
+        const float tr = g_renderer.trees().model(t.species, t.variant).trunk_radius * t.height / lk.nominal_height;
+        const float p[3] = {t.x, t.y, t.z}, ext[3] = {tr + 0.5f, 1.5f, tr + 0.5f};
+        float q[3];
+        ++tested;
+        if (g_nav.nearest(p, ext, kAll, q)) {
+            const float d = std::sqrt((q[0] - t.x) * (q[0] - t.x) + (q[2] - t.z) * (q[2] - t.z));
+            worst = (std::min)(worst, d - tr);
+            if (d < tr + 0.2f) {
+                if (through < 12) {
+                    unsigned char ar = 0;
+                    float q2[3];
+                    g_nav.nearest(p, ext, kAll, q2, &ar);
+                    int gathered = 0;
+                    engine::nav::TileInput ti;
+                    ti.tx = int(std::floor(t.x / 64.0f)); ti.tz = int(std::floor(t.z / 64.0f)); ti.size = 64.0f;
+                    gather_nav(ti);
+                    for (const auto& o : ti.obstacles) if (!o.capsule && o.a[0] == t.x && o.a[2] == t.z) gathered = 1;
+                    std::fprintf(f, "      tree %u species %u at (%.2f, %.2f, %.2f) r %.2f: mesh at (%.2f, %.2f, %.2f) %.2f m off, area %d, gathered %d, ground %.2f\n",
+                                 t.id, unsigned(t.species), t.x, t.y, t.z, tr, q[0], q[1], q[2], d, int(ar), gathered,
+                                 g_renderer.ground_below(t.x, t.z, t.y + 10.0f));
+                }
+                ++through;
+            }
+        }
+    }
+    std::snprintf(buf, sizeof buf, "the mesh keeps 0.2 m clear of every trunk: %d of %d trees within 100 m nearer; "
+                  "least clearance %.2f m past the bark (the agent is 0.4 m)", through, tested, worst);
+    check(tested > 0 && through == 0, buf);
+
+    // D. Paths across the meadow, 80 m in eight directions.
+    std::fprintf(f, "\nD. paths, 80 m from the spawn\n");
+    const float start[3] = {g_spawn.x, g_spawn.ground, g_spawn.z};
+    std::vector<float> best_path;
+    float best_end[3] = {0, 0, 0};
+    int complete_n = 0, sane = 0;
+    for (int k = 0; k < 8; ++k) {
+        const float a = float(k) * 0.78539816f;
+        const float b[3] = {g_spawn.x + std::sin(a) * 80.0f, 0.0f, g_spawn.z + std::cos(a) * 80.0f};
+        float bb[3] = {b[0], wg.height(b[0], b[2]), b[2]};
+        std::vector<float> pts;
+        float len = 0.0f;
+        bool complete = false;
+        const bool ok = g_nav.path(start, bb, kGround, pts, &len, &complete);
+        std::fprintf(f, "      %3.0f deg: %s, %zu corners, %.1f m (%.2f x straight)\n", a * 57.29578f,
+                     !ok ? "no path" : (complete ? "complete" : "partial"), pts.size() / 3, len, len / 80.0f);
+        if (ok && complete) {
+            ++complete_n;
+            if (len < 80.0f * 2.0f) ++sane;
+            if (best_path.empty()) { best_path = pts; std::memcpy(best_end, bb, sizeof best_end); }
+        }
+    }
+    check(complete_n > 0 && sane == complete_n,
+          std::to_string(complete_n) + " of 8 reach their target, each under twice the straight line");
+
+    // E. A swim: the nearest deep water, from the spawn's land.
+    std::fprintf(f, "\nE. a swim\n");
+    float water[3] = {0, 0, 0};
+    bool found = false;
+    for (float r = 8.0f; r < 190.0f && !found; r += 4.0f)
+        for (int k = 0; k < 32 && !found; ++k) {
+            const float a = float(k) * 0.19634954f;
+            const float x = g_spawn.x + std::sin(a) * r, z = g_spawn.z + std::cos(a) * r;
+            if (wg.height(x, z) < sea - 2.5f) {
+                // 12 m on into the deep, if it stays deep.
+                const float x2 = x + std::sin(a) * 12.0f, z2 = z + std::cos(a) * 12.0f;
+                const bool deeper = wg.height(x2, z2) < sea - 2.5f;
+                water[0] = deeper ? x2 : x; water[1] = sea; water[2] = deeper ? z2 : z;
+                found = true;
+            }
+        }
+    std::vector<float> swim_path;
+    if (!found) {
+        std::fprintf(f, "      no deep water within 190 m of the spawn: not tested\n");
+    } else {
+        float len = 0.0f, len2 = 0.0f;
+        bool c_all = false, c_ground = false;
+        std::vector<float> p2;
+        const bool ok = g_nav.path(start, water, kAll, swim_path, &len, &c_all);
+        g_nav.path(start, water, kGround, p2, &len2, &c_ground);
+        unsigned char area = 0;
+        float q[3];
+        const float ext[3] = {1.0f, 2.0f, 1.0f};
+        g_nav.nearest(water, ext, kAll, q, &area);
+        std::snprintf(buf, sizeof buf, "to (%.0f, %.0f), %.0f m of water under it: amphibious %s (%.0f m), on foot %s; the water's area %d (swim %d)",
+                      water[0], water[2], sea - wg.height(water[0], water[2]), ok && c_all ? "complete" : "NOT complete",
+                      len, c_ground ? "complete" : "stops short", int(area), int(engine::nav::kAreaSwim));
+        check(ok && c_all && !c_ground && area == engine::nav::kAreaSwim, buf);
+    }
+
+    // F. A log laid across the first complete path: rebuilt, the path goes round.
+    std::fprintf(f, "\nF. a log across the path\n");
+    std::vector<float> log_path;
+    engine::nav::Obstacle log;
+    if (best_path.size() >= 6) {
+        // Half way along the path's first long leg.
+        size_t leg = 0;
+        float leg_len = 0.0f;
+        for (size_t i = 0; i + 1 < best_path.size() / 3; ++i) {
+            const float* p = &best_path[i * 3];
+            const float* q = &best_path[i * 3 + 3];
+            const float l = std::sqrt((q[0] - p[0]) * (q[0] - p[0]) + (q[2] - p[2]) * (q[2] - p[2]));
+            if (l > leg_len) { leg_len = l; leg = i; }
+        }
+        const float* p = &best_path[leg * 3];
+        const float* q = &best_path[leg * 3 + 3];
+        const float mx = 0.5f * (p[0] + q[0]), mz = 0.5f * (p[2] + q[2]);
+        const float dx = (q[0] - p[0]) / leg_len, dz = (q[2] - p[2]) / leg_len;
+        const float gy = wg.height(mx, mz);
+        log.capsule = true;
+        log.r = 0.35f;
+        // Lying level on the highest ground under it, as a log comes to rest.
+        log.a[0] = mx - dz * 5.0f; log.a[2] = mz + dx * 5.0f;
+        log.b[0] = mx + dz * 5.0f; log.b[2] = mz - dx * 5.0f;
+        float top = -1e30f;
+        for (int k = 0; k <= 40; ++k) {
+            const float u = float(k) / 40.0f;
+            top = (std::max)(top, g_renderer.ground_below(log.a[0] + (log.b[0] - log.a[0]) * u,
+                                                          log.a[2] + (log.b[2] - log.a[2]) * u, gy + 20.0f));
+        }
+        log.a[1] = log.b[1] = top + log.r;
+        (void)gy;
+        float before = 0.0f;
+        for (size_t i = 0; i + 1 < best_path.size() / 3; ++i)
+            before = (std::max)(before, -seg_dist(&best_path[i * 3], &best_path[i * 3 + 3], log.a, log.b));
+        g_nav_extra.assign(1, log);
+        float lo[3], hi[3];
+        for (int k = 0; k < 3; ++k) { lo[k] = (std::min)(log.a[k], log.b[k]) - 1.0f; hi[k] = (std::max)(log.a[k], log.b[k]) + 1.0f; }
+        g_nav.invalidate_box(lo, hi);
+        const size_t built0 = g_nav.stats().built;
+        const double ms0 = g_nav.stats().ms_total;
+        const auto re = settle(1, 20000);
+        const size_t rebuilt = g_nav.stats().built - built0;
+        float len = 0.0f;
+        bool complete = false;
+        g_nav.path(start, best_end, kGround, log_path, &len, &complete);
+        float clear = 1e30f;
+        for (size_t i = 0; i + 1 < log_path.size() / 3; ++i)
+            clear = (std::min)(clear, seg_dist(&log_path[i * 3], &log_path[i * 3 + 3], log.a, log.b));
+        std::snprintf(buf, sizeof buf, "a 10 m log (r 0.35) across it at (%.0f, %.0f): %zu tiles rebuilt in %.0f ms (%.0f ms a tile), "
+                      "the path %s, %.1f m, its nearest pass %.2f m from the log's axis",
+                      mx, mz, rebuilt, re.second, rebuilt ? (g_nav.stats().ms_total - ms0) / double(rebuilt) : 0.0,
+                      complete ? "complete" : "NOT complete", len, clear);
+        check(rebuilt > 0 && complete && clear >= log.r + 0.3f, buf);
+    } else {
+        check(false, "no path to lay a log across");
+    }
+
+    // G. A dig under the mesh: the tile sees the hole.
+    std::fprintf(f, "\nG. a dig\n");
+    if (!onmesh.empty()) {
+        // An on-mesh point 25-60 m from the spawn, away from the log.
+        float pt[3] = {onmesh[0][0], onmesh[0][1], onmesh[0][2]};
+        for (const auto& o : onmesh) {
+            const float dx = o[0] - g_spawn.x, dz = o[2] - g_spawn.z, d = std::sqrt(dx * dx + dz * dz);
+            if (d > 25.0f && d < 60.0f && plan_dist(o.data(), log.a, log.b) > 12.0f) { pt[0] = o[0]; pt[1] = o[1]; pt[2] = o[2]; break; }
+        }
+        g_renderer.dig(pt[0], pt[1] - 1.0f, pt[2], 3.0f, -4.0f, 1);
+        nav_invalidate_around(pt, 5.0f);
+        const auto re = settle(1, 20000);
+        const float ext[3] = {0.3f, 8.0f, 0.3f};
+        float q[3];
+        const bool still = g_nav.nearest(pt, ext, kAll, q) && std::fabs(q[0] - pt[0]) < 0.3f && std::fabs(q[2] - pt[2]) < 0.3f;
+        std::snprintf(buf, sizeof buf, "a 3 m sphere dug 1 m under (%.1f, %.1f, %.1f): rebuilt in %.0f ms; the mesh there %s",
+                      pt[0], pt[1], pt[2], re.second,
+                      still ? (std::string("drops to ") + std::to_string(q[1] - pt[1]).substr(0, 5) + " m").c_str() : "is gone (unwalkable)");
+        check(!still || q[1] < pt[1] - 2.0f, buf);
+    }
+
+    // H. The map: 256 m round the spawn at 0.5 m a pixel.
+    {
+        const int N = 512;
+        const float m_px = 0.5f, x0 = g_spawn.x - 128.0f, z0 = g_spawn.z - 128.0f;
+        std::vector<uint8_t> img(size_t(N) * N * 3);
+        // Hillshade, sea blue.
+        for (int py = 0; py < N; ++py)
+            for (int px = 0; px < N; ++px) {
+                const float x = x0 + (float(px) + 0.5f) * m_px, z = z0 + (float(py) + 0.5f) * m_px;
+                const float h = wg.height(x, z);
+                const float hx = wg.height(x + 1.0f, z) - h, hz = wg.height(x, z + 1.0f) - h;
+                float l = 0.55f + 0.35f * (-hx * 0.7f - hz * 0.7f);
+                l = l < 0.1f ? 0.1f : (l > 1.0f ? 1.0f : l);
+                uint8_t* c = &img[(size_t(py) * N + px) * 3];
+                if (h < sea) { c[0] = uint8_t(30 * l); c[1] = uint8_t(60 * l); c[2] = uint8_t(120 * l); }
+                else { c[0] = c[1] = c[2] = uint8_t(120 * l); }
+            }
+        // The mesh's detail triangles, by area.
+        const dtNavMesh* nm = g_nav.mesh();
+        auto plot_tri = [&](const float* a, const float* b, const float* c, const uint8_t col[3]) {
+            const float ax = (a[0] - x0) / m_px, az = (a[2] - z0) / m_px, bx = (b[0] - x0) / m_px, bz = (b[2] - z0) / m_px;
+            const float cx = (c[0] - x0) / m_px, cz = (c[2] - z0) / m_px;
+            const int minx = (std::max)(0, int(std::floor((std::min)({ax, bx, cx}))));
+            const int maxx = (std::min)(N - 1, int(std::ceil((std::max)({ax, bx, cx}))));
+            const int minz = (std::max)(0, int(std::floor((std::min)({az, bz, cz}))));
+            const int maxz = (std::min)(N - 1, int(std::ceil((std::max)({az, bz, cz}))));
+            const float den = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz);
+            if (std::fabs(den) < 1e-9f) return;
+            for (int py = minz; py <= maxz; ++py)
+                for (int px = minx; px <= maxx; ++px) {
+                    const float X = float(px) + 0.5f, Z = float(py) + 0.5f;
+                    const float w0 = ((bz - cz) * (X - cx) + (cx - bx) * (Z - cz)) / den;
+                    const float w1 = ((cz - az) * (X - cx) + (ax - cx) * (Z - cz)) / den;
+                    if (w0 < 0.0f || w1 < 0.0f || w0 + w1 > 1.0f) continue;
+                    uint8_t* d = &img[(size_t(py) * N + px) * 3];
+                    for (int k = 0; k < 3; ++k) d[k] = uint8_t((int(d[k]) + 2 * int(col[k])) / 3);
+                }
+        };
+        for (int i = 0; i < nm->getMaxTiles(); ++i) {
+            const dtMeshTile* t = nm->getTile(i);
+            if (!t || !t->header) continue;
+            for (int ip = 0; ip < t->header->polyCount; ++ip) {
+                const dtPoly* poly = &t->polys[ip];
+                if (poly->getType() != DT_POLYTYPE_GROUND) continue;
+                const dtPolyDetail* pd = &t->detailMeshes[ip];
+                const unsigned char ar = poly->getArea();
+                const uint8_t col[3] = {uint8_t(ar == engine::nav::kAreaSwim ? 60 : (ar == engine::nav::kAreaWade ? 60 : 90)),
+                                        uint8_t(ar == engine::nav::kAreaSwim ? 140 : (ar == engine::nav::kAreaWade ? 220 : 210)),
+                                        uint8_t(ar == engine::nav::kAreaSwim ? 255 : (ar == engine::nav::kAreaWade ? 220 : 80))};
+                for (int j = 0; j < pd->triCount; ++j) {
+                    const unsigned char* tr = &t->detailTris[(pd->triBase + unsigned(j)) * 4];
+                    const float* v[3];
+                    for (int k = 0; k < 3; ++k)
+                        v[k] = tr[k] < poly->vertCount ? &t->verts[poly->verts[tr[k]] * 3]
+                                                       : &t->detailVerts[(pd->vertBase + tr[k] - poly->vertCount) * 3];
+                    plot_tri(v[0], v[1], v[2], col);
+                }
+            }
+        }
+        auto dot = [&](float x, float z, int r, uint8_t R, uint8_t G, uint8_t B) {
+            const int cx = int((x - x0) / m_px), cz = int((z - z0) / m_px);
+            for (int dz = -r; dz <= r; ++dz)
+                for (int dx = -r; dx <= r; ++dx) {
+                    const int px = cx + dx, py = cz + dz;
+                    if (px < 0 || py < 0 || px >= N || py >= N || dx * dx + dz * dz > r * r) continue;
+                    uint8_t* d = &img[(size_t(py) * N + px) * 3];
+                    d[0] = R; d[1] = G; d[2] = B;
+                }
+        };
+        auto line = [&](const std::vector<float>& pts, uint8_t R, uint8_t G, uint8_t B) {
+            for (size_t i = 0; i + 1 < pts.size() / 3; ++i)
+                for (int k = 0; k <= 200; ++k) {
+                    const float u = float(k) / 200.0f;
+                    dot(pts[i * 3] + (pts[i * 3 + 3] - pts[i * 3]) * u, pts[i * 3 + 2] + (pts[i * 3 + 5] - pts[i * 3 + 2]) * u, 1, R, G, B);
+                }
+        };
+        for (const worldgen::TreeInstance& t : trees) dot(t.x, t.z, 1, 200, 40, 30);
+        line(best_path, 255, 230, 40);
+        line(swim_path, 255, 255, 255);
+        line(log_path, 255, 140, 0);
+        if (log.capsule) {
+            std::vector<float> lg = {log.a[0], log.a[1], log.a[2], log.b[0], log.b[1], log.b[2]};
+            line(lg, 230, 40, 230);
+        }
+        dot(g_spawn.x, g_spawn.z, 3, 255, 0, 0);
+        write_bmp24("build/nav_report.bmp", N, N, img);
+        std::fprintf(f, "\nbuild/nav_report.bmp: 256 m round the spawn (red), +x right, +z down, 0.5 m a pixel. Green walkable, "
+                        "cyan wading, blue swimming, dark red trunks, yellow the first path, orange the same round the log "
+                        "(magenta), white the swim.\n");
+    }
+    g_nav_extra.clear();
+    std::fprintf(f, "\n%s: %d failed\n", fails ? "FAILURES" : "ALL PASSED", fails);
+    std::fclose(f);
+    return fails;
+}
+
 // --mob-test (ADR-007, phase 2): spawning, freezing, saving and thawing,
 // against the shipping creatures.json at the spawn. build/mob_test.txt, and
 // build/mob_test.bmp (the nearest creature from 5 m); the exit code is the
@@ -2627,8 +3137,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
     const bool pit_mode = hl.find("--dig-water") != std::string::npos;
     const bool survival_mode = hl.find("--survival-test") != std::string::npos;
     const bool mob_mode = hl.find("--mob-test") != std::string::npos;
+    const bool nav_mode = hl.find("--nav-report") != std::string::npos;
     const bool headless = report_mode || fell_mode || dig_tree_mode || lights_mode || leak_mode ||
-                          pit_mode || survival_mode || mob_mode ||
+                          pit_mode || survival_mode || mob_mode || nav_mode ||
                           !shot_path.empty() || flight_seconds > 0.0 ||
                           walk_seconds > 0.0 || swim_seconds > 0.0 ||
                           overhang_seconds > 0.0 ||
@@ -2726,6 +3237,18 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             if (g_creatures_ok) {
                 g_creatures.set_table(&g_creature_table);
                 g_creatures.set_world(wg.field_id());
+            }
+            std::string nerr;
+            g_nav_ok = g_nav.init(&wg.world(), &wg.params(), &wg.table(), g_creature_table.zones.size_m, 3, nerr);
+            if (g_nav_ok) {
+                g_nav.set_gather(gather_nav);
+                g_nav.set_ready([] {
+                    return (!g_renderer.trees_on() || g_renderer.tree_field().settled()) &&
+                           g_renderer.rock_field().settled();
+                });
+            } else if (FILE* sf = std::fopen("build/startup.txt", "a")) {
+                std::fprintf(sf, "           navmesh NOT started: %s\n", nerr.c_str());
+                std::fclose(sf);
             }
             if (FILE* sf = std::fopen("build/startup.txt", "a")) {
                 if (g_creatures_ok)
@@ -5496,6 +6019,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         return 0;
     }
 
+    if (nav_mode) {
+        const int r = run_nav_report();
+        g_nav.shutdown();
+        g_renderer.shutdown();
+        g_physics.shutdown();
+        return r;
+    }
+
     if (mob_mode) {
         const int r = run_mob_test();
         g_renderer.shutdown();
@@ -7517,11 +8048,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             const engine::Renderer::AimedDig d =
                 g_renderer.dig_aimed(eye, fwd, kDigReach, kDigRadii[g_dig_size]);
             if (d.hit && g_walk) g_ev_dug = true;
+            if (d.dug && g_nav_ok) nav_invalidate_around(d.centre, kDigRadii[g_dig_size] + engine::kEditBand + 0.5f);
             if (!d.hit) std::snprintf(g_tree_msg, sizeof g_tree_msg, "dig: no ground within %.0f m", kDigReach);
             else std::snprintf(g_tree_msg, sizeof g_tree_msg, "dug r %.2f m at %.1f m, %zu voxels, %.1f ms",
                                kDigRadii[g_dig_size], d.dist, d.voxels, d.ms);
         }
         stealth_frame(float(dt));
+        nav_frame();
         creatures_frame(float(dt), g_paused, w / h);
         if (g_snap_walk_frames >= 0 && --g_snap_walk_frames < 0) {
             g_walk = true;
@@ -7556,6 +8089,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 if (ok4) { g_surv.reset_fall(); g_jump_window = 0.0f; }
                 const bool ok5 = g_creatures_ok && g_creatures.load("build/mobs.bin", err);
                 if (ok5) g_mob_anim.clear();
+                if (g_nav_ok) g_nav.invalidate_all();
                 hud_say((ok || ok2 || ok3 || ok4 || ok5) ? "Loaded" : "Nothing to load");
             }
             g_want_save = g_want_load = false;
