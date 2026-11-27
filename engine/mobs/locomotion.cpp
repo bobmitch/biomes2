@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace engine {
 namespace mobs {
@@ -85,8 +86,10 @@ void Locomotion::update(float dt, std::vector<Mob>& live, const float player[3])
 
         // --- steering: along the path to the goal
         float want[2] = {0.0f, 0.0f};
+        float asked_speed = 0.0f;
         if (m.gait > 0 && nav_) {
             const float gdx = m.goal[0] - b.path_goal[0], gdz = m.goal[2] - b.path_goal[2];
+            if (gdx * gdx + gdz * gdz > 0.25f) b.detours = 0;
             b.repath -= dt;
             if (b.corners.empty() || gdx * gdx + gdz * gdz > 0.25f || b.repath <= 0.0f) {
                 float len = 0.0f;
@@ -101,6 +104,7 @@ void Locomotion::update(float dt, std::vector<Mob>& live, const float player[3])
                 const bool last = b.next + 1 == n;
                 if (hdist(m.pos, &b.corners[b.next * 3]) > (last ? tuning_.arrive : tuning_.corner)) break;
                 ++b.next;
+                b.detours = 0;   // progress
             }
             if (n == 0 || b.next >= n) {
                 // There, or as near as the mesh goes (or nowhere to go): stand.
@@ -114,11 +118,29 @@ void Locomotion::update(float dt, std::vector<Mob>& live, const float player[3])
                 float spd = m.gait >= 2 ? K.run_speed : K.walk_speed;
                 // Ease into the goal, or a body overshoots and circles it.
                 if (b.next + 1 == n) spd *= (std::min)(1.0f, (std::max)(0.35f, l / 1.5f));
+                // A sidestep under way: its point instead of the corner.
+                if (b.detour_t > 0.0f) {
+                    b.detour_t -= dt;
+                    float sx = b.detour[0] - m.pos[0], sz = b.detour[2] - m.pos[2];
+                    const float sl = std::sqrt(sx * sx + sz * sz);
+                    if (sl < 0.4f || b.detour_t <= 0.0f) {
+                        b.detour_t = 0.0f;
+                        b.repath = 0.0f;   // round it: plan again from here
+                    } else {
+                        dx = sx / sl;
+                        dz = sz / sl;
+                    }
+                }
                 want[0] = dx * spd;
                 want[1] = dz * spd;
+                asked_speed = spd;
             }
         }
-        // Apart from the others (the near ones' bodies collide as well).
+        // The others. Pushed apart within `separation` (the near ones'
+        // bodies also collide); and one ahead in the line of travel is
+        // steered round -- away from the side it is on, or, met head on, to
+        // the right, which both take, so they pass rather than mirror.
+        const float wl = std::sqrt(want[0] * want[0] + want[1] * want[1]);
         for (size_t j = 0; j < live.size(); ++j) {
             if (j == i) continue;
             const float dx = m.pos[0] - live[j].pos[0], dz = m.pos[2] - live[j].pos[2];
@@ -128,6 +150,19 @@ void Locomotion::update(float dt, std::vector<Mob>& live, const float player[3])
                 const float d = std::sqrt(d2), push = (s - d) / s * 1.5f;
                 want[0] += dx / d * push;
                 want[1] += dz / d * push;
+            }
+            if (wl > 0.1f && d2 < tuning_.look_ahead * tuning_.look_ahead) {
+                const float ux = want[0] / wl, uz = want[1] / wl;
+                const float rx = -dx, rz = -dz;                 // towards the other
+                const float ahead = rx * ux + rz * uz;
+                const float nx = uz, nz = -ux;                  // the right of travel
+                const float side = rx * nx + rz * nz;
+                if (ahead > 0.0f && ahead < tuning_.look_ahead && std::fabs(side) < tuning_.pass_width) {
+                    const float go = std::fabs(side) < 0.05f ? 1.0f : (side > 0.0f ? -1.0f : 1.0f);
+                    const float k = (1.0f - ahead / tuning_.look_ahead) * (1.0f - std::fabs(side) / tuning_.pass_width);
+                    want[0] += nx * go * wl * 1.2f * k;
+                    want[1] += nz * go * wl * 1.2f * k;
+                }
             }
         }
 
@@ -172,12 +207,40 @@ void Locomotion::update(float dt, std::vector<Mob>& live, const float player[3])
         b.speed += (v - b.speed) * (1.0f - std::exp(-12.0f * dt));
         b.vertical = (m.pos[1] - before[1]) / dt;
         const bool asked = want[0] * want[0] + want[1] * want[1] > 0.04f;
-        b.stuck = asked && v < 0.1f ? b.stuck + dt : 0.0f;
-        if (b.stuck > 3.0f) {
-            // Wedged: give up on this goal; the behaviour picks another.
-            m.gait = 0;
-            b.corners.clear();
+        // Blocked -- by another creature, the player, a log the mesh has not
+        // seen rest yet: under 30% of the asked speed for a moment, step
+        // aside (away from the nearest creature, else alternately left and
+        // right) and plan again from there. Too many and the goal is given
+        // up: the behaviour picks another.
+        if (asked_speed > 0.1f && v < 0.3f * asked_speed) b.stuck += dt;
+        else b.stuck = (std::max)(0.0f, b.stuck - dt);
+        if (b.stuck > tuning_.stuck_after && b.detour_t <= 0.0f && m.gait > 0 && nav_) {
             b.stuck = 0.0f;
+            if (++b.detours > tuning_.max_sidesteps) {
+                m.gait = 0;
+                b.corners.clear();
+                b.detours = 0;
+            } else {
+                float ux = want[0], uz = want[1];
+                const float ul = std::sqrt(ux * ux + uz * uz);
+                if (ul > 1e-4f) { ux /= ul; uz /= ul; } else { ux = std::sin(m.yaw); uz = std::cos(m.yaw); }
+                const float nx = uz, nz = -ux;
+                float go = (b.detours & 1) ? 1.0f : -1.0f;
+                float best = 2.5f * 2.5f;
+                for (size_t j = 0; j < live.size(); ++j) {
+                    if (j == i) continue;
+                    const float rx = live[j].pos[0] - m.pos[0], rz = live[j].pos[2] - m.pos[2];
+                    const float d2 = rx * rx + rz * rz;
+                    if (d2 < best) { best = d2; go = (rx * nx + rz * nz) > 0.0f ? -1.0f : 1.0f; }
+                }
+                const float to[3] = {m.pos[0] + nx * go * tuning_.sidestep + ux * 0.5f, m.pos[1],
+                                     m.pos[2] + nz * go * tuning_.sidestep + uz * 0.5f};
+                float q[3];
+                if (nav_->move_along(m.pos, to, include, q)) {
+                    std::memcpy(b.detour, q, sizeof q);
+                    b.detour_t = 2.5f;
+                }
+            }
         }
         // Face where it is going; standing, where it was told to look.
         // Only a creature asked to move turns to its travel: a body settling
@@ -193,6 +256,39 @@ void Locomotion::update(float dt, std::vector<Mob>& live, const float player[3])
         }
         m.state_t += dt;   // the behaviour's clock: time in its state
         b.idle = m.gait == 0 ? b.idle + dt : 0.0f;
+    }
+
+    // Off physics nothing stops two creatures overlapping but this: any pair
+    // nearer than min_gap with one or both on the mesh is pushed apart --
+    // the mesh one wholly when the other has a body -- and back onto the mesh.
+    if (nav_) {
+        for (size_t i = 0; i < live.size(); ++i)
+            for (size_t j = i + 1; j < live.size(); ++j) {
+                Body& bi = bodies_[live[i].id];
+                Body& bj = bodies_[live[j].id];
+                if (bi.close && bj.close) continue;
+                float dx = live[i].pos[0] - live[j].pos[0], dz = live[i].pos[2] - live[j].pos[2];
+                float d = std::sqrt(dx * dx + dz * dz);
+                if (d >= tuning_.min_gap) continue;
+                if (d < 1e-4f) { dx = 1.0f; dz = 0.0f; d = 1.0f; } else { dx /= d; dz /= d; }
+                const float over = tuning_.min_gap - d;
+                const float si = bi.close ? 0.0f : (bj.close ? 1.0f : 0.5f);
+                const float sj = bj.close ? 0.0f : (bi.close ? 1.0f : 0.5f);
+                auto shove = [&](Mob& m, Body& b, float k, float sx, float sz) {
+                    if (k <= 0.0f) return;
+                    const float to[3] = {m.pos[0] + sx * over * k, m.pos[1], m.pos[2] + sz * over * k};
+                    float q[3];
+                    unsigned char area = 0;
+                    if (nav_->move_along(m.pos, to, include_for(m.kind), q, &area)) {
+                        m.pos[0] = q[0];
+                        m.pos[2] = q[2];
+                        m.pos[1] = area == nav::kAreaSwim ? sea_ - tuning_.float_depth : q[1];
+                    }
+                    (void)b;
+                };
+                shove(live[i], bi, si, dx, dz);
+                shove(live[j], bj, sj, -dx, -dz);
+            }
     }
 }
 

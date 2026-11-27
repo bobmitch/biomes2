@@ -2450,6 +2450,92 @@ int run_mimic_test() {
         check(has(s, SEARCH) && has(s, LOOK) && has(s, RETURN) && state() == IDLE && look_dist >= 0.0f && look_dist < 1.5f &&
                   home < 1.5f, buf);
     }
+    // 7. Open slopes: the mimic facing up or down a slope, a player walking
+    // (0.85 visibility) by day 8, 20 and 35 m along it, in its cone. Each is
+    // seen unless something real hides them; what hid the rest is counted.
+    std::fprintf(f, "\n7. open slopes\n");
+    {
+        struct Site { float p[3]; float up[2]; float grade; };
+        std::vector<Site> sites;
+        for (int k = 0; k < 400 && sites.size() < 12; ++k) {
+            const float a = float(k) * 2.39996f, r = 15.0f + 140.0f * float(k % 37) / 37.0f;
+            const float x = g_spawn.x + std::sin(a) * r, z = g_spawn.z + std::cos(a) * r;
+            const float gx = (wg.height(x + 2.0f, z) - wg.height(x - 2.0f, z)) / 4.0f;
+            const float gz = (wg.height(x, z + 2.0f) - wg.height(x, z - 2.0f)) / 4.0f;
+            const float g = std::sqrt(gx * gx + gz * gz);
+            if (g < 0.25f || g > 0.75f) continue;
+            Site st;
+            if (!on_mesh(x, z, st.p)) continue;
+            st.up[0] = gx / g; st.up[1] = gz / g; st.grade = g;
+            bool near_other = false;
+            for (const Site& o : sites)
+                if ((o.p[0] - x) * (o.p[0] - x) + (o.p[2] - z) * (o.p[2] - z) < 900.0f) near_other = true;
+            if (!near_other) sites.push_back(st);
+        }
+        int tried = 0, seen_n = 0, hid_vertical = 0, hid_chest_ray = 0, hid_both_rays = 0, hid_range = 0, unplaced = 0;
+        float worst_v = 0.0f;
+        for (const Site& st : sites)
+            for (int updown = 0; updown < 2; ++updown)
+                for (float d : {8.0f, 20.0f, 35.0f}) {
+                    const float sgn = updown == 0 ? 1.0f : -1.0f;
+                    float q[3];
+                    if (!on_mesh(st.p[0] + st.up[0] * d * sgn, st.p[2] + st.up[1] * d * sgn, q)) { ++unplaced; continue; }
+                    ++tried;
+                    // The checks as Minds makes them, to say which hides.
+                    const float eye[3] = {st.p[0], st.p[1] + 1.6f, st.p[2]};
+                    const float chest[3] = {q[0], q[1] + 1.2f, q[2]}, head[3] = {q[0], q[1] + 1.7f, q[2]};
+                    const float h = std::sqrt((chest[0] - eye[0]) * (chest[0] - eye[0]) + (chest[2] - eye[2]) * (chest[2] - eye[2]));
+                    const float v = std::atan2(std::fabs(chest[1] - eye[1]), h) * 57.29578f;
+                    worst_v = (std::max)(worst_v, v);
+                    g_felling.update(q[0], q[2]);
+                    const bool rc = minds_clear(eye, chest), rh = minds_clear(eye, head);
+                    const float dist = std::sqrt(h * h + (chest[1] - eye[1]) * (chest[1] - eye[1]));
+                    // And the creature itself.
+                    fresh();
+                    {
+                        Mob* w = C.find_live(mid);
+                        // Re-seat this mimic at the site, facing along the slope.
+                        w->pos[0] = st.p[0]; w->pos[1] = st.p[1]; w->pos[2] = st.p[2];
+                        std::memcpy(w->home, st.p, sizeof w->home);
+                        w->yaw = std::atan2(st.up[0] * sgn, st.up[1] * sgn);
+                        C.clear();
+                        run(0.1f, nullptr, nullptr);
+                        mid = C.spawn_at(mimic, st.p, std::atan2(st.up[0] * sgn, st.up[1] * sgn), 10.0 * 3600.0);
+                    }
+                    put_player(q);
+                    act = Act();
+                    act.speed = 1.4f;
+                    Seen sv;
+                    run(1.5f, &sv, [&] { return state() == APPROACH || state() == CHASE || state() == STARE; });
+                    const bool seen = has(sv, APPROACH) || has(sv, CHASE) || has(sv, STARE);
+                    if (seen) { ++seen_n; continue; }
+                    if (dist > 50.0f * 0.85f) ++hid_range;
+                    else if (v > 60.0f) ++hid_vertical;
+                    else if (!rc && !rh) ++hid_both_rays;
+                    else if (!rc) ++hid_chest_ray;
+                    int prop = 0;
+                    const float dl = std::sqrt((head[0] - eye[0]) * (head[0] - eye[0]) + (head[1] - eye[1]) * (head[1] - eye[1]) +
+                                               (head[2] - eye[2]) * (head[2] - eye[2]));
+                    const float hd3[3] = {(head[0] - eye[0]) / dl, (head[1] - eye[1]) / dl, (head[2] - eye[2]) / dl};
+                    const float hit = g_physics.probe_ray(eye, hd3, dl, prop);
+                    const float hp[3] = {eye[0] + hd3[0] * hit, eye[1] + hd3[1] * hit, eye[2] + hd3[2] * hit};
+                    const float gh = wg.height(hp[0], hp[2]);
+                    std::fprintf(f, "      hidden: grade %.2f, %s %.0f m, %.1f m off, %.0f deg, rays %s/%s; the head ray hits %s "
+                                 "%.1f m out, %.2f m %s the generated ground; eye %.2f m over it\n",
+                                 st.grade, updown == 0 ? "up" : "down", d, dist, v, rc ? "clear" : "blocked",
+                                 rh ? "clear" : "blocked", prop ? "a PROP" : "terrain", hit, std::fabs(hp[1] - gh),
+                                 hp[1] > gh ? "over" : "under", eye[1] - wg.height(eye[0], eye[2]));
+                }
+        std::snprintf(buf, sizeof buf, "%zu slope sites (grade 0.25-0.75), %d placements (%d off the mesh): %d seen; hidden by "
+                      "range %d, the vertical limit %d, the chest ray alone %d, both rays %d; steepest look %.0f degrees",
+                      sites.size(), tried, unplaced, seen_n, hid_range, hid_vertical, hid_chest_ray, hid_both_rays, worst_v);
+        std::fprintf(f, "      %s\n", buf);
+        // Every one not seen is hidden by something real: rock or a trunk
+        // across every line of sight. Not the vertical limit, not range.
+        const int unexplained = tried - seen_n - hid_both_rays - hid_chest_ray - hid_range - hid_vertical;
+        check(tried > 0 && hid_vertical == 0 && hid_range == 0 && unexplained == 0, buf);
+    }
+
     // 6. By moonlight (0.19 lx: 15% of its sight) a sprinter 25 m off is not
     // seen; by torchlight (60 lx on them: 79%) they are. A save keeps the chase.
     std::fprintf(f, "\n6. night\n");
@@ -2732,6 +2818,189 @@ int run_move_test() {
         check(at.gait == 1 && loaded && same && back && back->gait == 0 && hd(back->pos, b) < 1.0f, buf);
         C.clear();
         run(0.1f, 0, nullptr, false);
+    }
+
+    // H-K. Creatures and each other: head on near and far, four to one
+    // place, one standing in the way. Frame by frame, the closest any two
+    // came (two capsules touch at 0.7 m).
+    auto frames_pair = [&](float seconds, const std::vector<uint32_t>& ids, float& closest) {
+        closest = 1e30f;
+        float t = 0.0f;
+        for (; t < seconds; t += 1.0f / 60.0f) {
+            run(1.0f / 60.0f, 0, nullptr, false);
+            bool moving = false;
+            for (size_t i = 0; i < ids.size(); ++i) {
+                const Mob* a1 = C.find_live(ids[i]);
+                if (a1 && a1->gait) moving = true;
+                for (size_t j = i + 1; j < ids.size(); ++j) {
+                    const Mob* b1 = C.find_live(ids[j]);
+                    if (a1 && b1) closest = (std::min)(closest, hd(a1->pos, b1->pos));
+                }
+            }
+            if (!moving) break;
+        }
+        return t;
+    };
+    auto head_on = [&](const char* label, const float p0[3], const float p1[3]) {
+        const uint32_t x = C.spawn_at(mimic, p0, 0.0f, now), y = C.spawn_at(mimic, p1, 0.0f, now);
+        Mob* mx = C.find_live(x);
+        mx->gait = 1;
+        std::memcpy(mx->goal, p1, sizeof mx->goal);
+        Mob* my = C.find_live(y);
+        my->gait = 1;
+        std::memcpy(my->goal, p0, sizeof my->goal);
+        float closest = 0.0f;
+        const float t = frames_pair(60.0f, {x, y}, closest);
+        mx = C.find_live(x);
+        my = C.find_live(y);
+        std::snprintf(buf, sizeof buf, "%s: both there in %.1f s (%.2f and %.2f m off their goals); never nearer than %.2f m",
+                      label, t, hd(mx->pos, p1), hd(my->pos, p0), closest);
+        check(hd(mx->pos, p1) < 1.0f && hd(my->pos, p0) < 1.0f && closest >= 0.6f, buf);
+        C.clear();
+        run(0.1f, 0, nullptr, false);
+    };
+    std::fprintf(f, "\nH-K. creatures and each other\n");
+    if (found) head_on("head on, 12-32 m from the player (bodies)", a, b);
+    {
+        float c0[3], c1[3];
+        bool ok = false;
+        for (int k = 0; k < 16 && !ok; ++k) {
+            const float ang = float(k) * 0.3926991f;
+            if (!on_mesh(player[0] + std::sin(ang) * 70.0f, player[2] + std::cos(ang) * 70.0f, c0)) continue;
+            if (!on_mesh(player[0] + std::sin(ang) * 90.0f, player[2] + std::cos(ang) * 90.0f, c1)) continue;
+            std::vector<float> pts;
+            bool complete = false;
+            float len = 0.0f;
+            ok = g_nav.path(c0, c1, walk, pts, &len, &complete) && complete && len < 26.0f;
+        }
+        if (ok) head_on("head on, 70-90 m out (on the mesh)", c0, c1);
+        else check(false, "no straight 20 m 70 m out for the head-on test");
+    }
+    if (found) {
+        // Four from round a point, all to it.
+        const float g0[3] = {b[0], b[1], b[2]};
+        std::vector<uint32_t> ids;
+        for (int k = 0; k < 4; ++k) {
+            const float ang = float(k) * 1.5707963f + 0.4f;
+            float q[3];
+            if (on_mesh(g0[0] + std::sin(ang) * 9.0f, g0[2] + std::cos(ang) * 9.0f, q)) {
+                const uint32_t id = C.spawn_at(mimic, q, 0.0f, now);
+                Mob* m = C.find_live(id);
+                m->gait = 1;
+                std::memcpy(m->goal, g0, sizeof m->goal);
+                ids.push_back(id);
+            }
+        }
+        float closest = 0.0f;
+        const float t = frames_pair(40.0f, ids, closest);
+        float furthest = 0.0f;
+        int standing = 0;
+        for (uint32_t id : ids) {
+            const Mob* m = C.find_live(id);
+            furthest = (std::max)(furthest, hd(m->pos, g0));
+            standing += m->gait == 0 ? 1 : 0;
+        }
+        std::snprintf(buf, sizeof buf, "%zu walk 9 m to one point: all standing in %.1f s (%d of %zu), the furthest %.2f m from it, "
+                      "never two nearer than %.2f m", ids.size(), t, standing, ids.size(), furthest, closest);
+        check(ids.size() >= 3 && standing == int(ids.size()) && furthest < 3.0f && closest >= 0.6f, buf);
+        C.clear();
+        run(0.1f, 0, nullptr, false);
+
+        // One standing half way along the path from a to b; another walks it.
+        std::vector<float> pts;
+        float len = 0.0f;
+        bool complete = false;
+        g_nav.path(a, b, walk, pts, &len, &complete);
+        float mid[3] = {0.5f * (a[0] + b[0]), 0.0f, 0.5f * (a[2] + b[2])};
+        float q[3];
+        // The point of the path nearest half way.
+        float bestd = 1e30f;
+        for (size_t i = 0; i + 1 < pts.size() / 3; ++i)
+            for (int k = 0; k <= 20; ++k) {
+                const float u = float(k) / 20.0f;
+                const float pp[3] = {pts[i * 3] + (pts[i * 3 + 3] - pts[i * 3]) * u, 0.0f, pts[i * 3 + 2] + (pts[i * 3 + 5] - pts[i * 3 + 2]) * u};
+                const float dd = std::fabs(hd(pp, a) - hd(pp, b));
+                if (dd < bestd) { bestd = dd; mid[0] = pp[0]; mid[2] = pp[2]; }
+            }
+        on_mesh(mid[0], mid[2], q);
+        const uint32_t stander = C.spawn_at(mimic, q, 0.0f, now);
+        const uint32_t walker = C.spawn_at(mimic, a, 0.0f, now);
+        Mob* m = C.find_live(walker);
+        m->gait = 1;
+        std::memcpy(m->goal, b, sizeof m->goal);
+        float closest2 = 0.0f;
+        const float t2 = frames_pair(60.0f, {walker, stander}, closest2);
+        m = C.find_live(walker);
+        const engine::mobs::Locomotion::Body* bw = g_loco.body(walker);
+        std::snprintf(buf, sizeof buf, "one standing on the path half way: the walker there in %.1f s (alone %.1f m of path), "
+                      "%.2f m off; never nearer than %.2f m to it; %d sidesteps in hand",
+                      t2, len, hd(m->pos, b), closest2, bw ? bw->detours : -1);
+        check(hd(m->pos, b) < 1.0f && closest2 >= 0.6f, buf);
+        C.clear();
+        run(0.1f, 0, nullptr, false);
+
+        // The PLAYER standing on the path: creatures do not steer round the
+        // player (a chasing one has to come up to them), so the body stops
+        // it and it must sidestep.
+        g_physics.place_character(q[0], q[1] + 0.05f, q[2]);
+        const uint32_t w2 = C.spawn_at(mimic, a, 0.0f, now);
+        m = C.find_live(w2);
+        m->gait = 1;
+        std::memcpy(m->goal, b, sizeof m->goal);
+        float closest3 = 1e30f;
+        int most = 0;
+        float t3 = 0.0f;
+        for (; t3 < 60.0f; t3 += 1.0f / 60.0f) {
+            run(1.0f / 60.0f, 0, nullptr, false);
+            float pf[3];
+            g_physics.character_position(pf);
+            const Mob* mm = C.find_live(w2);
+            closest3 = (std::min)(closest3, hd(mm->pos, pf));
+            if (const engine::mobs::Locomotion::Body* bb = g_loco.body(w2)) most = (std::max)(most, bb->detours);
+            if (mm->gait == 0) break;
+        }
+        m = C.find_live(w2);
+        std::snprintf(buf, sizeof buf, "the player standing on the path half way: the walker there in %.1f s, %.2f m off "
+                      "(slid round the body: %d sidesteps); never nearer than %.2f m to the player", t3, hd(m->pos, b), most, closest3);
+        check(hd(m->pos, b) < 1.0f && closest3 >= 0.6f, buf);
+        g_physics.place_character(player[0], player[1] + 0.05f, player[2]);
+        C.clear();
+        run(0.1f, 0, nullptr, false);
+
+        // A 2 m log across the path that the mesh has not seen (one still
+        // settling): physics stops the walker, and it must step round.
+        {
+            // Across the path's direction at the half-way point.
+            float ux = b[0] - a[0], uz = b[2] - a[2];
+            for (size_t i = 0; i + 1 < pts.size() / 3; ++i) {
+                const float pp[3] = {pts[i * 3], 0.0f, pts[i * 3 + 2]};
+                const float qq[3] = {pts[i * 3 + 3], 0.0f, pts[i * 3 + 5]};
+                if (plan_dist(q, pp, qq) < 0.5f) { ux = qq[0] - pp[0]; uz = qq[2] - pp[2]; break; }
+            }
+            const float ul = std::sqrt(ux * ux + uz * uz);
+            ux /= ul; uz /= ul;
+            const float la[3] = {q[0] - uz * 1.0f, q[1] + 0.35f, q[2] + ux * 1.0f};
+            const float lb[3] = {q[0] + uz * 1.0f, q[1] + 0.35f, q[2] - ux * 1.0f};
+            const uint32_t logb = g_physics.add_static_capsule(la, lb, 0.35f);
+            const uint32_t w3 = C.spawn_at(mimic, a, 0.0f, now);
+            m = C.find_live(w3);
+            m->gait = 1;
+            std::memcpy(m->goal, b, sizeof m->goal);
+            int most3 = 0;
+            float t4 = 0.0f;
+            for (; t4 < 60.0f; t4 += 1.0f / 60.0f) {
+                run(1.0f / 60.0f, 0, nullptr, false);
+                if (const engine::mobs::Locomotion::Body* bb = g_loco.body(w3)) most3 = (std::max)(most3, bb->detours);
+                if (C.find_live(w3)->gait == 0) break;
+            }
+            m = C.find_live(w3);
+            std::snprintf(buf, sizeof buf, "a 2 m log across the path the mesh has not seen: the walker there in %.1f s, %.2f m off, "
+                          "after %d sidesteps", t4, hd(m->pos, b), most3);
+            check(hd(m->pos, b) < 1.0f && most3 >= 1, buf);
+            g_physics.remove_body(logb);
+            C.clear();
+            run(0.1f, 0, nullptr, false);
+        }
     }
 
     // F. The still of a walk: one walking past the camera.

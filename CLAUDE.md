@@ -1485,9 +1485,18 @@ behaviour scripts): every phase of the ADR.**
   follows a navmesh path to its goal -- re-planned when the goal moves 0.5
   m or every 1.5 s (3 s far off), corners passed within 0.5 m, the goal
   within 0.6 m, easing in over the last 1.5 m -- at its kind's speed,
-  filtered by how it moves (walkers walk and wade, the mimic swims too),
-  pushed apart from neighbours within 1.2 m. Asked to move and not moving
-  for 3 s, it gives the goal up.
+  filtered by how it moves (walkers walk and wade, the mimic swims too).
+- **Creatures and each other**: pushed apart within 1.2 m; one ahead within
+  3 m and 1 m of the line of travel is steered round -- away from the side
+  it is on, or, met head on, to the same hand, which both take, so they
+  pass rather than mirror. Bodies (near) collide with each other and the
+  player in Jolt; off physics a final pass keeps any two centres 0.75 m
+  apart, back onto the mesh. Creatures do NOT steer round the player (a
+  chasing one has to come up to them); a body slides round theirs.
+- **Stuck** (under 30% of the asked speed for 0.8 s -- the player, a log
+  the mesh has not stamped yet): a 2 m sidestep away from the nearest
+  creature (else alternately left and right), then a new plan from there;
+  after 4 without passing a corner, the goal is given up.
 - **Near the player** (within 34 m, released past 38) a creature has a
   PHYSICS BODY: `PhysicsWorld::add_walker`, the player's capsule and its
   rules, through the same `step_body` -- ground, slopes, steps, buoyancy,
@@ -1503,9 +1512,18 @@ behaviour scripts): every phase of the ADR.**
   for a creature with a body, 1 further out, staggered: it HEARS the
   player (their level through `perception::hears`) and SEES them (its
   range x their visibility x the light on them, the cone HORIZONTAL and
-  60 degrees up or down, a clear physics ray eye to chest). As a 3D cone,
-  a player on a slope 2 m off, or lower down 30 m away, fell out of 45
-  degrees. No player while flying.
+  `view_vertical_deg` up or down -- the mimic's 120, no limit -- and a
+  clear physics ray to their chest or head from its eye or a head's width
+  either side). As a 3D cone, a player on a slope 2 m off, or lower down
+  30 m away, fell out of 45 degrees; from one point, a trunk beside the
+  creature blinded it to a whole sector. No player while flying.
+- **What hides a player on a slope** (`--mimic-test` 7: 12 slopes of grade
+  0.25-0.75 near the spawn, the player walking 8, 20 and 35 m up or down
+  the slope in the cone, 67 placements): the steepest look was 33
+  degrees, so a vertical limit of 60 never hid anyone; what did was a rise
+  between them (7), trees and rocks (7), and a trunk right beside the
+  mimic's eye (3), which the wider eye fixed: 49 seen, now 54, the other
+  13 behind real crests and trunks.
 - **Behaviour is Lua**: a kind's `script` returns hooks -- `on_wake`,
   `on_see(c, ev)` every tick it sees them, `on_lose` the tick it stops,
   `on_hear` every tick it hears them unseen, then `on_think(c, dt)` --
@@ -1542,8 +1560,12 @@ behaviour scripts): every phase of the ADR.**
   way), a run back (5.19 against 5.0), a walk 70 m out (on the mesh, no
   body), a run in from 50 m (mesh, then a body; the biggest step in a
   frame 0.083 m, a run's own), a walk frozen half way, saved, read back and
-  finished, and a swim from the nearest beach to 3.7 m of water (feet 1.46
-  m under, swimming); stills `build/move_walk.bmp`, `move_swim.bmp`. Every
+  finished, two passing head on near (never nearer than 0.90 m) and far
+  (0.92), four walking to one point (they stand round it, never nearer
+  than 0.82), one standing on the path walked round (0.97), the player on
+  the path slid round (0.74), a 2 m log the mesh has not seen stepped
+  round (1 sidestep), and a swim from the nearest beach to 3.7 m of water
+  (feet ~1.3-1.5 m under, swimming); stills `build/move_walk.bmp`, `move_swim.bmp`. Every
   body is given back. The player's `--swim` and `--walk` are unchanged by
   the refactor (eye never under; worst step 2 cm).
 - `--mob-test` (`build/mob_test.txt`, exit code = failures): 24 game hours

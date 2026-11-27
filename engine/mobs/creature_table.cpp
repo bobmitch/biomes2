@@ -72,6 +72,7 @@ bool CreatureTable::load(const char* path, const worldgen::ArchetypeTable& biome
             num("view_range_m", k.view_range_m);
             num("view_cone_deg", k.view_cone_deg);
             num("dark_gain", k.dark_gain);
+            num("view_vertical_deg", k.view_vertical_deg);
             if (e.has("script")) k.script = e.string("script");
             if (k.health <= 0.0f || k.hear_range_m < 0.0f || k.view_range_m < 0.0f || k.dark_gain < 0.0f)
                 throw std::runtime_error(k.id + ": health > 0, ranges and dark_gain >= 0");

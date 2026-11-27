@@ -387,7 +387,9 @@ Last gathered: 2026-11-21, after the exploration fog; creatures added
   [Creatures and stealth]
 - **Movement**: no jumping, climbing or turning on the spot (the body
   turns as it walks); far-off creatures ignore a rolling log until it
-  rests and is stamped, and do not avoid the player; a far-off swimmer
+  rests and is stamped; no creature steers round the player (by choice:
+  a body slides round theirs); the sidestep is local (2 m), so a wide
+  obstacle the mesh has not seen is given up after 4; a far-off swimmer
   floats at a fixed depth, with no waves; creatures do not tire, drown or
   take falls; a stuck creature only gives up its goal after 3 s.
   [Creatures and stealth]

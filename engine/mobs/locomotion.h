@@ -39,7 +39,13 @@ public:
         float corner = 0.5f;                       // ... from a corner that is passed
         float repath_near = 1.5f, repath_mid = 3.0f;
         float turn_rate = 8.0f;                    // rad/s
-        float separation = 1.2f;                   // metres kept between creatures (mid range)
+        float separation = 1.2f;                   // metres a creature is pushed apart within
+        float min_gap = 0.75f;                     // centres never closer, off physics (two capsules 0.7)
+        float look_ahead = 3.0f;                   // another creature this far ahead is steered round
+        float pass_width = 1.0f;                   // ... if it is within this of the line of travel
+        float stuck_after = 0.8f;                  // seconds at under 30% of the asked speed: sidestep
+        float sidestep = 2.0f;                     // metres to the side
+        int   max_sidesteps = 4;                   // then the goal is given up
         float float_depth = 1.35f;                 // a swimmer's feet under the surface (physics' kFloatDepth)
         float swim_speed = 0.5f;                   // of the asked-for speed, mid range (physics' kSwimSpeed)
     };
@@ -57,6 +63,9 @@ public:
         bool  grounded = true, swimming = false;
         float stuck = 0.0f;             // seconds asked to move and not moving
         float idle = 0.0f;              // seconds standing (the stand-in wander's clock)
+        float detour[3] = {0, 0, 0};    // a sidestep's point, while detour_t > 0
+        float detour_t = 0.0f;
+        int   detours = 0;              // sidesteps since the last corner passed
         bool  facing = false;           // turning, standing, to face_yaw
         float face_yaw = 0.0f;
     };

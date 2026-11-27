@@ -297,15 +297,26 @@ void Minds::update(float dt, const Player& p, const ClearFn& clear) {
             const float fwd[3] = {std::sin(m.yaw), 0.0f, std::cos(m.yaw)};
             const float light = perception::light_factor(p.lux, K.dark_gain, light_);
             const float range = perception::sight_range(K.view_range_m, p.visibility, light);
-            // The cone is the HORIZONTAL field of view; up and down an eye
-            // looks 60 degrees either way. As a 3D cone, a player on a slope
-            // two metres off, or lower down 30 m away, fell out of 45 degrees.
+            // The cone is the HORIZONTAL field of view, and the kind says how
+            // far up and down it looks (view_vertical_deg; 90 or more, any
+            // way). As a 3D cone, a player on a slope two metres off, or lower
+            // down 30 m away, fell out of 45 degrees.
             const float flat[3] = {to[0], 0.0f, to[2]};
             const float h = std::sqrt(to[0] * to[0] + to[2] * to[2]);
-            const bool vertical_ok = std::fabs(to[1]) <= h * 1.7320508f;   // tan 60
-            if (dist <= range && perception::in_cone(fwd, flat, K.view_cone_deg) && vertical_ok &&
-                (!clear || clear(eye, chest)))
-                seeing = true;
+            const bool vertical_ok = K.view_vertical_deg >= 90.0f ||
+                                     std::fabs(to[1]) <= h * std::tan(K.view_vertical_deg * 0.017453293f);
+            if (dist <= range && perception::in_cone(fwd, flat, K.view_cone_deg) && vertical_ok) {
+                // A clear line from the eye, or from a head's width either
+                // side of it, to the chest or the head: one point for an eye
+                // let a trunk beside the creature blind it to a whole sector.
+                const float head[3] = {p.feet[0], p.feet[1] + 1.7f, p.feet[2]};
+                const float side[3] = {std::cos(m.yaw) * 0.35f, 0.0f, -std::sin(m.yaw) * 0.35f};
+                for (int e = 0; e < 3 && !seeing; ++e) {
+                    const float s = e == 0 ? 0.0f : (e == 1 ? 1.0f : -1.0f);
+                    const float from[3] = {eye[0] + side[0] * s, eye[1], eye[2] + side[2] * s};
+                    seeing = !clear || clear(from, chest) || clear(from, head);
+                }
+            }
             if (!seeing && perception::hears(p.level_db, dist, K.hear_range_m, K.hear_threshold_db)) {
                 hearing = true;
                 db = perception::level_at(p.level_db, dist);

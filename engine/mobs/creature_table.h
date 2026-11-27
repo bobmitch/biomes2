@@ -34,6 +34,9 @@ struct CreatureKind {
     // Perception (engine/mobs/perception.h).
     float hear_range_m = 20.0f, hear_threshold_db = 34.0f;
     float view_range_m = 50.0f, view_cone_deg = 45.0f, dark_gain = 1.0f;
+    // How far above or below level it sees, degrees; 90 or more: no limit
+    // (the cone is horizontal).
+    float view_vertical_deg = 60.0f;
     std::string script;                  // game/scripts/<script>
 };
 

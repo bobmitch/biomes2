@@ -133,11 +133,14 @@ width; the mimic's 45 is 22.5 each side) and `dark_gain` (night vision).
 It sees the player when, all of:
 
 - the HORIZONTAL angle from its facing is within half the cone, and the
-  vertical within 60 degrees (as built: a 3D cone lost a player on a slope
-  close by, or lower down far off);
+  vertical within the kind's `view_vertical_deg` (the mimic's 120: no
+  limit) -- as built: a 3D cone lost a player on a slope close by, or
+  lower down far off;
 - d <= view_range x **visibility** x **light**;
-- a physics ray from its eyes to the player's chest and head is clear
-  (terrain, trunks, rocks; foliage and crowns do not block yet).
+- a physics ray to the player's chest or head is clear from its eye or a
+  head's width (0.35 m) either side of it (terrain, trunks, rocks; foliage
+  and crowns do not block yet). One point for an eye let a trunk beside
+  the creature blind it to a whole sector.
 
 **Visibility** is the player's posture and speed (`items.json` `stealth`):
 standing still 0.7, walk 0.85, jog 0.95, sprint 1.0; crouched still 0.35,
@@ -223,8 +226,10 @@ built in the engine block like Jolt; worldgen and validate never see it.
 - **Mid** (the rest of the active area): no physics; the creature slides
   along the mesh (Detour's moveAlongSurface), feet on the polygon's detail
   height. Detour's crowd was the plan; at tens of creatures a path
-  follower with a separation push does the same, and a crowd can replace
-  it if crowds ever come. The near tier is 34 m in, 38 m out.
+  follower does the same -- with a separation push, steering round a
+  creature ahead (both take the same hand head on), a hard 0.75 m gap off
+  physics, and a sidestep and new plan when stuck -- and a crowd can
+  replace it if crowds ever come. The near tier is 34 m in, 38 m out.
 - **Frozen**: outside the active area (decision 1).
 
 ### 6. Behaviour is Lua; the engine routes
