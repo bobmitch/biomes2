@@ -3232,12 +3232,57 @@ the terrain and the trees and received by both through one function,
 - **Filtering (PCSS)**: a 12-tap blocker search, the penumbra from the
   NEAREST blocker times the sun's angular diameter (0.53 degrees), never
   under 1.5 texels, then a 16-tap Poisson PCF. Pixels the search finds
-  wholly lit or wholly shadowed stop there. The rotation is per shadow
-  texel AND walks per frame (`l_shadow_frame`): fixed, it left a speckle of
-  dark dots in every penumbra that TAA could not average. The average
+  wholly lit or wholly shadowed stop there. The average
   blocker (textbook PCSS) blurred a trunk's shadow at its foot with the
   crown 15 m up; the nearest one keeps contact hard. Sunflecks now read as
   the soft discs the sun makes, not the pixel-sharp mottling 3x3 PCF drew.
+- **The taps are turned PER PIXEL, and that is what TAA needs.** Under a
+  canopy the shadow map is dappled at the texel (3.3 cm at cascade 0, at
+  the default level) and the penumbra is a crown 15-20 m up, 0.14 m of it:
+  16 taps over a disc four texels in radius are a coarse Monte Carlo
+  estimate of that coverage, about +-12% a frame. **Where its error lands decides everything.** The
+  rotation used to be hashed from `floor(uv * res)`, one draw per shadow
+  TEXEL, so every screen pixel over a texel shared one estimate and the
+  error came in blocks several pixels wide -- wider than TAA's 3x3
+  neighbourhood, so the variance clamp locked on to the block and threw the
+  history away. Sunlit forest floor was a mosaic of lit and unlit tiles
+  that reshuffled every frame: the one thing in the engine a player calls
+  noise. Hashed from `floor(uv * res * 32)` instead -- a sub-texel cell, so
+  per pixel at any distance -- each pixel draws its own, the neighbourhood
+  spans many draws, the history survives and TAA converges on the real
+  coverage. **The estimator did not change; only where its error lands.**
+  `BIOMES_PCSS` is the A/B: 0 per texel + frame (the old one), 1 per texel
+  fixed, 2 per pixel + frame (the default).
+  Measured at the spawn wood (`--cam 736 44.6 -288 0.9 -0.35 --time 8
+  --res 1920 1080 --sea-state 0 --wind-dir 40 --ev100 10.03`), eight
+  consecutive raw frames from `--shake 90`, mean |dLuma| between frames and
+  the share of pixels moving over 20 levels: per texel 2.94 and 3.82%, per
+  pixel **1.41 and 0.61%** -- against 1.27 with the shadows off altogether,
+  so the shadow's share of the per-frame change went 1.67 -> 0.14, a 92%
+  cut. The p99.9 went 99.7 -> 37.0 levels. With TAA OFF both are 9.83: the
+  estimator is identical and TAA now removes 7x of it where it removed 3.3.
+  What is left is fine grain on the ground, not crawling blocks.
+  **Cost: none.** 1440p `--gpu-profile 120`: frame 5.673 -> 5.651 ms,
+  terrain pass 0.952 -> 0.973; walking 6.36 / 6.43 against 6.47 / 6.46 ms;
+  cracks 0 both; `--leak-test` 0.00101 nits as before. Where the casters are
+  low-frequency there is nothing to estimate and nothing changes: an open
+  meadow's still differs on 0.31% of pixels by more than 2 levels (max 21),
+  and its per-frame change is 0.411 against 0.409.
+- **Turn the clock AND the weather off before reading a shake.** Two
+  confounds cost an hour here: auto-exposure still adapting (fix it with
+  `--ev100`, or the whole frame shifts and swamps the measurement), and
+  `--wind 6`, which closes the sky over this wood -- no sun, no penumbra,
+  and both variants measure 0.144 and look identical. Check the still's
+  mean luma before believing a quiet number.
+- **Not the grass, measured.** With the shadow fixed, the per-frame change
+  left is the ground cover, so a minimum screen WIDTH for a blade was built
+  (`--grass-min-px`, the clamp in `vs_blade`) on the theory that sub-pixel
+  blades flip their coverage as they sway. It did nothing: 1.693 at 0 px,
+  1.693 at 0.75, 1.651 at 2, 1.549 at 3 -- and at 3 px the sward is visibly
+  fatter. `cs_emit`'s `widen` (sqrt of the thinning) already holds a blade
+  at about a pixel at every distance, so there was no sub-pixel blade to
+  find. Removed; the residual is the estimator's own fine grain, which is
+  what it should be.
 - **Seams and the far end**: each cascade blends into the next over its
   last 12%; the last blends into the far terrain shadow over its last
   20%, 1.36-1.6 km. It used to end at 520 m with a 52 m fade, and shadows

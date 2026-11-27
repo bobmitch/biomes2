@@ -1289,6 +1289,11 @@ void Renderer::record_shadows(const ViewConstants& view) {
     sc.shadow_frame[0] = float(post_frame_ % 1024u);
     sc.shadow_frame[1] = pom_on_ ? 1.0f : 0.0f;   // parallax on the scans (pom.hlsli)
     sc.shadow_frame[2] = 0.0f;   // the first cascade drawn (was 2 under RT shadows; rt-last)
+    // Which rotation the PCSS taps are turned by (shadow.hlsli): 2, per
+    // pixel, so TAA can average the estimate's error. 0 is the old
+    // per-texel rotation and 1 the fixed one, for the A/B.
+    static const char* pcss_env = std::getenv("BIOMES_PCSS");
+    sc.shadow_frame[3] = pcss_env ? float(std::atoi(pcss_env)) : 2.0f;
     far_.constants(on && far_on_, sc.far_map);
     if (forest_.ready() && forest_on_ && trees_on_) {
         sc.forest[0] = sc.forest[1] = -0.5f * forest_.extent();
