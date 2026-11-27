@@ -436,6 +436,13 @@ public:
     // illuminance behind it (lux at the eye from visible local lights).
     float light_presence() const { return light_presence_; }
     float light_lux_at_eye() const { return light_lux_eye_; }
+    // The illuminance on a body at `p` (lux, luminance): the key light's beam
+    // if the physics ray towards it is clear, thinned by the cloud cover's
+    // mean (not the shadow map at p -- that is on the GPU); the sky's light
+    // times the eye's open sky (HeightGi::camera_open -- the camera's, which
+    // rides the player); and every local light in clear view, the carried
+    // torch always. What creatures see the player by (ADR-007).
+    float illuminance_at(const float p[3]) const;
     const DarkVision& dark_vision() const { return dark_; }
     // A simulated time step for the eye's adaptation instead of the wall
     // clock's (< 0: the wall clock), so a timed test is the same curve

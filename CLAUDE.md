@@ -20,7 +20,9 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `tools/models/` | `pack_character.py`: the rigged glTF characters and the animation library in `assets/models/` (not in git) to `assets/models/packed/` (`*.chr`, `ual.anim`). |
 | `engine/rocks/` | Layer 9's rocks: procedural meshes, the CPU tile streamer, instanced drawing on the terrain's root signature, static colliders. |
 | `engine/props/` | Things to pick up: the caves' glowing mushrooms (`glow_mushrooms.h`), and layer 10's forage plants (`forage.h`): streaming in 64 m zones, picks and regrowth, drawing, picking with E. |
-| `engine/player/` | The player's survival: items (`items.h`), the 8 x 4 inventory, health / stamina / food / the game clock (`survival.h`), item icons painted from data (`icons.h`). No GPU. |
+| `engine/player/` | The player's survival: items (`items.h`), the 8 x 4 inventory, health / stamina / food / the game clock (`survival.h`), item icons painted from data (`icons.h`), the player as heard and seen (`stealth.h`). No GPU. |
+| `engine/nav/` | The navmesh (ADR-007): `nav_tile.h` builds one Recast/Detour tile from the field's solid spans, the water and the obstacles; `nav_world.h` streams tiles round the player on workers and answers queries. Recast/Detour is the `third_party/recastnavigation` submodule (v1.6.0, zlib). |
+| `engine/mobs/` | Creatures (ADR-007, being built): `perception.h`, the arithmetic of hearing (dB) and sight (cone, range, light); `creature_table.h` (`game/data/creatures.json`); `creatures.h`, the zones that spawn, freeze, save and thaw them; `locomotion.h`, how they move; `minds.h`, what they notice (perception on a think tick) and the Lua host for their behaviours (`game/scripts/creatures/*.lua`). No GPU. |
 | `game/data/` | `items.json`: every item, the player's numbers, the clock, the start inventory. Gameplay data, outside the hash. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32), Windows only: seeds as maps plus their gameplay numbers. See "The world viewer". |
@@ -121,11 +123,15 @@ The engine's headless modes all write a text file under `build/` and exit:
 `--shot`, `--flight <s>`, `--walk <s>`, `--overhang`, `--dig`, `--dig-save`,
 `--dig-verify`, `--dig-stress`, `--check-dialect`, `--probe-field`,
 `--band-report`, `--sea-report`, `--swim`, `--dig-water`, `--blend-report`, `--tab-test`,
+`--mob-test` (creatures: spawning, freezing, saving, thawing; see Creatures and stealth),
+`--nav-report` (the navmesh round the spawn: tiles, coverage, trunks, paths, a swim, a log, a dig, and a map),
+`--move-test` (creatures walking, running, swimming, handed from the mesh to physics, frozen mid-walk),
+`--mimic-test` (the mimic's script: heard, unheard, seen, chased, stared, lost, by moonlight and torchlight),
 `--clock-jump` (with `--shot`: the light under the ground after the clock
 jumps or runs, `build/time_jump.txt`; see The near field),
 `--sky-report` (CPU only, no device: the atmosphere against clear-sky
-references), `--pose-sheet` (the character in sixteen fixed poses from fixed
-cameras -- idle, walk, jog, sprint, jump, swim, torch, the axe -- `build/pose_*.bmp` and `pose_sheet.txt`), `--shot ... --gpu-profile [frames]` (per-pass GPU times,
+references), `--pose-sheet` (the character in nineteen fixed poses from fixed
+cameras -- idle, walk, jog, sprint, jump, swim, torch, the axe, crouch -- `build/pose_*.bmp` and `pose_sheet.txt`), `--shot ... --gpu-profile [frames]` (per-pass GPU times,
 pipeline statistics and the trees' overdraw, `<shot>.gpu.txt`; see Trees),
 `--leak-test`
 (ADR-004 L6: a sealed chamber, unlit and torch-lit, the heightfield GI against
@@ -1315,7 +1321,8 @@ Valheim's rules, deliberately (`engine/player/`, data in
   away a tool. **Tools**: the axe (left click chops only with it in hand)
   and the torch (in hand = the carried light; `F` still toggles the light
   directly, for debugging). A new game starts with both (`start` in
-  items.json). **Tab** opens the inventory (the old fly/walk toggle is
+  items.json). **Left Ctrl** crouches (see Creatures and stealth).
+  **Tab** opens the inventory (the old fly/walk toggle is
   **F10**, a system key: `WM_SYSKEYDOWN`): click takes a stack, click again
   places it (merge or swap), Shift + click splits into an empty slot, right
   click uses. The game runs on behind it.
@@ -1359,6 +1366,214 @@ Valheim's rules, deliberately (`engine/player/`, data in
 - **Not done**: see gaps.md -- the window loop itself (keys, the clock
   running, sprint drain, a jump's cost, fall damage, the respawn) has only
   been run through its parts headlessly, not played.
+
+### Creatures and stealth (ADR-007)
+
+`docs/adr-007-creatures-perception-navigation.md` is the plan: 64 m zones
+that spawn, simulate and FREEZE their creatures (saved, so leaving does not
+shake a chase), per-zone spawn rules with an area cap, perception by sound
+and sight, Recast/Detour navmeshes built from the field, simulation by
+distance, behaviour in Lua. Data in `game/data/creatures.json` (to come)
+and items.json's `stealth` block; never in the golden hash. **Phases 1
+(the player's side) and 2 (zones, spawning, freezing, saving, drawing) are
+built, and phases 3 (the navmesh), 4 (movement) and 5 (perception and
+behaviour scripts): every phase of the ADR.**
+
+- **Crouch**: Left Ctrl toggles it on land (in the water Ctrl still dives
+  while held; Right Ctrl does nothing); 1.4 m/s (`stealth.crouch_speed`),
+  no sprint -- Shift, a jump or swimming stands the player up. The
+  animator blends `Crouch_Idle_Loop` to `Crouch_Fwd_Loop` by speed on the
+  crouch's own phase (`LocomotionInput::crouch`). The capsule keeps its
+  height.
+- **Sound** (`engine/player/stealth.h`): a source level in dB at 1 m --
+  silent standing, crouch walk 35, walk 50, jog 60, sprint 70 (by speed,
+  walk 1.4 m/s, jog 5, sprint 8), swimming 55, treading water 40, +4
+  wading, nothing in the air -- and decaying spikes (30 dB/s): jump 62,
+  landing 64 + 2 a metre fallen, the axe 82, a dig 78. A creature hears
+  it within its `hear_range` where L - 20 log10(d) reaches its threshold
+  (`engine/mobs/perception.h`): the mimic's 20 m and 34 dB hear a jog to
+  20 m, a walk to 6.3, a crouch walk to 1.1.
+- **Sight**: visibility by posture and speed (crouched still 0.35, moving
+  0.5; standing 0.7, walk 0.85, jog 0.95, sprint 1; swimming 0.5) x the
+  LIGHT on the player through a log curve (0.05 lx the floor 0.1, 400 lx
+  full; moonlight 0.15, dusk 0.59, a carried torch at night 0.79), scaled
+  by a creature's `dark_gain` for night vision, x its view range, inside
+  its cone (the TOTAL width), with a clear ray.
+- **The light on the player** is `Renderer::illuminance_at` (chest height,
+  every frame): the key light's beam if a physics ray to it is clear,
+  times the cloud cover's MEAN sunlit share (not the shadow map at the
+  player); pi x the sky's mean radiance x the camera's open sky x
+  `storm_dim`; every placed light in clear view and the carried torch.
+  Crowns do not shade it (they are not colliders).
+- **The HUD** shows it bottom right while walking (brighter crouched): the
+  level in dB and the share seen in full light, as two bars
+  (`engine.player()` has `crouching`, `noise_db`, `visibility`, `light`,
+  `lux`).
+- `--survival-test` section A2 checks the gaits, spikes and decay, the
+  hearing distances, the visibility table, the light curve, the cone and
+  the sight ranges against the mimic's numbers, on the default tuning (so
+  retuning items.json moves nothing there).
+- **Zones** (`engine/mobs/creatures.h`): 64 m, the forage and rock tiles'
+  grid. A zone whose centre is within `zones.active_m` (128 m) of the
+  player wakes -- 11 at the spawn -- and freezes past `release_m` (160 m,
+  hysteresis). Freezing takes every creature standing in it out of the
+  live list as it is, with its rules' remaining waits; its clock stands
+  still while frozen, and thawing puts back exactly what was there. A
+  creature that walks into a sleeping zone freezes with that zone.
+- **Spawning**: per awake zone and rule, an attempt every `interval_h` game
+  hours (each zone's first somewhere in its first interval), at most one
+  per call (a clock jump fires no burst), with `chance`, under
+  `max_per_zone` and `max_active`, within `hours`. A point: up to 12
+  random spots in the zone, on dry ground under a 0.6 slope (the 2.5D
+  generated height), out of channels and cave mouths, not on a prop where
+  physics has them, where the rule's biome weighs `min_weight`, 20 m from
+  the player and `min_same_m` from its own kind, and NOT visible -- outside
+  the view widened by 10 degrees, or both rays from the eye (to feet and
+  head) blocked (`player_could_see`). Rolls hash the field id, the zone,
+  the rule and the zone's attempt count. Measured at the spawn
+  (`--mob-test`): the area cap (4) is reached in ~1.5 game hours (~2 real
+  minutes), every mimic 61-94 m off, out of view.
+- **Saving**: F6 / F9 write and read `build/mobs.bin` beside the edits
+  (live creatures written into their zones as frozen; kinds by id, so the
+  table may change under a save; another world's save is refused).
+- **Drawing**: the character renderer draws up to 31 creatures (nearest
+  first, `zones.max_drawn`) on the player's mesh, each its own block of the
+  bone buffer -- root SRV t0's address moved per draw -- with its kind's
+  TINT in the block's last record (`kTintBone` 254), in the main pass,
+  every cascade, and every light face being redrawn within 2 m of one. An
+  animator each (idle for now), made when first drawn.
+- **The navmesh** (`engine/nav/`): one Recast/Detour tile per 64 m zone
+  within 192 m of the player (`kNavRadius`), built on three workers,
+  dropped past 288 m. **Built from the field, not from triangles**: per
+  0.5 m column (cells CENTRED on the edit lattice) the density is sampled
+  at the lattice points down a band round the 2.5D height -- padded by
+  layer 6's overhang reach, down to any placed cave, over any edited brick
+  -- and every run of rock is handed to `rcAddSpan`, its ends where the
+  density crosses zero. Then Recast's pipeline (agent 0.4 m, 1.8 m, climb
+  0.5 m: 45 degrees over a cell). The main thread GATHERS the trunks
+  (radius widened 40% of the root flare), rocks, stumps, resting logs and
+  a copy of the edited bricks; the worker never touches engine state.
+  Obstacles are stamped as solid spans inflated by a whole cell. Areas:
+  ground; WADE where the floor is within 1 m under sea level; deeper the
+  floor is not walkable and a thin span at sea level - 0.5 m is SWIM (half
+  a metre down so the deepest wading floor connects). Flags walk / wade /
+  swim; a query includes what the creature can use, swimming costs 3x.
+- **Rebuilds**: a dig (`nav_invalidate_around`), a log coming to rest or
+  starting to roll (`nav_frame` watches `TreeFelling::shapes`), a load
+  (`invalidate_all`). The old tile stays until its replacement lands; a
+  stale result is thrown away. Tiles wait until the trees and rocks have
+  streamed in (`set_ready`).
+- **Spawning uses it**: where a tile is in, a spawn point must be on the
+  mesh, walkable and dry, and stands at the mesh's height.
+- **Measured** (`--nav-report`, seed 0, 224 m round the spawn): 49 tiles,
+  20,780 polys, ~335 ms a tile on a worker (max 608), ~203 thousand field
+  samples a tile, 5.6 s for all of them from a cold start; 97.8% of dry
+  land under 35 degrees on the mesh; every trunk within 100 m at least
+  0.46 m from the mesh past its bark; 7 of 8 paths 80 m out complete, 1.02-
+  1.22 x the straight line; a swim 182 m to 4 m of water that the
+  walkers' filter cannot complete; a 10 m log across a path rebuilt in one
+  tile (~350 ms) and passed 1.4 m off its axis; a 3 m dig leaves no mesh
+  in the hole. `build/nav_report.bmp` is the map: 256 m at 0.5 m a pixel.
+- **Two things that bit**: cells sampled at their corner put the whole
+  mesh a quarter cell off the world; and eroding by one 0.5 m cell clears
+  a blocked cell's sides, not its corners, so the mesh touched thin trunks
+  diagonally 0.1-0.2 m from the axis. A quarter cell of inflation left
+  0.09 m past the bark; a whole cell, 0.46. Contours are simplified to
+  0.35 m (Recast's demo allows 1.3 m, which cut corners through trunks).
+- **Movement** (`engine/mobs/locomotion.h`): a creature with a gait (1
+  walk, 2 run; saved on the Mob with its goal, so a frozen chase resumes)
+  follows a navmesh path to its goal -- re-planned when the goal moves 0.5
+  m or every 1.5 s (3 s far off), corners passed within 0.5 m, the goal
+  within 0.6 m, easing in over the last 1.5 m -- at its kind's speed,
+  filtered by how it moves (walkers walk and wade, the mimic swims too).
+- **Creatures and each other**: pushed apart within 1.2 m; one ahead within
+  3 m and 1 m of the line of travel is steered round -- away from the side
+  it is on, or, met head on, to the same hand, which both take, so they
+  pass rather than mirror. Bodies (near) collide with each other and the
+  player in Jolt; off physics a final pass keeps any two centres 0.75 m
+  apart, back onto the mesh. Creatures do NOT steer round the player (a
+  chasing one has to come up to them); a body slides round theirs.
+- **Stuck** (under 30% of the asked speed for 0.8 s -- the player, a log
+  the mesh has not stamped yet): a 2 m sidestep away from the nearest
+  creature (else alternately left and right), then a new plan from there;
+  after 4 without passing a corner, the goal is given up.
+- **Near the player** (within 34 m, released past 38) a creature has a
+  PHYSICS BODY: `PhysicsWorld::add_walker`, the player's capsule and its
+  rules, through the same `step_body` -- ground, slopes, steps, buoyancy,
+  swimming, wading's drag. Jolt's `CharacterVsCharacterCollisionSimple`
+  makes the player and every creature collide. Further out it slides along
+  the mesh (`NavWorld::move_along`, Detour's moveAlongSurface), feet at the
+  mesh's height, or 1.35 m under the sea in a swim area at half speed, as a
+  body floats. The hand-over puts the body where the creature stands.
+- **Animated** from what it did -- measured speed, supported, swimming,
+  vertical speed -- through the player's animator, so walk, jog, sprint,
+  swim and the air come from the same clips.
+- **Perception** (`engine/mobs/minds.h`), on a think tick -- 5 a second
+  for a creature with a body, 1 further out, staggered: it HEARS the
+  player (their level through `perception::hears`) and SEES them (its
+  range x their visibility x the light on them, the cone HORIZONTAL and
+  `view_vertical_deg` up or down -- the mimic's 120, no limit -- and a
+  clear physics ray to their chest or head from its eye or a head's width
+  either side). As a 3D cone, a player on a slope 2 m off, or lower down
+  30 m away, fell out of 45 degrees; from one point, a trunk beside the
+  creature blinded it to a whole sector. No player while flying.
+- **What hides a player on a slope** (`--mimic-test` 7: 12 slopes of grade
+  0.25-0.75 near the spawn, the player walking 8, 20 and 35 m up or down
+  the slope in the cone, 67 placements): the steepest look was 33
+  degrees, so a vertical limit of 60 never hid anyone; what did was a rise
+  between them (7), trees and rocks (7), and a trunk right beside the
+  mimic's eye (3), which the wider eye fixed: 49 seen, now 54, the other
+  13 behind real crests and trunks.
+- **Behaviour is Lua**: a kind's `script` returns hooks -- `on_wake`,
+  `on_see(c, ev)` every tick it sees them, `on_lose` the tick it stops,
+  `on_hear` every tick it hears them unseen, then `on_think(c, dt)` --
+  called with a handle whose methods are listed in `minds.h` (state and
+  mark are saved; `move_to`, `stop`, `face`, `random_point`, ...). One Lua
+  state for every creature, apart from the UI's (a UI that fails to start
+  does not stop them). Errors go to `build/creature_log.txt` and leave
+  the creature standing. A kind with no script wanders
+  (`Locomotion::wander`).
+- **The mimic** (`game/scripts/creatures/mimic.lua`): IDLE wanders near
+  home; HEARD, it stops, turns to the sound and listens (ALERT, 4 s after
+  the last sound) -- turned, it often then sees; SEEN within its sight it
+  walks over (APPROACH), within 40 m runs (CHASE), at 2.2 m stops and
+  stares (STARE) until they step 3.5 m off. Out of view it keeps on to
+  where it saw them for 3 s (a pursuer weaving round trees has them out of
+  its 45 degrees every few steps; without the grace it flipped to
+  searching and back), then SEARCHes there, LOOKs about for 6 s and
+  RETURNs home.
+- **A standing creature keeps its facing**: only a creature asked to move
+  turns to its travel. A body settling on a slope slid fast enough to swing
+  an idle mimic 8 degrees, and a player 15 degrees off its facing fell out
+  of the cone.
+- `--mimic-test` (`build/mimic_test.txt`): a player whose speed, crouch and
+  light the test sets, at places along a line of clear sight: a jog 15 m
+  behind (ALERT 0.7 s, standing, CHASE at 1.2 s as it turns and sees); a
+  walk 15 m behind and a crouch-walk 3 m behind unheard, a crouch-walk 0.8
+  m heard; standing still 45 m ahead by day unseen, sprinting seen (walks,
+  runs from 39 m, stares, facing them); 30 degrees off unseen, 15 seen; a
+  chase lost, searched, looked about 0.6 m from where it lost them, home;
+  a sprinter 25 m off unseen by moonlight, seen by torchlight; a chase
+  through a save. `build/mimic_stare.bmp` is the stare.
+- `--move-test` (`build/move_test.txt`): a walk near the player (1.40 m/s
+  measured against 1.4; feet within 0.10 m of the mesh; a body all the
+  way), a run back (5.19 against 5.0), a walk 70 m out (on the mesh, no
+  body), a run in from 50 m (mesh, then a body; the biggest step in a
+  frame 0.083 m, a run's own), a walk frozen half way, saved, read back and
+  finished, two passing head on near (never nearer than 0.90 m) and far
+  (0.92), four walking to one point (they stand round it, never nearer
+  than 0.82), one standing on the path walked round (0.97), the player on
+  the path slid round (0.74), a 2 m log the mesh has not seen stepped
+  round (1 sidestep), and a swim from the nearest beach to 3.7 m of water
+  (feet ~1.3-1.5 m under, swimming); stills `build/move_walk.bmp`, `move_swim.bmp`. Every
+  body is given back. The player's `--swim` and `--walk` are unchanged by
+  the refactor (eye never under; worst step 2 cm).
+- `--mob-test` (`build/mob_test.txt`, exit code = failures): 24 game hours
+  at the spawn (spawns, distances, biome, unseen, both caps), the player
+  2 km away (all freeze, the zone's clock stands for 10 game hours), a save
+  read back and another world's refused, the return (every creature back
+  bit for bit, the clock where it stood), and `build/mob_test.bmp`, the
+  nearest from 5 m.
 
 ### Forage (layer 10): things to pick, and the zones they live in
 

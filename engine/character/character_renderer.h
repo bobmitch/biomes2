@@ -11,6 +11,12 @@
 // are cached, so the renderer redraws the ones the body is in (or was) when
 // pose_serial() changes. Not the heightfield GI's top-down map: a body is
 // not terrain.
+//
+// CREATURES (ADR-007) draw on the same mesh: up to kMaxBodies - 1 more
+// poses a frame, each a block of the bone buffer of its own (bound per draw
+// by moving root SRV t0's address), its TINT in the block's last record. They
+// cast into the cascades and into whatever light faces are redrawn anyway;
+// the light faces' bookkeeping (pose_serial) is the player's alone.
 // ---------------------------------------------------------------------------
 #ifndef ENGINE_CHARACTER_RENDERER_H
 #define ENGINE_CHARACTER_RENDERER_H
@@ -28,7 +34,8 @@ namespace engine {
 class CharacterRenderer {
 public:
     static const UINT kFrames = 2;
-    static const UINT kMaxJoints = 255;
+    static const UINT kMaxJoints = 255;   // the last record of a block is the body's tint
+    static const UINT kMaxBodies = 32;    // the player and 31 creatures
     // Heap slots of the two texture arrays: t49..t50, a range of the
     // terrain's table (Renderer::create_mesh_pipeline).
     static const UINT kSrvA = 110, kSrvB = 111;
@@ -46,6 +53,12 @@ public:
     bool visible() const { return visible_; }
     // The body's bounding sphere this frame; false when nothing is drawn.
     bool bounds(float c[3], float& r) const;
+    // This frame's creatures: n bodies, 12 floats a joint each (the model's
+    // joint count), and an RGB tint each.
+    void set_creatures(const std::vector<float>& bones, const std::vector<float>& tints, size_t n);
+    size_t creatures() const { return creature_n_; }
+    // Whether a creature's root joint is within r of p.
+    bool creature_near(const float p[3], float r) const;
     // Changes whenever a joint has moved 3 mm since the last change.
     unsigned long long pose_serial() const { return pose_serial_; }
 
@@ -61,12 +74,16 @@ public:
 
 private:
     template <class T> using ComPtr = Microsoft::WRL::ComPtr<T>;
-    void bind(ID3D12GraphicsCommandList* cmd, UINT frame);
+    void bind(ID3D12GraphicsCommandList* cmd);
+    void draw_bodies(ID3D12GraphicsCommandList* cmd, UINT frame);
 
     bool ready_ = false, visible_ = false, drawn_[kFrames] = {false, false};
     std::string note_;
     CharacterModel model_;
     std::vector<float> pose_;
+    std::vector<float> creature_bones_, creature_tints_;
+    size_t creature_n_ = 0;
+    UINT bodies_[kFrames] = {0, 0};   // blocks written this frame (the player's is block 0)
     std::vector<float> joints_, committed_;   // joint positions, now and at the last serial
     float bound_c_[3] = {0, 0, 0}, bound_r_ = 0.0f;
     unsigned long long pose_serial_ = 0;

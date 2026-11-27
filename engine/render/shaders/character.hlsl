@@ -26,7 +26,10 @@ cbuffer MeshConstants : register(b0) {
 };
 
 struct Bone { float4 r0, r1, r2; };
+// One body's block: its joints, and in the last record (kTintBone) its tint
+// -- the player's white, a creature's its kind's (ADR-007).
 StructuredBuffer<Bone> g_bones : register(t0);
+static const uint kTintBone = 254;   // CharacterRenderer::kMaxJoints - 1
 
 // Per material (layer): albedo (sRGB), and normal x, normal y DOWN the
 // texture, roughness (tools/models/pack_character.py).
@@ -49,6 +52,7 @@ struct VSOut {
     float3 nrm   : TEXCOORD1;
     float2 uv    : TEXCOORD2;
     nointerpolation uint mat : TEXCOORD3;
+    nointerpolation float3 tint : TEXCOORD4;
 };
 
 void skin(VSIn v, out float3 p, out float3 n) {
@@ -70,6 +74,7 @@ VSOut vs_character(VSIn v) {
     o.clip = mul(float4(o.world, 1.0f), view_proj);
     o.uv = v.uv;
     o.mat = v.mat;
+    o.tint = g_bones[kTintBone].r0.rgb;
     return o;
 }
 
@@ -125,7 +130,7 @@ SceneOut ps_character(VSOut i, bool front : SV_IsFrontFace) {
         const float3 p = T * inv * tn.x + B * inv * tn.y + n * tz;
         if (dot(p, p) > 1e-8f) ns = normalize(p);
     }
-    float3 albedo = a.rgb;
+    float3 albedo = a.rgb * i.tint;
     float rough = clamp(b.z, 0.08f, 1.0f);
     // Rain: cloth and skin are porous-ish; between soil and rock.
     wet_surface(albedo, rough, ns, n, 0.6f, wet_at(i.world, n));

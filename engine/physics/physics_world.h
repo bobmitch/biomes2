@@ -152,13 +152,13 @@ public:
     // 0: no body, 1: heightfield, 2: mesh shape.
     int chunk_shape(const ChunkKey& k) const;
 
-    Medium medium() const { return medium_; }
+    Medium medium() const { return player_.medium; }
     // World y of the water's surface over the character, last step. Only
     // meaningful when sea_present().
-    float  water_surface() const { return water_y_; }
-    bool   sea_present() const { return sea_here_; }
+    float  water_surface() const { return player_.water_y; }
+    bool   sea_present() const { return player_.sea_here; }
     // Metres of the character below the surface, 0 dry to 2.3 fully under.
-    float  submersion() const { return submerged_; }
+    float  submersion() const { return player_.submerged; }
 
     // Buoyancy balances gravity at this depth of the feet below the surface,
     // which puts the eye (1.6 m above the feet) 0.25 m clear of still water.
@@ -170,6 +170,20 @@ public:
     // Horizontal speed in water as a fraction of the asked-for speed.
     static constexpr float kSwimSpeed = 0.5f;
 
+    // --- Creatures' bodies (ADR-007): the player's capsule and rules -- ground,
+    // slopes, steps, buoyancy, swimming -- for as many as are near. Each is a
+    // CharacterVirtual of its own; they and the player collide with each
+    // other. step_walker moves one at once (ExtendedUpdate); update() then
+    // steps the rest of the world.
+    int    add_walker(float x, float y, float z);
+    void   remove_walker(int id);
+    void   place_walker(int id, float x, float y, float z);
+    void   step_walker(int id, float dt, float vx, float vz, bool jump, float swim = 0.0f);
+    bool   walker_position(int id, float out[3]) const;
+    bool   walker_supported(int id) const;
+    Medium walker_medium(int id) const;
+    size_t walkers() const { return walker_state_.size(); }
+
     void  character_position(float out[3]) const;
     bool  character_grounded() const;
     bool  character_supported() const;   // on ground or on a steep slope
@@ -179,8 +193,22 @@ public:
     int   character_ground_lod() const;
     float character_half_extent() const { return half_height_ + radius_; }
 
+    // One character's water and motion state between steps.
+    struct BodyState {
+        Medium medium = Medium::Dry;
+        bool   sea_here = false;
+        float  water_y = 0.0f;
+        float  submerged = 0.0f;
+        float  water_rate = 0.0f;   // m/s the surface rises along the path
+        // Applied AFTER the on-ground branch, which zeroes any upward
+        // velocity it finds. Setting the velocity directly from outside is
+        // silently undone on the next step.
+        float  pending_launch = 0.0f;
+    };
+
 private:
     struct Impl;
+    void step_body(void* character, BodyState& b, float dt, float vx, float vz, bool jump, float swim);
     std::unique_ptr<Impl> impl_;
     std::string prop_error_;   // why the last add_prop_mesh failed
 
@@ -190,18 +218,12 @@ private:
     std::unordered_map<JPH::uint32, int> body_lod_;
     std::unordered_map<JPH::uint32, int> body_is_mesh_;
     size_t mesh_bodies_ = 0;
-    // Applied in update() AFTER the on-ground branch, which zeroes any
-    // upward velocity it finds. Setting the velocity directly from outside
-    // is silently undone on the next step.
-    float  pending_launch_ = 0.0f;
+    BodyState player_;
+    std::unordered_map<int, BodyState> walker_state_;
+    int next_walker_ = 1;
 
     SeaParams sea_;
     std::function<float(float, float)> column_height_;
-    Medium medium_ = Medium::Dry;
-    bool   sea_here_ = false;
-    float  water_y_ = 0.0f;
-    float  submerged_ = 0.0f;
-    float  water_rate_ = 0.0f;   // m/s the surface rises along the path
 
     float radius_ = 0.35f;
     float half_height_ = 0.80f;

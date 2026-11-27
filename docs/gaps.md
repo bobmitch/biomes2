@@ -5,7 +5,8 @@ the section of CLAUDE.md named in brackets has the measurement and the why.
 None of these blocks anything that works today. Ordered by area, not by
 priority.
 
-Last gathered: 2026-11-21, after the exploration fog.
+Last gathered: 2026-11-21, after the exploration fog; creatures added
+2026-11-27.
 
 ## Gameplay: survival, the inventory, forage
 
@@ -371,7 +372,64 @@ Last gathered: 2026-11-21, after the exploration fog.
 - Keys are fixed: the controls screen is a table in `menu.lua`, not a
   binding table. The engine's own hotkeys stay in `wnd_proc`. [UI and scripting]
 
+## Creatures (ADR-007)
+
+- **Every phase of ADR-007 is built**, and none of it has been PLAYED in
+  the window: each part is tested headless (`--mob-test`, `--nav-report`,
+  `--move-test`, `--mimic-test`). [Creatures and stealth]
+- **Sound passes through rock**: hearing is distance and level only, so a
+  creature hears a jog through a hill. Sight is blocked by terrain,
+  trunks and rocks (physics), not by crowns, bushes or grass.
+  [Creatures and stealth]
+- **A behaviour's session memory is lost on a freeze** (the mimic's
+  listening and looking timers, its 3 s grace): it resumes its saved state
+  and mark, and starts those afresh. The body turns to look; no head turn.
+  [Creatures and stealth]
+- **Movement**: no jumping, climbing or turning on the spot (the body
+  turns as it walks); far-off creatures ignore a rolling log until it
+  rests and is stamped; no creature steers round the player (by choice:
+  a body slides round theirs); the sidestep is local (2 m), so a wide
+  obstacle the mesh has not seen is given up after 4; a far-off swimmer
+  floats at a fixed depth, with no waves; creatures do not tire, drown or
+  take falls; a stuck creature only gives up its goal after 3 s.
+  [Creatures and stealth]
+- **Spawn ground falls back to the 2.5D generated height** where no nav
+  tile is in yet (a fresh start, the edge of the area), and a creature dug
+  under does not settle. [Creatures and stealth]
+- **Navmesh**: only the human size class is built; no in-engine overlay
+  (the report's map only); a tile costs ~335 ms of a worker, all field
+  evaluations -- sampling at 0.25 m for a finer mesh would cost 4x, and
+  interpolating the 0.5 m lattice instead is the cheaper road; crowns,
+  bushes and grass do not block; a flooded cave or a pit below sea level
+  gets no swim surface (only a column's top floor does); a tree that
+  settles into a dig is stamped where its tile last saw it; overhang and
+  cave floors are in the spans but no test walks one. [Creatures and stealth]
+- **A moving creature does not redraw a cached light face**: it is drawn
+  into faces redrawn anyway, so a torch's shadow of a creature that has
+  walked can lag up to 240 frames. Only the player's body has the
+  bookkeeping. [Creatures and stealth]
+- **No culling of creature bodies**: all drawn (up to 31) in every pass and
+  cascade. Fine at the mimic's cap of 4. [Creatures and stealth]
+- **Snapshots (F8) do not carry creatures.** [Creatures and stealth]
+- **Crouching keeps the capsule's height**: no crawling under a low roof.
+  [Creatures and stealth]
+- **The light on the player is approximate**: the cloud cover's mean
+  (not the shadow map where they stand), the CAMERA's open sky, and crowns
+  do not shade it -- standing in a wood at noon counts as full sun.
+  [Creatures and stealth]
+- **No ambient masking yet**: wind and rain do not cover footsteps (the
+  perception call takes `ambient_db`, passed 0). No audio at all: sound is
+  a gameplay number. [Creatures and stealth]
+- **Creatures that cannot bear light** (blinded by a torch, hiding by day)
+  need a gain CURVE, not `dark_gain`; foliage and crowns do not block a
+  creature's sight. [ADR-007]
+
 ## Future design: NPC simulation by distance (nothing built)
+
+*ADR-007 settles this for CREATURES: a zone that leaves the active area
+freezes its creatures as they are and saves them, with no catch-up (a
+player cannot shake a chase by leaving). The catch-up below is for
+persistent NPCs with schedules, still to come.*
 
 A note from 2026-11-23, before any NPC code exists, so the first NPC work
 does not simulate every NPC in the world. NPCs and player constructions
