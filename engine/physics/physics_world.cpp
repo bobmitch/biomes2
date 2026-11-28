@@ -10,6 +10,8 @@
 #include <Jolt/Physics/Collision/Shape/ScaledShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
+#include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
+#include <Jolt/Physics/Constraints/HingeConstraint.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyInterface.h>
@@ -78,6 +80,7 @@ struct PhysicsWorld::Impl {
     JPH::RefConst<JPH::Shape> character_shape;
     JPH::Ref<JPH::CharacterVirtualSettings> character_settings;
     std::unordered_map<int, JPH::Ref<JPH::CharacterVirtual> > walkers;
+    std::unordered_map<uint32_t, JPH::Ref<JPH::TwoBodyConstraint> > hinges;
     // The player and every creature collide with each other.
     JPH::CharacterVsCharacterCollisionSimple cvc;
     std::vector<JPH::RefConst<JPH::Shape>> prop_shapes;   // add_prop_mesh
@@ -137,6 +140,12 @@ bool PhysicsWorld::init(std::string& error) {
 
 void PhysicsWorld::shutdown() {
     if (!impl_) return;
+    // Constraints first: a body cannot be destroyed out from under one.
+    for (std::unordered_map<uint32_t, JPH::Ref<JPH::TwoBodyConstraint> >::iterator it = impl_->hinges.begin();
+         it != impl_->hinges.end(); ++it) {
+        impl_->system.RemoveConstraint(it->second);
+    }
+    impl_->hinges.clear();
     JPH::BodyInterface& bi = impl_->system.GetBodyInterface();
     for (std::unordered_map<ChunkKey, JPH::BodyID, ChunkKeyHash>::iterator it = bodies_.begin();
          it != bodies_.end(); ++it) {
@@ -338,6 +347,111 @@ uint32_t PhysicsWorld::add_log(const float pos[3], const float rot[4], float tru
     return h;
 }
 
+uint32_t PhysicsWorld::add_piece(const float pos[3], const float rot[4], float radius,
+                                 const float a[3], const float b[3], const float vel[3],
+                                 const float spin[3], bool asleep) {
+    if (!impl_) return 0;
+    const JPH::Vec3 pa(a[0], a[1], a[2]), pb(b[0], b[1], b[2]);
+    JPH::Vec3 axis = pb - pa;
+    const float len = axis.Length();
+    if (len < 1e-3f || radius <= 0.0f) return 0;
+    axis /= len;
+    // An EIGHT-SIDED PRISM, not a capsule. A capsule is a perfect roller:
+    // on any slope gravity beats the damping and the log creeps downhill
+    // for ever, never sleeping (--fell: still turning at 3.7 rad/s twelve
+    // seconds after it fell). A real log stops because it is not round, and
+    // so does this one -- rolling onto the next facet has to lift it, which
+    // on gentle ground it cannot do. The faces are circumscribed, so the
+    // drawn trunk is inscribed in the shape.
+    const int sides = 8;
+    const float circum = radius / std::cos(3.14159265f / float(sides));
+    JPH::Vec3 u = JPH::Vec3::sAxisX().Cross(axis);
+    if (u.LengthSq() < 1e-6f) u = JPH::Vec3::sAxisZ().Cross(axis);
+    u = u.Normalized();
+    const JPH::Vec3 v = axis.Cross(u);
+    JPH::Array<JPH::Vec3> pts;
+    pts.reserve(size_t(sides) * 2);
+    for (int i = 0; i < sides; ++i) {
+        const float ang = 6.28318531f * (float(i) + 0.5f) / float(sides);
+        const JPH::Vec3 off = u * (std::cos(ang) * circum) + v * (std::sin(ang) * circum);
+        pts.push_back(pa + off);
+        pts.push_back(pb + off);
+    }
+    // Points are already in the body's frame -- which is the MODEL's frame,
+    // so the draw and physics agree without a second transform.
+    JPH::ConvexHullShapeSettings hull(pts, (std::min)(0.02f, radius * 0.1f));
+    hull.SetDensity(650.0f);
+    JPH::ShapeSettings::ShapeResult r = hull.Create();
+    if (r.HasError()) return 0;
+    JPH::BodyCreationSettings bcs(r.Get(), JPH::RVec3(pos[0], pos[1], pos[2]),
+                                  JPH::Quat(rot[0], rot[1], rot[2], rot[3]).Normalized(),
+                                  JPH::EMotionType::Dynamic, Layers::MOVING);
+    // 0.7, not 0.9: wood on grassy soil is 0.6-0.8, and the difference is
+    // what decides whether a person can shove a round of firewood at all.
+    // At 0.9 a 167 kg round needs 1.5 kN to break away and nothing short of
+    // a winch moved; the log's own prism is what stops it rolling, not this.
+    bcs.mFriction = 0.7f;
+    bcs.mRestitution = 0.02f;
+    bcs.mLinearDamping = 0.25f;
+    // Low, because the PRISM is what stops a log now, not drag: an eight-
+    // sided one has to lift its own weight over an edge to keep rolling and
+    // loses the normal component of the impact at every facet. 1.6 was
+    // picked while fighting a capsule, which damping cannot stop at all,
+    // and it left a log on steep ground stopping limply.
+    bcs.mAngularDamping = 0.5f;
+    bcs.mLinearVelocity = JPH::Vec3(vel[0], vel[1], vel[2]);
+    bcs.mAngularVelocity = JPH::Vec3(spin[0], spin[1], spin[2]);
+    const JPH::BodyID id = impl_->system.GetBodyInterface().CreateAndAddBody(
+        bcs, asleep ? JPH::EActivation::DontActivate : JPH::EActivation::Activate);
+    if (id.IsInvalid()) return 0;
+    const uint32_t h = id.GetIndexAndSequenceNumber();
+    props_[h] = id;
+    ++dynamic_props_;
+    return h;
+}
+
+uint32_t PhysicsWorld::add_debris(const float pos[3], const float rot[4], float radius,
+                                  float density, const float vel[3], const float spin[3]) {
+    if (!impl_ || radius <= 0.01f) return 0;
+    // An ICOSAHEDRON, for the same reason a log is a prism: a sphere is the
+    // perfect roller and no damping stops one on a slope. A tangle of
+    // branches sprawls where it lands, and twenty faces is what that costs
+    // -- a regular icosahedron sits still on any slope under 21 degrees
+    // (the face's inradius over the solid's, atan(0.382)), which is the
+    // octagonal trunk's 22.5 within a degree and a half. The vertices are
+    // ON the nominal sphere, so the hull is strictly inside it and clumps
+    // that did not overlap before still do not.
+    static const float kPhi = 0.8506508f, kOne = 0.5257311f;   // (1, phi) / |(1, phi)|
+    JPH::Array<JPH::Vec3> pts;
+    pts.reserve(12);
+    for (int s1 = -1; s1 <= 1; s1 += 2)
+        for (int s2 = -1; s2 <= 1; s2 += 2) {
+            const float a = float(s1) * kOne * radius, b = float(s2) * kPhi * radius;
+            pts.push_back(JPH::Vec3(0.0f, a, b));
+            pts.push_back(JPH::Vec3(a, b, 0.0f));
+            pts.push_back(JPH::Vec3(b, 0.0f, a));
+        }
+    JPH::ConvexHullShapeSettings ss(pts, (std::min)(0.05f, radius * 0.1f));
+    ss.SetDensity(density > 0.1f ? density : 0.1f);
+    JPH::ShapeSettings::ShapeResult r = ss.Create();
+    if (r.HasError()) return 0;
+    JPH::BodyCreationSettings bcs(r.Get(), JPH::RVec3(pos[0], pos[1], pos[2]),
+                                  JPH::Quat(rot[0], rot[1], rot[2], rot[3]).Normalized(),
+                                  JPH::EMotionType::Dynamic, Layers::MOVING);
+    bcs.mFriction = 0.95f;
+    bcs.mRestitution = 0.0f;
+    bcs.mLinearDamping = 0.5f;     // a crown is a parachute, not a cannonball
+    bcs.mAngularDamping = 0.9f;    // ... and it must stop rolling, or it never fades
+    bcs.mLinearVelocity = JPH::Vec3(vel[0], vel[1], vel[2]);
+    bcs.mAngularVelocity = JPH::Vec3(spin[0], spin[1], spin[2]);
+    const JPH::BodyID id = impl_->system.GetBodyInterface().CreateAndAddBody(bcs, JPH::EActivation::Activate);
+    if (id.IsInvalid()) return 0;
+    const uint32_t h = id.GetIndexAndSequenceNumber();
+    props_[h] = id;
+    ++dynamic_props_;
+    return h;
+}
+
 void PhysicsWorld::remove_body(uint32_t handle) {
     if (!impl_) return;
     std::unordered_map<uint32_t, JPH::BodyID>::iterator it = props_.find(handle);
@@ -361,6 +475,91 @@ bool PhysicsWorld::body_pose(uint32_t handle, float pos[3], float rot[4], bool& 
     rot[0] = q.GetX(); rot[1] = q.GetY(); rot[2] = q.GetZ(); rot[3] = q.GetW();
     active = bi.IsActive(it->second);
     return true;
+}
+
+bool PhysicsWorld::body_velocity(uint32_t handle, float lin[3], float ang[3]) const {
+    if (!impl_) return false;
+    std::unordered_map<uint32_t, JPH::BodyID>::const_iterator it = props_.find(handle);
+    if (it == props_.end()) return false;
+    const JPH::BodyInterface& bi = impl_->system.GetBodyInterface();
+    const JPH::Vec3 v = bi.GetLinearVelocity(it->second), w = bi.GetAngularVelocity(it->second);
+    lin[0] = v.GetX(); lin[1] = v.GetY(); lin[2] = v.GetZ();
+    ang[0] = w.GetX(); ang[1] = w.GetY(); ang[2] = w.GetZ();
+    return true;
+}
+
+uint32_t PhysicsWorld::add_hinge(uint32_t body, uint32_t anchor, const float point[3],
+                                 const float axis[3]) {
+    if (!impl_) return 0;
+    std::unordered_map<uint32_t, JPH::BodyID>::const_iterator a = props_.find(body);
+    std::unordered_map<uint32_t, JPH::BodyID>::const_iterator b = props_.find(anchor);
+    if (a == props_.end() || b == props_.end()) return 0;
+    JPH::Vec3 ax(axis[0], axis[1], axis[2]);
+    if (ax.LengthSq() < 1e-8f) return 0;
+    ax = ax.Normalized();
+    // Any direction square to the axis will do for the hinge's zero angle.
+    JPH::Vec3 nrm = JPH::Vec3::sAxisY().Cross(ax);
+    if (nrm.LengthSq() < 1e-8f) nrm = JPH::Vec3::sAxisX().Cross(ax);
+    nrm = nrm.Normalized();
+    JPH::HingeConstraintSettings cs;
+    cs.mSpace = JPH::EConstraintSpace::WorldSpace;
+    cs.mPoint1 = cs.mPoint2 = JPH::RVec3(point[0], point[1], point[2]);
+    cs.mHingeAxis1 = cs.mHingeAxis2 = ax;
+    cs.mNormalAxis1 = cs.mNormalAxis2 = nrm;
+    JPH::TwoBodyConstraint* c = impl_->system.GetBodyInterface().CreateConstraint(&cs, a->second, b->second);
+    if (!c) return 0;
+    impl_->system.AddConstraint(c);
+    const uint32_t h = ++next_hinge_;
+    impl_->hinges[h] = c;
+    return h;
+}
+
+void PhysicsWorld::remove_hinge(uint32_t handle) {
+    if (!impl_ || !handle) return;
+    std::unordered_map<uint32_t, JPH::Ref<JPH::TwoBodyConstraint> >::iterator it = impl_->hinges.find(handle);
+    if (it == impl_->hinges.end()) return;
+    impl_->system.RemoveConstraint(it->second);
+    impl_->hinges.erase(it);
+}
+
+void PhysicsWorld::set_body_damping(uint32_t handle, float linear, float angular) {
+    if (!impl_) return;
+    std::unordered_map<uint32_t, JPH::BodyID>::iterator it = props_.find(handle);
+    if (it == props_.end()) return;
+    JPH::BodyLockWrite lock(impl_->system.GetBodyLockInterface(), it->second);
+    if (!lock.Succeeded()) return;
+    JPH::MotionProperties* mp = lock.GetBody().GetMotionProperties();
+    if (!mp) return;
+    mp->SetLinearDamping(linear < 0.0f ? 0.0f : linear);
+    mp->SetAngularDamping(angular < 0.0f ? 0.0f : angular);
+}
+
+void PhysicsWorld::rest_body(uint32_t handle) {
+    if (!impl_) return;
+    std::unordered_map<uint32_t, JPH::BodyID>::iterator it = props_.find(handle);
+    if (it == props_.end()) return;
+    JPH::BodyInterface& bi = impl_->system.GetBodyInterface();
+    bi.SetLinearAndAngularVelocity(it->second, JPH::Vec3::sZero(), JPH::Vec3::sZero());
+    bi.DeactivateBody(it->second);
+}
+
+bool PhysicsWorld::body_point_velocity(uint32_t handle, const float p[3], float v[3]) const {
+    if (!impl_) return false;
+    std::unordered_map<uint32_t, JPH::BodyID>::const_iterator it = props_.find(handle);
+    if (it == props_.end()) return false;
+    const JPH::BodyInterface& bi = impl_->system.GetBodyInterface();
+    const JPH::Vec3 w = bi.GetPointVelocity(it->second, JPH::RVec3(p[0], p[1], p[2]));
+    v[0] = w.GetX(); v[1] = w.GetY(); v[2] = w.GetZ();
+    return true;
+}
+
+void PhysicsWorld::set_body_velocity(uint32_t handle, const float lin[3], const float ang[3]) {
+    if (!impl_) return;
+    std::unordered_map<uint32_t, JPH::BodyID>::iterator it = props_.find(handle);
+    if (it == props_.end()) return;
+    JPH::BodyInterface& bi = impl_->system.GetBodyInterface();
+    bi.SetLinearAndAngularVelocity(it->second, JPH::Vec3(lin[0], lin[1], lin[2]),
+                                   JPH::Vec3(ang[0], ang[1], ang[2]));
 }
 
 void PhysicsWorld::remove_chunk(const ChunkKey& key) {
@@ -452,10 +651,72 @@ void PhysicsWorld::launch_character(float vy) {
     player_.pending_launch = vy;
 }
 
+void PhysicsWorld::set_push_strength(float newtons) {
+    if (!impl_ || !impl_->character) return;
+    impl_->character->SetMaxStrength(newtons > 0.0f ? newtons : 0.0f);
+}
+
 void PhysicsWorld::update(float dt, float vx, float vz, bool jump, float swim) {
     if (!impl_ || !impl_->character) return;
     if (dt > 0.05f) dt = 0.05f;
     step_body(impl_->character.GetPtr(), player_, dt, vx, vz, jump, swim);
+    // What it ended up leaning on, and anything it walked into. Jolt's contact normal points towards the
+    // character, so walking INTO something is a negative dot with where the
+    // feet were asked to go. The character's own step has just run, so the
+    // contact list is this frame's.
+    push_ = Push();
+    bumps_.clear();
+    for (std::unordered_map<uint32_t, float>::iterator it = bump_cd_.begin(); it != bump_cd_.end();) {
+        it->second -= dt;
+        if (it->second <= 0.0f) it = bump_cd_.erase(it); else ++it;
+    }
+    {
+        const float want_len = std::sqrt(vx * vx + vz * vz);
+        const bool want_move = want_len > 1e-2f;
+        const JPH::Vec3 want = want_move ? JPH::Vec3(vx / want_len, 0.0f, vz / want_len)
+                                         : JPH::Vec3::sZero();
+        const JPH::CharacterVirtual::ContactList& cl = impl_->character->GetActiveContacts();
+        JPH::BodyInterface& bi = impl_->system.GetBodyInterface();
+        const float char_mass = impl_->character->GetMass();
+        std::vector<uint32_t> touching;
+        for (size_t i = 0; i < cl.size(); ++i) {
+            if (cl[i].mMotionTypeB != JPH::EMotionType::Dynamic) continue;
+            const uint32_t h = cl[i].mBodyB.GetIndexAndSequenceNumber();
+            if (!props_.count(h)) continue;
+            touching.push_back(h);
+            // Jolt's contact normal points AT the character, so walking
+            // into it is a negative dot with where the feet were asked to go.
+            const float into = want_move ? -cl[i].mContactNormal.Dot(want) : 0.0f;
+            JPH::RefConst<JPH::Shape> sh = bi.GetShape(cl[i].mBodyB);
+            const float m = sh ? sh->GetMassProperties().mMass : 0.0f;
+            if (into > 0.25f && m > push_.mass) {
+                push_.on = true;
+                push_.body = h;
+                push_.mass = m;
+                push_.speed = bi.GetLinearVelocity(cl[i].mBodyB).Length();
+            }
+            // The bump: a NEW contact only, off cooldown, coming in fast
+            // enough to be a knock rather than a lean, and on a normal
+            // within 45 degrees of level -- standing on a log must not
+            // punt it into the ground.
+            const bool fresh = std::find(touched_.begin(), touched_.end(), h) == touched_.end();
+            if (!fresh || into <= 0.0f || bump_cd_.count(h)) continue;
+            const float closing = into * want_len;
+            if (closing < kBumpMinSpeed || std::fabs(cl[i].mContactNormal.GetY()) > 0.707f) continue;
+            JPH::Vec3 dir = -cl[i].mContactNormal;
+            dir.SetY(0.0f);
+            const float dl = dir.Length();
+            if (dl < 1e-3f) continue;
+            dir /= dl;
+            const float j = char_mass * closing * bump_transfer_;
+            bi.AddImpulse(cl[i].mBodyB, dir * j, cl[i].mPosition);
+            bump_cd_[h] = kBumpCooldown;
+            Bump b;
+            b.body = h; b.speed = closing; b.impulse = j; b.mass = m;
+            bumps_.push_back(b);
+        }
+        touched_.swap(touching);
+    }
     // The static bodies still need the broadphase kept current as chunks come
     // and go. A falling log is the one dynamic body; two collision steps at
     // the 50 ms clamp keep a toppling trunk from tunnelling a heightfield.
@@ -527,7 +788,8 @@ Medium PhysicsWorld::walker_medium(int id) const {
 // One character's step: the water over it, buoyancy or gravity, the asked-for
 // horizontal velocity, and Jolt's ExtendedUpdate. The player's and every
 // creature's, the same rules.
-void PhysicsWorld::step_body(void* character, BodyState& b, float dt, float vx, float vz, bool jump, float swim) {
+void PhysicsWorld::step_body(void* character, BodyState& b, float dt, float vx, float vz, bool jump,
+                             float swim) {
     JPH::CharacterVirtual* c = static_cast<JPH::CharacterVirtual*>(character);
     const JPH::Vec3 gravity = impl_->system.GetGravity();
     float& pending_launch_ = b.pending_launch;

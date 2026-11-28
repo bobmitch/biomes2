@@ -16,9 +16,13 @@ struct TreeInstance {
     float  scale;
     float4 rot;
     uint   model;
-    uint   mode;
+    uint   mode;      // kind in bits 0-3, the fade's cut in 8-15 (tree_field.h)
     float  hit_time;
     uint   id;
+    float2 band;      // a piece's model-local y band
+    float2 cap;
+    float2 axis_lo;
+    float2 axis_hi;
 };
 
 struct ModelInfo {
@@ -99,7 +103,13 @@ void cs_cull(uint3 id : SV_DispatchThreadID) {
 
     // Bounding sphere round the crown and trunk. A felled log is lying down,
     // so its sphere is centred on the trunk's midpoint wherever that went.
-    const float half = 0.5f * m.top * t.scale;
+    const uint kind = t.mode & 0xFu;
+    // A piece is a short band of the trunk (or a clump of crown) somewhere
+    // along it, so its sphere is centred on the band, not on the model.
+    const float half = kind >= 3u ? 0.5f * (t.band.x + t.band.y) * t.scale
+                                  : 0.5f * m.top * t.scale;
+    const float extent = kind >= 3u ? 0.5f * (t.band.y - t.band.x) * t.scale
+                                    : 0.5f * m.top * t.scale;
     float3 axis = float3(0.0f, 1.0f, 0.0f);
     {
         const float3 q = t.rot.xyz;
@@ -107,7 +117,7 @@ void cs_cull(uint3 id : SV_DispatchThreadID) {
         axis = axis + t.rot.w * tt + cross(q, tt);
     }
     const float3 c = t.pos + axis * half;
-    const float r = max(m.radius * t.scale, half) * 1.1f;
+    const float r = max(m.radius * t.scale, extent) * 1.1f;
 
     const float3 dv = c - cam_pos;
     const float d = length(dv);
@@ -127,8 +137,9 @@ void cs_cull(uint3 id : SV_DispatchThreadID) {
     const uint mesh0 = t.model, mesh1 = model_count + t.model;
     const uint imp = model_count * 2u;
 
-    // Logs and stumps are few and near; always the full mesh.
-    if (t.mode != 0u) {
+    // Logs, stumps and pieces are few and near; always the full mesh. An
+    // impostor is the whole tree baked, which is not what any of them is.
+    if (kind != 0u) {
         append(mesh0, pack(i, 1.0f, 0u, 0u));
         return;
     }

@@ -12,7 +12,7 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `worldgen/assign/` | Quota assignment (layer 3). Portable C++, no host deps. |
 | `worldgen/data/` | `archetypes.json` — the biome table. All tuning lives here. |
 | `worldgen/golden/` | Pinned seed hashes. Changes must be deliberate. |
-| `engine/trees/` | Tree meshes (procedural, made here), the CPU tile streamer over layer 8, GPU culling and impostors, felling. |
+| `engine/trees/` | Tree meshes (procedural, made here), the CPU tile streamer over layer 8, GPU culling and impostors, and felling: the fall, the crown coming off, the trunk broken into firewood, and a falling tree knocking the next one down. |
 | `engine/foliage/` | Ground cover -- grass, flowers, bushes -- generated on the GPU each frame (`foliage.hlsl`), and `trample.{h,cpp}`, the map of where something has stood in it. |
 | `engine/ui/` | The UI layer: RmlUi's D3D12 renderer, input routing, and the `engine` Lua module (tunables). |
 | `game/` | What the UI and scripts ARE: `scripts/*.lua` (entry `main.lua`) and `ui/*.rml`, `*.rcss`. |
@@ -23,7 +23,7 @@ Procedural voxel world generator for a bounded disc world. Full design in
 | `engine/player/` | The player's survival: items (`items.h`), the 8 x 4 inventory, health / stamina / food / the game clock (`survival.h`), item icons painted from data (`icons.h`), the player as heard and seen (`stealth.h`). No GPU. |
 | `engine/nav/` | The navmesh (ADR-007): `nav_tile.h` builds one Recast/Detour tile from the field's solid spans, the water and the obstacles; `nav_world.h` streams tiles round the player on workers and answers queries. Recast/Detour is the `third_party/recastnavigation` submodule (v1.6.0, zlib). |
 | `engine/mobs/` | Creatures (ADR-007, being built): `perception.h`, the arithmetic of hearing (dB) and sight (cone, range, light); `creature_table.h` (`game/data/creatures.json`); `creatures.h`, the zones that spawn, freeze, save and thaw them; `locomotion.h`, how they move; `minds.h`, what they notice (perception on a think tick) and the Lua host for their behaviours (`game/scripts/creatures/*.lua`); `combat.h`, blows both ways. No GPU. |
-| `game/data/` | `items.json`: every item, the player's numbers, the clock, the start inventory. Gameplay data, outside the hash. |
+| `game/data/` | `items.json`: every item, the player's numbers, the clock, the start inventory, and the `logs` block (what a felled tree is worth and what it takes to break up). Gameplay data, outside the hash. |
 | `tools/validate/` | Headless N-seed harness. CI entry point. |
 | `tools/view/` | Native world viewer (Win32), Windows only: seeds as maps plus their gameplay numbers. See "The world viewer". |
 | `tools/shared/` | Presentation (`render.h`) and gameplay measures of a seed (`seed_metrics.h`), shared by the harness and the viewer. |
@@ -137,7 +137,7 @@ pipeline statistics and the trees' overdraw, `<shot>.gpu.txt`; see Trees),
 `--leak-test`
 (ADR-004 L6: a sealed chamber, unlit and torch-lit, the heightfield GI against
 the bare fallback), `--lights-report` (ADR-004 L3: local lights at night, six
-configurations timed), `--fell` (with `--fell-save` / `--fell-verify`), `--dig-settle` and
+configurations timed), `--fell` (with `--fell-save` / `--fell-verify`), `--fell-chain`, `--dig-settle` and
 `--survival-test` (the player's rules and the forage layer; see Survival).
 Every mode takes `--seed <n>` (which world; 0 by default, and every view
 measured in this file is seed 0), `--character male|female` (which pack; male by default) and
@@ -1057,14 +1057,226 @@ trees hidden behind rock (0 PS invocations, which is how it showed).
   tree shadow casters 2.3 (cascade 0's LOD 0 1.3), terrain 1.7, tree colour
   1.3. Cracks 0, as before.
 
-**Felling** (`TreeFelling`): trunks within 40 m of the player are static
-capsules; a click swings from the eye; 2 + one per 6 cm of diameter fells it.
-The tree's id is marked felled, a stump (static) and a log (Jolt rigid body:
-a 650 kg/m^3 trunk capsule and a 6 kg/m^3 crown sphere) replace it, both drawn
-from the same mesh split at `kCutHeight`. F6/F9 save/load `build/edits.bin`
-and `build/trees.bin` (same field id). `--fell` walks into a trunk, fells
-it and watches the log; `--fell-save` then `--fell-verify` in a second
-process checks the log is where it rested and the tree does not stand.
+**Felling, and what a felled tree is worth** (`TreeFelling`, tuning in
+items.json's `logs` block -- gameplay data, outside the golden hash).
+Trunks within 40 m of the player are static capsules; a click swings from
+the eye and takes the TOOL's `damage` off the tree, of which the reference
+axe's `chop_damage` (15) is one chop, and a tree has `hits_needed` of them
+(2 + one per 6 cm of diameter). The id is marked felled, a stump (static)
+replaces its base, and the rest becomes a chain of things:
+
+- **A tree goes over on a HINGE at its stump, down its own lean.** A felled
+  log used to be a free rigid body given a 0.35 rad/s kick, and a free body
+  turns about its CENTRE OF MASS, which is halfway up the trunk -- so the
+  butt swung out from under it the moment it was cut and the whole thing
+  read as a kick rather than a topple. It is now pinned to the stump by a
+  Jolt hinge about the horizontal axis square to the fall
+  (`PhysicsWorld::add_hinge`), released once it has tipped
+  `hinge_release_deg` (45) and slips off. Measured, in `--fell`: the butt
+  drifted **0.845 m** while still under 20 degrees as a free body,
+  **0.000 m** hinged. The nudge is `topple_spin_rad_s` (0.05), only enough
+  to break an upright tree's equilibrium, since a pendulum balanced exactly
+  on its end never falls; gravity does the rest, slowly at first and faster
+  as it goes. It reaches 10 degrees at 1.2 s, 45 at 2.5, 80 at 2.9, the same
+  to a tenth over four runs -- hinging made the fall repeatable as well as
+  right.
+  **It falls the way it LEANS.** Every tree is planted with up to three
+  degrees of lean of its own (`tree_standing_rotation`), so that is already
+  a direction of its own, and it is the one direction gravity helps a hinge
+  go. The axe no longer steers it at all: being able to aim a fall by
+  walking round the trunk was most of what made it read as a shove.
+  `topple_heading` is the fallback for a tree that stands too straight.
+- **A KNOCKED tree is thrown, not hinged** (`fell`'s `knocked`). A tree
+  brought down by another is being driven somewhere it may not want to go,
+  and a one-axis hinge simply refuses to go against the lean: forced across
+  its own two degrees, a 24 m tree stood at three degrees off upright for
+  as long as anyone watched. Working out a nudge big enough to carry it
+  over its lean was tried (the rod's barrier, sqrt(3 g (1 - cos phi) / L))
+  and was still not reliable. So a knock gets a free body and
+  `knock_spin_rad_s` (0.35) -- which is also what being hit by three tonnes
+  of oak amounts to, butt and all.
+- **What falls is a tree; what stays is a trunk.** Mid-fall the body is the
+  WHOLE TRUNK, cut to top, which is exactly what is drawn until the crown
+  sheds. It used to be the bole plus a 6 kg/m^3 sphere for the crown, and
+  that sphere is 5.7 m across on a big tree and sits 15 m up -- right where
+  its neighbours' own trunk capsules are. **A tree in a wood was created
+  already jammed against three of them**: as a free body it shoved its way
+  out, which was the other half of why the butt jumped, and pinned to its
+  stump it could not fall at all. A trunk-thick capsule passes between its
+  neighbours' crowns, which carry no collision anyway, and still meets
+  their TRUNKS, which is the collision worth having; the mass and the
+  length are the whole tree's, so it swings at a 24 m tree's rate rather
+  than a 6 m bole's. Proved by removing the sphere as a one-off and
+  watching the same tree fall. It SHEDS the crown once it has come to rest
+  (or after `shed_after_s`): the body is swapped for the bole's shape
+  alone, keeping pose and motion, and the crown becomes DEBRIS. Shedding
+  part way down (the first version tried a tilt) left a 23 m tree with a
+  7 m trunk in mid-air, sweeping nothing past 7 m.
+- **Nothing damps a tree going over.** While hinged the body is set to
+  0.05 linear and 0.02 angular damping, and `release_hinge` puts back the
+  0.6 a landing log wants (`set_body_damping`). Near the vertical gravity's
+  torque is almost nothing and 0.6 is the dominant term: it was the first
+  suspect for a tree that would not fall, and the measurement that cleared
+  it -- undamping changed nothing -- is what pointed at the crown sphere.
+- **Debris** is `debris_pieces` (3) clumps of the crown: a band of the same
+  mesh on a light **ICOSAHEDRON**, spilled off the top at `debris_toss`
+  (0.6) of the speed it had there, which falls, stops, lies there
+  `debris_rest_s` and fades over `debris_fade_s`. The shape is the log's
+  argument again -- a sphere is the perfect roller and damping cannot stop
+  one on a slope, where twenty faces have to be climbed over. A regular
+  icosahedron sits still on anything under 21 degrees (atan of the face's
+  inradius over the solid's, 0.382), within a degree and a half of the
+  octagonal trunk's 22.5, and its vertices are ON the nominal sphere so the
+  hull is strictly inside it and clumps that did not overlap still do not.
+  **Measured** (`--fell`'s `the crown:` line, which records each clump as
+  it stops): as spheres they rolled **8.4 m** from where they came off the
+  tree on average, worst 11.6, still going after 3.7 s -- the crown ended
+  up nowhere near the tree. As icosahedra, **0.5-2.4 m**, stopped in about
+  a second. **A clump's body still goes the moment it stops** (under
+  `kDebrisSlow` for `kDebrisSlowFor`, or after `kDebrisAir`), because
+  nothing needs to collide with a fading clump and a rolling one keeps
+  knocking the log awake. The angular damping stays at 0.9 where the
+  trunk's came down to 0.5: a tangle of foliage really is a parachute, so
+  drag is honest there in a way it is not for a solid bole. Debris is never
+  saved and never stamps the navmesh: it is a moment, not a thing.
+- **A trunk is firewood in waiting.** Every PIECE of one carries health
+  (`health_per_m3` of its own wood, never under `min_health`) in the axe's
+  own currency. Chop a whole log through and it breaks in two at
+  `split_at`; chop a half through and it comes apart into `billets` rounds,
+  as many as it takes for none to be longer than `billet_max_m`. **E** picks
+  a round up for `wood_per_m3` of its volume (`wood`, items.json). The
+  pieces are the chain: 7 swings to split, 5 to billet, in `--fell`.
+- **Nothing new is modelled.** A piece is drawn as a BAND of the species'
+  own mesh -- `kTreePiece` in the instance's packed `mode` -- with the
+  cut's own disc moved to each end, scaled to the trunk's radius there and
+  set on the trunk's AXIS, which wanders as it rises (`trunk_axis_at`, the
+  profile `build_trunk` now keeps on the mesh): a disc on the model's
+  centre line sits a third of a radius off the opening at the top of a tall
+  trunk. Debris is `kTreeDebris`, the same band of the crown instead:
+  branches and leaves, no discs. The band is cut per pixel on `local_y`, so
+  the pieces of one trunk never overlap. `TreeGpuInstance` grew 48 -> 80
+  bytes for the band, the discs and the axis; the fade rides in `mode`'s
+  high bits as the share of pixels to throw away, so a zeroed instance is
+  still an opaque standing tree.
+- **A log is an EIGHT-SIDED PRISM to physics, not a capsule.** A capsule is
+  a perfect roller, and no amount of friction changes that: in rolling
+  without slipping the contact point has zero relative velocity, so Coulomb
+  friction does no work there and cannot dissipate anything. What stops a
+  real log is ROLLING RESISTANCE -- the contact patch deforms and the
+  normal force acts ahead of the contact -- and the textbook derivation of
+  that is a polygon having to lift itself over each edge. So the polygon is
+  the model, not a stand-in for it: the bark ridges, the knots, the sinking
+  into soil and the 5 cm stones nobody will ever place all arrive as one
+  height barrier at the contact, and `sides` is where they are paid for.
+  An *n*-gon stays where it is on any slope under pi/n -- 22.5 degrees at
+  eight sides, tipping beating sliding, which needs 35 -- and a moving one
+  loses the normal component of the impact at every facet. The faces are
+  circumscribed, so the drawn trunk is inscribed in the shape (+8.2% of r,
+  1.8 cm on a 0.22 m trunk, under the 0.5 m voxel). **`sides` trades
+  "stays put" against "rolls smoothly"**: 8 bumps 18 mm per facet, 12 would
+  bump 7.8 mm and stop at 15 degrees. Before it, `--fell`'s log was still
+  turning at 3.7 rad/s twelve seconds after it fell -- the old crown sphere
+  had been what wedged it, and nobody had noticed.
+  **Angular damping is 0.5 and friction 0.7**, both lowered once the prism
+  was carrying the load: 1.6 was picked while fighting the capsule, which
+  damping cannot stop at all, and it left a log stopping limply on steep
+  ground; 0.9 of friction is high for wood on soil (0.6-0.8) and was the
+  difference between a round of firewood that can be shoved and one that
+  cannot. On top of both, a piece that has been under `kRestSpeed` for
+  `kRestFor` is told it has arrived (`rest_body`: zero velocity,
+  deactivate) -- it stays dynamic, so walking into it, chopping it or
+  splitting it wakes it again, and the near-field of a prism still
+  micro-jitters on a contact without it.
+- **The player moves what is lying about by WALKING INTO IT** (items.json's
+  `player` block). A new contact with a dynamic prop hands it an impulse of
+  `bump_transfer` (1) x the character's 70 kg x the closing speed, applied
+  horizontally at the contact point: `PhysicsWorld::bumps()`. Only a FRESH
+  contact, only above `kBumpMinSpeed` (0.6 m/s, slower is a lean), only on
+  a normal within 45 degrees of level (standing on a log must not punt it
+  into the ground), and not again for `kBumpCooldown` (0.35 s), so a
+  contact that chatters cannot machine-gun it and holding forward is not
+  the same as backing off and walking in again.
+  **The distance goes as the SQUARE of how fast you came in**, because the
+  impulse is linear in the approach and the slide that follows is
+  v^2 / 2a. That quadratic IS the mechanic, and it needs no new key --
+  walking, jogging and sprinting are already three speeds. Measured on a
+  111 kg round, per knock: a walk **0.1-0.19 m**, a jog **0.7-1.5 m**, a
+  sprint **2.3-5.6 m**; a 382 kg bole takes the same jog knock and goes
+  0.1-0.37 m; a three-tonne oak gets 3 mm from a sprint and is right to
+  ignore you. `bump_transfer` 0.6 was tried as the honest discount for a
+  body that buckles rather than a billiard ball, and made WALKING into a
+  log worth a centimetre a knock -- the one thing this exists for -- so it
+  is 1, which is also exactly what a controller that stops dead loses.
+- **A FORCE cannot do this, which is why the first version could not.**
+  `mMaxStrength` is a force cap: `HandleContact` works out the impulse
+  needed to match the character's velocity and then clamps it to
+  `mMaxStrength * dt`, 21.7 N s a frame at 1300 N. The ground takes
+  mu m g dt back every frame, 19.1 N s for a 167 kg round at mu 0.7. So
+  below the breakaway force NOTHING ACCUMULATES: walking into a log a
+  hundred times did exactly what walking into it once did, and the only
+  way to move anything was to hold contact and out-push friction. That is
+  why a rule had to exist suppressing Jolt's 0.4 m stair step-up over
+  loose props (so contact could be held at all), why `--fell` passed three
+  runs in five, and why it is all gone. **Clambering over logs is fine
+  now.** An impulse has no threshold: every knock moves the log something.
+- **The sustained heave is KEPT, for what cannot be clambered.** Leaning on
+  something builds from `push_newtons` (400) to `heave_newtons` (1300)
+  over `heave_ramp_s`, costing `heave_cost` (7) stamina a second scaled by
+  the weight strained against (0.4-2x of a 400 kg reference); out of
+  stamina there is only the nudge. The two regimes never need to know
+  about each other. Against a 0.33 m bole it is now moot -- the player
+  climbs it instead, which is allowed -- but a big oak's bole is 0.7 m
+  across, well over the step-up, and there the lean is all there is.
+  **Nothing exercises it**: see gaps.md.
+  The arithmetic of what gives: rolling a piece over one facet of its
+  prism takes about tan(pi/8) m g = 0.414 m g and SLIDING it 0.7 m g, so
+  rolling goes first, which is what a wheel is. A 111 kg round wants 451 N
+  to roll, a half 776, a 382 kg bole 1552, a three-tonne oak 14 kN.
+- **The one lie: Jolt's character does not rebound.** It hands the log its
+  momentum and then simply stops, so the player's own momentum vanishes
+  with no stagger, no knockback and no cost. Normal for a kinematic
+  controller, and the only place this model is dishonest.
+- **A falling tree hurts what it lands on.** Each frame a moving whole log
+  is tested against the standing trunks round it: its own trunk line, and
+  -- while it still has its crown -- the crown's sphere, which is what
+  usually reaches. A tree toppling about its butt comes down on its
+  branches, and they stop it about 15 degrees past the diagonal, so the
+  trunk line never descends onto a neighbour's trunk at all. The blow is
+  worth half the trunk's mass at the speed of the point that struck
+  (`body_point_velocity`), as `impact_per_chop` (8000) joules to a chop of
+  damage, above `impact_min_speed`; the faller then keeps `impact_keep` of
+  its speed, so a big one carries on. One blow per pair, so a log resting
+  against a trunk does not saw it down. A tree felled this way goes down
+  the way it was pushed and strikes in its turn.
+- **Measured** (`--fell-chain`, seed 0): a 23.8 m oak dropped on a 10.2 m
+  tree 15 m off lands at 9.8 m/s carrying 98 kJ -- 12 chops, 183 health
+  against its 90 -- and brings it down; that one's own blows are worth
+  3-9 health and fell nothing. At `impact_per_chop` 2500 the same cut took
+  four trees down, which is a free wood pile.
+- **Tests.** `--fell` is the whole life of one tree in eight phases:
+  walking into the trunk, the swings to fell it, the log tipping and
+  coming to rest (9.2 s -- it keeps its crown for most of that), shoving
+  the whole log and getting nowhere, chopping it in two, chopping a half
+  into rounds, E on a round (`+3 Wood`), and walking into a round twice at
+  each gait to see the knocks scale. **Phases 4 and 8 walk in, back off and
+  walk in again** rather than leaning for three seconds and seeing whether
+  the terrain helped: every run starts from the same stand-off at the same
+  gait, so the ground only gets to decide how far the piece then slides.
+  That is what fixed the flakiness at its cause -- the lean version passed
+  three runs in five, this passes four of four;
+  `build/fell.bmp`, `fell_crown.bmp` (the fall, crown on) and
+  `fell_wood.bmp`. `--fell-save` then `--fell-verify` in a second
+  process checks the log is where it rested and the tree does not stand.
+  `--fell-chain` drops one tree on another and lists every blow,
+  `build/fell_chain.bmp`. **`--fell-chain` holds `--fell` inside it**, and
+  `find()` does not care: the longer name is tested first and excluded
+  from the shorter (CLAUDE.md's `--ground` trap again).
+- F6/F9 save/load `build/edits.bin` and `build/trees.bin` (same field id).
+  **`trees.bin` is format 3**: stumps and pieces, each with its band, stage
+  and health. Older saves are refused, as another world's are.
+- **Not done**: see gaps.md -- a stump cannot be chopped out, the crown's
+  clumps are spheres to physics however they are drawn, and nothing is
+  built from the wood yet.
 
 ### Far forest: the canopy shell
 
@@ -1381,8 +1593,9 @@ Valheim's rules, deliberately (`engine/player/`, data in
   the foods' regen; stamina continuously, 1 s after its last use, not while
   swimming.
 - **Stamina**: sprint 10 a second, swimming under way 6, a jump 10 (paid on
-  the press, from the ground), a swing of the axe 8, a dig 5 -- on foot
-  only; flying spends nothing. With none: no sprint, jump, swing or dig
+  the press, from the ground), a swing of the axe 8, a dig 5, and shoving a
+  felled log `heave_cost` (7) a second by its weight (see Felling) -- on
+  foot only; flying spends nothing. With none: no sprint, jump, swing or dig
   (an action needs at least half its cost), and swimming drowns, 5 health
   a second. **A fall** over 4 m hurts, linearly to 100 at 20 m; into water,
   nothing. At 0 health the player wakes at the spawn with no food (the

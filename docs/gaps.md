@@ -216,6 +216,58 @@ Last gathered: 2026-11-21, after the exploration fog; creatures added
 
 ## Ground cover, trees and rocks
 
+- **A stump cannot be chopped out.** A felled tree leaves one for good: it
+  is static, has no health, and gives no wood. Valheim's gives a little.
+  [Felling]
+- **The crown's clumps are spheres to physics however they are drawn.** A
+  band of branches lands and settles like a beach ball, so a clump can
+  come to rest standing where a tangle of branches would have sprawled;
+  and a clump that falls on the player pushes them. They are gone in a few
+  seconds, which is why it has not been worth a hull. [Felling]
+- **A felled tree's pieces do not burn, build or stack in the world.** The
+  wood goes into the inventory and stops there -- there is no construction
+  yet, and a campfire (V) takes no fuel. [Felling; Survival]
+- **Debris stamps nothing and shades no grass**: it is left out of the
+  trample map and the navmesh on purpose (a rebuild for something that
+  lives five seconds), so a crown lies ON the sward rather than in it.
+  [Felling; Ground cover]
+- **Every piece of every felled tree keeps a body for ever.** Logs always
+  did; breaking one up makes four of them, each a sleeping dynamic body
+  and a draw, however far away the player walks. Nothing despawns and
+  nothing is pooled. [Felling]
+- **A knocked tree still kicks its butt out.** Only a tree the player cuts
+  hinges on its stump; one brought down by another is a free body, so the
+  look the hinge was built to fix is still there whenever a chain runs.
+  A hinge released as soon as it is fought, or a two-axis joint, would do
+  it. [Felling]
+- **The crown no longer props a falling tree.** Its physics is a trunk-thick
+  capsule now, so a tree lies flat instead of coming to rest on its
+  branches at about 75 degrees. The crown's own clumps only appear once it
+  has stopped. [Felling]
+- **A falling trunk passes through its neighbours' crowns**, which carry no
+  collision at all -- only trunks do. It meets their trunks, and the
+  analytic blow (which does use a crown sphere) is what decides damage, so
+  nothing is missed; it is the picture that is thin. [Felling]
+- **Nothing exercises the sustained heave.** Everything in the test world
+  is under the character's 0.4 m step-up, so the player climbs it rather
+  than leaning on it, and the knock does the work. The heave only matters
+  against a bole too tall to clamber -- a big oak's is 0.7 m across -- and
+  no test stands next to one. [Felling]
+- **The player does not rebound off what they bump.** Jolt's character
+  hands the log its momentum and stops dead: no stagger, no knockback, no
+  cost for charging a three-tonne oak at a sprint. [Felling]
+- **The clumps of crown are convex**, so a tangle of branches lands and
+  settles like a rolled die rather than sprawling. Twenty faces stop it
+  rolling away, which was the complaint; the shape is still wrong.
+  [Felling]
+- **Nothing but the player can shove a log.** Creatures get Jolt's default
+  100 N and no bump of their own, so a boar cannot roll one, and nothing
+  pushes a log but the player or a blow from another falling tree.
+  [Felling; Creatures]
+- **A falling tree hurts trees and nothing else.** Not the player, not a
+  creature, not a rock, not another log: the test is against the standing
+  trunks only. A tree dropped on a mimic should flatten it. [Felling;
+  Creatures]
 - **Grass grows through rock footprints and puddles**: the bake is cached
   per 16 m tile and sees neither rocks nor puddles (it does see dig edits
   now). [Rocks; Ground cover; The wet world]
