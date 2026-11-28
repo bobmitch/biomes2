@@ -6,7 +6,7 @@ None of these blocks anything that works today. Ordered by area, not by
 priority.
 
 Last gathered: 2026-11-21, after the exploration fog; creatures added
-2026-11-27, combat the same day.
+2026-11-27, combat the same day; particles and smoke (ADR-008) 2026-11-28.
 
 ## Gameplay: survival, the inventory, forage
 
@@ -626,3 +626,46 @@ undecided).
   set small.
 - **Constructions ride the same zones**: waking a zone loads its buildings
   and its people together, and its catch-up advances construction too.
+  *Whatever layer they live in, they must be VOXELISABLE on demand: see
+  the next section and ADR-008 decision 8.*
+
+## Future design: particles and smoke (ADR-008, nothing built)
+
+`docs/adr-008-particles-and-smoke.md`, proposed 2026-11-28. There is no
+particle, decal or smoke code in the tree. Two systems over one
+dual-compiled substrate: ballistic particles (sparks, chips, leaves, dust,
+blood) simulated on the GPU and drawn as unsorted cards, and smoke as a
+MEDIUM -- a sparse 1 m world grid for its state, injected into the mist's
+froxels (`cs_fog_inject`) for its lighting and its drawing. Rising,
+filling and spilling come from the sky-access flood's distance-to-sky,
+which is already built, already threaded and already edit-aware.
+
+What is recorded here because it constrains OTHER work:
+
+- **Buildings must be voxelisable, whoever owns them.** Smoke's fill and
+  spill read the near field's 1 m occupancy and the sky-access flood, and
+  both see only the field and the edit store. A building neither can see
+  gets smoke through its walls -- and, sooner, the near field's probes
+  lighting its inside with open sky. This does NOT mean constructions
+  must live in the brick store (the note above expects their own layer,
+  and ADR-008 agrees): it means the layer must answer "is this 1 m cell
+  solid" over a box and bump a generation when a building is placed,
+  changed or destroyed, so the flood can forget the cells near it the way
+  it forgets a dig's. The precedent is `nav_tile.h`, where the main
+  thread gathers trunks, rocks, stumps and resting logs and the worker
+  stamps them as solid spans. **The navmesh will need the same stamp list
+  regardless**, or creatures path through walls; smoke is a second
+  consumer of it. A building that MOVES re-floods, so moving structures
+  are the case to settle first.
+- **Decals do not exist.** "Blood splats" is two features: airborne
+  droplets (particles) and a mark that stays. Nothing in the engine
+  leaves a mark on a surface. The trample map is the shape to copy -- a
+  toroidal camera-centred texture of world state with a decay, read by
+  whichever shader already draws that surface, forgetting whatever
+  scrolls past its edge. Blood, scorch and char all fit it. Undecided.
+- **Nothing writes motion vectors**, so fast particles will ghost under
+  TAA, as the character already does (see "The player character"). Either
+  particles get velocity output or they draw after TAA; untried.
+- **Smoke past the near field's 128 m volume has no walls and no
+  escape route** and falls back to a drifting plume with no grid. A fire
+  seen across a valley is a column, not a volume. By design, unmeasured.
