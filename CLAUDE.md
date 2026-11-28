@@ -1104,14 +1104,76 @@ replaces its base, and the rest becomes a chain of things:
   out, which was the other half of why the butt jumped, and pinned to its
   stump it could not fall at all. A trunk-thick capsule passes between its
   neighbours' crowns, which carry no collision anyway, and still meets
-  their TRUNKS, which is the collision worth having; the mass and the
-  length are the whole tree's, so it swings at a 24 m tree's rate rather
-  than a 6 m bole's. Proved by removing the sphere as a one-off and
-  watching the same tree fall. It SHEDS the crown once it has come to rest
-  (or after `shed_after_s`): the body is swapped for the bole's shape
-  alone, keeping pose and motion, and the crown becomes DEBRIS. Shedding
-  part way down (the first version tried a tilt) left a 23 m tree with a
-  7 m trunk in mid-air, sweeping nothing past 7 m.
+  their TRUNKS, which is the collision worth having; the LENGTH is the
+  whole tree's, so it swings at a 24 m tree's rate rather than a 6 m
+  bole's. Proved by removing the sphere as a one-off and watching the same
+  tree fall.
+- **The crown is a TENTH of the mass, not half of it** (items.json's
+  `logs.crown_mass_share`, 0.1). The falling body is two capsules in a
+  compound, not one: the bole at wood's 650 kg/m^3, and the band above it
+  -- branches, twigs and leaves, mostly air -- at whatever density gives it
+  that share. The two overlap by a diameter, because a capsule spanning
+  [a, b] is only full width between a + r and b - r and two laid end to end
+  pinch the trunk to a point where they meet; overlapped, the hull is the
+  same unbroken cylinder it was, so nothing about the collision changed.
+  As ONE uniform capsule the crown weighed as much as the bole under it,
+  which put the centre of mass at half the height instead of a third: the
+  fall was slow and the thing had far too much angular momentum to shed
+  once it was down. Measured on `--fell`'s 14.5 m test tree: 45 degrees at
+  1.9 s against 2.1, 80 at 2.2-2.6 against 2.5, and it comes to rest
+  **3.1-3.9 s** after the cut against 9.2. `crown_mass_share` 0.5 is the
+  A/B: it is about what a uniform capsule gave.
+  - **0.05 was tried and was worse, for a reason since fixed.** A lighter
+    crown is a lower moment of inertia about the butt, so the tree falls
+    faster and lands HARDER -- and at the time `impacts_frame` charged a
+    blow 0.5 x the BOLE's mass whatever had struck, so the crown's own
+    mass never entered it and the chain went UP: 4 trees in four runs of
+    four, 1405 health, against 0.1's usual 3. The cost was not monotonic
+    in the share, which is worth remembering about any number that feeds
+    both the motion and the damage: sweep it rather than reason about it.
+    The blow's mass is the body's own now (below), so the share and the
+    chain pull the same way; 0.05 has not been re-swept since, and the
+    clumps did scatter further and far less predictably (0.1-3.3 m against
+    0.1's tight 1.2-1.7).
+- **It sheds the crown THE MOMENT THAT CROWN MEETS THE GROUND**, which in
+  the open is the first thing a falling tree touches at all: the body is
+  swapped for the bole's shape alone, keeping pose and motion, and the
+  crown becomes DEBRIS. On the test tree that is 2.2-2.3 s after the cut,
+  about 80 degrees over, where before it waited for the log to stop moving
+  (`shed_after_s` is now only the fallback for a tree hung up in its
+  neighbours that never reaches the ground). Shedding on a TILT was tried
+  in the first version and is still wrong -- it left a 23 m tree with a 7 m
+  trunk in mid-air, sweeping nothing past 7 m.
+  - **Only a contact on the crown's own band counts**, measured by taking
+    the contact point into the model's frame and comparing with the bole's
+    top. Any contact at all is too blunt: a hinged tree rubs its own stump
+    on the way over, and a tree knocked down by another is struck ON ITS
+    TRUNK by the faller -- neither takes a twig off the top.
+  - **... and only against the GROUND, not against another prop**
+    (`Touch::prop`). A tree falling through a wood tangles with its
+    neighbours and breaks limbs on them; it does not shed its whole canopy
+    on the first one -- and the canopy is also the only part of it that
+    reaches a tree fifteen metres away, so a faller that sheds on a
+    standing trunk is a bare bole by twenty degrees and knocks nothing
+    down at all. That was measured: the chain went to 0 trees. Gating on
+    the tilt instead (45 degrees, the hinge's own release) has the same
+    fault more quietly -- the crown passes over its victim before then.
+  - **`impacts_frame` runs BEFORE the shed**, so the frame a crown sweeps
+    into a neighbour still swings the whole tree at it.
+  - **The bole is given the velocity of ITS OWN centre** (`body_point_
+    velocity` at its midpoint), not the whole tree's. They are metres
+    apart along the trunk, and handing a new body the speed of a point it
+    no longer contains is the difference between a trunk settling and one
+    launched -- which did not matter while the crown came off a log lying
+    still, and does now.
+  - **Jolt tells it: a `ContactListener`** (`PhysicsWorld::watch_contacts`,
+    `touches()`). Only watched bodies are recorded and `note_contact`
+    returns on one relaxed atomic load when nothing is watched, so a world
+    with no tree in the air pays nothing. A SPECULATIVE contact (negative
+    `mPenetrationDepth`: Jolt looking ahead, and the step may not change a
+    velocity at all) is not a touch -- a canopy exploding a few centimetres
+    above the ground is the failure that rules out. `remove_body` drops the
+    watch, because Jolt reuses a handle's index.
 - **Nothing damps a tree going over.** While hinged the body is set to
   0.05 linear and 0.02 angular damping, and `release_hinge` puts back the
   0.6 a landing log wants (`set_body_damping`). Near the vertical gravity's
@@ -1132,7 +1194,11 @@ replaces its base, and the rest becomes a chain of things:
   it stops): as spheres they rolled **8.4 m** from where they came off the
   tree on average, worst 11.6, still going after 3.7 s -- the crown ended
   up nowhere near the tree. As icosahedra, **0.5-2.4 m**, stopped in about
-  a second. **A clump's body still goes the moment it stops** (under
+  a second -- and **1.2-1.6 m on average, worst 1.9, in about 3.4 s** since
+  the crown comes off against the ground rather than off a log already
+  lying still: a clump leaves at `debris_toss` of a tip doing eight metres
+  a second, so it scatters ahead of the fall instead of spilling off the
+  top. **A clump's body still goes the moment it stops** (under
   `kDebrisSlow` for `kDebrisSlowFor`, or after `kDebrisAir`), because
   nothing needs to collide with a fading clump and a rolling one keeps
   knocking the log awake. The angular damping stays at 0.9 where the
@@ -1236,26 +1302,80 @@ replaces its base, and the rest becomes a chain of things:
   momentum and then simply stops, so the player's own momentum vanishes
   with no stagger, no knockback and no cost. Normal for a kinematic
   controller, and the only place this model is dishonest.
-- **A falling tree hurts what it lands on.** Each frame a moving whole log
-  is tested against the standing trunks round it: its own trunk line, and
-  -- while it still has its crown -- the crown's sphere, which is what
-  usually reaches. A tree toppling about its butt comes down on its
-  branches, and they stop it about 15 degrees past the diagonal, so the
-  trunk line never descends onto a neighbour's trunk at all. The blow is
-  worth half the trunk's mass at the speed of the point that struck
-  (`body_point_velocity`), as `impact_per_chop` (8000) joules to a chop of
-  damage, above `impact_min_speed`; the faller then keeps `impact_keep` of
-  its speed, so a big one carries on. One blow per pair, so a log resting
-  against a trunk does not saw it down. A tree felled this way goes down
-  the way it was pushed and strikes in its turn.
-- **Measured** (`--fell-chain`, seed 0): a 23.8 m oak dropped on a 10.2 m
-  tree 15 m off lands at 9.8 m/s carrying 98 kJ -- 12 chops, 183 health
-  against its 90 -- and brings it down; that one's own blows are worth
-  3-9 health and fell nothing. At `impact_per_chop` 2500 the same cut took
-  four trees down, which is a free wood pile.
+- **A falling tree hurts what it lands on** -- the trees still standing,
+  and the logs already lying about. Each frame a moving whole log is tested
+  against both: its own trunk line, and -- while it still has its crown --
+  the crown's sphere, which is what usually reaches. A tree toppling about
+  its butt comes down on its branches, and they stop it about 15 degrees
+  past the diagonal, so the trunk line never descends onto a neighbour's
+  trunk at all. `impact_per_chop` (4000) joules is a chop of damage; a
+  felled tree goes down the way it was pushed and strikes in its turn,
+  keeping `impact_keep` of its speed.
+- **The blow is what it delivered THERE, and three things decide it.**
+  Every one of them was a flat number before, and between them they are why
+  a wood used to go over like dominoes.
+  - **The MASS is the body's at the point that touched**, along the line
+    the blow pushes: the collision reduced mass,
+    `1 / (1/m + (r x n) . I^-1 (r x n))`, straight out of Jolt
+    (`PhysicsWorld::body_impact_mass`). It is not the tree's mass and for a
+    long turning thing it is nowhere near it: the crown of the test oak is
+    a tenth of its mass eight metres off its centre, and meets **375-820 kg**
+    where a flat half of the trunk charged 1535. Measured at the strike,
+    and the report prints it.
+  - **The SPEED is the CLOSING speed** along the line between the two,
+    where the full speed of the point counted before. A crown sweeping PAST
+    a trunk at the same height closes on it hardly at all; a crown coming
+    down on a shorter tree finds the top of that trunk below it, the line
+    tilts upward, and the fall's own speed is the blow. Which way the
+    struck tree is SHOVED is a separate thing -- the faller's travel,
+    flattened, since a tree goes over sideways and never down.
+  - **The DAMAGE follows the peak of the load, not the first touch.**
+    `Piece::struck` is a map of what each thing has already taken, as the
+    energy of the hardest blow so far, and only the INCREASE counts. A log
+    lying against a trunk cannot saw it down, because its energy never
+    rises -- which is what "one blow per pair" was for -- but a tree that
+    brushes a neighbour at twenty degrees and then bears down on it gets
+    credit for the whole load, which is what snaps a trunk. Without it the
+    pair's one blow was spent on the graze and the landing counted for
+    nothing. `Impact` is one entry per pair too, added to as it grows:
+    frame by frame it was thirty records of a health apiece.
+  - Two gates keep the standing wood out of it. A blow worth less than ONE
+    CHOP is a **graze** -- bark, twigs and spring take it -- so it is not
+    recorded and does not start the peak. And a tree that has tipped less
+    than `impact_lean_deg` (15) is **leaning, not falling**: crowns
+    interlock in a wood and a trunk is pressed against its neighbours long
+    before anyone cuts it, so its first contacts are the ones it already
+    had. A log on the ground is on its side, so neither gate holds one
+    back.
+- **A log on the ground takes the same blow against its own health**, and
+  the chain it already has: enough and a whole one **breaks in two**,
+  enough again and a half **comes apart into rounds of firewood**, which E
+  picks up. A round is left out -- it is already what a log breaks down
+  into. It needs no knock: it is a real body and the contact has shoved it
+  already. `split` and `billet` rebuild `pieces_`, so the blows are
+  collected and applied after the loop over them, never inside it.
+- **Measured** (`--fell-chain`, seed 0, repeatable to the health over three
+  runs): a 23.8 m oak is cut at a 10.1 m sapling 8.4 m off. On the way it
+  bears down on two big trees at 11.6 and 12.1 m/s -- 29.3 and 27.4 kJ on
+  431 and 375 kg -- and **neither goes down**: they take 110 and 103
+  health and hold. It fells the sapling it was aimed at (26.3 kJ on 719 kg,
+  99 health against its 90), then lands across that tree's own log and
+  **breaks it in two**, and both halves **into firewood**; two more trees
+  take 68 and 52 health and hold. **8 blows, 1 tree down, 2 down in all**
+  -- where the flat half-mass blow took 3 or 4 -- and "4 took a blow and
+  held; the worst off needs 7 chops now where it needed 14", which is the
+  other half of the point: a tree a neighbour fell against is quicker to
+  fell with the axe.
+  **The corridor the test looks for is as wide as a CROWN** (10 m, was 6):
+  at 6 m the faller swiped big neighbours just outside it, hung up on them
+  -- a blow that does not fell simply stops the faller, which is what a
+  hung-up tree is -- and never reached what it was felled at. Picking the
+  pair by trunk alone is what made the old numbers look like a chain.
 - **Tests.** `--fell` is the whole life of one tree in eight phases:
   walking into the trunk, the swings to fell it, the log tipping and
-  coming to rest (9.2 s -- it keeps its crown for most of that), shoving
+  coming to rest (3.3-3.9 s; it keeps its crown to 2.2 s, where the crown
+  meets the ground, and the report's `the crown broke off at` line is the
+  check that it was the ground and not the `shed_after_s` timer), shoving
   the whole log and getting nowhere, chopping it in two, chopping a half
   into rounds, E on a round (`+3 Wood`), and walking into a round twice at
   each gait to see the knocks scale. **Phases 4 and 8 walk in, back off and
@@ -1264,10 +1384,15 @@ replaces its base, and the rest becomes a chain of things:
   gait, so the ground only gets to decide how far the piece then slides.
   That is what fixed the flakiness at its cause -- the lean version passed
   three runs in five, this passes four of four;
-  `build/fell.bmp`, `fell_crown.bmp` (the fall, crown on) and
-  `fell_wood.bmp`. `--fell-save` then `--fell-verify` in a second
+  `build/fell.bmp`, `fell_crown.bmp` (shot on the clumps appearing, so it
+  is always the moment the crown comes off) and `fell_wood.bmp`. `--fell-save` then `--fell-verify` in a second
   process checks the log is where it rested and the tree does not stand.
-  `--fell-chain` drops one tree on another and lists every blow,
+  `--fell-chain` drops one tree on another and lists every blow -- one
+  line per pair, with the hardest moment of it and what it cost in all --
+  then checks the mechanism rather than the body count: a blow landed and
+  was worth real damage, a big enough one brought a tree down, a smaller
+  one only weakened what it hit (and says how many chops that saved), and
+  a log already on the ground was broken up by a tree coming down on it.
   `build/fell_chain.bmp`. **`--fell-chain` holds `--fell` inside it**, and
   `find()` does not care: the longer name is tested first and excluded
   from the shorter (CLAUDE.md's `--ground` trap again).

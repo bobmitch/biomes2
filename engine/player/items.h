@@ -118,7 +118,17 @@ struct LogTuning {
     std::string wood_item = "wood";
     float wood_per_m3 = 9.0f;        // ... and what one is worth, by its volume
     float billet_max_m = 1.2f;       // a round is no longer than this
-    float shed_after_s = 8.0f;       // a log drops its crown once it is down, or this long after
+    // The canopy comes off at the first thing the crown touches -- a tree
+    // lands on its branches and they break -- and shed_after_s only catches
+    // one that touched nothing and is still leaning somewhere.
+    float shed_after_s = 8.0f;
+    // ... and how much of a standing tree's mass is in that canopy. The
+    // branches, twigs and leaves above the bole are mostly air: a tenth is
+    // generous. Modelled as solid trunk the whole way up they weighed as
+    // much as the bole, which put the centre of mass at half the height
+    // instead of a third -- a slow topple, and far too much spin to shed
+    // once it was down.
+    float crown_mass_share = 0.1f;
     // How a tree goes over. It pivots on its stump (a hinge) until it has
     // tipped hinge_release_deg, then slips off and falls free; the spin is
     // only the nudge that breaks an upright tree's equilibrium, since a
@@ -129,6 +139,13 @@ struct LogTuning {
     float debris_toss = 0.6f;        // ... with this share of the speed it had there
     float impact_per_chop = 8000.0f; // joules of impact worth one chop of damage
     float impact_min_speed = 2.5f;   // slower than this and nothing is hurt
+    // A tree that has tipped less than this is LEANING, not falling, and
+    // anything it touches it was already touching: crowns interlock in a
+    // wood, and a trunk whose top is six metres of branches is pressed
+    // against its neighbours long before anyone cuts it. Without the gate
+    // a faller spent its one blow per neighbour at 2-4 m/s in the first
+    // quarter-second, and dropped its crown there too.
+    float impact_lean_deg = 15.0f;
     float impact_keep = 0.6f;        // the speed a faller keeps after felling another
     int   debris_pieces = 3;         // clumps the crown comes off as
     float debris_rest_s = 2.5f;      // ... how long they lie there once settled ...

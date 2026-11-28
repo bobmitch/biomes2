@@ -9,12 +9,13 @@
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/ScaledShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
-#include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Constraints/HingeConstraint.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyInterface.h>
+#include <Jolt/Physics/Body/BodyLock.h>
+#include <Jolt/Physics/Collision/ContactListener.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
@@ -67,6 +68,30 @@ public:
     }
 };
 
+// Jolt's way of saying "these two just touched". It is registered for the
+// life of the system and does nothing at all while nothing is watched: the
+// atomic read in note_contact is the whole cost of a world with no tree in
+// the air. Called from the physics job threads, so note_contact locks.
+class ContactRecorder final : public JPH::ContactListener {
+public:
+    explicit ContactRecorder(PhysicsWorld* w) : world_(w) {}
+    void OnContactAdded(const JPH::Body& b1, const JPH::Body& b2,
+                        const JPH::ContactManifold& m, JPH::ContactSettings&) override {
+        if (!world_->watching_contacts()) return;
+        // A SPECULATIVE contact (negative depth) is Jolt looking ahead: the
+        // surfaces have not met and the step may not even change a velocity.
+        // A canopy that broke off a few centimetres short of the ground
+        // would read as it exploding in mid-air.
+        if (m.mPenetrationDepth <= 0.0f || m.mRelativeContactPointsOn1.empty()) return;
+        const JPH::RVec3 p = m.GetWorldSpaceContactPointOn1(0);
+        const float wp[3] = {float(p.GetX()), float(p.GetY()), float(p.GetZ())};
+        world_->note_contact(b1.GetID().GetIndexAndSequenceNumber(),
+                             b2.GetID().GetIndexAndSequenceNumber(), wp);
+    }
+private:
+    PhysicsWorld* world_;
+};
+
 }  // namespace
 
 struct PhysicsWorld::Impl {
@@ -84,6 +109,7 @@ struct PhysicsWorld::Impl {
     // The player and every creature collide with each other.
     JPH::CharacterVsCharacterCollisionSimple cvc;
     std::vector<JPH::RefConst<JPH::Shape>> prop_shapes;   // add_prop_mesh
+    std::unique_ptr<ContactRecorder> contacts;
 };
 
 PhysicsWorld::PhysicsWorld() = default;
@@ -111,6 +137,8 @@ bool PhysicsWorld::init(std::string& error) {
     impl_->system.Init(4096, 0, 8192, 2048,
                        impl_->bp_layers, impl_->obj_vs_bp, impl_->obj_pair);
     impl_->system.SetGravity(JPH::Vec3(0.0f, -22.0f, 0.0f));
+    impl_->contacts.reset(new ContactRecorder(this));
+    impl_->system.SetContactListener(impl_->contacts.get());
 
     // The capsule is offset so the character's POSITION is its feet. Jolt's
     // own shape origin is the capsule centre, and a character controller whose
@@ -312,21 +340,37 @@ uint32_t PhysicsWorld::add_static_capsule(const float a[3], const float b[3], fl
 }
 
 uint32_t PhysicsWorld::add_log(const float pos[3], const float rot[4], float trunk_r, float y0,
-                               float y1, float crown_y, float crown_r, const float spin[3],
+                               float y1, float top, float crown_mass, const float spin[3],
                                bool asleep) {
     if (!impl_) return 0;
-    JPH::StaticCompoundShapeSettings cs;
-    {
-        const float len = y1 - y0;
+    // A capsule spanning [a, b] -- caps included, which is how both of these
+    // are measured -- holds this much.
+    auto capsule_volume = [trunk_r](float len) {
+        const float r = trunk_r;
+        return 3.14159265f * r * r * (std::max)(len, 2.0f * r) - (2.0f / 3.0f) * 3.14159265f * r * r * r;
+    };
+    auto add_capsule = [&](JPH::StaticCompoundShapeSettings& cs, float a, float b, float density) {
+        const float len = b - a;
         const float half = len > 2.0f * trunk_r ? 0.5f * len - trunk_r : 0.01f;
-        JPH::CapsuleShapeSettings* trunk = new JPH::CapsuleShapeSettings(half, trunk_r);
-        trunk->SetDensity(650.0f);
-        cs.AddShape(JPH::Vec3(0.0f, 0.5f * (y0 + y1), 0.0f), JPH::Quat::sIdentity(), trunk);
-    }
-    if (crown_r > 0.05f) {
-        JPH::SphereShapeSettings* crown = new JPH::SphereShapeSettings(crown_r);
-        crown->SetDensity(6.0f);
-        cs.AddShape(JPH::Vec3(0.0f, crown_y, 0.0f), JPH::Quat::sIdentity(), crown);
+        JPH::CapsuleShapeSettings* c = new JPH::CapsuleShapeSettings(half, trunk_r);
+        c->SetDensity((std::max)(0.5f, density));
+        cs.AddShape(JPH::Vec3(0.0f, 0.5f * (a + b), 0.0f), JPH::Quat::sIdentity(), c);
+    };
+    JPH::StaticCompoundShapeSettings cs;
+    const float kWood = 650.0f;
+    const float bole_mass = kWood * capsule_volume(y1 - y0);
+    add_capsule(cs, y0, y1, kWood);
+    // The crown band, starting a DIAMETER down inside the bole: a capsule
+    // spanning [a, b] is only full width between a + r and b - r, so two laid
+    // end to end would pinch the trunk to a point where they meet. Overlapped,
+    // the hull is one unbroken cylinder, and the two masses simply add.
+    const float f = (std::min)((std::max)(crown_mass, 0.0f), 0.9f);
+    if (top > y1 + 0.1f && f > 0.001f) {
+        const float lo = (std::max)(y0, y1 - 2.0f * trunk_r);
+        const float m = bole_mass * f / (1.0f - f);
+        add_capsule(cs, lo, top, m / capsule_volume(top - lo));
+    } else if (top > y1) {
+        add_capsule(cs, (std::max)(y0, y1 - 2.0f * trunk_r), top, 0.5f);
     }
     JPH::ShapeSettings::ShapeResult r = cs.Create();
     if (r.HasError()) return 0;
@@ -336,7 +380,7 @@ uint32_t PhysicsWorld::add_log(const float pos[3], const float rot[4], float tru
     bcs.mFriction = 0.8f;
     bcs.mRestitution = 0.05f;
     bcs.mLinearDamping = 0.1f;
-    bcs.mAngularDamping = 0.6f;    // a crown rolls on its sphere for ever at 0.35
+    bcs.mAngularDamping = 0.6f;    // what a landing log wants; the fall undamps it
     bcs.mAngularVelocity = JPH::Vec3(spin[0], spin[1], spin[2]);
     const JPH::BodyID id = impl_->system.GetBodyInterface().CreateAndAddBody(
         bcs, asleep ? JPH::EActivation::DontActivate : JPH::EActivation::Activate);
@@ -454,6 +498,9 @@ uint32_t PhysicsWorld::add_debris(const float pos[3], const float rot[4], float 
 
 void PhysicsWorld::remove_body(uint32_t handle) {
     if (!impl_) return;
+    // Jolt reuses a handle's index, so a watch left on a body that has gone
+    // would start reporting another body's contacts as its own.
+    if (watching_.load(std::memory_order_relaxed) != 0) watch_contacts(handle, false);
     std::unordered_map<uint32_t, JPH::BodyID>::iterator it = props_.find(handle);
     if (it == props_.end()) return;
     JPH::BodyInterface& bi = impl_->system.GetBodyInterface();
@@ -522,6 +569,35 @@ void PhysicsWorld::remove_hinge(uint32_t handle) {
     impl_->hinges.erase(it);
 }
 
+void PhysicsWorld::watch_contacts(uint32_t handle, bool on) {
+    std::lock_guard<std::mutex> lock(touch_mu_);
+    std::vector<uint32_t>::iterator it =
+        std::find(contact_watch_.begin(), contact_watch_.end(), handle);
+    if (on) {
+        if (it == contact_watch_.end()) contact_watch_.push_back(handle);
+    } else if (it != contact_watch_.end()) {
+        contact_watch_.erase(it);
+    }
+    watching_.store(int(contact_watch_.size()), std::memory_order_relaxed);
+}
+
+void PhysicsWorld::note_contact(uint32_t h1, uint32_t h2, const float point[3]) {
+    if (watching_.load(std::memory_order_relaxed) == 0) return;
+    std::lock_guard<std::mutex> lock(touch_mu_);
+    for (int side = 0; side < 2; ++side) {
+        const uint32_t me = side ? h2 : h1, other = side ? h1 : h2;
+        if (std::find(contact_watch_.begin(), contact_watch_.end(), me) == contact_watch_.end())
+            continue;
+        if (touches_.size() >= 64) return;   // a frame's worth is plenty
+        Touch t;
+        t.body = me;
+        t.other = other;
+        t.prop = props_.count(other) != 0;
+        for (int k = 0; k < 3; ++k) t.point[k] = point[k];
+        touches_.push_back(t);
+    }
+}
+
 void PhysicsWorld::set_body_damping(uint32_t handle, float linear, float angular) {
     if (!impl_) return;
     std::unordered_map<uint32_t, JPH::BodyID>::iterator it = props_.find(handle);
@@ -550,6 +626,29 @@ bool PhysicsWorld::body_point_velocity(uint32_t handle, const float p[3], float 
     const JPH::BodyInterface& bi = impl_->system.GetBodyInterface();
     const JPH::Vec3 w = bi.GetPointVelocity(it->second, JPH::RVec3(p[0], p[1], p[2]));
     v[0] = w.GetX(); v[1] = w.GetY(); v[2] = w.GetZ();
+    return true;
+}
+
+bool PhysicsWorld::body_impact_mass(uint32_t handle, const float point[3], const float dir[3],
+                                    float& mass) const {
+    mass = 0.0f;
+    if (!impl_) return false;
+    std::unordered_map<uint32_t, JPH::BodyID>::const_iterator it = props_.find(handle);
+    if (it == props_.end()) return false;
+    JPH::Vec3 n(dir[0], dir[1], dir[2]);
+    const float nl = n.Length();
+    if (nl < 1e-6f) return false;
+    n /= nl;
+    const JPH::BodyLockRead lock(impl_->system.GetBodyLockInterface(), it->second);
+    if (!lock.Succeeded()) return false;
+    const JPH::Body& b = lock.GetBody();
+    if (!b.IsDynamic()) return false;
+    const JPH::Vec3 r(JPH::RVec3(point[0], point[1], point[2]) - b.GetCenterOfMassPosition());
+    const JPH::Vec3 rn = r.Cross(n);
+    const float denom = b.GetMotionProperties()->GetInverseMass() +
+                        rn.Dot(b.GetInverseInertia().Multiply3x3(rn));
+    if (denom < 1e-9f) return false;
+    mass = 1.0f / denom;
     return true;
 }
 
@@ -720,6 +819,10 @@ void PhysicsWorld::update(float dt, float vx, float vz, bool jump, float swim) {
     // The static bodies still need the broadphase kept current as chunks come
     // and go. A falling log is the one dynamic body; two collision steps at
     // the 50 ms clamp keep a toppling trunk from tunnelling a heightfield.
+    if (watching_.load(std::memory_order_relaxed) != 0 || !touches_.empty()) {
+        std::lock_guard<std::mutex> lock(touch_mu_);
+        touches_.clear();
+    }
     impl_->system.Update(dt, dt > 0.02f ? 2 : 1, &impl_->temp, impl_->jobs.get());
 }
 

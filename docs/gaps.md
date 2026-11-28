@@ -242,8 +242,22 @@ Last gathered: 2026-11-21, after the exploration fog; creatures added
   it. [Felling]
 - **The crown no longer props a falling tree.** Its physics is a trunk-thick
   capsule now, so a tree lies flat instead of coming to rest on its
-  branches at about 75 degrees. The crown's own clumps only appear once it
-  has stopped. [Felling]
+  branches at about 75 degrees. The clumps do appear the moment that
+  capsule's crown band touches anything, so what is missing is the prop,
+  not the timing. [Felling]
+- **A falling tree hangs up on what it fails to fell, for ever.** A blow
+  that is not enough simply stops the faller against the standing trunk's
+  static capsule, which is right -- that is what a hung-up tree is -- but
+  nothing resolves it: it is not felled, it cannot be pushed on, and
+  chopping it is chopping a log that happens to be at forty degrees. A
+  real woodcutter's problem with a real answer (a winch, a second cut),
+  and none of it exists. [Felling]
+- **A blow's damage ignores WHERE up the struck trunk it landed.** A
+  cantilever fixed in the ground bends by the moment, so the same blow
+  near the top is worth far more than one at the base, and a thick trunk
+  resists as the cube of its radius where its health is about linear in
+  it. The energy is honest about the faller and says nothing about the
+  victim's shape. [Felling]
 - **A falling trunk passes through its neighbours' crowns**, which carry no
   collision at all -- only trunks do. It meets their trunks, and the
   analytic blow (which does use a crown sphere) is what decides damage, so

@@ -25,7 +25,9 @@
 #include <Jolt/Core/JobSystemThreadPool.h>
 
 #include <algorithm>
+#include <atomic>
 #include <functional>
+#include <mutex>
 #include <vector>
 #include <memory>
 #include <unordered_map>
@@ -91,13 +93,20 @@ public:
     //
     // A static capsule between two world points: a standing trunk, a stump.
     uint32_t add_static_capsule(const float a[3], const float b[3], float radius);
-    // A felled tree: a dense trunk capsule from y0 to y1 on the local axis
-    // and a light sphere for the crown, posed at (pos, rot), already turning
-    // at `spin` rad/s. Wood at 650 kg/m^3; the crown at 6, because a crown is
-    // mostly air and a solid one would weigh as much as the trunk ten times.
+    // A felled tree, mid-fall: a trunk-thick capsule the whole tree's length
+    // on the local axis, posed at (pos, rot) and already turning at `spin`
+    // rad/s. It is TWO capsules, not one, and that is about mass rather than
+    // shape: the bole [y0, y1] is solid wood at 650 kg/m^3, the part above
+    // it -- branches, twigs and leaves, mostly air -- carries `crown_mass` of
+    // the whole body's mass and no more. Drawn as one length of trunk either
+    // way, since the two overlap by a radius and the hull is the same
+    // cylinder. Modelled as ONE uniform capsule the crown weighed as much as
+    // the trunk under it: the centre of mass sat at half the height instead
+    // of a third, which is a slow fall and far too much angular momentum to
+    // shed once the thing is on the ground.
     // `asleep` adds it without waking it, for a log loaded from a save.
     uint32_t add_log(const float pos[3], const float rot[4], float trunk_r, float y0, float y1,
-                     float crown_y, float crown_r, const float spin[3], bool asleep);
+                     float top, float crown_mass, const float spin[3], bool asleep);
     // A piece of a felled trunk -- half a log, a billet of firewood: one
     // dense capsule between two points in the body's OWN frame, since the
     // trunk's axis wanders and a piece from up the tree is not on the
@@ -127,6 +136,17 @@ public:
     // turning about its butt has a still base and a fast top.
     bool     body_point_velocity(uint32_t handle, const float p[3], float v[3]) const;
     void     set_body_velocity(uint32_t handle, const float lin[3], const float ang[3]);
+    // The mass a blow at `point` pushing along `dir` actually meets: the
+    // collision reduced mass, 1 / (1/m + (r x n) . I^-1 (r x n)) with r from
+    // the body's centre of mass. It is NOT the body's mass, and for a long
+    // turning thing it is not close to it -- a light crown eight metres off
+    // the centre of a falling trunk meets a small fraction of the tree,
+    // which is why a branch snaps instead of felling what it lands on, and
+    // why pushing a log end-on meets the whole log. This is what "the
+    // momentum it had at the point it hit" means for a body that is turning
+    // as well as moving.
+    bool     body_impact_mass(uint32_t handle, const float point[3], const float dir[3],
+                              float& mass) const;
     // Drag, changed after the fact. A tree going over on its stump has
     // nothing damping its rotation and the damping a LOG wants would stop
     // it leaving the vertical at all; a log lying on the ground wants the
@@ -148,6 +168,25 @@ public:
     // Release it once the trunk is far enough over to slip off the stump.
     uint32_t add_hinge(uint32_t body, uint32_t anchor, const float point[3], const float axis[3]);
     void     remove_hinge(uint32_t handle);
+
+    // Contacts, for the things that have to know the MOMENT they touched
+    // something: a falling tree's canopy, which breaks off against the first
+    // thing it meets. Only watched bodies are recorded -- with none watched
+    // the listener returns on one atomic read, so a world with nothing in
+    // the air pays nothing for this. A speculative contact (Jolt reports
+    // one before the surfaces actually meet) is not a touch. The list is the
+    // last step's and update() clears it.
+    void watch_contacts(uint32_t handle, bool on);
+    struct Touch {
+        uint32_t body = 0;               // the watched body
+        uint32_t other = 0;              // what it met
+        bool     prop = false;           // ... a trunk, stump, rock or log; else terrain
+        float    point[3] = {0, 0, 0};   // where, in world metres
+    };
+    const std::vector<Touch>& touches() const { return touches_; }
+    // The contact listener's way in. Not for callers.
+    bool watching_contacts() const { return watching_.load(std::memory_order_relaxed) != 0; }
+    void note_contact(uint32_t h1, uint32_t h2, const float point[3]);
 
     // How hard the character may shove a dynamic body, in newtons. Jolt's
     // own default is 100 N, which will not move anything made of wood: a
@@ -313,6 +352,10 @@ private:
     uint32_t  next_hinge_ = 0;
     Push      push_;
     std::vector<Bump>     bumps_;     // this frame's
+    std::vector<uint32_t> contact_watch_;
+    std::atomic<int>      watching_{0};   // read by every contact, on any thread
+    mutable std::mutex    touch_mu_;      // Jolt calls back from its job threads
+    std::vector<Touch>    touches_;
     std::vector<uint32_t> touched_;   // loose props in contact last frame
     std::unordered_map<uint32_t, float> bump_cd_;   // handle -> seconds until it may be bumped again
     float     bump_transfer_ = 1.0f;

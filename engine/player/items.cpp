@@ -135,12 +135,14 @@ bool ItemTable::load(const char* path, std::string& error) {
             num("wood_per_m3", g.wood_per_m3);
             num("billet_max_m", g.billet_max_m);
             num("shed_after_s", g.shed_after_s);
+            num("crown_mass_share", g.crown_mass_share);
             num("topple_spin_rad_s", g.topple_spin_rad_s);
             num("knock_spin_rad_s", g.knock_spin_rad_s);
             num("hinge_release_deg", g.hinge_release_deg);
             num("debris_toss", g.debris_toss);
             num("impact_per_chop", g.impact_per_chop);
             num("impact_min_speed", g.impact_min_speed);
+            num("impact_lean_deg", g.impact_lean_deg);
             num("impact_keep", g.impact_keep);
             float debris = float(g.debris_pieces);
             num("debris_pieces", debris);
@@ -150,10 +152,11 @@ bool ItemTable::load(const char* path, std::string& error) {
             if (g.chop_damage <= 0.0f || g.health_per_m3 <= 0.0f || g.min_health <= 0.0f ||
                 g.split_at <= 0.05f || g.split_at >= 0.95f || g.billets < 1 || g.billets > 8 ||
                 g.impact_per_chop <= 0.0f || g.debris_pieces < 0 || g.debris_pieces > 8 ||
-                g.billet_max_m <= 0.1f || g.debris_fade_s <= 0.0f)
+                g.billet_max_m <= 0.1f || g.debris_fade_s <= 0.0f ||
+                g.crown_mass_share < 0.0f || g.crown_mass_share > 0.5f)
                 throw std::runtime_error("logs: chop_damage, health_per_m3, min_health, "
                                          "impact_per_chop and debris_fade_s > 0, 0.05 < split_at < 0.95, "
-                                         "1..8 billets, 0..8 debris_pieces");
+                                         "1..8 billets, 0..8 debris_pieces, crown_mass_share 0..0.5");
         }
         if (root.has("clock")) {
             const jsonlite::Value& c = root.at("clock");

@@ -8204,7 +8204,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 if (d < 0.35f * ha || d > 0.80f * ha) continue;
                 // ... and nothing else standing in the way: a third trunk in
                 // the corridor takes the blow first, which is correct and
-                // useless as a test.
+                // useless as a test. The corridor is as wide as a CROWN,
+                // not as a trunk -- a crown is three metres of branches
+                // either side of the axis, and at six metres the faller was
+                // swiping big neighbours just outside the corridor, hanging
+                // up on them and never reaching what it was felled at.
                 bool clear = true;
                 for (size_t k = 0; k < st.size() && clear; ++k) {
                     if (k == i || k == j) continue;
@@ -8212,7 +8216,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                     const float along = (wx * ex + wz * ez) / (d * d);
                     if (along <= 0.02f || along >= 0.98f) continue;
                     const float px = wx - ex * along, pz = wz - ez * along;
-                    if (px * px + pz * pz < 6.0f * 6.0f) clear = false;
+                    if (px * px + pz * pz < 10.0f * 10.0f) clear = false;
                 }
                 if (!clear) continue;
                 // Big faller, thin victim, struck well out along the trunk.
@@ -8269,7 +8273,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
 
         // Watch for ten seconds.
         std::fprintf(f, "\nblows -- who landed on whom, and what it cost them:\n");
-        int blows = 0, chained = 0;
+        int blows = 0, chained = 0, log_blows = 0, log_breaks = 0;
+        float first_fell = -1.0f;
+        int weakened = 0, saved_chops = 0, saved_was = 0, saved_now = 0;
+        std::unordered_map<uint64_t, float> first_blow;
         bool b_felled = false, hit = false;
         float hit_speed = 0.0f, hit_energy = 0.0f, hit_damage = 0.0f;
         bool shot = false;
@@ -8280,21 +8287,18 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             sync_sea(tsim);
             g_physics.update(step, 0.0f, 0.0f, false, 0.0f);
             g_felling.update(A.x, A.z, step);
+            // The list is NOT cleared each frame: felling keeps one entry
+            // per pair and adds to it as the blow bears down, so the
+            // totals are only right once the fall is over. All this
+            // frame does is note when each pair was first struck.
             for (const engine::TreeFelling::Impact& im : g_felling.impacts()) {
-                if (blows < 8) {
-                    std::fprintf(f, "   %5.2f s: %08x lands on %08x at %.1f m/s, %.0f J, %.0f health%s\n",
-                                 tsim, im.faller, im.struck, im.speed, im.energy, im.damage,
-                                 im.felled ? " -- DOWN IT GOES" : "");
-                }
-                ++blows;
-                if (im.felled) ++chained;
-                if (im.energy > hit_energy) { hit_speed = im.speed; hit_energy = im.energy; }
-                hit_damage += im.damage;
-                if (im.struck != B.id) continue;
-                hit = true;
-                if (im.felled) b_felled = true;
+                const uint64_t key = (uint64_t(im.faller) << 32) ^ im.struck;
+                if (first_blow.find(key) == first_blow.end()) first_blow[key] = tsim;
+                if (im.felled && first_fell < 0.0f) first_fell = tsim;
             }
-            g_felling.clear_impacts();
+            chained = 0;
+            for (const engine::TreeFelling::Impact& im : g_felling.impacts())
+                if (im.felled) ++chained;
             if (chained > 0 && !shot && tsim > 1.2f) {
                 shot = true;
                 RECT cr;
@@ -8323,13 +8327,54 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 if (now[i].id == B.id) b_standing = true;
             }
         }
+        for (const engine::TreeFelling::Impact& im : g_felling.impacts()) {
+            char what[64];
+            if (im.piece)
+                std::snprintf(what, sizeof what, "the %s of %08x",
+                              im.stage == 0 ? "log" : "half-log", unsigned(im.struck));
+            else
+                std::snprintf(what, sizeof what, "%08x", unsigned(im.struck));
+            const uint64_t key = (uint64_t(im.faller) << 32) ^ im.struck;
+            if (blows < 10)
+                std::fprintf(f, "   %5.2f s: %08x bears down on %s, hardest %.1f m/s"
+                                " on %.0f kg = %.0f J; %.0f health in all%s\n",
+                             first_blow.count(key) ? first_blow[key] : 0.0f, im.faller, what,
+                             im.speed, im.mass, im.energy, im.damage,
+                             im.felled ? " -- DOWN IT GOES"
+                                       : (im.broke ? " -- IT BREAKS" : ""));
+            ++blows;
+            if (im.piece) { ++log_blows; if (im.broke) ++log_breaks; continue; }
+            if (im.energy > hit_energy) { hit_speed = im.speed; hit_energy = im.energy; }
+            hit_damage += im.damage;
+            if (!im.felled) {
+                // It held. What the blow is worth to the woodcutter is
+                // the swings it saved: a tree that took a glancing hit
+                // from its neighbour is standing, and weaker.
+                float taken = 0.0f, full = 0.0f;
+                if (g_felling.tree_damage(unsigned(im.struck), taken, full) && taken > 0.0f) {
+                    ++weakened;
+                    const float chop = g_felling.tuning().chop_damage;
+                    const int was = int(std::ceil(full / chop));
+                    const int now = int(std::ceil((full - taken) / chop));
+                    if (was - now > saved_chops) { saved_chops = was - now; saved_was = was; saved_now = now; }
+                }
+            }
+            if (im.struck != uint64_t(B.id)) continue;
+            hit = true;
+            if (im.felled) b_felled = true;
+        }
         std::fprintf(f, "\n%d blows in all, %.0f health between them; the heaviest at %.1f m/s\n"
                         "        carried %.0f J, which is %.1f chops of the axe's %.0f\n",
                      blows, hit_damage, hit_speed, hit_energy,
                      hit_energy / g_felling.tuning().impact_per_chop,
                      g_felling.tuning().chop_damage);
-        std::fprintf(f, "%d of them brought a tree down; trees down in all: %zu\n", chained,
+        std::fprintf(f, "%d of them brought a tree down (the first at %.2f s); trees down in all: %zu\n",
+                     chained, first_fell, 
                      g_felling.felled());
+        std::fprintf(f, "blows that landed on a log already down: %d, of which %d broke it\n",
+                     log_blows, log_breaks);
+        std::fprintf(f, "%d took a blow and held; the worst off needs %d chops now where it"
+                        " needed %d\n", weakened, saved_now, saved_was);
         std::fprintf(f, "the tree it was aimed at (%08x, %.0f health): %s\n", B.id, bhealth,
                      b_felled ? "brought down by the blow"
                               : (b_standing ? "still standing -- the faller met another first" : "gone"));
@@ -8339,7 +8384,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         // is six metres across and takes whatever is in the way. What this
         // asserts is the mechanism: a blow landed, it was worth real damage,
         // and enough of it brought a second tree down.
-        const bool pass = dropped && !a_standing && blows > 0 && hit_energy > 0.0f && chained > 0;
+        // The mechanism, not the body count: a blow landed and was worth
+        // real damage; a big enough one brought a tree down and a smaller
+        // one only weakened what it hit; and a log already on the ground
+        // was broken up by a tree coming down on it.
+        const bool pass = dropped && !a_standing && blows > 0 && hit_energy > 0.0f &&
+                          chained > 0 && weakened > 0 && saved_chops > 0 && log_breaks > 0;
         (void)hit;
         std::fprintf(f, "\n%s\n", pass ? "PASS" : "FAIL");
         std::fclose(f);
@@ -8507,6 +8557,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         unsigned long long frames = 0;
         size_t colliders_seen = 0;
         bool crown_shot = false;
+        double shed_at = -1.0;      // when the crown came off, after the cut
+        float  shed_tilt = 0.0f;    // ... and how far over the trunk was
         double next_swing = 4.5;
         for (;;) {
             LARGE_INTEGER now;
@@ -8578,6 +8630,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                     const float bx = pos[0] - tree.x, bz = pos[2] - tree.z;
                     const float drift = std::sqrt(bx * bx + bz * bz);
                     if (tilt < 20.0f && drift > butt_drift) butt_drift = drift;
+                    // The crown comes off against the first thing it meets,
+                    // so the clumps appearing IS that moment.
+                    if (shed_at < 0.0 && g_felling.debris() > 0) {
+                        shed_at = total - felled_at;
+                        shed_tilt = tilt;
+                    }
                     if (tilt >= 10.0f && t10 < 0.0) t10 = total - felled_at;
                     if (tilt >= 45.0f && t45 < 0.0) t45 = total - felled_at;
                     if (tilt >= 80.0f && t80 < 0.0) t80 = total - felled_at;
@@ -8592,10 +8650,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 }
             }
             if (frame(float(total))) ++frames;
-            // The crown coming apart, a second and a half after the cut:
-            // the trunk on its way down and the clumps of branches and
-            // leaves thrown along with it.
-            if (felled && !crown_shot && total - felled_at > 1.8) {
+            // The crown coming apart, the moment it does: the trunk still
+            // on its way over and the clumps of branches and leaves thrown
+            // along with it. Shot on the clumps appearing rather than on a
+            // timer, so the still is always of the thing itself.
+            if (felled && !crown_shot && (shed_at >= 0.0 || total - felled_at > 6.0)) {
                 crown_shot = true;
                 float lp[3], lr[4];
                 bool la = false;
@@ -8645,6 +8704,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
         std::fprintf(f, "   it pivots on its stump: the butt drifted %.3f m while under 20 degrees;\n"
                         "   reached 10 degrees at %.1f s, 45 at %.1f s, 80 at %.1f s\n",
                      butt_drift, t10, t45, t80);
+        if (shed_at >= 0.0)
+            std::fprintf(f, "   the crown broke off at %.1f s, %.0f degrees over --"
+                            " the first thing it met\n", shed_at, shed_tilt);
+        else
+            std::fprintf(f, "   the crown NEVER came off\n");
         std::fprintf(f, "   still standing in the tree field: %s\n", standing ? "YES -- FAIL" : "no");
         std::fprintf(f, "frames %llu, felled trees %zu, physics props %zu\n", frames, g_felling.felled(),
                      g_physics.prop_count());
@@ -8659,8 +8723,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                             "on average\n              (worst %.1f m), after %.1f s\n",
                          ds.stopped, ds.mean_travel(), ds.travel_max, ds.mean_stop_s());
         }
+        // The crown must come off ON THE WAY DOWN, not at the shed_after_s
+        // timer: that is the difference between a tree landing on its
+        // branches and a log lying still that remembers to drop them.
         const bool fall_pass = grounded_at_walk && blocked && felled && max_tilt > 60.0f && rested &&
-                               mid_sink < 0.6f && !standing;
+                               mid_sink < 0.6f && !standing &&
+                               shed_at >= 0.0 && shed_at < double(g_items.logs.shed_after_s);
         if (!fall_pass) verdict_fail = 1;
 
         if (do_save) {
