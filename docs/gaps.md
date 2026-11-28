@@ -242,8 +242,31 @@ Last gathered: 2026-11-21, after the exploration fog; creatures added
   it. [Felling]
 - **The crown no longer props a falling tree.** Its physics is a trunk-thick
   capsule now, so a tree lies flat instead of coming to rest on its
-  branches at about 75 degrees. The crown's own clumps only appear once it
-  has stopped. [Felling]
+  branches at about 75 degrees. The clumps do appear the moment that
+  capsule's crown band touches anything, so what is missing is the prop,
+  not the timing. [Felling]
+- **A falling tree hangs up on what it fails to fell, for ever.** A blow
+  that is not enough simply stops the faller against the standing trunk's
+  static capsule, which is right -- that is what a hung-up tree is -- but
+  nothing resolves it: it is not felled, it cannot be pushed on, and
+  chopping it is chopping a log that happens to be at forty degrees. A
+  real woodcutter's problem with a real answer (a winch, a second cut),
+  and none of it exists. [Felling]
+- **Debris cannot hit the player.** The crown's clumps are not Pieces and
+  are left out of the blow test, so the one part of a falling tree that
+  arrives after everything else has stopped is harmless. They weigh ~44 kg
+  and would be under the energy floor anyway, which is why it has not been
+  worth plumbing. [Felling]
+- **Nothing else dynamic can hit the player.** Rocks are static and
+  creatures have their own `attack` block, so "a physics object with
+  momentum hurts you" reaches exactly as far as felled wood. A rockfall,
+  a cart or anything thrown would each need wiring of their own. [Felling]
+- **A blow's damage ignores WHERE up the struck trunk it landed.** A
+  cantilever fixed in the ground bends by the moment, so the same blow
+  near the top is worth far more than one at the base, and a thick trunk
+  resists as the cube of its radius where its health is about linear in
+  it. The energy is honest about the faller and says nothing about the
+  victim's shape. [Felling]
 - **A falling trunk passes through its neighbours' crowns**, which carry no
   collision at all -- only trunks do. It meets their trunks, and the
   analytic blow (which does use a crown sphere) is what decides damage, so

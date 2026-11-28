@@ -28,6 +28,18 @@ void model_point(const float pos[3], const float rot[4], float scale, float x, f
     for (int k = 0; k < 3; ++k) out[k] = pos[k] + r[k];
 }
 
+// ... and the inverse: a world point in the model's own metres. The
+// rotation is a unit quaternion, so its inverse is its conjugate.
+void world_point(const float pos[3], const float rot[4], float scale, const float p[3],
+                 float out[3]) {
+    const float d[3] = {p[0] - pos[0], p[1] - pos[1], p[2] - pos[2]};
+    const float inv[4] = {-rot[0], -rot[1], -rot[2], rot[3]};
+    float l[3];
+    qrot(inv, d, l);
+    const float k = 1.0f / ((scale > 1e-4f) ? scale : 1e-4f);
+    for (int i = 0; i < 3; ++i) out[i] = l[i] * k;
+}
+
 // Squared distance from a point to a segment, and where along it.
 float point_seg(const float p[3], const float a[3], const float b[3], float& t) {
     const float d[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
@@ -104,6 +116,11 @@ bool topple_lean(const float rot[4], float out[3]) {
 
 const uint32_t kMagic = 0x45455254u;   // "TREE"
 const uint32_t kFormat = 3u;           // 1: logs. 2: unused. 3: stumps and pieces.
+
+// The player, in `Piece::struck`. Tree ids are 32 bits and piece keys start
+// one above this (`next_piece_` is pre-incremented), so it is the one value
+// in the map that can never be either.
+const uint64_t kPlayerKey = 0x100000000ull;
 
 }  // namespace
 
@@ -249,29 +266,42 @@ void TreeFelling::update(float x, float z, float dt) {
         // slower than kRestSpeed, so without this the thing being pushed
         // goes to sleep under the player's shoulder every half second.
         if (physics_->push().on && physics_->push().body == p.body) p.slow_s = 0.0f;
-        if (p.crowned && p.hinge) {
-            const float up_y = 1.0f - 2.0f * (p.rot[0] * p.rot[0] + p.rot[2] * p.rot[2]);
-            const float tilt = std::acos((std::max)(-1.0f, (std::min)(1.0f, up_y))) * 57.29578f;
-            if (tilt >= tune_.hinge_release_deg) release_hinge(p);
-        }
+        const float up_y = 1.0f - 2.0f * (p.rot[0] * p.rot[0] + p.rot[2] * p.rot[2]);
+        const float tilt = std::acos((std::max)(-1.0f, (std::min)(1.0f, up_y))) * 57.29578f;
+        if (p.crowned && p.hinge && tilt >= tune_.hinge_release_deg) release_hinge(p);
         if (p.crowned) {
-            // The crown comes off when the fall is OVER -- a tree keeps its
-            // crown all the way down, which is both what it looks like and
-            // what lets its whole length sweep what it lands on. Shedding
-            // part way through left a 23 m tree with a 7 m trunk in mid-air,
-            // sweeping nothing past 7 m. The timer catches one left leaning.
-            if (p.slow_s >= kRestFor || p.age >= tune_.shed_after_s) shed.push_back(p.key);
+            // The crown comes off the moment it MEETS THE GROUND, which
+            // in the open is the first thing a falling tree touches at all.
+            // Two things it deliberately does not count:
+            //  - a contact on the BOLE. That is the stump the tree is
+            //    pivoting on, and the tree that knocked this one down, and
+            //    neither takes a twig off the top.
+            //  - a contact with another PROP -- a standing trunk, a rock, a
+            //    log. A tree falling through a wood tangles with its
+            //    neighbours and breaks limbs on them; it does not shed its
+            //    whole canopy, and the canopy is also the only part of it
+            //    that reaches a tree fifteen metres away. Shedding on those
+            //    too, a faller in a close wood was a bare bole by twenty
+            //    degrees and could not knock anything down at all.
+            // The rest rule and the timer stay behind both, for a tree that
+            // ends up hung up in its neighbours and never reaches the
+            // ground at all.
+            const bool met = crown_touched(p);
+            if (met || p.slow_s >= kRestFor || p.age >= tune_.shed_after_s)
+                shed.push_back(p.key);
         } else if (p.slow_s >= kRestFor && active) {
             physics_->rest_body(p.body);
             p.slow_s = 0.0f;
         }
     }
+    // BEFORE the shed: a tree whose crown has just swept into a neighbour
+    // has touched something, so this is the frame it drops that crown, and
+    // the blow it struck is the whole tree's.
+    impacts_frame();
     for (uint64_t k : shed) {
         std::unordered_map<uint64_t, Piece>::iterator it = pieces_.find(k);
         if (it != pieces_.end()) shed_crown(it->second);
     }
-
-    impacts_frame();
 
     // The debris: it falls, it stops, it lies there, it goes.
     for (size_t i = 0; i < debris_.size();) {
@@ -369,9 +399,35 @@ void TreeFelling::update(float x, float z, float dt) {
     renderer_->set_tree_extras(extra);
 }
 
-// A log that has tipped lets its crown go: the body becomes the bole's
-// capsule alone (same pose, same motion), and the crown above it becomes a
-// few clumps thrown along the way the tree was already going.
+void TreeFelling::set_player(const float feet[3], float height, float radius) {
+    for (int k = 0; k < 3; ++k) player_[k] = feet[k];
+    player_h_ = height;
+    player_r_ = radius > 0.05f ? radius : 0.05f;
+}
+
+// Has anything touched this tree ABOVE its bole since the last step? The
+// contact comes back in world metres, so it is taken into the model's own
+// frame and compared with the band the crown occupies: `hi` is the top of
+// the bole, everything over it is branches.
+//
+// Why not any contact at all. A hinged tree pivots against its own stump on
+// the way over, and a tree knocked down by another is struck on its TRUNK by
+// the faller -- both are contacts, and neither takes a twig off the top.
+bool TreeFelling::crown_touched(const Piece& p) const {
+    if (!p.body) return false;
+    const std::vector<PhysicsWorld::Touch>& ts = physics_->touches();
+    for (size_t i = 0; i < ts.size(); ++i) {
+        if (ts[i].body != p.body || ts[i].prop) continue;
+        float local[3];
+        world_point(p.pos, p.rot, p.scale, ts[i].point, local);
+        if (local[1] > p.hi) return true;
+    }
+    return false;
+}
+
+// A tree whose crown has met something lets it go: the body becomes the
+// bole's capsule alone (same pose, same motion), and the crown above it
+// becomes a few clumps thrown along the way the tree was already going.
 // The trunk slips off its stump once it is far enough over: past the
 // release angle the hinge is a lie, and holding it there would stand the
 // butt up in the air for the whole rest of the fall.
@@ -390,7 +446,17 @@ void TreeFelling::shed_crown(Piece& p) {
     bool active = false;
     physics_->body_velocity(p.body, vel, spin);
     physics_->body_pose(p.body, p.pos, p.rot, active);
+    // The bole's new body turns about ITS OWN centre, which is metres down
+    // the trunk from the whole tree's. Handed the whole tree's velocity it
+    // would be given the speed of a point it no longer contains -- which,
+    // now that the crown comes off mid-fall rather than off a log lying
+    // still, is the difference between a trunk settling and one launched.
+    float mid[3];
+    model_point(p.pos, p.rot, p.scale, 0.5f * (p.ax_lo[0] + p.ax_hi[0]),
+                0.5f * (p.lo + p.hi), 0.5f * (p.ax_lo[1] + p.ax_hi[1]), mid);
+    physics_->body_point_velocity(p.body, mid, vel);
     p.crowned = false;
+    physics_->watch_contacts(p.body, false);
     physics_->remove_body(p.body);
     const float a[3] = {p.ax_lo[0] * p.scale, p.lo * p.scale, p.ax_lo[1] * p.scale};
     const float b[3] = {p.ax_hi[0] * p.scale, p.hi * p.scale, p.ax_hi[1] * p.scale};
@@ -416,9 +482,16 @@ void TreeFelling::shed_crown(Piece& p) {
         const float mid = 0.5f * (d.lo + d.hi);
         float centre[3];
         model_point(p.pos, p.rot, p.scale, 0.0f, mid, 0.0f, centre);
-        // Thrown along the way it was going, at a share of the speed it had
-        // there -- which by now is little, since the crown comes off once
-        // the tree is down: the clumps spill off the top rather than fly.
+        // Thrown along the way it was going, at debris_toss of the speed
+        // that part of the tree had -- which, now that the crown comes off
+        // against the ground rather than off a log already lying still, is
+        // most of a tip doing eight metres a second: the clumps scatter
+        // ahead of the fall (1.2-1.6 m, worst 1.9) rather than spill off a
+        // trunk that has stopped.
+        // The point velocity of the BOLE's body, extrapolated to where the
+        // crown was: a rigid body's field is v + w x r wherever r points, so
+        // this is the speed that part of the tree had the instant before it
+        // came apart.
         float pv[3] = {0, 0, 0};
         physics_->body_point_velocity(p.body, centre, pv);
         for (int k = 0; k < 3; ++k) pv[k] *= tune_.debris_toss;
@@ -500,15 +573,20 @@ void TreeFelling::fell(uint32_t id, uint32_t model, float scale, const float bas
     // it simply could not fall at all (3 degrees after ten seconds). A
     // trunk-thick capsule passes between its neighbours' crowns, which
     // carry no collision anyway, and still meets their TRUNKS, which is
-    // the collision worth having. The mass and the length are the whole
-    // tree's too, so it swings on the hinge at a 24 m tree's rate rather
-    // than a 6 m bole's.
+    // the collision worth having. The length is the whole tree's, so it
+    // swings on the hinge at a 24 m tree's rate rather than a 6 m bole's --
+    // but the MASS over the bole is only crown_mass_share of it, because
+    // branches and leaves are mostly air and a solid trunk-thick crown put
+    // the centre of mass at half the height instead of a third.
     physics_->remove_body(p->body);
     p->crowned = true;
     const std::vector<float>& prof = m.lod[0].trunk_y;
     const float trunk_top = prof.empty() ? m.top : prof.back();
-    p->body = physics_->add_log(p->pos, p->rot, p->r, y0 * s, (std::max)(trunk_top, y1) * s,
-                                0.0f, 0.0f, spin, false);
+    p->body = physics_->add_log(p->pos, p->rot, p->r, y0 * s, y1 * s,
+                                (std::max)(trunk_top, y1) * s, tune_.crown_mass_share,
+                                spin, false);
+    // Watched, so the first thing its crown meets takes the crown off.
+    if (p->body) physics_->watch_contacts(p->body, true);
     // ... and it PIVOTS ON ITS STUMP while it goes. Without this the log is
     // a free body turning about its own centre of mass, halfway up the
     // trunk, so the butt swings out from under it the instant it is cut.
@@ -542,20 +620,49 @@ bool TreeFelling::fell_toward(uint32_t id, const float dir[3]) {
     return false;
 }
 
-// A falling trunk against the trees still standing. Energy, not force: half
-// the trunk's mass at the speed the point that touched was going, which is
-// what separates an oak coming down from a birch brushing past. One blow per
-// pair -- a log that comes to rest leaning on a trunk must not saw it down.
+// A falling trunk against everything else: the trees still standing, and
+// the logs already lying about.
+//
+// ENERGY, not force -- and the energy the blow actually delivers, which is
+// two things the first version had wrong. The mass is what the body
+// PRESENTS AT THE POINT that touched, along the line the blow pushes
+// (`PhysicsWorld::body_impact_mass`), not a flat half of the trunk: a crown
+// is a tenth of the tree's mass eight metres off its centre of mass, so it
+// meets a few tens of kilogrammes, and the middle of a bole meets the whole
+// log. And the speed is the CLOSING speed along that line, so a crown
+// sweeping PAST a trunk does nothing, where its full speed counted before.
+// Between them they are what the eye reads as "it came down hard on it"
+// rather than "it was in the way", and they are why a wood no longer goes
+// over like dominoes.
+//
+// A log on the ground takes the same blow against its own health: enough
+// and a whole one breaks in two, enough again and a half comes apart into
+// rounds of firewood. It needs no knock -- it is a real body and the
+// collision has already shoved it.
+//
+// One blow per pair, so a log that comes to rest leaning on a trunk does
+// not saw it down.
 void TreeFelling::impacts_frame() {
     if (pieces_.empty()) return;
     const TreeRenderer& tr = renderer_->trees();
     const std::vector<worldgen::TreeInstance>& st = renderer_->tree_field().standing();
-    if (st.empty()) return;
     struct Knock { uint32_t id = 0; float away[3] = {0, 0, 0}; };
     std::vector<Knock> knocked;
+    struct Hurt { uint64_t key = 0; float damage = 0.0f; };
+    std::vector<Hurt> hurt;
+    auto hurt_so_far = [&](uint64_t key) {
+        float d = 0.0f;
+        for (size_t i = 0; i < hurt.size(); ++i) if (hurt[i].key == key) d += hurt[i].damage;
+        return d;
+    };
     for (std::unordered_map<uint64_t, Piece>::iterator it = pieces_.begin(); it != pieces_.end(); ++it) {
         Piece& p = it->second;
-        if (p.stage != 0) continue;   // a half or a billet carries nothing worth passing on
+        // A half or a billet carries nothing worth passing on to a TREE --
+        // but a round of firewood rolling down a slope is exactly the sort
+        // of thing that should catch someone's legs, so every stage is
+        // tested against the player. The energy floor is what decides
+        // whether it is worth anything: a 111 kg round at 4 m/s is under a
+        // kilojoule and does nothing at all.
         bool active = false;
         float pos[3], rot[4];
         if (!physics_->body_pose(p.body, pos, rot, active) || !active) continue;
@@ -565,6 +672,11 @@ void TreeFelling::impacts_frame() {
         const float wl = std::sqrt(spin[0] * spin[0] + spin[1] * spin[1] + spin[2] * spin[2]);
         const float len = (p.hi - p.lo) * p.scale;
         if (sp + wl * len < tune_.impact_min_speed) continue;
+        // Leaning, not falling: see impact_lean_deg. A log on the ground is
+        // on its side, so this never holds one back.
+        const float up_y = 1.0f - 2.0f * (rot[0] * rot[0] + rot[2] * rot[2]);
+        if (std::acos((std::max)(-1.0f, (std::min)(1.0f, up_y))) * 57.29578f < tune_.impact_lean_deg)
+            continue;
         // While it still has its crown the whole TREE is swinging, and the
         // trunk runs on past the bole: a 23 m tree whose bole is 7 m would
         // otherwise sweep nothing past 7 m and never reach what it is
@@ -576,81 +688,220 @@ void TreeFelling::impacts_frame() {
         if (p.crowned) trunk_axis_at(fm, reach, rx, rz, rr);
         model_point(pos, rot, p.scale, p.ax_lo[0], p.lo, p.ax_lo[1], a);
         model_point(pos, rot, p.scale, rx, reach, rz, b);
+        float crown_c[3] = {0, 0, 0};
+        const float crown_r = p.crowned ? fm.crown_r * p.scale : 0.0f;
+        if (p.crowned) model_point(pos, rot, p.scale, 0.0f, fm.crown_centre, 0.0f, crown_c);
+
+        // Does the faller meet the segment [c, d] of something `target_r`
+        // thick, and if so with what? `at` is where it touched, `n` the way
+        // the blow pushes, and the energy is the closing speed along n
+        // against the mass the body meets there.
+        struct Hit { float at[3]; float n[3]; float speed; float mass; float energy; };
+        auto strike = [&](const float c[3], const float d[3], float target_r, Hit& h) -> bool {
+            float u = 0.0f, v = 0.0f;
+            const float d2 = seg_seg(a, b, c, d, u, v);
+            const float hit_r = p.r + target_r;
+            bool touched = d2 <= hit_r * hit_r;
+            float onto[3];
+            if (touched) {
+                for (int k = 0; k < 3; ++k) h.at[k] = a[k] + (b[k] - a[k]) * u;
+                for (int k = 0; k < 3; ++k) onto[k] = c[k] + (d[k] - c[k]) * v;
+            } else if (crown_r > 0.05f) {
+                // The CROWN is what usually reaches: a tree toppling about
+                // its butt comes down on its branches, and they stop it at
+                // about 15 degrees past the diagonal, so the trunk line
+                // never descends onto a neighbour's own trunk at all.
+                float w = 0.0f;
+                const float cd2 = point_seg(crown_c, c, d, w);
+                if (cd2 > (crown_r + target_r) * (crown_r + target_r)) return false;
+                touched = true;
+                for (int k = 0; k < 3; ++k) h.at[k] = crown_c[k];
+                for (int k = 0; k < 3; ++k) onto[k] = c[k] + (d[k] - c[k]) * w;
+            }
+            if (!touched) return false;
+            // How fast it was going THERE -- a tree turning about its base
+            // has a still butt and a fast top -- and how much of that is
+            // INTO what it hit rather than past it.
+            float pv[3];
+            if (!physics_->body_point_velocity(p.body, h.at, pv)) return false;
+            // The blow is the part of that going INTO what it met: the
+            // closing speed along the line between them. A crown sweeping
+            // PAST a trunk at the same height closes on it hardly at all,
+            // where its full speed used to count in full; a crown coming
+            // down on a shorter tree finds the top of that trunk below it,
+            // so the line tilts upward and the fall's own speed is the blow.
+            float n[3];
+            for (int k = 0; k < 3; ++k) n[k] = onto[k] - h.at[k];
+            const float nl = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+            if (nl < 1e-3f) {
+                // Dead centre: take the way it is travelling as the push.
+                const float pl = std::sqrt(pv[0] * pv[0] + pv[1] * pv[1] + pv[2] * pv[2]);
+                if (pl < 1e-3f) return false;
+                for (int k = 0; k < 3; ++k) n[k] = pv[k] / pl;
+            } else {
+                for (int k = 0; k < 3; ++k) n[k] /= nl;
+            }
+            h.speed = pv[0] * n[0] + pv[1] * n[1] + pv[2] * n[2];
+            if (h.speed < tune_.impact_min_speed) return false;
+            // Which way it is SHOVED is the way the faller is travelling,
+            // flattened -- a tree goes over sideways, never down.
+            const float hl = std::sqrt(pv[0] * pv[0] + pv[2] * pv[2]);
+            if (hl > 1e-3f) { h.n[0] = pv[0] / hl; h.n[1] = 0.0f; h.n[2] = pv[2] / hl; }
+            else { h.n[0] = n[0]; h.n[1] = 0.0f; h.n[2] = n[2]; }
+            // The mass it meets there. The fallback is the old flat half of
+            // the trunk, so a body physics cannot read still does something
+            // -- and the report prints the mass, so it shows if it happens.
+            if (!physics_->body_impact_mass(p.body, h.at, n, h.mass) || h.mass <= 0.0f)
+                h.mass = 0.5f * p.mass;
+            h.energy = 0.5f * h.mass * h.speed * h.speed;
+            // A GRAZE does nothing, and -- this is the point -- does not use
+            // up the pair's one blow. A crown is six metres across and is
+            // already pressed against its neighbours while the tree stands,
+            // so the first contact of a fall is never the blow: it is the
+            // tree leaning on what it was leaning on. Marked struck there,
+            // every tree spent its blow at 2-3 m/s in the first fifth of a
+            // second and the real landing counted for nothing. A blow worth
+            // less than ONE SWING OF THE AXE is that graze -- bark, twigs
+            // and spring take it -- so it is not recorded at all, and the
+            // same pair is asked again next frame, when the crown is coming
+            // down faster.
+            return h.energy >= tune_.impact_per_chop;
+        };
+        // One entry per pair, added to as the blow grows.
+        auto record = [&](uint64_t struck, bool is_piece, int stage, const Hit& h, float dmg,
+                          bool done) {
+            Impact* im = nullptr;
+            for (size_t i = impacts_.size(); i-- > 0;)
+                if (impacts_[i].faller == p.tree && impacts_[i].struck == struck) {
+                    im = &impacts_[i];
+                    break;
+                }
+            if (!im) {
+                if (impacts_.size() > 64) impacts_.erase(impacts_.begin());
+                impacts_.push_back(Impact());
+                im = &impacts_.back();
+                im->faller = p.tree;
+                im->struck = struck;
+                im->piece = is_piece;
+                im->stage = stage;
+            }
+            im->speed = (std::max)(im->speed, h.speed);
+            im->mass = (std::max)(im->mass, h.mass);
+            im->energy = (std::max)(im->energy, h.energy);
+            im->damage += dmg;
+            im->felled = im->felled || (!is_piece && done);
+            im->broke = im->broke || (is_piece && done);
+        };
+
+        // The trees still standing, and the logs already down: a whole
+        // bole only.
         const float lo_x = (std::min)(a[0], b[0]), hi_x = (std::max)(a[0], b[0]);
         const float lo_z = (std::min)(a[2], b[2]), hi_z = (std::max)(a[2], b[2]);
-        for (size_t i = 0; i < st.size(); ++i) {
+        for (size_t i = 0; p.stage == 0 && i < st.size(); ++i) {
             const worldgen::TreeInstance& t = st[i];
-            if (p.struck.count(t.id)) continue;
             const TreeModel& m = tr.model(t.species, t.variant);
             const float ts = t.height / tr.look(t.species).nominal_height;
             const float tr_r = m.trunk_radius * ts;
-            const float pad = p.r + tr_r + 0.5f;
+            const float pad = p.r + crown_r + tr_r + 0.5f;
             if (t.x < lo_x - pad || t.x > hi_x + pad || t.z < lo_z - pad || t.z > hi_z + pad) continue;
             // The standing trunk, from its base to where its crown begins.
             const float c[3] = {t.x, t.y, t.z};
             const float d[3] = {t.x, t.y + (std::max)(m.crown_base, 0.5f * m.top) * ts, t.z};
-            float u = 0.0f, v = 0.0f;
-            const float d2 = seg_seg(a, b, c, d, u, v);
-            const float hit_r = p.r + tr_r;
-            float at[3];
-            for (int k = 0; k < 3; ++k) at[k] = a[k] + (b[k] - a[k]) * u;
-            bool touched = d2 <= hit_r * hit_r;
-            if (!touched && p.crowned) {
-                // The CROWN is what usually reaches: a tree toppling about
-                // its butt comes down on its branches, and they stop it at
-                // about 15 degrees past the diagonal, so the trunk line
-                // never descends onto a neighbour's own trunk at all. The
-                // crown's sphere is the same one its body carries.
-                float cc[3];
-                model_point(pos, rot, p.scale, 0.0f, fm.crown_centre, 0.0f, cc);
-                const float cr = fm.crown_r * p.scale;
-                if (cr > 0.05f) {
-                    float w = 0.0f;
-                    const float cd2 = point_seg(cc, c, d, w);
-                    if (cd2 <= (cr + tr_r) * (cr + tr_r)) {
-                        touched = true;
-                        for (int k = 0; k < 3; ++k) at[k] = cc[k];
-                    }
-                }
-            }
-            if (!touched) continue;
-            // How fast the tree was going THERE: one turning about its base
-            // has a still butt and a fast top.
-            float pv[3];
-            if (!physics_->body_point_velocity(p.body, at, pv)) continue;
-            const float v2 = pv[0] * pv[0] + pv[1] * pv[1] + pv[2] * pv[2];
-            const float speed = std::sqrt(v2);
-            // Overlapping but barely moving: a log settling against a trunk.
-            // Left unmarked, so it still counts if it starts rolling again.
-            if (speed < tune_.impact_min_speed) continue;
-            p.struck.insert(t.id);
-            const float energy = 0.5f * (0.5f * p.mass) * v2;
-            const float dmg = energy / tune_.impact_per_chop * tune_.chop_damage;
+            Hit h;
+            if (!strike(c, d, tr_r, h)) continue;
+            float& peak = p.struck[uint64_t(t.id)];
+            if (h.energy <= peak) continue;
+            const float dmg = (h.energy - peak) / tune_.impact_per_chop * tune_.chop_damage;
+            peak = h.energy;
             const float health = tree_health(tr_r);
             const float took = damage_[t.id] + dmg;
             damage_[t.id] = took;
-            Impact im;
-            im.faller = p.tree;
-            im.struck = t.id;
-            im.speed = speed;
-            im.energy = energy;
-            im.damage = dmg;
-            im.felled = took >= health;
-            impacts_.push_back(im);
-            if (impacts_.size() > 64) impacts_.erase(impacts_.begin());
-            if (!im.felled) continue;
+            const bool down = took >= health;
+            record(uint64_t(t.id), false, 0, h, dmg, down);
+            if (!down) continue;
             // It goes down the way it was pushed, and the faller carries on
             // with what it has left.
             Knock k;
             k.id = t.id;
-            const float hl = std::sqrt(pv[0] * pv[0] + pv[2] * pv[2]);
-            if (hl > 1e-3f) { k.away[0] = pv[0] / hl; k.away[2] = pv[2] / hl; }
+            const float hl = std::sqrt(h.n[0] * h.n[0] + h.n[2] * h.n[2]);
+            if (hl > 1e-3f) { k.away[0] = h.n[0] / hl; k.away[2] = h.n[2] / hl; }
             else { k.away[0] = 1.0f; }
             knocked.push_back(k);
             float lv[3], av[3];
             for (int kk = 0; kk < 3; ++kk) { lv[kk] = vel[kk] * tune_.impact_keep; av[kk] = spin[kk] * tune_.impact_keep; }
             physics_->set_body_velocity(p.body, lv, av);
         }
+
+        // ... and the logs already on the ground. A round of firewood is
+        // left out: it is already the thing a log breaks down into, so
+        // there is nothing for a blow to do to it but shove it, which the
+        // contact has done.
+        for (std::unordered_map<uint64_t, Piece>::const_iterator jt = pieces_.begin();
+             p.stage == 0 && jt != pieces_.end(); ++jt) {
+            const Piece& q = jt->second;
+            if (q.key == p.key || q.stage > 1) continue;
+            float c[3], d[3];
+            model_point(q.pos, q.rot, q.scale, q.ax_lo[0], q.lo, q.ax_lo[1], c);
+            model_point(q.pos, q.rot, q.scale, q.ax_hi[0], q.hi, q.ax_hi[1], d);
+            Hit h;
+            if (!strike(c, d, q.r, h)) continue;
+            float& peak = p.struck[q.key];
+            if (h.energy <= peak) continue;
+            const float dmg = (h.energy - peak) / tune_.impact_per_chop * tune_.chop_damage;
+            peak = h.energy;
+            Hurt hu;
+            hu.key = q.key;
+            hu.damage = dmg;
+            const bool breaks = q.health - hurt_so_far(q.key) - dmg <= 0.0f;
+            hurt.push_back(hu);
+            record(q.key, true, q.stage, h, dmg, breaks);
+        }
+
+        // ... and the player, standing in the way. One blow per pair as
+        // ever, by the same peak-of-the-load rule: a tree bearing down on
+        // them goes on hurting, a log lying on them does not.
+        if (player_h_ > 0.1f) {
+            const float foot = (std::min)(player_r_, 0.45f * player_h_);
+            const float c[3] = {player_[0], player_[1] + foot, player_[2]};
+            const float d[3] = {player_[0], player_[1] + player_h_ - foot, player_[2]};
+            Hit h;
+            if (strike(c, d, player_r_, h)) {
+                float& peak = p.struck[kPlayerKey];
+                if (h.energy > peak) {
+                    PlayerHit* ph = nullptr;
+                    for (size_t i = player_hits_.size(); i-- > 0;)
+                        if (player_hits_[i].tree == p.tree && player_hits_[i].stage == p.stage) {
+                            ph = &player_hits_[i];
+                            break;
+                        }
+                    if (!ph) {
+                        if (player_hits_.size() > 32) player_hits_.erase(player_hits_.begin());
+                        player_hits_.push_back(PlayerHit());
+                        ph = &player_hits_.back();
+                        ph->tree = p.tree;
+                        ph->stage = p.stage;
+                    }
+                    ph->speed = (std::max)(ph->speed, h.speed);
+                    ph->mass = (std::max)(ph->mass, h.mass);
+                    ph->energy = (std::max)(ph->energy, h.energy);
+                    ph->damage += (h.energy - peak) / tune_.impact_per_chop * tune_.chop_damage;
+                    peak = h.energy;
+                }
+            }
+        }
+    }
+
+    // What the blows did, once nothing is iterating the pieces any more:
+    // split() and billet() both rebuild the map.
+    for (size_t i = 0; i < hurt.size(); ++i) {
+        std::unordered_map<uint64_t, Piece>::iterator q = pieces_.find(hurt[i].key);
+        if (q == pieces_.end()) continue;
+        q->second.health -= hurt[i].damage;
+        if (q->second.health > 0.0f) continue;
+        // No hit flash: impacts_frame has no clock, and a log broken by a
+        // tree landing on it does not need the axe's.
+        if (q->second.stage == 0) split(q->second, -100.0f);
+        else billet(q->second, -100.0f);
     }
     for (size_t i = 0; i < knocked.size(); ++i) {
         const TreeRenderer& trr = renderer_->trees();

@@ -16,11 +16,16 @@
 // down by another tree is thrown instead, because a one-axis hinge will not
 // go against a lean. Either way it keeps its crown all the way down -- that
 // is what makes the fall read, and it is the tree's whole length that
-// sweeps whatever it lands on -- and sheds it once it has come to rest: the
-// body is swapped for the bole's shape alone, and the crown becomes DEBRIS,
-// a few clumps of branches and leaves that spill off the top, settle, lie
-// there and fade out. Nothing permanent in the world is ever more than a
-// trunk.
+// sweeps whatever it lands on -- and sheds it against the FIRST THING ITS
+// CROWN MEETS, which is what branches do: the body is swapped for the
+// bole's shape alone, and the crown becomes DEBRIS, a few clumps of
+// branches and leaves that spill off the top, settle, lie there and fade
+// out. Nothing permanent in the world is ever more than a trunk.
+//
+// While it is a whole tree it is two capsules, not one, and that is about
+// MASS rather than shape: the bole is solid wood, and everything above it
+// -- branches, twigs and leaves, mostly air -- carries
+// `logs.crown_mass_share` of the body and no more.
 //
 // A trunk is firewood in waiting. Every piece of one carries health in the
 // same currency the axe does (items.json `logs`): chop a whole log through
@@ -94,6 +99,34 @@ public:
     void set_tuning(const player::LogTuning& t) { tune_ = t; }
     const player::LogTuning& tuning() const { return tune_; }
 
+    // Where the player is standing, for a tree to come down ON: their feet,
+    // and the capsule physics walks them round in. Set every frame by
+    // whoever has a player; with none set nothing can hit them, which is
+    // what a flying camera and a headless report want.
+    void set_player(const float feet[3], float height, float radius);
+    void clear_player() { player_h_ = 0.0f; }
+
+    // A blow that landed on the player since the list was cleared. Felling
+    // knows nothing about health -- main.cpp hands these to Survival, where
+    // damage and death live. The arithmetic is a standing tree's exactly:
+    // the mass the falling body met AT the point it touched, the closing
+    // speed there, `impact_per_chop` joules to a chop of damage. So a crown
+    // that would take a sapling down takes the woodcutter with it, and a
+    // round of firewood rolling past is a graze or nothing at all.
+    struct PlayerHit {
+        uint32_t tree = 0;     // whose log it was
+        int      stage = 0;    // 0 the whole bole, 1 a half, 2 a round
+        float    speed = 0.0f, mass = 0.0f, energy = 0.0f, damage = 0.0f;
+    };
+    // ONE PER LOG, added to as the blow bears down, exactly as `Impact`
+    // is: the peak rule hands out a dozen small increments over a fall,
+    // which is one event and not twelve. A caller that drains the list
+    // every frame (the window loop, where it becomes health) therefore
+    // gets that frame's share; one that reads it at the end (the test)
+    // gets the whole blow.
+    const std::vector<PlayerHit>& player_hits() const { return player_hits_; }
+    void clear_player_hits() { player_hits_.clear(); }
+
     // Keep trunk colliders round (x, z), read every piece's pose from
     // physics, shed the crown of a log that has tipped, age the debris, let
     // a falling trunk hurt what it lands on, and hand the lot to the
@@ -128,13 +161,23 @@ public:
     // Damage a STANDING tree has taken, and the health it has.
     bool tree_damage(uint32_t id, float& taken, float& health) const;
 
-    // A falling trunk landing on a standing tree, since the list was cleared.
+    // A falling trunk landing on something, since the list was cleared: a
+    // standing tree, or a log already on the ground. ONE PER PAIR, added to
+    // as the blow bears down -- `damage` is what it has cost in all, and
+    // `speed`, `mass` and `energy` are the hardest moment of it. Frame by
+    // frame it is thirty entries of a health apiece, which is neither what
+    // happened nor readable.
     struct Impact {
-        uint32_t faller = 0, struck = 0;
-        float    speed = 0.0f;     // of the trunk where it struck, m/s
+        uint32_t faller = 0;
+        uint64_t struck = 0;       // a tree id, or a piece key if `piece`
+        bool     piece = false;    // what it landed on was a felled log
+        int      stage = 0;        // ... and which stage of one
+        float    speed = 0.0f;     // the CLOSING speed where it struck, m/s
+        float    mass = 0.0f;      // the mass the blow met there (not the tree's)
         float    energy = 0.0f;    // joules it carried there
         float    damage = 0.0f;    // health it took off
-        bool     felled = false;   // ... and whether that was enough
+        bool     felled = false;   // enough to bring the tree down ...
+        bool     broke = false;    // ... or to break the log it landed on
     };
     const std::vector<Impact>& impacts() const { return impacts_; }
     void clear_impacts() { impacts_.clear(); }
@@ -195,7 +238,15 @@ private:
         float    slow_s = 0.0f;    // how long it has been creeping rather than moving
         uint32_t body = 0;
         uint32_t hinge = 0;        // the stump it is still pivoting on, while it falls
-        std::unordered_set<uint32_t> struck;   // trees it has already knocked
+        // What each thing it has met has already taken from it, as the
+        // ENERGY of the hardest blow so far. A pair is not done after one
+        // touch: a tree that brushes a neighbour at twenty degrees goes on
+        // bearing down on it, and what snaps the trunk is the peak of that,
+        // not the first contact. Only the INCREASE counts, so a log lying
+        // against a trunk -- whose energy never rises -- cannot saw it down.
+        // Tree ids and piece keys share the map; piece keys start above
+        // every tree id, so the two can never collide.
+        std::unordered_map<uint64_t, float> struck;
     };
     // The crown, coming apart: a band of the mesh on a light sphere, which
     // falls, settles, lies there and fades. Never saved.
@@ -227,6 +278,7 @@ private:
     // real kick -- which is what being hit by three tonnes of oak is.
     void   fell(uint32_t id, uint32_t model, float scale, const float base[3],
                 const float stand_rot[4], const float away[3], bool knocked);
+    bool   crown_touched(const Piece& p) const;
     void   shed_crown(Piece& p);
     void   release_hinge(Piece& p);
     void   split(Piece& p, float time);
@@ -249,6 +301,10 @@ private:
     std::vector<Debris>                    debris_;
     DebrisStats                            debris_stats_;
     std::vector<Impact>                    impacts_;
+    std::vector<PlayerHit>                 player_hits_;
+    float                                  player_[3] = {0, 0, 0};
+    float                                  player_h_ = 0.0f;   // 0: no player to hit
+    float                                  player_r_ = 0.35f;
     // Above every tree id, so a piece's Shape key can never be a stump's.
     uint64_t next_piece_ = 0x100000000ull;
     unsigned long long field_version_ = 0;
