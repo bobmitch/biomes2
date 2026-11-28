@@ -6,7 +6,7 @@ None of these blocks anything that works today. Ordered by area, not by
 priority.
 
 Last gathered: 2026-11-21, after the exploration fog; creatures added
-2026-11-27, combat the same day.
+2026-11-27, combat the same day; particles and smoke (ADR-008) 2026-11-28.
 
 ## Gameplay: survival, the inventory, forage
 
@@ -626,3 +626,78 @@ undecided).
   set small.
 - **Constructions ride the same zones**: waking a zone loads its buildings
   and its people together, and its catch-up advances construction too.
+  *Whatever layer they live in, they must be VOXELISABLE on demand: see
+  the next section and ADR-008 decision 8.*
+
+## Future design: particles and smoke (ADR-008, nothing built)
+
+`docs/adr-008-particles-and-smoke.md`, proposed 2026-11-28. There is no
+particle, decal or smoke code in the tree. Three categories over one
+dual-compiled substrate, split by what is STORED rather than by what the
+effect is called: **ballistic** (sparks, chips, leaves, dust, blood -- a
+persistent buffer, spawned and freed, drawn as unsorted cards),
+**ambient fields** (snow, pollen, ash, fireflies -- no state at all, a
+hash of index and time, the rain's pattern generalised), and **media**
+(smoke first, but steam, gas and dust clouds the same code -- a sparse
+1 m world grid injected into the mist's froxels, `cs_fog_inject`, for its
+lighting and its drawing). Rising, filling and spilling come from the
+sky-access flood's distance-to-sky, already built, already threaded,
+already edit-aware. **A kind is a row in `game/data/particles.json`, not
+a C++ type**, emitted from C++ or Lua, with `on_hit` naming another kind
+so particles compose -- that decision is what the design turns on.
+
+What is recorded here because it constrains OTHER work:
+
+- **Buildings must be voxelisable, whoever owns them.** Smoke's fill and
+  spill read the near field's 1 m occupancy and the sky-access flood, and
+  both see only the field and the edit store. A building neither can see
+  gets smoke through its walls -- and, sooner, the near field's probes
+  lighting its inside with open sky. This does NOT mean constructions
+  must live in the brick store (the note above expects their own layer,
+  and ADR-008 agrees): it means the layer must answer "is this 1 m cell
+  solid" over a box and bump a generation when a building is placed,
+  changed or destroyed, so the flood can forget the cells near it the way
+  it forgets a dig's. The precedent is `nav_tile.h`, where the main
+  thread gathers trunks, rocks, stumps and resting logs and the worker
+  stamps them as solid spans. **The navmesh will need the same stamp list
+  regardless**, or creatures path through walls; smoke is a second
+  consumer of it. A building that MOVES re-floods, so moving structures
+  are the case to settle first.
+- **Decals do not exist.** "Blood splats" is two features: airborne
+  droplets (particles) and a mark that stays. Nothing in the engine
+  leaves a mark on a surface. The trample map is the shape to copy -- a
+  toroidal camera-centred texture of world state with a decay, read by
+  whichever shader already draws that surface, forgetting whatever
+  scrolls past its edge. Blood, scorch and char all fit it. Undecided.
+- **Soft alpha is foreclosed, knowingly.** Particles sort nothing, which
+  is only free because additive blending is order-independent and
+  alpha-TESTED cutouts write depth. Semi-transparent soft alpha is the
+  case that excludes -- it went unnoticed in the ADR's first draft
+  because every founding effect happens to be a cutout or additive. The
+  first want of a soft dust puff, or a translucent wisp too small for the
+  froxels, hits it. Escapes, cheapest first: push it to the medium layer;
+  accept additive; weighted-blended OIT, a real fallback at a real cost.
+  [ADR-008 decision 13]
+- **Particle lights share the ONE light budget, by design.** A kind may
+  cast light (`"group"`: one light at the live particles' centroid, lumens
+  summed, the glow mushrooms' pattern; or `"each"`, capped at a few), and
+  it takes a slot of `kMaxLights` 256 and joins the existing importance
+  sort on lumens over distance squared -- no reserved budget, so a fire
+  5 m off beats a spark shower 40 m off with no policy to maintain.
+  Thousands of individually lighting particles are structurally out of
+  reach, not merely untuned: the clustered forward path is O(lights in
+  the cluster) per pixel and 46.5 per lit cluster already costs 4.42 ms.
+  Whoever adds emitters that want to light the ground en masse needs a
+  different technique (light it from the medium, or splat an irradiance
+  volume), not more slots. [ADR-008 decision 7]
+- **Ribbons, trails and beams are not a particle kind.** An arrow's wake,
+  a sword arc, a whip, and the magic beams `local_lights.h` already
+  anticipates are connected geometry extruded along a path over time: a
+  fourth renderer over the same substrate. Additive work, not blocked by
+  anything, but nobody should assume particles cover it.
+- **Nothing writes motion vectors**, so fast particles will ghost under
+  TAA, as the character already does (see "The player character"). Either
+  particles get velocity output or they draw after TAA; untried.
+- **Smoke past the near field's 128 m volume has no walls and no
+  escape route** and falls back to a drifting plume with no grid. A fire
+  seen across a valley is a column, not a volume. By design, unmeasured.

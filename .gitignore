@@ -46,5 +46,9 @@ build/edits.bin
 # CC0 scans: fetched and packed by tools/textures/fetch_scans.py, never committed
 assets/textures/download/
 assets/textures/packed/
-# Characters: packed from assets/models/ by tools/models/pack_character.py
-assets/models/packed/
+# Characters: the CC0 kit and the animation library, and the packs
+# tools/models/pack_character.py builds from them. 266 MB, never committed --
+# CLAUDE.md says what to run to fetch and pack them. The WHOLE directory,
+# unlike assets/textures/ above, which tracks scans.json and so ignores only
+# its subfolders.
+assets/models/
