@@ -24,7 +24,9 @@
 #include <Jolt/Core/TempAllocator.h>
 #include <Jolt/Core/JobSystemThreadPool.h>
 
+#include <algorithm>
 #include <functional>
+#include <vector>
 #include <memory>
 #include <unordered_map>
 
@@ -96,6 +98,18 @@ public:
     // `asleep` adds it without waking it, for a log loaded from a save.
     uint32_t add_log(const float pos[3], const float rot[4], float trunk_r, float y0, float y1,
                      float crown_y, float crown_r, const float spin[3], bool asleep);
+    // A piece of a felled trunk -- half a log, a billet of firewood: one
+    // dense capsule between two points in the body's OWN frame, since the
+    // trunk's axis wanders and a piece from up the tree is not on the
+    // model's centre line. Given a velocity as well as a spin, so a half
+    // that breaks off a rolling log carries its motion.
+    uint32_t add_piece(const float pos[3], const float rot[4], float radius, const float a[3],
+                       const float b[3], const float vel[3], const float spin[3], bool asleep);
+    // A clump of crown falling away from a felled tree: one light sphere,
+    // temporary. Low density, because a crown is mostly air -- it should
+    // tumble and settle, not bounce the log it came off.
+    uint32_t add_debris(const float pos[3], const float rot[4], float radius, float density,
+                        const float vel[3], const float spin[3]);
     // Rocks (layer 9): a static mesh shape built once per model, in the
     // model's own unit space, and static bodies that scale and place it.
     // add_prop_mesh returns the shape's index, or -1.
@@ -106,6 +120,80 @@ public:
     // Where a body is: its shape origin and rotation. `active` false once
     // Jolt has put it to sleep, which is what "came to rest" means.
     bool     body_pose(uint32_t handle, float pos[3], float rot[4], bool& active) const;
+    // How fast it is going, and how fast it is turning. A falling tree's
+    // momentum is what it does to the tree it lands on.
+    bool     body_velocity(uint32_t handle, float lin[3], float ang[3]) const;
+    // ... and how fast one particular world point of it is moving: a tree
+    // turning about its butt has a still base and a fast top.
+    bool     body_point_velocity(uint32_t handle, const float p[3], float v[3]) const;
+    void     set_body_velocity(uint32_t handle, const float lin[3], const float ang[3]);
+    // Drag, changed after the fact. A tree going over on its stump has
+    // nothing damping its rotation and the damping a LOG wants would stop
+    // it leaving the vertical at all; a log lying on the ground wants the
+    // damping back.
+    void     set_body_damping(uint32_t handle, float linear, float angular);
+    // Stop it dead and put it to sleep. A capsule on a slope rolls for ever
+    // whatever the damping -- gravity always wins the balance -- so a log
+    // that has slowed to a creep is told it has arrived. It stays dynamic:
+    // walk into it, chop it or split it and Jolt wakes it again.
+    void     rest_body(uint32_t handle);
+
+    // A HINGE between a dynamic body and an anchor, about `axis` through
+    // `point` in world space. A felled tree needs one at its stump: left as
+    // a free body it rotates about its own CENTRE OF MASS, which is halfway
+    // up the trunk, so the butt swings out sideways the instant it is cut
+    // and the whole thing reads as a kick rather than a topple. Hinged, it
+    // is a pendulum about its base -- barely moving at first and
+    // accelerating as it goes over, which is what a falling tree does.
+    // Release it once the trunk is far enough over to slip off the stump.
+    uint32_t add_hinge(uint32_t body, uint32_t anchor, const float point[3], const float axis[3]);
+    void     remove_hinge(uint32_t handle);
+
+    // How hard the character may shove a dynamic body, in newtons. Jolt's
+    // own default is 100 N, which will not move anything made of wood: a
+    // 130 kg round of firewood needs about 380 N to roll and 1.1 kN to
+    // slide. Set it every frame -- a nudge costs nothing, a heave costs
+    // stamina, and main.cpp decides which the player is doing.
+    void     set_push_strength(float newtons);
+    // What the character is leaning on, as of the last update(): the
+    // heaviest dynamic prop it is touching AND moving into, and how fast
+    // that prop is actually going. `on` false when it is pushing nothing.
+    struct Push {
+        bool     on = false;
+        uint32_t body = 0;
+        float    mass = 0.0f;    // kg
+        float    speed = 0.0f;   // m/s, what it is actually doing
+    };
+    const Push& push() const { return push_; }
+
+    // A BUMP: walking into something loose hands it the character's
+    // momentum. The sustained push above is a FORCE, which Jolt caps at
+    // mMaxStrength * dt and the ground's friction cancels outright below
+    // the breakaway threshold -- so walking into a log a hundred times did
+    // exactly what walking into it once did. An impulse has no threshold:
+    // it changes the log's velocity there and then and friction only
+    // decelerates it afterwards, so every knock moves it something and the
+    // distance goes as the SQUARE of how fast you came in. That quadratic
+    // is the mechanic -- nudge it at a walk and almost nothing happens,
+    // back off and charge it and it goes -- and it needs no new key, since
+    // walking, jogging and sprinting are already three different speeds.
+    //
+    // `k` is the share of the character's momentum handed over; 1 is the
+    // honest value, because Jolt's character stops dead against a wall and
+    // loses all of its own.
+    void set_bump_transfer(float k) { bump_transfer_ = k; }
+    struct Bump {
+        uint32_t body = 0;
+        float    speed = 0.0f;    // closing speed along the contact, m/s
+        float    impulse = 0.0f;  // N s handed over
+        float    mass = 0.0f;     // kg of what took it
+    };
+    const std::vector<Bump>& bumps() const { return bumps_; }
+    // Only a NEW contact bumps, and then not again for this long: a contact
+    // that chatters on and off must not machine-gun the log, and leaning on
+    // one must not be the same as walking into it over and over.
+    static constexpr float kBumpCooldown = 0.35f;
+    static constexpr float kBumpMinSpeed = 0.6f;   // slower is a lean, not a knock
     size_t   prop_count() const { return props_.size(); }
     // Any ray: metres to the first body, -1 for none; `prop` 1 if that body
     // is a prop (a trunk, a stump, a log) rather than terrain.
@@ -222,6 +310,12 @@ private:
     std::unordered_map<int, BodyState> walker_state_;
     int next_walker_ = 1;
 
+    uint32_t  next_hinge_ = 0;
+    Push      push_;
+    std::vector<Bump>     bumps_;     // this frame's
+    std::vector<uint32_t> touched_;   // loose props in contact last frame
+    std::unordered_map<uint32_t, float> bump_cd_;   // handle -> seconds until it may be bumped again
+    float     bump_transfer_ = 1.0f;
     SeaParams sea_;
     std::function<float(float, float)> column_height_;
 

@@ -82,6 +82,11 @@ static_assert(sizeof(TreeVertex) == 48, "TreeVertex is read as a StructuredBuffe
 struct TreeMesh {
     std::vector<TreeVertex> v;
     std::vector<uint32_t>   idx;
+    // The trunk's own axis, as build_trunk sampled it: height, radius and
+    // where the centre has wandered to, from the cut upward. A log chopped
+    // into pieces needs both to close each end with a disc, and the mesh's
+    // vertices cannot say -- branches are bark too, at the same heights.
+    std::vector<float> trunk_y, trunk_r, trunk_x, trunk_z;
 };
 
 // What one species variant looks like at both levels, plus what culling,
@@ -95,6 +100,11 @@ struct TreeModel {
     float crown_centre = 8.0f;    // centre of the crown's volume, for physics
     float crown_r = 3.0f;         // radius of a sphere standing for the crown
 };
+
+// The trunk's axis at height y, in model metres: where its centre is and how
+// thick it is there. Clamped to the profile's ends; radius 0 if the model
+// carries no profile.
+void trunk_axis_at(const TreeModel& m, float y, float& x, float& z, float& r);
 
 TreeModel build_tree_model(const TreeLook& look, uint32_t species, uint32_t variant);
 

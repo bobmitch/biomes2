@@ -31,17 +31,42 @@ namespace engine {
 
 class WorldGpu;
 
-// What the GPU reads per tree. 48 bytes, StructuredBuffer-aligned.
+// What one instance draws of its model. A standing tree, the stump left
+// behind, the whole felled log -- and a PIECE, a band of the trunk between
+// two heights, which is what a log chopped in half, a billet of firewood and
+// a clump of the crown falling away all are. One mesh, five uses.
+enum TreeDrawKind : uint32_t {
+    kTreeStanding = 0, kTreeLog = 1, kTreeStump = 2,
+    kTreePiece = 3,    // a band of the TRUNK: bark and the discs closing it
+    kTreeDebris = 4    // a band of the CROWN: its branches and leaves, no discs
+};
+
+// The kind and the fade in one word. The fade is stored as the share of
+// pixels to THROW AWAY, so a zeroed instance is an opaque standing tree.
+inline uint32_t tree_mode(uint32_t kind, float fade = 1.0f) {
+    const float cut = 1.0f - (fade < 0.0f ? 0.0f : (fade > 1.0f ? 1.0f : fade));
+    return (kind & 0xFu) | (uint32_t(cut * 255.0f + 0.5f) << 8);
+}
+
+// What the GPU reads per tree. 80 bytes, StructuredBuffer-aligned.
 struct TreeGpuInstance {
     float    pos[3];     // trunk base, world metres
     float    scale;      // height / the species' nominal height
     float    rot[4];     // quaternion x, y, z, w
     uint32_t model;      // species * kTreeVariants + variant
-    uint32_t mode;       // 0 standing, 1 felled log, 2 stump
+    uint32_t mode;       // tree_mode(): kind in bits 0-3, the fade's cut in 8-15
     float    hit_time;   // last chop, on the frame clock, for the shake
     uint32_t id;         // worldgen tree id
+    float    clip_lo;    // kTreePiece: the model-local y band it draws ...
+    float    clip_hi;
+    float    cap_lo;     // ... the end discs' radial scale there, 0 for none ...
+    float    cap_hi;
+    float    axis_lo[2]; // ... and where the trunk's own axis stands (x, z) at
+    float    axis_hi[2]; //     each end: it wanders, so a disc on the model's
+                         //     axis would sit off the opening by a third of a
+                         //     radius at the top of a tall trunk.
 };
-static_assert(sizeof(TreeGpuInstance) == 48, "read as a StructuredBuffer");
+static_assert(sizeof(TreeGpuInstance) == 80, "read as a StructuredBuffer");
 
 // Mesh variants per species. A tree's variant byte from layer 8 picks one.
 static const uint32_t kTreeVariants = 4;

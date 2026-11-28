@@ -345,7 +345,13 @@ void build_trunk(Builder& b, TreeMesh& m, const TreeLook& L, float H, float top_
     b.cap(V3(0, kCutHeight, 0), rc * 0.995f, sides, false);
     axis.clear(); radius.clear();
     for (size_t i = 1; i < n.size(); ++i) { axis.push_back(n[i].p); radius.push_back(n[i].r); }
-    (void)m;
+    // Keep it on the mesh: a felled log broken into pieces closes each end
+    // with the cut's disc scaled to the radius there.
+    m.trunk_y.clear(); m.trunk_r.clear(); m.trunk_x.clear(); m.trunk_z.clear();
+    for (size_t i = 1; i < n.size(); ++i) {
+        m.trunk_y.push_back(n[i].p.y); m.trunk_r.push_back(n[i].r);
+        m.trunk_x.push_back(n[i].p.x); m.trunk_z.push_back(n[i].p.z);
+    }
 }
 
 // Point and radius on the trunk at height y, from the sampled axis.
@@ -690,6 +696,21 @@ TreeModel build_tree_model(const TreeLook& look, uint32_t species, uint32_t vari
     tm.crown_r = std::max(0.3f, std::min(look.crown_radius * H, 0.5f * (tm.top - tm.crown_base)) * 0.8f);
     if (look.form == TreeForm::Snag) tm.crown_r = 0.0f;
     return tm;
+}
+
+void trunk_axis_at(const TreeModel& m, float y, float& x, float& z, float& r) {
+    const TreeMesh& t = m.lod[0];
+    x = z = r = 0.0f;
+    if (t.trunk_y.empty()) return;
+    size_t i = 1;
+    for (; i < t.trunk_y.size(); ++i) if (y <= t.trunk_y[i]) break;
+    if (i >= t.trunk_y.size()) i = t.trunk_y.size() - 1;
+    if (i == 0) { x = t.trunk_x[0]; z = t.trunk_z[0]; r = t.trunk_r[0]; return; }
+    const float d = std::max(1e-4f, t.trunk_y[i] - t.trunk_y[i - 1]);
+    const float u = clamp01((y - t.trunk_y[i - 1]) / d);
+    x = t.trunk_x[i - 1] + (t.trunk_x[i] - t.trunk_x[i - 1]) * u;
+    z = t.trunk_z[i - 1] + (t.trunk_z[i] - t.trunk_z[i - 1]) * u;
+    r = t.trunk_r[i - 1] + (t.trunk_r[i] - t.trunk_r[i - 1]) * u;
 }
 
 CrownVolume crown_volume(const TreeModel& tm, const TreeLook& look) {

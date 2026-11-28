@@ -68,6 +68,11 @@ bool ItemTable::load(const char* path, std::string& error) {
             num("axe_cost", t.axe_cost);
             num("swing_buffer_s", t.swing_buffer_s);
             num("dig_cost", t.dig_cost);
+            num("push_newtons", t.push_newtons);
+            num("heave_newtons", t.heave_newtons);
+            num("heave_ramp_s", t.heave_ramp_s);
+            num("heave_cost", t.heave_cost);
+            num("bump_transfer", t.bump_transfer);
             num("drown_damage", t.drown_damage);
             num("fall_safe_m", t.fall_safe_m);
             num("fall_lethal_m", t.fall_lethal_m);
@@ -113,6 +118,42 @@ bool ItemTable::load(const char* path, std::string& error) {
             if (s.crouch_speed <= 0.0f || s.spike_decay_db_s <= 0.0f || s.light.dark_lux <= 0.0f ||
                 s.light.full_lux <= s.light.dark_lux)
                 throw std::runtime_error("stealth: crouch_speed and spike_decay_db_s > 0, 0 < dark_lux < full_lux");
+        }
+        if (root.has("logs")) {
+            const jsonlite::Value& p = root.at("logs");
+            auto num = [&](const char* k, float& v) { if (p.has(k)) v = float(p.number(k)); };
+            LogTuning& g = logs;
+            num("wood_density", g.wood_density);
+            num("chop_damage", g.chop_damage);
+            num("health_per_m3", g.health_per_m3);
+            num("min_health", g.min_health);
+            num("split_at", g.split_at);
+            float billets = float(g.billets);
+            num("billets", billets);
+            g.billets = int(billets + 0.5f);
+            if (p.has("wood_item")) g.wood_item = p.string("wood_item");
+            num("wood_per_m3", g.wood_per_m3);
+            num("billet_max_m", g.billet_max_m);
+            num("shed_after_s", g.shed_after_s);
+            num("topple_spin_rad_s", g.topple_spin_rad_s);
+            num("knock_spin_rad_s", g.knock_spin_rad_s);
+            num("hinge_release_deg", g.hinge_release_deg);
+            num("debris_toss", g.debris_toss);
+            num("impact_per_chop", g.impact_per_chop);
+            num("impact_min_speed", g.impact_min_speed);
+            num("impact_keep", g.impact_keep);
+            float debris = float(g.debris_pieces);
+            num("debris_pieces", debris);
+            g.debris_pieces = int(debris + 0.5f);
+            num("debris_rest_s", g.debris_rest_s);
+            num("debris_fade_s", g.debris_fade_s);
+            if (g.chop_damage <= 0.0f || g.health_per_m3 <= 0.0f || g.min_health <= 0.0f ||
+                g.split_at <= 0.05f || g.split_at >= 0.95f || g.billets < 1 || g.billets > 8 ||
+                g.impact_per_chop <= 0.0f || g.debris_pieces < 0 || g.debris_pieces > 8 ||
+                g.billet_max_m <= 0.1f || g.debris_fade_s <= 0.0f)
+                throw std::runtime_error("logs: chop_damage, health_per_m3, min_health, "
+                                         "impact_per_chop and debris_fade_s > 0, 0.05 < split_at < 0.95, "
+                                         "1..8 billets, 0..8 debris_pieces");
         }
         if (root.has("clock")) {
             const jsonlite::Value& c = root.at("clock");

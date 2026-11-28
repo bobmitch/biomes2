@@ -27,10 +27,21 @@ struct TreeInstance {
     float  scale;
     float4 rot;
     uint   model;
-    uint   mode;    // 0 standing, 1 felled log, 2 stump
+    uint   mode;    // kind in bits 0-3, the fade's cut in 8-15 (tree_field.h)
     float  hit_time;
     uint   id;
+    float2 band;    // a piece's model-local y band
+    float2 cap;     // the discs closing its ends: radial scale, 0 for none
+    float2 axis_lo; // where the trunk's own axis stands (x, z) at each end
+    float2 axis_hi;
 };
+
+// 0 standing, 1 a felled log, 2 a stump, 3 a PIECE -- a band of the trunk
+// between two heights, which is what half a chopped log and a billet of
+// firewood are -- and 4 DEBRIS, the same band of the crown instead.
+uint tree_kind(TreeInstance t) { return t.mode & 0xFu; }
+// The share of a piece's pixels to throw away as it fades out. 0: all there.
+float tree_fade_cut(uint mode) { return float((mode >> 8) & 0xFFu) / 255.0f; }
 
 struct ModelInfo {
     float radius;     // metres at nominal, horizontal
@@ -282,6 +293,7 @@ struct MeshOut {
     float  local_y : TEXCOORD6;
     nointerpolation uint packed : TEXCOORD7;
     nointerpolation uint mode : TEXCOORD8;
+    nointerpolation float2 band : TEXCOORD17;   // a piece's model-local y band
     nointerpolation float3 bark : TEXCOORD9;
     nointerpolation float3 leaf : TEXCOORD10;
     nointerpolation float tint : TEXCOORD11;
@@ -313,12 +325,31 @@ MeshOut mesh_vertex(uint vid, uint iid, bool lit) {
     const bool cap_up = v.kind > 2.5f && v.kind < 3.5f;
     const bool cap_dn = v.kind > 3.5f;
     const bool foliage = v.kind > 0.5f && v.kind < 2.5f;
-    if (inst.mode == 0u && (cap_up || cap_dn)) return degenerate();
-    if (inst.mode == 1u && cap_up) return degenerate();
-    if (inst.mode == 2u && (cap_dn || foliage)) return degenerate();
+    const uint kind = tree_kind(inst);
+    if (kind == 0u && (cap_up || cap_dn)) return degenerate();
+    if (kind == 1u && cap_up) return degenerate();
+    if (kind == 2u && (cap_dn || foliage)) return degenerate();
 
     float3 p = v.pos;
-    if (inst.mode == 0u) {
+    // A piece draws the band [band.x, band.y] of the trunk, cut per pixel
+    // below, and closes each end with the cut's own disc, moved to that
+    // height, scaled to the trunk's radius there and set on the axis, which
+    // wanders as it rises. It is wood, so it carries no leaves; debris is
+    // the other way round -- branches and foliage, and no discs.
+    if (kind == 3u && foliage) return degenerate();
+    if (kind == 4u && (cap_up || cap_dn)) return degenerate();
+    if (kind == 3u) {
+        if (cap_dn) {
+            if (inst.cap.x <= 0.0f) return degenerate();
+            p = float3(inst.axis_lo.x + p.x * inst.cap.x, inst.band.x,
+                       inst.axis_lo.y + p.z * inst.cap.x);
+        } else if (cap_up) {
+            if (inst.cap.y <= 0.0f) return degenerate();
+            p = float3(inst.axis_hi.x + p.x * inst.cap.y, inst.band.y,
+                       inst.axis_hi.y + p.z * inst.cap.y);
+        }
+    }
+    if (kind == 0u) {
         // Wind (tree_sway.h), worked out in WORLD space and turned into the
         // model's frame at the end, so every tree bends the way the air goes
         // whatever its yaw. The local speed is the gust field at the trunk,
@@ -342,6 +373,14 @@ MeshOut mesh_vertex(uint vid, uint iid, bool lit) {
         }
         const float4 inv = float4(-inst.rot.xyz, inst.rot.w);
         p += qrot(inv, off) / max(inst.scale, 0.05f);
+    } else if (kind == 3u) {
+        // A piece being chopped shakes too, along its own length: it is the
+        // same feedback, and a log takes several swings to break.
+        const float since = time - inst.hit_time;
+        if (since >= 0.0f && since < 0.6f) {
+            const float a = sin(since * 55.0f) * (1.0f - since / 0.6f) * 0.04f;
+            p += float3(a, 0.0f, a * 0.6f) / max(inst.scale, 0.05f);
+        }
     }
 
     const float3 world = inst.pos + qrot(inst.rot, p * inst.scale);
@@ -353,9 +392,10 @@ MeshOut mesh_vertex(uint vid, uint iid, bool lit) {
     o.ao = v.ao;
     o.kind = v.kind;
     o.seed = v.seed;
-    o.local_y = v.pos.y;
+    o.local_y = kind >= 3u ? p.y : v.pos.y;
     o.packed = packed;
     o.mode = inst.mode;
+    o.band = inst.band;
     o.bark = lk.bark;
     o.leaf = lk.leaf;
     o.tint = hash11(float(inst.id) * 0.013f);
@@ -414,11 +454,25 @@ float card_coverage(MeshOut i) {
 // cross-fades and the far fade), the cut of a log or a stump, and a leaf
 // card's coverage. The depth prepass asks this and nothing else; the colour
 // pass after it does not ask again -- depth EQUAL already says.
+// A piece: the band of the trunk it is, and the fade as it goes. Everything
+// outside the band belongs to another piece or to nothing. The fade is its
+// own dither -- a second pattern, offset from the level's -- so a clump of
+// crown thins away where it lies instead of vanishing in one frame.
+bool piece_kept(MeshOut i, float frame) {
+    if (i.local_y < i.band.x - 0.01f || i.local_y > i.band.y + 0.01f) return false;
+    const float cut = float((i.mode >> 8) & 0xFFu) / 255.0f;
+    if (cut > 0.0f && dither(i.clip.xy + 3.1415927f * frame + 31.0f) < cut) return false;
+    return true;
+}
+
 bool mesh_kept(MeshOut i) {
-    if (!keep_pixel(i.clip.xy, i.packed, fmod(l_shadow_frame.x, 64.0f))) return false;
+    const float frame = fmod(l_shadow_frame.x, 64.0f);
+    if (!keep_pixel(i.clip.xy, i.packed, frame)) return false;
+    const uint kind = i.mode & 0xFu;
     // The cut: a log keeps the trunk above it, a stump below it.
-    if (i.mode == 1u && i.kind < 0.5f && i.local_y - cut_height + 0.002f < 0.0f) return false;
-    if (i.mode == 2u && i.kind < 0.5f && cut_height + 0.002f - i.local_y < 0.0f) return false;
+    if (kind == 1u && i.kind < 0.5f && i.local_y - cut_height + 0.002f < 0.0f) return false;
+    if (kind == 2u && i.kind < 0.5f && cut_height + 0.002f - i.local_y < 0.0f) return false;
+    if (kind >= 3u && !piece_kept(i, frame)) return false;
     if (i.kind > 0.5f && i.kind < 2.5f && card_coverage(i) < 0.5f) return false;
     return true;
 }
@@ -514,8 +568,10 @@ static const float kImpostorShadowOpacity = 0.78f;
 // colour. Without the leaf test every card would cast a solid square.
 void ps_mesh_shadow(MeshOut i) {
     if (!keep_pixel(i.clip.xy, i.packed, 0.0f)) discard;
-    if (i.mode == 1u && i.kind < 0.5f) clip(i.local_y - cut_height + 0.002f);
-    if (i.mode == 2u && i.kind < 0.5f) clip(cut_height + 0.002f - i.local_y);
+    const uint kind = i.mode & 0xFu;
+    if (kind == 1u && i.kind < 0.5f) clip(i.local_y - cut_height + 0.002f);
+    if (kind == 2u && i.kind < 0.5f) clip(cut_height + 0.002f - i.local_y);
+    if (kind >= 3u && !piece_kept(i, 0.0f)) discard;
     if (i.kind > 0.5f && i.kind < 2.5f) {
         // LOD 1 in the first cascade too: a tree past LOD 0's 45 m casts
         // into the first cascade's box (which is fitted round its 28 m slice
