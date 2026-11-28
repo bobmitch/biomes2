@@ -632,13 +632,19 @@ undecided).
 ## Future design: particles and smoke (ADR-008, nothing built)
 
 `docs/adr-008-particles-and-smoke.md`, proposed 2026-11-28. There is no
-particle, decal or smoke code in the tree. Two systems over one
-dual-compiled substrate: ballistic particles (sparks, chips, leaves, dust,
-blood) simulated on the GPU and drawn as unsorted cards, and smoke as a
-MEDIUM -- a sparse 1 m world grid for its state, injected into the mist's
-froxels (`cs_fog_inject`) for its lighting and its drawing. Rising,
-filling and spilling come from the sky-access flood's distance-to-sky,
-which is already built, already threaded and already edit-aware.
+particle, decal or smoke code in the tree. Three categories over one
+dual-compiled substrate, split by what is STORED rather than by what the
+effect is called: **ballistic** (sparks, chips, leaves, dust, blood -- a
+persistent buffer, spawned and freed, drawn as unsorted cards),
+**ambient fields** (snow, pollen, ash, fireflies -- no state at all, a
+hash of index and time, the rain's pattern generalised), and **media**
+(smoke first, but steam, gas and dust clouds the same code -- a sparse
+1 m world grid injected into the mist's froxels, `cs_fog_inject`, for its
+lighting and its drawing). Rising, filling and spilling come from the
+sky-access flood's distance-to-sky, already built, already threaded,
+already edit-aware. **A kind is a row in `game/data/particles.json`, not
+a C++ type**, emitted from C++ or Lua, with `on_hit` naming another kind
+so particles compose -- that decision is what the design turns on.
 
 What is recorded here because it constrains OTHER work:
 
@@ -663,6 +669,20 @@ What is recorded here because it constrains OTHER work:
   toroidal camera-centred texture of world state with a decay, read by
   whichever shader already draws that surface, forgetting whatever
   scrolls past its edge. Blood, scorch and char all fit it. Undecided.
+- **Soft alpha is foreclosed, knowingly.** Particles sort nothing, which
+  is only free because additive blending is order-independent and
+  alpha-TESTED cutouts write depth. Semi-transparent soft alpha is the
+  case that excludes -- it went unnoticed in the ADR's first draft
+  because every founding effect happens to be a cutout or additive. The
+  first want of a soft dust puff, or a translucent wisp too small for the
+  froxels, hits it. Escapes, cheapest first: push it to the medium layer;
+  accept additive; weighted-blended OIT, a real fallback at a real cost.
+  [ADR-008 decision 12]
+- **Ribbons, trails and beams are not a particle kind.** An arrow's wake,
+  a sword arc, a whip, and the magic beams `local_lights.h` already
+  anticipates are connected geometry extruded along a path over time: a
+  fourth renderer over the same substrate. Additive work, not blocked by
+  anything, but nobody should assume particles cover it.
 - **Nothing writes motion vectors**, so fast particles will ghost under
   TAA, as the character already does (see "The player character"). Either
   particles get velocity output or they draw after TAA; untried.
