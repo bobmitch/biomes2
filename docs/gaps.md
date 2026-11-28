@@ -252,6 +252,15 @@ Last gathered: 2026-11-21, after the exploration fog; creatures added
   chopping it is chopping a log that happens to be at forty degrees. A
   real woodcutter's problem with a real answer (a winch, a second cut),
   and none of it exists. [Felling]
+- **Debris cannot hit the player.** The crown's clumps are not Pieces and
+  are left out of the blow test, so the one part of a falling tree that
+  arrives after everything else has stopped is harmless. They weigh ~44 kg
+  and would be under the energy floor anyway, which is why it has not been
+  worth plumbing. [Felling]
+- **Nothing else dynamic can hit the player.** Rocks are static and
+  creatures have their own `attack` block, so "a physics object with
+  momentum hurts you" reaches exactly as far as felled wood. A rockfall,
+  a cart or anything thrown would each need wiring of their own. [Felling]
 - **A blow's damage ignores WHERE up the struck trunk it landed.** A
   cantilever fixed in the ground bends by the moment, so the same blow
   near the top is worth far more than one at the base, and a thick trunk

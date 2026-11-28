@@ -221,6 +221,13 @@ void publish_character() {
     // and stump. In that order, because the map takes 64 capsules a frame
     // and the player's own trail is the one nobody will forgive missing.
     if (g_trample) stamp_trample();
+    // ... and where they are standing for a tree to come down ON. Only on
+    // foot: a flying camera is not a body and cannot be hit.
+    if (g_walk)
+        g_felling.set_player(g_feet, 2.0f * g_physics.character_half_extent(),
+                             g_physics.character_radius());
+    else
+        g_felling.clear_player();
     g_last_feet[0] = g_feet[0];
     g_last_feet[1] = g_feet[2];
     g_have_last_feet = true;
@@ -539,6 +546,7 @@ engine::player::ItemTable g_items;
 engine::player::Survival  g_surv;
 bool  g_surv_ok = false;        // game/data/items.json loaded
 bool  g_surv_run = false;       // the window loop is running it
+float g_tree_hit_quiet = 10.0f; // seconds since a log last hit the player
 std::vector<std::string> g_hud_msgs;   // the HUD's message line, drained by the script
 std::string g_prompt;           // what E would do now
 bool  g_jump_was_down = false;
@@ -1155,6 +1163,32 @@ void combat_frame(float dt) {
     if (g_hurt > 0.0f) g_hurt = (std::max)(0.0f, g_hurt - dt / kHurtFade);
 }
 
+// What fell on the player: a trunk coming down, a log rolling into them.
+// The damage is worked out where the blow is (felling.h) in the axe's own
+// currency, so a crown that would take a sapling down takes them with it --
+// which is the whole point, and why standing in the wrong place while a
+// tree goes over is how people die in their first hour.
+void felling_hits_frame(float dt) {
+    const std::vector<engine::TreeFelling::PlayerHit>& hits = g_felling.player_hits();
+    float dmg = 0.0f;
+    int stage = 0;
+    for (size_t i = 0; i < hits.size(); ++i) {
+        dmg += hits[i].damage;
+        stage = hits[i].stage;
+    }
+    g_felling.clear_player_hits();
+    if (dmg <= 0.0f) { g_tree_hit_quiet += dt; return; }
+    if (g_surv.dead()) return;
+    g_surv.damage(dmg);
+    g_hurt = 1.0f;
+    // A tree bearing down on them hurts for a dozen frames running, and
+    // that is ONE thing happening: the health goes every frame, the line
+    // is said once.
+    if (g_tree_hit_quiet > 0.75f)
+        hud_say(stage == 0 ? "A falling tree hits you" : "A log hits you");
+    g_tree_hit_quiet = 0.0f;
+}
+
 // A frame of the creatures: zones round the player wake and freeze, spawns
 // come due on the game clock, the nearest are drawn.
 void creatures_frame(float dt, bool paused, float aspect) {
@@ -1186,6 +1220,7 @@ void survival_frame(float dt, bool moving, bool sprinting) {
         m.grounded = g_physics.character_supported();
         m.feet_y = g_feet[1];
     }
+    felling_hits_frame(dt);
     g_surv.update(dt, m);
     if (g_time_lapse && dt > 0.0f) g_surv.advance_clock(double(dt) * 360.0);   // H: an hour every ten seconds
     if (g_surv.dead()) {
@@ -8764,6 +8799,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
                 push_frame(dt_s);
                 g_physics.update(dt_s, vx, vz, false, 0.0f);
                 g_physics.character_position(g_feet);
+                // The player is a thing a log can hit, through all of the
+                // shoving: walking into firewood hands the log momentum
+                // (physics_world.h's bumps), and it must not hand the
+                // player any back. Phase 9 reports what it cost them.
+                g_felling.set_player(g_feet, 2.0f * g_physics.character_half_extent(),
+                                     g_physics.character_radius());
                 g_felling.update(g_feet[0], g_feet[2], dt_s);
                 frame(tsim);
             };
@@ -9047,6 +9088,130 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdline, int show) {
             }
         }
         if (!(split_ok && billet_ok && pick_ok && push_ok)) verdict_fail = 1;
+
+        // 9. STANDING IN THE WAY. A tree that comes down on the woodcutter
+        //    hits them with the blow it would have dealt a sapling -- the
+        //    mass its body met at the point that touched, the closing speed
+        //    there, impact_per_chop joules to a chop (felling.h) -- and the
+        //    axe's currency is the player's, so a crown is worth several
+        //    times a fresh one's health. Dying to the first tree you fell
+        //    is a rite of passage.
+        bool crush_ok = false;
+        float t9 = 30.0f;   // phases 4-8 kept their own clock inside their block
+        {
+            // Another tree near the first, big enough to matter, with a
+            // direction it can go in where there is room to stand at the
+            // reach of its crown and the ground is not a cliff.
+            const std::vector<worldgen::TreeInstance> now = g_renderer.tree_field().standing();
+            const worldgen::TreeInstance* vic = nullptr;
+            float vh = 0.0f, vr = 0.0f, vbase[3] = {0, 0, 0}, vdir[3] = {1, 0, 0};
+            float stand[3] = {0, 0, 0}, nearest = 1e30f;
+            for (size_t i = 0; i < now.size(); ++i) {
+                float b2[3], h2 = 0.0f, r2 = 0.0f;
+                int n2 = 0;
+                if (!g_felling.tree_info(now[i].id, b2, h2, r2, n2)) continue;
+                if (h2 < 10.0f || r2 < 0.15f) continue;
+                const float dx = now[i].x - tree.x, dz = now[i].z - tree.z;
+                const float d2 = dx * dx + dz * dz;
+                if (d2 > 60.0f * 60.0f || d2 >= nearest) continue;
+                for (int k = 0; k < 16; ++k) {
+                    const float ang = 0.3926991f * float(k);
+                    const float ux = std::cos(ang), uz = std::sin(ang);
+                    // Under the crown, well out along the trunk, where the
+                    // blow is worth something.
+                    const float sx = now[i].x + ux * 0.62f * h2, sz = now[i].z + uz * 0.62f * h2;
+                    const float g = wg.height(sx, sz);
+                    if (std::fabs(g - b2[1]) > 2.0f) continue;
+                    bool clear = true;
+                    for (size_t j = 0; j < now.size() && clear; ++j) {
+                        if (j == i) continue;
+                        const float ex = now[j].x - sx, ez = now[j].z - sz;
+                        if (ex * ex + ez * ez < 3.0f * 3.0f) clear = false;
+                    }
+                    if (!clear) continue;
+                    nearest = d2;
+                    vic = &now[i];
+                    vh = h2; vr = r2;
+                    for (int c = 0; c < 3; ++c) vbase[c] = b2[c];
+                    vdir[0] = ux; vdir[1] = 0.0f; vdir[2] = uz;
+                    stand[0] = sx; stand[1] = g; stand[2] = sz;
+                    break;
+                }
+            }
+            if (!vic) {
+                std::fprintf(f, "9. standing in the way: NO SECOND TREE with room to stand under it\n");
+            } else {
+                const float ph = 2.0f * g_physics.character_half_extent();
+                const float pr = g_physics.character_radius();
+                // Everything in the list so far came from phases 4-8, where
+                // the player spent twenty seconds walking into logs and
+                // shoving them about. None of it should have hurt: a log
+                // the player pushes is going AWAY from them.
+                float shove_dmg = 0.0f;
+                for (size_t i = 0; i < g_felling.player_hits().size(); ++i)
+                    shove_dmg += g_felling.player_hits()[i].damage;
+                g_felling.clear_player_hits();
+                g_physics.place_character(stand[0], stand[1] + 0.05f, stand[2]);
+                g_physics.character_position(g_feet);
+                const bool dropped = g_felling.fell_toward(vic->id, vdir);
+                float worst = 0.0f, worst_mass = 0.0f, worst_speed = 0.0f, total = 0.0f;
+                int blows = 0;
+                bool shot9 = false;
+                for (float e = 0.0f; e < 6.0f; e += 1.0f / 60.0f) {
+                    t9 += 1.0f / 60.0f;
+                    sync_physics_terrain();
+                    sync_sea(t9);
+                    // Held where they stand -- a test of the blow, not of
+                    // whether the capsule is shoved out of the way.
+                    g_physics.place_character(stand[0], stand[1] + 0.05f, stand[2]);
+                    g_physics.update(1.0f / 60.0f, 0.0f, 0.0f, false, 0.0f);
+                    g_physics.character_position(g_feet);
+                    g_felling.set_player(g_feet, ph, pr);
+                    g_felling.update(g_feet[0], g_feet[2], 1.0f / 60.0f);
+                    // Never drained, so felling keeps adding to one entry
+                    // per log: the totals are read once it is over.
+                    blows = int(g_felling.player_hits().size());
+                    if (blows > 0 && !shot9) {
+                        // The moment it reaches them, from the side.
+                        shot9 = true;
+                        engine::Camera c = g_camera;
+                        c.x = stand[0] - vdir[2] * 9.0f;
+                        c.z = stand[2] + vdir[0] * 9.0f;
+                        c.y = wg.height(c.x, c.z) + 2.6f;
+                        c.yaw = std::atan2(stand[0] - c.x, stand[2] - c.z);
+                        c.pitch = -0.05f;
+                        RECT cr;
+                        GetClientRect(hwnd, &cr);
+                        engine::ViewConstants v = {};
+                        fill_view(c, float(cr.right - cr.left), float(cr.bottom - cr.top), t9, v);
+                        std::string err;
+                        g_renderer.capture(v, "build/fell_crush.bmp", err);
+                    }
+                    frame(t9);
+                }
+                const std::vector<engine::TreeFelling::PlayerHit>& hs = g_felling.player_hits();
+                for (size_t i = 0; i < hs.size(); ++i) {
+                    total += hs[i].damage;
+                    if (hs[i].energy <= worst) continue;
+                    worst = hs[i].energy;
+                    worst_mass = hs[i].mass;
+                    worst_speed = hs[i].speed;
+                }
+                const float base_hp = g_items.tuning.base_health;
+                crush_ok = blows > 0 && total > 0.0f && shove_dmg <= 0.0f;
+                std::fprintf(f, "9. standing in the way: a %.1f m tree (%08x) felled onto the player\n"
+                                "   %.1f m out along it, %s\n",
+                             vh, vic->id, 0.62f * vh, dropped ? "cut" : "NOT CUT");
+                std::fprintf(f, "   %d log%s hit them: hardest %.1f m/s on %.0f kg = %.0f J; %.0f damage in all,\n"
+                                "   against a fresh player's %.0f health -- %s\n",
+                             blows, blows == 1 ? "" : "s", worst_speed, worst_mass, worst, total, base_hp,
+                             total >= base_hp ? "IT KILLS THEM" : "they live");
+                std::fprintf(f, "   the twenty seconds of shoving logs about before this cost them\n"
+                                "   %.0f damage (0 wanted: a log the player pushes goes AWAY from them)\n"
+                                "   build/fell_crush.bmp\n", shove_dmg);
+            }
+        }
+        if (!crush_ok) verdict_fail = 1;
 
         // A picture of it: from 10 m back, looking at the log's middle.
         {

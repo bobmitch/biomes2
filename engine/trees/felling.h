@@ -99,6 +99,34 @@ public:
     void set_tuning(const player::LogTuning& t) { tune_ = t; }
     const player::LogTuning& tuning() const { return tune_; }
 
+    // Where the player is standing, for a tree to come down ON: their feet,
+    // and the capsule physics walks them round in. Set every frame by
+    // whoever has a player; with none set nothing can hit them, which is
+    // what a flying camera and a headless report want.
+    void set_player(const float feet[3], float height, float radius);
+    void clear_player() { player_h_ = 0.0f; }
+
+    // A blow that landed on the player since the list was cleared. Felling
+    // knows nothing about health -- main.cpp hands these to Survival, where
+    // damage and death live. The arithmetic is a standing tree's exactly:
+    // the mass the falling body met AT the point it touched, the closing
+    // speed there, `impact_per_chop` joules to a chop of damage. So a crown
+    // that would take a sapling down takes the woodcutter with it, and a
+    // round of firewood rolling past is a graze or nothing at all.
+    struct PlayerHit {
+        uint32_t tree = 0;     // whose log it was
+        int      stage = 0;    // 0 the whole bole, 1 a half, 2 a round
+        float    speed = 0.0f, mass = 0.0f, energy = 0.0f, damage = 0.0f;
+    };
+    // ONE PER LOG, added to as the blow bears down, exactly as `Impact`
+    // is: the peak rule hands out a dozen small increments over a fall,
+    // which is one event and not twelve. A caller that drains the list
+    // every frame (the window loop, where it becomes health) therefore
+    // gets that frame's share; one that reads it at the end (the test)
+    // gets the whole blow.
+    const std::vector<PlayerHit>& player_hits() const { return player_hits_; }
+    void clear_player_hits() { player_hits_.clear(); }
+
     // Keep trunk colliders round (x, z), read every piece's pose from
     // physics, shed the crown of a log that has tipped, age the debris, let
     // a falling trunk hurt what it lands on, and hand the lot to the
@@ -273,6 +301,10 @@ private:
     std::vector<Debris>                    debris_;
     DebrisStats                            debris_stats_;
     std::vector<Impact>                    impacts_;
+    std::vector<PlayerHit>                 player_hits_;
+    float                                  player_[3] = {0, 0, 0};
+    float                                  player_h_ = 0.0f;   // 0: no player to hit
+    float                                  player_r_ = 0.35f;
     // Above every tree id, so a piece's Shape key can never be a stump's.
     uint64_t next_piece_ = 0x100000000ull;
     unsigned long long field_version_ = 0;

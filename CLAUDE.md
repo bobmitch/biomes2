@@ -1347,6 +1347,38 @@ replaces its base, and the rest becomes a chain of things:
     before anyone cuts it, so its first contacts are the ones it already
     had. A log on the ground is on its side, so neither gate holds one
     back.
+- **And it lands on the PLAYER, which is how people die in their first
+  hour.** They are one more target segment -- the capsule physics walks
+  them round in, given to felling by `set_player` from `publish_character`,
+  beside the trample stamp that answers the same question for the grass --
+  and the blow is a standing tree's exactly. The axe's currency is the
+  player's, so the arithmetic needs no scale of its own: a crown worth 99
+  health against a sapling is worth 99 against a fresh player's 25.
+  Measured (`--fell`'s phase 9): a 15.8 m tree felled onto someone standing
+  9.8 m out along it hits at **21.8 m/s on 175 kg = 15.7 kJ, 59 damage**
+  -- it kills them twice over.
+  - **Every stage of a piece is tested against them**, where only a whole
+    bole is tested against trees and logs: a round of firewood rolling
+    down a slope should catch someone's legs. The energy floor decides
+    whether it is worth anything, and a 111 kg round at 4 m/s is under a
+    kilojoule, so in practice nothing but a falling tree or a log with a
+    hill behind it does.
+  - **Shoving wood about must not hurt**, and does not: the blow needs the
+    log to be CLOSING on the player, and a log the player walks into is
+    going away from them -- `bumps()` just handed it their momentum.
+    `--fell` sets the player as a target through all twenty seconds of
+    phases 4-8 and asserts those cost **0 damage**, because this is the
+    one thing that would turn the bump mechanic into self-harm.
+  - **Only on foot** (`g_walk`): a flying camera is not a body and
+    `clear_player` takes it out of the world. Nothing headless sets a
+    player at all, so no report can be hit by accident.
+  - `felling_hits_frame` hands the blows to `Survival::damage` next to the
+    creatures' own, with the red flash. The health goes every frame the
+    blow grows; the HUD line is said ONCE, since a tree bearing down on
+    someone for a dozen frames is one thing happening and not twelve.
+    `PlayerHit` is aggregated per log the same way `Impact` is -- a caller
+    that drains it every frame gets that frame's share, one that reads it at
+    the end gets the whole blow.
 - **A log on the ground takes the same blow against its own health**, and
   the chain it already has: enough and a whole one **breaks in two**,
   enough again and a half **comes apart into rounds of firewood**, which E
@@ -1371,14 +1403,16 @@ replaces its base, and the rest becomes a chain of things:
   -- a blow that does not fell simply stops the faller, which is what a
   hung-up tree is -- and never reached what it was felled at. Picking the
   pair by trunk alone is what made the old numbers look like a chain.
-- **Tests.** `--fell` is the whole life of one tree in eight phases:
+- **Tests.** `--fell` is the whole life of one tree in nine phases:
   walking into the trunk, the swings to fell it, the log tipping and
   coming to rest (3.3-3.9 s; it keeps its crown to 2.2 s, where the crown
   meets the ground, and the report's `the crown broke off at` line is the
   check that it was the ground and not the `shed_after_s` timer), shoving
   the whole log and getting nowhere, chopping it in two, chopping a half
   into rounds, E on a round (`+3 Wood`), and walking into a round twice at
-  each gait to see the knocks scale. **Phases 4 and 8 walk in, back off and
+  each gait to see the knocks scale, and a SECOND tree felled onto the
+  player standing 62% of the way out along it (`build/fell_crush.bmp`),
+  which is the one phase that can kill them. **Phases 4 and 8 walk in, back off and
   walk in again** rather than leaning for three seconds and seeing whether
   the terrain helped: every run starts from the same stand-off at the same
   gait, so the ground only gets to decide how far the piece then slides.

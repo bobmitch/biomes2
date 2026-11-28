@@ -319,6 +319,7 @@ public:
     // position alone once several levels have bodies in the same place.
     int   character_ground_lod() const;
     float character_half_extent() const { return half_height_ + radius_; }
+    float character_radius() const { return radius_; }
 
     // One character's water and motion state between steps.
     struct BodyState {

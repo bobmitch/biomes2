@@ -117,6 +117,11 @@ bool topple_lean(const float rot[4], float out[3]) {
 const uint32_t kMagic = 0x45455254u;   // "TREE"
 const uint32_t kFormat = 3u;           // 1: logs. 2: unused. 3: stumps and pieces.
 
+// The player, in `Piece::struck`. Tree ids are 32 bits and piece keys start
+// one above this (`next_piece_` is pre-incremented), so it is the one value
+// in the map that can never be either.
+const uint64_t kPlayerKey = 0x100000000ull;
+
 }  // namespace
 
 int TreeFelling::hits_needed(float trunk_r) const {
@@ -394,6 +399,12 @@ void TreeFelling::update(float x, float z, float dt) {
     renderer_->set_tree_extras(extra);
 }
 
+void TreeFelling::set_player(const float feet[3], float height, float radius) {
+    for (int k = 0; k < 3; ++k) player_[k] = feet[k];
+    player_h_ = height;
+    player_r_ = radius > 0.05f ? radius : 0.05f;
+}
+
 // Has anything touched this tree ABOVE its bole since the last step? The
 // contact comes back in world metres, so it is taken into the model's own
 // frame and compared with the band the crown occupies: `hi` is the top of
@@ -646,7 +657,12 @@ void TreeFelling::impacts_frame() {
     };
     for (std::unordered_map<uint64_t, Piece>::iterator it = pieces_.begin(); it != pieces_.end(); ++it) {
         Piece& p = it->second;
-        if (p.stage != 0) continue;   // a half or a billet carries nothing worth passing on
+        // A half or a billet carries nothing worth passing on to a TREE --
+        // but a round of firewood rolling down a slope is exactly the sort
+        // of thing that should catch someone's legs, so every stage is
+        // tested against the player. The energy floor is what decides
+        // whether it is worth anything: a 111 kg round at 4 m/s is under a
+        // kilojoule and does nothing at all.
         bool active = false;
         float pos[3], rot[4];
         if (!physics_->body_pose(p.body, pos, rot, active) || !active) continue;
@@ -777,10 +793,11 @@ void TreeFelling::impacts_frame() {
             im->broke = im->broke || (is_piece && done);
         };
 
-        // The trees still standing.
+        // The trees still standing, and the logs already down: a whole
+        // bole only.
         const float lo_x = (std::min)(a[0], b[0]), hi_x = (std::max)(a[0], b[0]);
         const float lo_z = (std::min)(a[2], b[2]), hi_z = (std::max)(a[2], b[2]);
-        for (size_t i = 0; i < st.size(); ++i) {
+        for (size_t i = 0; p.stage == 0 && i < st.size(); ++i) {
             const worldgen::TreeInstance& t = st[i];
             const TreeModel& m = tr.model(t.species, t.variant);
             const float ts = t.height / tr.look(t.species).nominal_height;
@@ -820,7 +837,7 @@ void TreeFelling::impacts_frame() {
         // there is nothing for a blow to do to it but shove it, which the
         // contact has done.
         for (std::unordered_map<uint64_t, Piece>::const_iterator jt = pieces_.begin();
-             jt != pieces_.end(); ++jt) {
+             p.stage == 0 && jt != pieces_.end(); ++jt) {
             const Piece& q = jt->second;
             if (q.key == p.key || q.stage > 1) continue;
             float c[3], d[3];
@@ -838,6 +855,39 @@ void TreeFelling::impacts_frame() {
             const bool breaks = q.health - hurt_so_far(q.key) - dmg <= 0.0f;
             hurt.push_back(hu);
             record(q.key, true, q.stage, h, dmg, breaks);
+        }
+
+        // ... and the player, standing in the way. One blow per pair as
+        // ever, by the same peak-of-the-load rule: a tree bearing down on
+        // them goes on hurting, a log lying on them does not.
+        if (player_h_ > 0.1f) {
+            const float foot = (std::min)(player_r_, 0.45f * player_h_);
+            const float c[3] = {player_[0], player_[1] + foot, player_[2]};
+            const float d[3] = {player_[0], player_[1] + player_h_ - foot, player_[2]};
+            Hit h;
+            if (strike(c, d, player_r_, h)) {
+                float& peak = p.struck[kPlayerKey];
+                if (h.energy > peak) {
+                    PlayerHit* ph = nullptr;
+                    for (size_t i = player_hits_.size(); i-- > 0;)
+                        if (player_hits_[i].tree == p.tree && player_hits_[i].stage == p.stage) {
+                            ph = &player_hits_[i];
+                            break;
+                        }
+                    if (!ph) {
+                        if (player_hits_.size() > 32) player_hits_.erase(player_hits_.begin());
+                        player_hits_.push_back(PlayerHit());
+                        ph = &player_hits_.back();
+                        ph->tree = p.tree;
+                        ph->stage = p.stage;
+                    }
+                    ph->speed = (std::max)(ph->speed, h.speed);
+                    ph->mass = (std::max)(ph->mass, h.mass);
+                    ph->energy = (std::max)(ph->energy, h.energy);
+                    ph->damage += (h.energy - peak) / tune_.impact_per_chop * tune_.chop_damage;
+                    peak = h.energy;
+                }
+            }
         }
     }
 
