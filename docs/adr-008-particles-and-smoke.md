@@ -5,12 +5,16 @@ decal or smoke code in the tree. Everything below is the plan. Tuning goes
 in data (decision 3), never in the golden hash: nothing here is upstream
 of it.
 
-Amended the same day, before any code, after the question *"is this open
+Amended twice the same day, before any code. First after *"is this open
 ended enough to accommodate ideas we have not had yet?"* -- which it was
-not. The architecture held; the INTERFACE was written around the five
-effects that prompted it. Decisions 1, 3, 5 and 12 are what changed, and
-the reasoning is kept in "Alternatives considered" so the argument is not
-had twice.
+not: the architecture held, but the INTERFACE had been written around the
+six effects that prompted it, so kinds became data (decision 3), ambient
+fields became a category of their own (decision 5), and what the design
+forecloses was written down (decision 13). Then after *"can particles act
+as light sources?"* -- which decision 4 had forbidden outright and should
+not have: decision 7 is the answer, and media gained an emission channel
+(decision 6). The reasoning for each is kept in "Alternatives considered",
+so the arguments are not had twice.
 
 ## Context
 
@@ -93,7 +97,7 @@ Three different answers to "what is stored", so three implementations:
 The split is physical, not a taxonomy of today's effects, which is why it
 should survive effects nobody has named yet. **A shape that fits none of
 them is a fourth renderer over the same substrate, not a tweak** -- see
-decision 12 for the two already known.
+decision 13 for the two already known.
 
 ### 2. Layer A, the substrate: `engine/particles/environment.h`
 
@@ -191,9 +195,11 @@ GPU-simulated, persistent buffer, CPU-fed spawn queue.
 - **Lit through `lighting.hlsli` like everything else** -- `gi_diffuse`,
   the local lights' cluster walk, the near field's probes -- so a chip in a
   cave is dark and a chip by a campfire is lit. Emissive kinds (sparks)
-  skip it: additive, ambient alpha 0 so GTAO does not darken them. A spark
-  must **not** become a real light; the budget is 256 uploaded and 24
-  shadowed, and those are for fires and torches.
+  skip it: additive, ambient alpha 0 so GTAO does not darken them.
+  **Emissive and illuminating are different things**: by default such a
+  kind is bright on screen and lights nothing around it. What it takes to
+  actually cast light, and what that costs, is decision 7 -- which the
+  first draft got wrong by forbidding it outright.
 - **Three scene targets, like every other scene PSO**, with the puddle mask
   written zero: a chip falling over a puddle should clear it, as grass and
   rock do.
@@ -244,7 +250,93 @@ there is no pressure projection and no fluid simulation. A medium with
 negative buoyancy (gas heavier than air) pools in hollows by the same
 arithmetic with the sign flipped, which is free and worth having.
 
-### 7. Fill and spill: the sky-access gradient IS the escape route
+**A medium carries EMISSION as well as density and albedo**, one more
+channel, and it is what makes flame possible at all. Fire is a hot
+emissive medium: without an emission term a flame can only be faked as a
+grey cloud with a light hidden inside it. In `cs_fog_inject` an emissive
+froxel simply adds its radiance before the phase-weighted sum, so it is
+volumetrically self-illuminated, it glows through its own smoke, and it
+needs no light slot to look right. **It still lights nothing around it**
+-- for that it wants one local light beside it, which is decision 7, and
+the division of labour there is the point: the emission is the LOOK, the
+light is the ILLUMINATION, and trying to make either do both is what
+makes fire look wrong.
+
+### 7. Particles as light sources: three tiers, one budget
+
+**Emissive and illuminating are different things**, and the first draft
+collapsed them by ruling that "a spark must not become a real light". That
+is right as a DEFAULT and wrong as a rule: it would have had someone
+reinventing from scratch a pattern that is already in the tree, or
+concluding the engine could not do this at all.
+
+**The precedent is the glow mushrooms**, whose header describes almost
+exactly what a particle group wants: *"each cluster is one local light at
+its middle... its lumens the mushrooms LEFT times `lumens_each`, shadowed
+like any other so it does not light through rock -- while it is among the
+24 most important (lumens over distance squared)."* One light for nine
+mushrooms, dimming as they are picked. A spark burst is the same shape: a
+group of emitters inside a metre or two, dimming as it dies.
+
+So a row in `particles.json` may carry a `light`, and there are three
+tiers:
+
+| `light` | what it does | cost |
+| --- | --- | --- |
+| *(absent)* | additive emissive: bright on screen, illuminates nothing | free |
+| `"group"` | ONE light at the live particles' centroid, lumens summed | 1 slot of 256 |
+| `"each"` | one light per particle, hard-capped at a few | 1 slot each |
+
+- **`"group"` is the default for anything bursty**, and it is very nearly
+  free visually: at any distance where a shower's illumination reads at
+  all, the shower is smaller than its own falloff, so a point at the
+  centroid and the true sum are indistinguishable.
+- **`"each"` is real but small** -- a thrown torch, a dropped ember, a
+  single magic bolt. Two to four, not two hundred.
+- **Thousands of individually lighting particles are not a budget to tune
+  but a structural impossibility.** The clustered forward path is O(lights
+  in the cluster) per pixel; `--lights-report` already measures 255
+  campfires at 46.5 lights per lit cluster costing 4.42 ms, and 256 is the
+  whole budget, which fires and torches need. Anyone wanting "every ember
+  lights the ground" is asking for a different technique -- light the
+  ground from the MEDIUM, or splat into an irradiance volume -- not for
+  more slots.
+
+**What a group light gets for free**, because it is an ordinary
+`LocalLightGpu` and nothing about it is special:
+
+- **volumetric glow** -- `cs_fog_inject` walks every light in the froxel's
+  cluster with its own shadow;
+- **bounce on nearby walls** -- the near field's fine hits are lit by the
+  frame's first 32 shadowed lights;
+- **terrain, trees and grass**, which already walk their pixel's cluster.
+
+Movement is handled too: `LocalLightGpu` carries `moving` ("moved within
+60 frames... the near field's far hits skip it"), and the fast-light path
+gives probes within 10 m a 0.1 s memory so the bounce tracks instead of
+lagging. That machinery exists because of the carried torch, and a spark
+shower is the same problem.
+
+The rules, which are what keep this from eating the frame:
+
+- **Particle lights enter the EXISTING importance sort** -- lumens over
+  distance squared -- as ordinary lights, with no reserved budget of their
+  own. A fire 5 m away then beats a spark shower 40 m away automatically,
+  and there is no second budget to balance against the first.
+- **Unshadowed by default**, so they light through walls. For a burst a
+  metre from the fire that threw it, nobody will see that. Shadowed is
+  opt-in and stays rare: 24 slots, and 64 campfires cost 2.98 ms
+  unshadowed against 3.55 with eight shadowed.
+- **Every row declares a maximum light count and a lumens ceiling**,
+  enforced like the per-kind particle budget of decision 3.
+
+**Fire wants three mechanisms, not one**, and this is the clearest case
+for the whole split: the LIGHT is a single well-placed local light (which
+campfires already have), the LOOK is an emissive medium (decision 6), and
+the SPARKS are emissive-only particles lighting nothing. Each does the one
+thing it is good at, and none pretends to be the others.
+
+### 8. Fill and spill: the sky-access gradient IS the escape route
 
 Per cell, in order:
 
@@ -268,7 +360,7 @@ at the ceiling and only sink once the chamber was full. Buoyancy running
 first is what keeps that honest -- the gradient is only consulted once a
 cell cannot rise.
 
-### 8. Media are drawn by the mist, not by cards
+### 9. Media are drawn by the mist, not by cards
 
 The medium raises `sigma_t` in `cs_fog_inject` and carries its own albedo
 (soot is dark, steam is not). Free, by doing it there:
@@ -292,7 +384,7 @@ in Layer B as a handful of ordinary lit cards: a volumetric column with
 particle wisps at its source. The hand-over is by distance from the
 emitter, not by distance from the camera.
 
-### 9. Distance LOD is not optional
+### 10. Distance LOD is not optional
 
 Sky access is requested per 8 m block round the camera and the occupancy
 volume is 128 m across. A fire 500 m away has neither. Three tiers:
@@ -306,7 +398,7 @@ volume is 128 m across. A fire 500 m away has neither. Three tiers:
 The expensive treatment applies only where the player can walk into the
 smoke, which is the only place the difference can be seen.
 
-### 10. Buildings must be VOXELISED -- not necessarily stored as voxels
+### 11. Buildings must be VOXELISED -- not necessarily stored as voxels
 
 **Noted now, deferred by agreement; nothing is built for it.**
 
@@ -348,7 +440,7 @@ is a second consumer of one stamp list.
 It blocks nothing here. Smoke in caves and in dug tunnels works with what
 is in the tree today.
 
-### 11. Decals are a separate feature, named here and not decided
+### 12. Decals are a separate feature, named here and not decided
 
 "Blood splats" is two features. The airborne droplets are Layer B. The
 mark that stays on the ground is a decal, and there is no decal system.
@@ -361,7 +453,7 @@ that scrolls past its edge. Blood, scorch marks and char all fit it.
 `on_hit` (decision 3) is how a particle would ask for one. Not decided
 here.
 
-### 12. What this design does NOT support, said plainly
+### 13. What this design does NOT support, said plainly
 
 So that it is a known cost rather than a discovery mid-playtest:
 
@@ -399,18 +491,44 @@ the test that the split in decision 1 was drawn in the right place.
    leaves (from a struck tree), dust (from `impacts_frame` when one lands,
    beside the trample stamp that already fires there), blood (from
    `on_hurt`), and one `on_hit` chain to prove kinds compose.
-4. **One ambient field**: snow or pollen, by biome, no spawn queue. The
+4. **A kind that casts light** (decision 7): the spark burst given
+   `"group"`, in a cave at night so the walls show it. The test is
+   `--lights-report`'s own: the burst takes ONE slot, the row's lumens
+   ceiling holds, it is sorted out by a nearer fire rather than by a rule
+   of its own, and the frame cost is within noise of the same burst
+   emissive-only. A still each way (`build/particle_light.bmp`), since
+   "the walls lit up" is not a number.
+5. **One ambient field**: snow or pollen, by biome, no spawn queue. The
    test is that it costs what the rain costs and holds still in the world
    while the camera moves (two `--no-taa` stills a metre apart).
-5. **Media in the open**: the grid, buoyancy, wind, injection into the
+6. **Media in the open**: the grid, buoyancy, wind, injection into the
    froxels. A campfire plume. `--smoke-test` with a still and a cost.
-6. **Media under cover**: the ceiling rule and the sky-access gradient.
+7. **Media under cover**: the ceiling rule and the sky-access gradient.
    The test is the shipping world's forest cave and a dug tunnel -- a fire
    in the chamber fills it and the smoke leaves by the mouth, and a fire in
    a sealed chamber fills it and stays. Both are already-reachable places
    with `--cave-walk` and `--dig-tunnel`.
 
 ## Alternatives considered
+
+**No particle lights at all.** The first draft's flat rule, and wrong:
+"emissive, never illuminating" is a sensible default dressed up as a
+constraint, and it hid the fact that the aggregate pattern was already
+shipping in `glow_mushrooms.h`. Kept as the default (a row with no
+`light`), dropped as a rule.
+
+**A light per particle, with a bigger light budget.** Rejected: it is not
+a tuning problem. The clustered forward path is O(lights in the cluster)
+per pixel, and the measured cost at 46.5 lights per lit cluster is already
+4.42 ms; raising `kMaxLights` makes that worse rather than better, and the
+256 are spoken for by fires and torches. A hundred emitters inside one
+metre want one light, which is also what they look like.
+
+**A separate light budget reserved for particles.** Rejected as a thing to
+balance forever: two budgets need a policy for how they trade against each
+other, and the engine already has the right policy for free -- one
+importance sort on lumens over distance squared, which a particle light
+joins as an ordinary light and wins or loses on its merits.
 
 **Kinds as a C++ enum, with each effect written as code.** The first
 draft's unstated assumption. Rejected on the second reading: it makes every
@@ -446,10 +564,10 @@ already debugged against `--leak-test`.
 
 ## Later
 
-Medium pooling against a built ceiling (decision 10); smoke that puts the
+Medium pooling against a built ceiling (decision 11); smoke that puts the
 player off, stings, or is seen by creatures; wind shelter behind terrain
-and buildings; decals (decision 11); ribbons, beams and soft alpha
-(decision 12); particles writing motion vectors -- nothing in this engine
+and buildings; decals (decision 12); ribbons, beams and soft alpha
+(decision 13); particles writing motion vectors -- nothing in this engine
 does, and fast particles will ghost under TAA, as the character already
 does; smoke casting a shadow; particles saved across a session (none are,
 by choice -- they are moments, as the felling debris is); audio, which

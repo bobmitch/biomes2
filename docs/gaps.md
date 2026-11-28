@@ -677,7 +677,19 @@ What is recorded here because it constrains OTHER work:
   first want of a soft dust puff, or a translucent wisp too small for the
   froxels, hits it. Escapes, cheapest first: push it to the medium layer;
   accept additive; weighted-blended OIT, a real fallback at a real cost.
-  [ADR-008 decision 12]
+  [ADR-008 decision 13]
+- **Particle lights share the ONE light budget, by design.** A kind may
+  cast light (`"group"`: one light at the live particles' centroid, lumens
+  summed, the glow mushrooms' pattern; or `"each"`, capped at a few), and
+  it takes a slot of `kMaxLights` 256 and joins the existing importance
+  sort on lumens over distance squared -- no reserved budget, so a fire
+  5 m off beats a spark shower 40 m off with no policy to maintain.
+  Thousands of individually lighting particles are structurally out of
+  reach, not merely untuned: the clustered forward path is O(lights in
+  the cluster) per pixel and 46.5 per lit cluster already costs 4.42 ms.
+  Whoever adds emitters that want to light the ground en masse needs a
+  different technique (light it from the medium, or splat an irradiance
+  volume), not more slots. [ADR-008 decision 7]
 - **Ribbons, trails and beams are not a particle kind.** An arrow's wake,
   a sword arc, a whip, and the magic beams `local_lights.h` already
   anticipates are connected geometry extruded along a path over time: a
